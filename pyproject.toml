@@ -1,10 +1,17 @@
 [project]
 name = "qtf-mcp"
-version = "0.1.3"
-description = "Add your description here"
+version = "0.2.0"
+description = "A股数据 MCP 服务，支持多种数据源"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["mcp[cli]>=1.22", "qtf", "ta-lib>=0.6.8"]
+dependencies = [
+    "mcp[cli]>=1.22",
+    "ta-lib>=0.6.8",
+    "akshare>=1.15.0",
+    "numpy>=1.26.0",
+    "click>=8.0.0",
+    "python-dotenv>=1.0.0",
+]
 
-[tool.uv.sources]
-qtf = { path = "libs/qtf-0.2.0-cp310-abi3-manylinux_2_28_x86_64.whl" }
+[project.scripts]
+qtf-mcp = "main:main"
