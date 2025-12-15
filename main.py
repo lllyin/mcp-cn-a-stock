@@ -22,7 +22,7 @@ from qtf_mcp.symbols import load_symbols
 
 
 @click.command()
-@click.option("--port", default=8000, help="Port to listen on for SSE")
+@click.option("--port", default=8686, help="Port to listen on for SSE")
 @click.option(
     "--transport",
     type=click.Choice(["stdio", "sse", "http"], case_sensitive=False),
