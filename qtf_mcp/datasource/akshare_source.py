@@ -125,39 +125,116 @@ class AkShareDataSource(DataSource):
         result = np.array([parse_value(v) for v in series], dtype=np.float64)
         return result
     
-    def _fetch_kline_sync(self, code: str, start_date: str, end_date: str) -> Optional[Dict]:
-        """同步获取K线数据"""
+    def _fetch_kline_sync(
+        self, code: str, start_date: str, end_date: str, adjust: str = "qfq"
+    ) -> Optional[Dict]:
+        """
+        同步获取K线数据
+        
+        Args:
+            code: 股票代码（纯数字）
+            start_date: 开始日期，格式 YYYY-MM-DD
+            end_date: 结束日期，格式 YYYY-MM-DD
+            adjust: 复权类型，qfq=前复权，hfq=后复权，空字符串=不复权
+        """
         try:
             import akshare as ak
             
-            # 使用东财接口获取前复权日K线
+            # 使用东财接口获取日K线
             df = ak.stock_zh_a_hist(
                 symbol=code,
                 period="daily",
                 start_date=start_date.replace("-", ""),
                 end_date=end_date.replace("-", ""),
-                adjust="qfq"  # 前复权
+                adjust=adjust
             )
             
             if df is None or df.empty:
                 return None
             
-            # 同时获取不复权数据用于计算
-            df_unadj = ak.stock_zh_a_hist(
-                symbol=code,
-                period="daily",
-                start_date=start_date.replace("-", ""),
-                end_date=end_date.replace("-", ""),
-                adjust=""  # 不复权
-            )
+            # 同时获取不复权数据用于计算（如果请求的不是不复权数据）
+            if adjust != "":
+                df_unadj = ak.stock_zh_a_hist(
+                    symbol=code,
+                    period="daily",
+                    start_date=start_date.replace("-", ""),
+                    end_date=end_date.replace("-", ""),
+                    adjust=""  # 不复权
+                )
+            else:
+                df_unadj = df
             
             return {
-                "qfq": df,
+                "adjusted": df,
                 "unadj": df_unadj if df_unadj is not None else df,
+                "adjust_type": adjust,
             }
         except Exception as e:
             logger.warning(f"获取K线数据失败 {code}: {e}")
             return None
+    
+    def fetch_kline_simple_sync(
+        self, symbol: str, start_date: str, end_date: str, adjust: str = "qfq"
+    ) -> Optional[Dict]:
+        """
+        简单获取 K 线数据（同步方法，返回简化的字典格式）
+        
+        Args:
+            symbol: 股票代码，格式如 "SH600000" 或 "SZ000001"
+            start_date: 开始日期，格式 YYYY-MM-DD
+            end_date: 结束日期，格式 YYYY-MM-DD
+            adjust: 复权类型，qfq=前复权（默认），hfq=后复权，空字符串=不复权
+            
+        Returns:
+            包含 K 线数据的字典列表，或 None
+        """
+        code, market = self._symbol_to_akshare(symbol)
+        kline_data = self._fetch_kline_sync(code, start_date, end_date, adjust)
+        
+        if kline_data is None:
+            return None
+        
+        df = kline_data["adjusted"]
+        adjust_type = kline_data["adjust_type"]
+        
+        # 转换为简单的字典列表格式
+        result = []
+        for _, row in df.iterrows():
+            result.append({
+                "日期": str(row["日期"]),
+                "开盘": float(row["开盘"]),
+                "收盘": float(row["收盘"]),
+                "最高": float(row["最高"]),
+                "最低": float(row["最低"]),
+                "成交量": int(row["成交量"]),
+                "成交额": float(row["成交额"]),
+                "振幅": float(row["振幅"]) if "振幅" in row else 0,
+                "涨跌幅": float(row["涨跌幅"]) if "涨跌幅" in row else 0,
+                "涨跌额": float(row["涨跌额"]) if "涨跌额" in row else 0,
+                "换手率": float(row["换手率"]) if "换手率" in row else 0,
+            })
+        
+        return {
+            "symbol": symbol,
+            "adjust": adjust_type if adjust_type else "不复权",
+            "data": result,
+        }
+    
+    async def fetch_kline_simple(
+        self, symbol: str, start_date: str, end_date: str, adjust: str = "qfq"
+    ) -> Optional[Dict]:
+        """
+        异步获取 K 线数据
+        
+        Args:
+            symbol: 股票代码，格式如 "SH600000" 或 "SZ000001"
+            start_date: 开始日期，格式 YYYY-MM-DD
+            end_date: 结束日期，格式 YYYY-MM-DD
+            adjust: 复权类型，qfq=前复权（默认），hfq=后复权，空字符串=不复权
+        """
+        return await _run_in_executor(
+            self.fetch_kline_simple_sync, symbol, start_date, end_date, adjust
+        )
     
     def _fetch_finance_sync(self, code: str) -> Optional[Dict]:
         """同步获取财务数据"""
@@ -289,7 +366,7 @@ class AkShareDataSource(DataSource):
         
         # 处理K线数据
         if kline_data:
-            df_qfq = kline_data.get("qfq")
+            df_qfq = kline_data.get("adjusted")
             df_unadj = kline_data.get("unadj")
             
             if df_qfq is not None and not df_qfq.empty:
