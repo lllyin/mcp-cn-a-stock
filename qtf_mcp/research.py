@@ -419,7 +419,9 @@ def build_financial_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> N
     ]
 
     rows = []
-    for i in range(len(dates) - 1, -1, -1):
+    # 从最后一个索引遍历到 0（不包含），与原始代码保持一致
+    # 跳过索引 0 是因为最早的财务数据可能不完整
+    for i in range(len(dates) - 1, 0, -1):
         date = datetime.datetime.fromtimestamp(dates[i] / 1e9)
         if date.month != 12 or years >= max_years:
             continue
