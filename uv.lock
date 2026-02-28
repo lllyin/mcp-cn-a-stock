@@ -47,6 +47,18 @@ wheels = [
 ]
 
 [[package]]
+name = "akshare-proxy-patch"
+version = "0.2.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "requests" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e6/80/b005ffdce05056bc3ab8e6e2b55dd4c6ea6b8f1e7d9aae3aae321f96d312/akshare_proxy_patch-0.2.7.tar.gz", hash = "sha256:b444cc38e2e847de9fbd8b270c6c49176802b7c79c280d8fb8c0d9bbe9dad52f", size = 3834, upload-time = "2026-02-11T15:34:12.241Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/36/28/59c9a79c5698f0d07c564da12bf044bf5aa952e45b62dd0b0feded8a5aaa/akshare_proxy_patch-0.2.7-py3-none-any.whl", hash = "sha256:2b10eb9321bff6a3d23a90d04fa771e3978f7e00a3415b8c798c8d447a65be8e", size = 3890, upload-time = "2026-02-11T15:34:09.98Z" },
+]
+
+[[package]]
 name = "annotated-doc"
 version = "0.0.4"
 source = { registry = "https://pypi.org/simple" }
@@ -979,6 +991,7 @@ version = "0.2.0"
 source = { virtual = "." }
 dependencies = [
     { name = "akshare" },
+    { name = "akshare-proxy-patch" },
     { name = "click" },
     { name = "mcp", extra = ["cli"] },
     { name = "numpy" },
@@ -995,6 +1008,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "akshare", specifier = ">=1.17.94" },
+    { name = "akshare-proxy-patch", specifier = "==0.2.7" },
     { name = "click", specifier = ">=8.3.1" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.22" },
     { name = "numpy", specifier = ">=1.26.0" },
@@ -1300,8 +1314,8 @@ name = "uvicorn"
 version = "0.41.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click" },
-    { name = "h11" },
+    { name = "click", marker = "sys_platform != 'emscripten'" },
+    { name = "h11", marker = "sys_platform != 'emscripten'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/32/ce/eeb58ae4ac36fe09e3842eb02e0eb676bf2c53ae062b98f1b2531673efdd/uvicorn-0.41.0.tar.gz", hash = "sha256:09d11cf7008da33113824ee5a1c6422d89fbc2ff476540d69a34c87fab8b571a", size = 82633, upload-time = "2026-02-16T23:07:24.1Z" }
 wheels = [

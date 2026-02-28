@@ -1,4 +1,9 @@
+import akshare_proxy_patch
 import akshare as ak
+
+# Initialize the proxy patch
+# Using the default gateway as per documentation
+akshare_proxy_patch.install_patch("101.201.173.125", "", 50)
 
 def test_stock_zh_a_hist():
     """

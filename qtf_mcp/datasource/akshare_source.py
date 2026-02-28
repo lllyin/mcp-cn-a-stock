@@ -13,7 +13,12 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
+import akshare_proxy_patch
 from .base import DataSource, StockData
+
+# Initialize the proxy patch to improve reliability of AkShare API calls,
+# especially for Eastmoney interfaces (push2his.eastmoney.com etc.)
+akshare_proxy_patch.install_patch("101.201.173.125", "", 50)
 
 logger = logging.getLogger("qtf_mcp")
 
