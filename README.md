@@ -37,15 +37,22 @@
 
 ### 1. 环境准备
 
-建议使用 Python 3.12+ 编译环境。
+建议使用 Python 3.12+ 编译环境（本说明以 Python 3.13 为例）。
 
 ```bash
 # 克隆仓库
 git clone git@github.com:lllyin/mcp-cn-a-stock.git
 cd mcp-cn-a-stock
 
-# 创建虚拟环境并安装依赖 (推荐使用 uv)
+# 创建虚拟环境 (.venv)
+python3.13 -m venv .venv
+
+# 激活虚拟环境
+source .venv/bin/activate
+
+# 安装依赖 (推荐使用 uv)
 uv sync
+
 # 或者使用 pip
 pip install .
 ```
@@ -67,7 +74,7 @@ AKSHARE_PROXY_PORT=50
 uv run qtf-mcp --transport http
 
 # 或者直接运行 python
-python main.py --transport http
+python3 main.py --transport http
 ```
 
 服务默认运行在 `http://localhost:8686/cnstock/mcp`。
