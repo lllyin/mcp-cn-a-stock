@@ -5,10 +5,10 @@
 """
 
 from .base import DataSource, StockData
-from .akshare_source import AkShareDataSource
+from .cn_stock_source import CNStockDataSource
 
-# 默认使用 AkShare 数据源
-default_datasource: DataSource = AkShareDataSource()
+# 默认使用 CNStock 数据源
+default_datasource: DataSource = CNStockDataSource()
 
 
 def get_datasource() -> DataSource:
@@ -26,8 +26,7 @@ def set_datasource(source: DataSource) -> None:
 __all__ = [
     "DataSource",
     "StockData",
-    "AkShareDataSource",
+    "CNStockDataSource",
     "get_datasource",
     "set_datasource",
 ]
-
