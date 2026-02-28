@@ -59,7 +59,7 @@ pip install .
 
 ### 2. 配置说明
 
-在项目根目录下创建 `.env` 文件，配置 AkShare 代理补丁（用于提高东财接口稳定性）：
+在项目根目录下创建 `.env` 文件，配置 [AkShare Proxy Patch](https://github.com/helloYie/akshare-proxy-patch)（用于提高东财接口稳定性）：
 
 ```env
 AKSHARE_PROXY_IP=你的代理IP
