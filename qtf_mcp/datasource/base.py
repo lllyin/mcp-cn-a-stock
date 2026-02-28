@@ -40,6 +40,7 @@ class StockData:
     # 财务数据
     finance_date: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     total_shares: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))   # 总股本
+    float_shares: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))   # 流通股本
     main_revenue: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))   # 主营收入
     net_profit: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))     # 净利润
     eps: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))            # 每股收益
@@ -88,6 +89,7 @@ class StockData:
             
             # 财务数据
             "TCAP": self.total_shares,
+            "FCAP": self.float_shares,
             "MR": self.main_revenue,
             "NP": self.net_profit,
             "EPS": self.eps,
@@ -121,6 +123,7 @@ class StockData:
                     "NAVPS": self.nav_per_share,
                     "ROE": self.roe,
                     "TCAP": self.total_shares,
+                    "FCAP": self.float_shares,
                 },
                 "1q",
             )  # type: ignore

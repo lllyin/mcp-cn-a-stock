@@ -338,15 +338,19 @@ def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> Non
         print("- 暂无资金流向数据", file=fp)
     print("", file=fp)
 
-    if is_stock(symbol):
-        tcap = data.get("TCAP", np.array([]))
-        if len(tcap) > 0 and tcap[-1] > 0:
-            print("## 换手率", file=fp)
-            print(f"- 当日: {volume[-1] / tcap[-1]:.2%}", file=fp)
-            for p in periods:
-                print(f"- {p}日均换手: {volume[-p:].mean() / tcap[-1]:.2%}", file=fp)
-                print(f"- {p}日总换手: {volume[-p:].sum() / tcap[-1]:.2%}", file=fp)
-            print("", file=fp)
+    # 换手率计算 (兆易创新等个股使用流通股本)
+    fcap = data.get("FCAP", np.array([]))
+    if len(fcap) == 0 or fcap[-1] == 0:
+        fcap = data.get("TCAP", np.array([]))
+        
+    if len(fcap) > 0 and fcap[-1] > 0:
+        # A股成交量单位是手(100股)，计算换手率需乘以100
+        print("## 换手率", file=fp)
+        print(f"- 当日: {volume[-1] * 100 / fcap[-1]:.2%}", file=fp)
+        for p in periods:
+            print(f"- {p}日均换手: {volume[-p:].mean() * 100 / fcap[-1]:.2%}", file=fp)
+            print(f"- {p}日总换手: {volume[-p:].sum() * 100 / fcap[-1]:.2%}", file=fp)
+        print("", file=fp)
 
 
 def build_technical_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> None:

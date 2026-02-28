@@ -362,9 +362,17 @@ class AkShareDataSource(DataSource):
             info = realtime_data["info"]
             stock_data.name = info.get("股票简称", "")
             
-            # 获取总股本
+            # 获取总股本、流通股本
             total_shares = info.get("总股本", 0)
             stock_data.total_shares = np.array([float(total_shares)])
+            
+            float_market_val = info.get("流通市值", 0)
+            latest_price = info.get("最新价", 0)
+            if latest_price > 0:
+                float_shares = float_market_val / latest_price
+                stock_data.float_shares = np.array([float(float_shares)])
+            else:
+                stock_data.float_shares = np.array([0.0])
         
         # 处理K线数据
         if kline_data:
