@@ -4,9 +4,15 @@
 
 ## 项目亮点
 
-- **基于开源库**：本仓库基于 [elsejj/mcp-cn-a-stock](https://github.com/elsejj/mcp-cn-a-stock) 修改，核心改进是将原有的私有数据源替换为基于 [AkShare](https://github.com/akfamily/akshare) 和 [efinance](https://github.com/nelsonie/efinance) 的开源数据接口，不再依赖外部付费 API。
+- **基于开源库**：本仓库基于 [elsejj/mcp-cn-a-stock](https://github.com/elsejj/mcp-cn-a-stock) 修改，核心改进是将原有的私有数据源替换为基于 [AkShare](https://github.com/akfamily/akshare) 和 [efinance](https://github.com/nelsonie/efinance) 的开源数据接口，**不再依赖内部私有API**。
 - **数据全面**：覆盖沪深京全市场股票及 **场内 ETF 基金**。
-- **本地运行**：通过本地环境直接获取实时行情和财报数据，保障隐私与速度。
+
+## 主要改进点
+
+1. **数据源迁移**：由 `AkShare` 和 `efinance` 提供数据，无需私有 API。
+2. **算法对齐**：优化了 KDJ 和振幅算法，数据与主流交易 APP 保持一致。
+3. **指标增强**：新增总市值、流通市值、动态市盈率、市净率等关键指标。
+4. **架构重构**：由 `CNStockDataSource` 统一驱动，支持 `.env` 环境配置。
 
 ## 功能特性
 
@@ -35,7 +41,7 @@
 
 ```bash
 # 克隆仓库
-git clone <your-repo-url>
+git clone git@github.com:lllyin/mcp-cn-a-stock.git
 cd mcp-cn-a-stock
 
 # 创建虚拟环境并安装依赖 (推荐使用 uv)
