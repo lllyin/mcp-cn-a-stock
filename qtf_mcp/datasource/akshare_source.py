@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 import akshare_proxy_patch
+import efinance as ef
 from .base import DataSource, StockData
 
 # Initialize the proxy patch to improve reliability of AkShare API calls,
@@ -143,28 +144,32 @@ class AkShareDataSource(DataSource):
             adjust: 复权类型，qfq=前复权，hfq=后复权，空字符串=不复权
         """
         try:
-            import akshare as ak
+            # 映射复权类型
+            adj_map = {"qfq": 1, "hfq": 2, "": 0}
+            fqt = adj_map.get(adjust, 1)
             
-            # 使用东财接口获取日K线
-            df = ak.stock_zh_a_hist(
-                symbol=code,
-                period="daily",
-                start_date=start_date.replace("-", ""),
-                end_date=end_date.replace("-", ""),
-                adjust=adjust
+            # 使用 efinance 获取日K线（底层也是东财，但支持 ETF 更好）
+            df = ef.stock.get_quote_history(
+                code,
+                beg=start_date.replace("-", ""),
+                end=end_date.replace("-", ""),
+                fqt=fqt
             )
             
             if df is None or df.empty:
+                logger.warning(f"获取K线数据为空 {code}")
                 return None
             
+            # 统一字段名（efinance 返回的包含 '股票名称', '股票代码'，移除它们以匹配后续逻辑，或保持不变）
+            # 后续逻辑主要使用 '日期', '开盘', '收盘' 等
+            
             # 同时获取不复权数据用于计算（如果请求的不是不复权数据）
-            if adjust != "":
-                df_unadj = ak.stock_zh_a_hist(
-                    symbol=code,
-                    period="daily",
-                    start_date=start_date.replace("-", ""),
-                    end_date=end_date.replace("-", ""),
-                    adjust=""  # 不复权
+            if fqt != 0:
+                df_unadj = ef.stock.get_quote_history(
+                    code,
+                    beg=start_date.replace("-", ""),
+                    end=end_date.replace("-", ""),
+                    fqt=0  # 不复权
                 )
             else:
                 df_unadj = df
@@ -293,18 +298,25 @@ class AkShareDataSource(DataSource):
     def _fetch_realtime_sync(self, code: str) -> Optional[Dict]:
         """同步获取实时数据（用于获取股票名称和总股本）"""
         try:
-            import akshare as ak
-            
-            # 获取实时行情
-            df = ak.stock_individual_info_em(symbol=code)
-            
-            if df is None or df.empty:
+            # 获取实时基准信息
+            info_series = ef.stock.get_base_info(code)
+            if info_series is None or info_series.empty:
                 return None
             
-            # 转换为字典
-            info = {}
-            for _, row in df.iterrows():
-                info[row["item"]] = row["value"]
+            info = {
+                "股票简称": info_series.get("股票名称", ""),
+            }
+            
+            # 获取实时快照以拿到最新价计算股本
+            snapshot = ef.stock.get_quote_snapshot(code)
+            if snapshot is not None and not snapshot.empty:
+                latest_price = snapshot.get("最新价", 0)
+                total_market_val = info_series.get("总市值", 0)
+                if latest_price > 0:
+                    info["总股本"] = total_market_val / latest_price
+                info["最新价"] = latest_price
+                info["总市值"] = total_market_val
+                info["流通市值"] = info_series.get("流通市值", 0)
             
             return {"info": info}
         except Exception as e:
@@ -314,13 +326,10 @@ class AkShareDataSource(DataSource):
     def _fetch_sector_sync(self, code: str) -> List[str]:
         """同步获取所属板块"""
         try:
-            import akshare as ak
-            
-            # 获取股票所属行业
-            df = ak.stock_board_industry_name_em()
-            
-            # 这里简化处理，返回空列表
-            # 实际使用时可以通过其他接口获取个股所属板块
+            # efinance 获取所属板块
+            df = ef.stock.get_belong_board(code)
+            if df is not None and not df.empty:
+                return df["板块名称"].tolist()
             return []
         except Exception as e:
             logger.warning(f"获取板块数据失败 {code}: {e}")
@@ -354,20 +363,8 @@ class AkShareDataSource(DataSource):
             stock_data.name = info.get("股票简称", "")
             
             # 获取总股本
-            total_shares_str = info.get("总股本", "0")
-            try:
-                if isinstance(total_shares_str, str):
-                    # 处理类似 "1.23亿" 的格式
-                    if "亿" in total_shares_str:
-                        stock_data.total_shares = np.array([float(total_shares_str.replace("亿", "")) * 1e8])
-                    elif "万" in total_shares_str:
-                        stock_data.total_shares = np.array([float(total_shares_str.replace("万", "")) * 1e4])
-                    else:
-                        stock_data.total_shares = np.array([float(total_shares_str)])
-                else:
-                    stock_data.total_shares = np.array([float(total_shares_str)])
-            except (ValueError, TypeError):
-                stock_data.total_shares = np.array([0.0])
+            total_shares = info.get("总股本", 0)
+            stock_data.total_shares = np.array([float(total_shares)])
         
         # 处理K线数据
         if kline_data:
@@ -386,6 +383,7 @@ class AkShareDataSource(DataSource):
                 
                 # 不复权收盘价
                 if df_unadj is not None and not df_unadj.empty:
+                    # 确保日期对齐（如果长度不同需要处理，通常是均匀的）
                     stock_data.close_unadj = df_unadj["收盘"].values.astype(np.float64)
                 else:
                     stock_data.close_unadj = stock_data.close.copy()
@@ -474,31 +472,16 @@ class AkShareDataSource(DataSource):
     async def fetch_stock_list(self) -> List[Dict[str, str]]:
         """获取股票列表"""
         def _fetch():
-            import akshare as ak
-            
+            # 使用 efinance 获取全市场实时行情作为列表
+            df = ef.stock.get_realtime_quotes()
             result = []
-            
-            # 获取沪深A股列表
-            try:
-                df_sh = ak.stock_info_sh_name_code()
-                for _, row in df_sh.iterrows():
-                    code = str(row.get("证券代码", row.get("SECURITY_CODE_A", "")))
-                    name = str(row.get("证券简称", row.get("SECURITY_NAME_A", "")))
-                    if code and name:
-                        result.append({"code": f"SH{code}", "name": name})
-            except Exception as e:
-                logger.warning(f"获取上海股票列表失败: {e}")
-            
-            try:
-                df_sz = ak.stock_info_sz_name_code()
-                for _, row in df_sz.iterrows():
-                    code = str(row.get("A股代码", ""))
-                    name = str(row.get("A股简称", ""))
-                    if code and name:
-                        result.append({"code": f"SZ{code}", "name": name})
-            except Exception as e:
-                logger.warning(f"获取深圳股票列表失败: {e}")
-            
+            if df is not None and not df.empty:
+                for _, row in df.iterrows():
+                    code = str(row["股票代码"])
+                    name = str(row["股票名称"])
+                    # 确定市场前缀
+                    prefix = "SH" if code.startswith(("6", "5")) else "SZ"
+                    result.append({"code": f"{prefix}{code}", "name": name})
             return result
         
         return await _run_in_executor(_fetch)

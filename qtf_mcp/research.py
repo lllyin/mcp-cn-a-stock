@@ -278,12 +278,13 @@ def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> Non
     print("", file=fp)
 
     print("## 振幅", file=fp)
-    if low[-1] != 0:
-        print(f"- 当日: {(high[-1] / low[-1] - 1):.2%}", file=fp)
+    if close[-1] != 0:
+        print(f"- 当日: {(high[-1] - low[-1]) / close[-1]:.2%}", file=fp)
+        
     for p in periods:
-        min_low = low[-p:].min()
-        if min_low != 0:
-            print(f"- {p}日振幅: {(high[-p:].max() / min_low - 1):.2%}", file=fp)
+        mean_p = close[-p:].mean()
+        if mean_p != 0:
+            print(f"- {p}日振幅: {(high[-p:].max() - low[-p:].min()) / mean_p:.2%}", file=fp)
     print("", file=fp)
 
     print("## 涨跌幅", file=fp)
