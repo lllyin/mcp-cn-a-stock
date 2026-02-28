@@ -296,9 +296,9 @@ def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> Non
     print("", file=fp)
 
     print("## 成交量(万手)", file=fp)
-    print(f"- 当日: {volume[-1] / 1e6:.2f}", file=fp)
+    print(f"- 当日: {volume[-1] / 1e4:.2f}", file=fp)
     for p in periods:
-        print(f"- {p}日均量(万手): {volume[-p:].mean() / 1e6:.2f}", file=fp)
+        print(f"- {p}日均量(万手): {volume[-p:].mean() / 1e4:.2f}", file=fp)
     print("", file=fp)
 
     print("## 成交额(亿)", file=fp)
