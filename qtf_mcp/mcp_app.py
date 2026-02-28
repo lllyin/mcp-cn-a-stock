@@ -91,7 +91,7 @@ async def full(symbol: str, ctx: Context) -> str:
 async def kline_daily(
   symbol: str,
   date: str,
-  adjust: Literal["qfq", "hfq", ""] = "qfq",
+  adjust: Literal["qfq", "hfq", "none"] = "qfq",
   ctx: Context = None,  # type: ignore
 ) -> str:
   """获取指定日期的股票日K线数据
@@ -103,8 +103,8 @@ async def kline_daily(
                   Stock symbol, must be in the format of "SH600000" or "SZ000001".
     date (str): 查询日期，格式 "YYYY-MM-DD"，如 "2024-12-13"。
                 Query date in format "YYYY-MM-DD".
-    adjust (str): 复权类型。"qfq"=前复权(默认), "hfq"=后复权, ""=不复权。
-                  Adjustment type: "qfq"=forward adjust(default), "hfq"=backward adjust, ""=no adjust.
+    adjust (str): 复权类型。"qfq"=前复权(默认), "hfq"=后复权, "none"=不复权。
+                  Adjustment type: "qfq"=forward adjust(default), "hfq"=backward adjust, "none"=no adjust.
   
   Returns:
     该日期的K线数据，包含开盘价、收盘价、最高价、最低价、成交量、成交额等。
@@ -116,7 +116,7 @@ async def kline_daily(
     return f"未找到 {symbol} 在 {date} 的数据。可能是非交易日或股票代码有误。"
   
   data = result["data"][0]
-  adjust_name = {"qfq": "前复权", "hfq": "后复权", "": "不复权"}.get(adjust, adjust)
+  adjust_name = {"qfq": "前复权", "hfq": "后复权", "none": "不复权"}.get(adjust, adjust)
   
   buf = StringIO()
   print(f"# {symbol} {date} 日K线数据 ({adjust_name})", file=buf)
@@ -140,7 +140,7 @@ async def kline_range(
   symbol: str,
   start_date: str,
   end_date: str,
-  adjust: Literal["qfq", "hfq", ""] = "qfq",
+  adjust: Literal["qfq", "hfq", "none"] = "qfq",
   ctx: Context = None,  # type: ignore
 ) -> str:
   """获取指定日期区间的股票日K线数据
@@ -154,8 +154,8 @@ async def kline_range(
                       Start date in format "YYYY-MM-DD".
     end_date (str): 结束日期，格式 "YYYY-MM-DD"，如 "2024-12-13"。
                     End date in format "YYYY-MM-DD".
-    adjust (str): 复权类型。"qfq"=前复权(默认), "hfq"=后复权, ""=不复权。
-                  Adjustment type: "qfq"=forward adjust(default), "hfq"=backward adjust, ""=no adjust.
+    adjust (str): 复权类型。"qfq"=前复权(默认), "hfq"=后复权, "none"=不复权。
+                  Adjustment type: "qfq"=forward adjust(default), "hfq"=backward adjust, "none"=no adjust.
   
   Returns:
     日期区间内的K线数据表格，包含每日的开高低收、成交量、涨跌幅等。
@@ -167,7 +167,7 @@ async def kline_range(
     return f"未找到 {symbol} 在 {start_date} 至 {end_date} 期间的数据。"
   
   data_list = result["data"]
-  adjust_name = {"qfq": "前复权", "hfq": "后复权", "": "不复权"}.get(adjust, adjust)
+  adjust_name = {"qfq": "前复权", "hfq": "后复权", "none": "不复权"}.get(adjust, adjust)
   
   buf = StringIO()
   print(f"# {symbol} K线数据 ({start_date} 至 {end_date}, {adjust_name})", file=buf)

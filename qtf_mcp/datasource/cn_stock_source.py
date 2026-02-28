@@ -140,7 +140,7 @@ class CNStockDataSource(DataSource):
         """同步获取K线数据"""
         try:
             # 映射复权类型
-            adj_map = {"qfq": 1, "hfq": 2, "": 0}
+            adj_map = {"qfq": 1, "hfq": 2, "none": 0}
             fqt = adj_map.get(adjust, 1)
             
             # 使用 efinance 获取日K线
@@ -209,7 +209,7 @@ class CNStockDataSource(DataSource):
         
         return {
             "symbol": symbol,
-            "adjust": adjust_type if adjust_type else "不复权",
+            "adjust": {"qfq": "前复权", "hfq": "后复权", "none": "不复权"}.get(adjust_type, adjust_type),
             "data": result,
         }
     
