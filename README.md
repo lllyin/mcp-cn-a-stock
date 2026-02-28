@@ -16,6 +16,16 @@
 - full: 提供所有中等数据和技术指标
   由大模型根据用户的问题需要，自行选择调用。
 
+## 运行
+1. 本地运行后，mcp地址为：`http://localhost:8686/cnstock/mcp`
+```
+ python3 main.py --transport http
+```
+2. MCP debug
+```
+npx @modelcontextprotocol/inspector --url http://localhost:8686/cnstock/mcp
+```
+
 ## 免责申明
 
 本项目会尽可能的保障准确可用, 但不对因此产生的任何后果负任何责任, 使用本 MCP 即代表接受此免责申明.
