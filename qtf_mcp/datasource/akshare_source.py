@@ -19,7 +19,7 @@ from .base import DataSource, StockData
 
 # Initialize the proxy patch to improve reliability of AkShare API calls,
 # especially for Eastmoney interfaces (push2his.eastmoney.com etc.)
-akshare_proxy_patch.install_patch("101.201.173.125", "", 50)
+akshare_proxy_patch.install_patch("101.201.173.125", "20260228WKES", 50)
 
 logger = logging.getLogger("qtf_mcp")
 
@@ -111,8 +111,10 @@ class AkShareDataSource(DataSource):
             # 移除百分号
             if s.endswith("%"):
                 s = s[:-1]
-                # 如果是百分比格式，已经移除了%，不需要额外除以100
-                # 因为 akshare 返回的 "24.00%" 意思就是 24%
+                try:
+                    return float(s) / 100.0
+                except ValueError:
+                    return 0.0
             
             # 处理亿/万单位
             multiplier = 1.0
@@ -318,6 +320,13 @@ class AkShareDataSource(DataSource):
                 info["总市值"] = total_market_val
                 info["流通市值"] = info_series.get("流通市值", 0)
             
+            # 获取实时详情表以获取 PE/PB
+            rt_quotes = ef.stock.get_realtime_quotes()
+            if rt_quotes is not None and not rt_quotes.empty:
+                match = rt_quotes[rt_quotes['股票代码'] == code]
+                if not match.empty:
+                    info["动态市盈率"] = match.iloc[0].get("动态市盈率", 0)
+            
             return {"info": info}
         except Exception as e:
             logger.warning(f"获取实时数据失败 {code}: {e}")
@@ -366,13 +375,22 @@ class AkShareDataSource(DataSource):
             total_shares = info.get("总股本", 0)
             stock_data.total_shares = np.array([float(total_shares)])
             
-            float_market_val = info.get("流通市值", 0)
+            total_market_cap = info.get("总市值", 0)
+            stock_data.total_market_cap = np.array([float(total_market_cap)])
+            
+            float_market_cap = info.get("流通市值", 0)
+            stock_data.float_market_cap = np.array([float(float_market_cap)])
+            
             latest_price = info.get("最新价", 0)
             if latest_price > 0:
-                float_shares = float_market_val / latest_price
+                float_shares = float_market_cap / latest_price
                 stock_data.float_shares = np.array([float(float_shares)])
             else:
                 stock_data.float_shares = np.array([0.0])
+            
+            # 获取实时动态市盈率
+            pe_ttm = info.get("动态市盈率", 0)
+            stock_data.pe_ttm = np.array([float(pe_ttm)])
         
         # 处理K线数据
         if kline_data:

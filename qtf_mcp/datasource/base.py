@@ -41,11 +41,18 @@ class StockData:
     finance_date: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     total_shares: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))   # 总股本
     float_shares: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))   # 流通股本
+    total_market_cap: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64)) # 总市值
+    float_market_cap: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64)) # 流通市值
     main_revenue: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))   # 主营收入
     net_profit: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))     # 净利润
     eps: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))            # 每股收益
     nav_per_share: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))  # 每股净资产
     roe: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))            # 净资产收益率
+    
+    # 估值指标
+    pe_static: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))     # 静态市盈率
+    pe_ttm: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))        # 动态市盈率
+    pb: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))            # 市净率
     
     # 资金流向
     fund_main_amount: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))   # 主力净额
@@ -90,11 +97,16 @@ class StockData:
             # 财务数据
             "TCAP": self.total_shares,
             "FCAP": self.float_shares,
+            "MCAP": self.total_market_cap,
+            "FMCAP": self.float_market_cap,
             "MR": self.main_revenue,
             "NP": self.net_profit,
             "EPS": self.eps,
             "NAVPS": self.nav_per_share,
             "ROE": self.roe,
+            "PE_STATIC": self.pe_static,
+            "PE_TTM": self.pe_ttm,
+            "PB": self.pb,
             
             # 资金流向
             "A_A": self.fund_main_amount,

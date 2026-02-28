@@ -164,6 +164,15 @@ def build_basic_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> None:
         print(f"- 行业概念: {sector}", file=fp)
     
     if is_stock(symbol):
+        # 总市值、流通市值
+        mcap = data.get("MCAP", np.array([]))
+        fmcap = data.get("FMCAP", np.array([]))
+        if len(mcap) > 0 and mcap[-1] > 0:
+            print(f"- 总市值: {mcap[-1]/1e8:.2f}亿", file=fp)
+        if len(fmcap) > 0 and fmcap[-1] > 0:
+            print(f"- 流通市值: {fmcap[-1]/1e8:.2f}亿", file=fp)
+    
+    if is_stock(symbol):
         # 总股本
         tcap = data.get("TCAP", np.array([]))
         if len(tcap) > 0:
@@ -178,7 +187,7 @@ def build_basic_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> None:
         # 净利润
         np_arr = data.get("NP", np.array([]))
         if len(np_arr) > 0 and last_year_index >= 0 and last_year_index < len(np_arr):
-            net_profit = np_arr[last_year_index] * 10000
+            net_profit = np_arr[last_year_index]
         else:
             net_profit = 0
         
@@ -187,17 +196,26 @@ def build_basic_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> None:
             total_amount = total_shares * current_price
             pe_static = total_amount / net_profit if net_profit != 0 else float("inf")
             print(f"- 市盈率(静): {pe_static:.2f}", file=fp)
+            
+            # 动态市盈率 (优先使用数据源直接提供的)
+            pe_ttm_arr = data.get("PE_TTM", np.array([]))
+            if len(pe_ttm_arr) > 0 and pe_ttm_arr[-1] > 0:
+                print(f"- 市盈率(动): {pe_ttm_arr[-1]:.2f}", file=fp)
         
         # 市净率
         navps = data.get("NAVPS", np.array([]))
         if len(navps) > 0 and navps[-1] != 0 and current_price > 0:
             pb = current_price / navps[-1]
+            # 优先检查数据源是否直接提供了 PB (如果有的话)
+            pb_arr = data.get("PB", np.array([]))
+            if len(pb_arr) > 0 and pb_arr[-1] > 0:
+                 pb = pb_arr[-1]
             print(f"- 市净率: {pb:.2f}", file=fp)
         
         # 净资产收益率
         roe = data.get("ROE", np.array([]))
         if len(roe) > 0:
-            print(f"- 净资产收益率: {roe[-1]:.2f}", file=fp)
+            print(f"- 净资产收益率: {roe[-1]*100:.2f}%", file=fp)
     
     print("", file=fp)
 
@@ -440,7 +458,7 @@ def build_financial_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> N
         ("净利润(亿元)", "NP", 1e8, True),
         ("每股收益", "EPS", 1, True),
         ("每股净资产", "NAVPS", 1, True),
-        ("净资产收益率(%)", "ROE", 1, True),
+        ("净资产收益率(%)", "ROE", 0.01, True),
     ]
 
     rows = []
