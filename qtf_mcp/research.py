@@ -20,19 +20,36 @@ def compute_kdj(close: ndarray, high: ndarray, low: ndarray, n: int = 9, m1: int
     """
     计算 KDJ 指标
     
-    使用 TA-Lib 的 STOCH 函数计算
+    使用中国证券软件通用的递归计算公式（递归权重 (n-1)/n），
+    以确保与东方财富、富途等软件显示数值一致。
+    K = (2/3)*prev_K + (1/3)*current_RSV
+    D = (2/3)*prev_D + (1/3)*current_K
     """
-    slowk, slowd = talib.STOCH(
-        high, low, close,
-        fastk_period=n,
-        slowk_period=m1,
-        slowk_matype=0,
-        slowd_period=m2,
-        slowd_matype=0
-    )
+    import pandas as pd
+    
+    s_close = pd.Series(close)
+    s_high = pd.Series(high)
+    s_low = pd.Series(low)
+    
+    # 计算 RSV (Raw Stochastic Value)
+    low_min = s_low.rolling(window=n).min()
+    high_max = s_high.rolling(window=n).max()
+    
+    # 避免分母为0
+    diff = high_max - low_min
+    rsv = (s_close - low_min) / diff * 100
+    rsv = rsv.fillna(50)
+    
+    # 递归计算 K, D (采用 com=m-1 对应的 alpha=1/m)
+    # K[t] = (2/3) * K[t-1] + (1/3) * RSV[t]
+    k = rsv.ewm(com=m1-1, adjust=False).mean()
+    # D[t] = (2/3) * D[t-1] + (1/3) * K[t]
+    d = k.ewm(com=m2-1, adjust=False).mean()
+    
     # J = 3*K - 2*D
-    j = 3 * slowk - 2 * slowd
-    return slowk, slowd, j
+    j = 3 * k - 2 * d
+    
+    return k.values, d.values, j.values
 
 
 def compute_macd(close: ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple:
