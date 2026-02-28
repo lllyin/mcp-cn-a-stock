@@ -295,10 +295,13 @@ def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> Non
     print("", file=fp)
 
     print("## 振幅", file=fp)
-    if close[-1] != 0:
-        print(f"- 当日: {(high[-1] - low[-1]) / close[-1]:.2%}", file=fp)
+    # 当日振幅使用昨收价作为基准 (符合市场标准)
+    prev_close = close[-2] if len(close) >= 2 else close[-1]
+    if prev_close != 0:
+        print(f"- 当日: {(high[-1] - low[-1]) / prev_close:.2%}", file=fp)
         
     for p in periods:
+        # 周期振幅使用用户指定的周期均价公式
         mean_p = close[-p:].mean()
         if mean_p != 0:
             print(f"- {p}日振幅: {(high[-p:].max() - low[-p:].min()) / mean_p:.2%}", file=fp)
