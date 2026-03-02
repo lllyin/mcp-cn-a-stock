@@ -283,17 +283,20 @@ def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> Non
     if "CLOSE" not in data or len(data["CLOSE"]) == 0:
         return
     
-    today_vol_est_ratio = today_volume_est_ratio(data)
-    close = data["CLOSE"]
-    volume = data.get("VOLUME", np.zeros_like(close))
-    volume = volume.copy()
-    if len(volume) > 0:
-        volume[-1] = volume[-1] * today_vol_est_ratio
+    today_ratio = today_volume_est_ratio(data)
+    is_intra_day = today_ratio > 1.05  # 显著超过1说明是盘中
     
-    amount = data.get("AMOUNT", np.zeros_like(close)) / 1e8
-    amount = amount.copy()
-    if len(amount) > 0:
-        amount[-1] = amount[-1] * today_vol_est_ratio
+    close = data["CLOSE"]
+    # 原始成交量/成交额
+    volume_actual = data.get("VOLUME", np.zeros_like(close)).copy()
+    amount_actual = (data.get("AMOUNT", np.zeros_like(close)) / 1e8).copy()
+    
+    # 预估全天成交量/成交额
+    volume_est = volume_actual.copy()
+    amount_est = amount_actual.copy()
+    if len(volume_est) > 0:
+        volume_est[-1] = volume_actual[-1] * today_ratio
+        amount_est[-1] = amount_actual[-1] * today_ratio
     
     high = data.get("HIGH", close)
     low = data.get("LOW", close)
@@ -313,13 +316,11 @@ def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> Non
     print("", file=fp)
 
     print("## 振幅", file=fp)
-    # 当日振幅使用昨收价作为基准 (符合市场标准)
     prev_close = close[-2] if len(close) >= 2 else close[-1]
     if prev_close != 0:
         print(f"- 当日: {(high[-1] - low[-1]) / prev_close:.2%}", file=fp)
         
     for p in periods:
-        # 周期振幅使用用户指定的周期均价公式
         mean_p = close[-p:].mean()
         if mean_p != 0:
             print(f"- {p}日振幅: {(high[-p:].max() - low[-p:].min()) / mean_p:.2%}", file=fp)
@@ -334,15 +335,28 @@ def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> Non
     print("", file=fp)
 
     print("## 成交量(万手)", file=fp)
-    print(f"- 当日: {volume[-1] / 1e4:.2f}", file=fp)
+    if is_intra_day:
+        print(f"- 当日(实时): {volume_actual[-1] / 1e4:.2f}", file=fp)
+    else:
+        print(f"- 当日: {volume_actual[-1] / 1e4:.2f}", file=fp)
+        
     for p in periods:
-        print(f"- {p}日均量(万手): {volume[-p:].mean() / 1e4:.2f}", file=fp)
+        # 均量使用预估值来填补当日，否则均值会偏低
+        vol_for_mean = volume_actual.copy()
+        vol_for_mean[-1] = volume_est[-1]
+        print(f"- {p}日均量(万手): {vol_for_mean[-p:].mean() / 1e4:.2f}", file=fp)
     print("", file=fp)
 
     print("## 成交额(亿)", file=fp)
-    print(f"- 当日: {amount[-1]:.2f}", file=fp)
+    if is_intra_day:
+        print(f"- 当日(实时): {amount_actual[-1]:.2f}", file=fp)
+    else:
+        print(f"- 当日: {amount_actual[-1]:.2f}", file=fp)
+        
     for p in periods:
-        print(f"- {p}日均额(亿): {amount[-p:].mean():.2f}", file=fp)
+        amt_for_mean = amount_actual.copy()
+        amt_for_mean[-1] = amount_est[-1]
+        print(f"- {p}日均额(亿): {amt_for_mean[-p:].mean():.2f}", file=fp)
     print("", file=fp)
 
     print("## 资金流向", file=fp)
@@ -356,18 +370,23 @@ def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> Non
         print("- 暂无资金流向数据", file=fp)
     print("", file=fp)
 
-    # 换手率计算 (兆易创新等个股使用流通股本)
+    # 换手率计算
     fcap = data.get("FCAP", np.array([]))
     if len(fcap) == 0 or fcap[-1] == 0:
         fcap = data.get("TCAP", np.array([]))
         
     if len(fcap) > 0 and fcap[-1] > 0:
-        # A股成交量单位是手(100股)，计算换手率需乘以100
         print("## 换手率", file=fp)
-        print(f"- 当日: {volume[-1] * 100 / fcap[-1]:.2%}", file=fp)
+        if is_intra_day:
+            print(f"- 当日(实时): {volume_actual[-1] * 100 / fcap[-1]:.2%}", file=fp)
+        else:
+            print(f"- 当日: {volume_actual[-1] * 100 / fcap[-1]:.2%}", file=fp)
+            
         for p in periods:
-            print(f"- {p}日均换手: {volume[-p:].mean() * 100 / fcap[-1]:.2%}", file=fp)
-            print(f"- {p}日总换手: {volume[-p:].sum() * 100 / fcap[-1]:.2%}", file=fp)
+            vol_for_mean = volume_actual.copy()
+            vol_for_mean[-1] = volume_est[-1]
+            print(f"- {p}日均换手: {vol_for_mean[-p:].mean() * 100 / fcap[-1]:.2%}", file=fp)
+            print(f"- {p}日总换手 (含今日): {vol_for_mean[-p:].sum() * 100 / fcap[-1]:.2%}", file=fp)
         print("", file=fp)
 
 
