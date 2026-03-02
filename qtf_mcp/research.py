@@ -315,6 +315,14 @@ def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> Non
         )
     print("", file=fp)
 
+    print("## 涨跌幅", file=fp)
+    if len(close) >= 2 and close[-2] != 0:
+        print(f"- 当日: {(close[-1] / close[-2] - 1):.2%}", file=fp)
+    for p in periods:
+        if close[-p] != 0:
+            print(f"- {p}日累计: {(close[-1] / close[-p] - 1) * 100:.2f}%", file=fp)
+    print("", file=fp)
+
     print("## 振幅", file=fp)
     prev_close = close[-2] if len(close) >= 2 else close[-1]
     if prev_close != 0:
@@ -324,14 +332,6 @@ def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> Non
         mean_p = close[-p:].mean()
         if mean_p != 0:
             print(f"- {p}日振幅: {(high[-p:].max() - low[-p:].min()) / mean_p:.2%}", file=fp)
-    print("", file=fp)
-
-    print("## 涨跌幅", file=fp)
-    if len(close) >= 2 and close[-2] != 0:
-        print(f"- 当日: {(close[-1] / close[-2] - 1):.2%}", file=fp)
-    for p in periods:
-        if close[-p] != 0:
-            print(f"- {p}日累计: {(close[-1] / close[-p] - 1) * 100:.2f}%", file=fp)
     print("", file=fp)
 
     print("## 成交量(万手)", file=fp)
