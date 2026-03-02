@@ -21,6 +21,10 @@ from .base import DataSource, StockData
 # especially for Eastmoney interfaces (push2his.eastmoney.com etc.)
 akshare_proxy_patch.install_patch(AKSHARE_PROXY_IP, AKSHARE_PROXY_PASSWORD, AKSHARE_PROXY_PORT)
 
+print(f"AKSHARE_PROXY_IP: {AKSHARE_PROXY_IP}")
+print(f"AKSHARE_PROXY_PASSWORD: {AKSHARE_PROXY_PASSWORD}")
+print(f"AKSHARE_PROXY_PORT: {AKSHARE_PROXY_PORT}")
+
 logger = logging.getLogger("qtf_mcp")
 
 # 线程池用于执行同步的调用
