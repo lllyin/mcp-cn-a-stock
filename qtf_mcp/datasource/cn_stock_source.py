@@ -173,8 +173,20 @@ class CNStockDataSource(DataSource):
             )
             
             if df is None or df.empty:
-                logger.warning(f"获取K线数据为空 {code}")
-                return None
+                logger.warning(f"efinance 获取K线数据为空 {code}，尝试使用 akshare fallback...")
+                import akshare as ak
+                ak_adj_map = {1: "qfq", 2: "hfq", 0: ""}
+                ak_adj = ak_adj_map.get(fqt, "qfq")
+                df = ak.fund_etf_hist_em(
+                    symbol=code,
+                    period="daily",
+                    start_date=start_date.replace("-", ""),
+                    end_date=end_date.replace("-", ""),
+                    adjust=ak_adj
+                )
+                if df is None or df.empty:
+                    logger.warning(f"akshare fallback 获取K线数据依然为空 {code}")
+                    return None
             
             # 同时获取不复权数据用于计算
             if fqt != 0:
@@ -184,6 +196,15 @@ class CNStockDataSource(DataSource):
                     end=end_date.replace("-", ""),
                     fqt=0  # 不复权
                 )
+                if df_unadj is None or df_unadj.empty:
+                    import akshare as ak
+                    df_unadj = ak.fund_etf_hist_em(
+                        symbol=code,
+                        period="daily",
+                        start_date=start_date.replace("-", ""),
+                        end_date=end_date.replace("-", ""),
+                        adjust=""
+                    )
             else:
                 df_unadj = df
             
@@ -244,6 +265,8 @@ class CNStockDataSource(DataSource):
     
     def _fetch_finance_sync(self, code: str) -> Optional[Dict]:
         """同步获取财务数据"""
+        if code.startswith(("1", "5")):
+            return None
         try:
             import akshare as ak
             df = ak.stock_financial_abstract_ths(symbol=code)
@@ -256,6 +279,8 @@ class CNStockDataSource(DataSource):
     
     def _fetch_fund_flow_sync(self, code: str) -> Optional[Dict]:
         """同步获取资金流向数据"""
+        if code.startswith(("1", "5")):
+            return None
         try:
             import akshare as ak
             df = ak.stock_individual_fund_flow(stock=code, market="sh" if code.startswith("6") else "sz")
@@ -268,6 +293,8 @@ class CNStockDataSource(DataSource):
     
     def _fetch_dividend_sync(self, code: str) -> Optional[Dict]:
         """同步获取分红数据"""
+        if code.startswith(("1", "5")):
+            return None
         try:
             import akshare as ak
             symbol = f"sh{code}" if code.startswith("6") else f"sz{code}"
@@ -282,6 +309,24 @@ class CNStockDataSource(DataSource):
     def _fetch_realtime_sync(self, code: str) -> Optional[Dict]:
         """同步获取实时数据"""
         try:
+            if code.startswith(("1", "5")):
+                import akshare as ak
+                df = ak.fund_etf_category_sina(symbol="ETF基金")
+                if df is not None and not df.empty:
+                    match = df[df["代码"].str.endswith(code)]
+                    if not match.empty:
+                        row = match.iloc[-1]
+                        info = {
+                            "股票简称": row.get("名称", ""),
+                            "最新价": row.get("最新价", 0),
+                            "总股本": 0.0,
+                            "总市值": 0.0,
+                            "流通市值": 0.0,
+                            "动态市盈率": 0.0,
+                        }
+                        return {"info": info}
+                return None
+                
             info_series = ef.stock.get_base_info(code)
             if info_series is None or info_series.empty:
                 return None
