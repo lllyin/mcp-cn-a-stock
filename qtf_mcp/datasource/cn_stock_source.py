@@ -53,6 +53,23 @@ class CNStockDataSource(DataSource):
     def name(self) -> str:
         return "CNStock"
     
+    def _safe_float(self, value, default: float = 0.0) -> float:
+        """
+        安全将任意值转换为 float。
+        对于 ETF、停牌股等特殊品种，efinance 可能返回 '-' 、None 等非数字内容。
+        """
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return float(value)
+        s = str(value).strip()
+        if s in ("", "-", "--", "N/A", "nan"):
+            return default
+        try:
+            return float(s)
+        except (ValueError, TypeError):
+            return default
+    
     def _symbol_to_akshare(self, symbol: str) -> tuple[str, str]:
         """
         将内部格式转换为 akshare 格式
@@ -330,23 +347,23 @@ class CNStockDataSource(DataSource):
             stock_data.name = info.get("股票简称", "")
             
             total_shares = info.get("总股本", 0)
-            stock_data.total_shares = np.array([float(total_shares)])
+            stock_data.total_shares = np.array([self._safe_float(total_shares)])
             
             total_market_cap = info.get("总市值", 0)
-            stock_data.total_market_cap = np.array([float(total_market_cap)])
+            stock_data.total_market_cap = np.array([self._safe_float(total_market_cap)])
             
             float_market_cap = info.get("流通市值", 0)
-            stock_data.float_market_cap = np.array([float(float_market_cap)])
+            stock_data.float_market_cap = np.array([self._safe_float(float_market_cap)])
             
-            latest_price = info.get("最新价", 0)
+            latest_price = self._safe_float(info.get("最新价", 0))
             if latest_price > 0:
-                float_shares = float_market_cap / latest_price
+                float_shares = self._safe_float(float_market_cap) / latest_price
                 stock_data.float_shares = np.array([float(float_shares)])
             else:
                 stock_data.float_shares = np.array([0.0])
             
             pe_ttm = info.get("动态市盈率", 0)
-            stock_data.pe_ttm = np.array([float(pe_ttm)])
+            stock_data.pe_ttm = np.array([self._safe_float(pe_ttm)])
         
         if kline_data:
             df_qfq = kline_data.get("adjusted")
