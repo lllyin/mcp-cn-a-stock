@@ -164,16 +164,10 @@ class CNStockDataSource(DataSource):
             adj_map = {"qfq": 1, "hfq": 2, "none": 0}
             fqt = adj_map.get(adjust, 1)
             
-            # 使用 efinance 获取日K线
-            df = ef.stock.get_quote_history(
-                code,
-                beg=start_date.replace("-", ""),
-                end=end_date.replace("-", ""),
-                fqt=fqt
-            )
-            
-            if df is None or df.empty:
-                logger.warning(f"efinance 获取K线数据为空 {code}，尝试使用 akshare fallback...")
+            df = None
+            # 特殊处理：如果是新上市的 ETF (以 1 或 5 开头)，efinance 往往识别不了
+            # 我们直接用 akshare 获取，避免 efinance 的 8s 超时等待
+            if code.startswith(("1", "5")):
                 import akshare as ak
                 ak_adj_map = {1: "qfq", 2: "hfq", 0: ""}
                 ak_adj = ak_adj_map.get(fqt, "qfq")
@@ -184,19 +178,37 @@ class CNStockDataSource(DataSource):
                     end_date=end_date.replace("-", ""),
                     adjust=ak_adj
                 )
+            
+            if df is None or df.empty:
+                # 使用 efinance 获取日K线
+                df = ef.stock.get_quote_history(
+                    code,
+                    beg=start_date.replace("-", ""),
+                    end=end_date.replace("-", ""),
+                    fqt=fqt
+                )
+            
+            if df is None or df.empty:
+                # 如果 efinance 还是不行 (可能由于代码不属于1/5开头但也是新股)，尝试 fallback
+                logger.warning(f"efinance 获取K线数据为空 {code}，尝试使用 akshare fallback...")
+                import akshare as ak
+                ak_adj_map = {1: "qfq", 2: "hfq", 0: ""}
+                ak_adj = ak_adj_map.get(fqt, "qfq")
+                
+                # 判断是股票还是基金
+                if code.startswith(("1", "5")):
+                    df = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""), adjust=ak_adj)
+                else:
+                    df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""), adjust=ak_adj)
+                
                 if df is None or df.empty:
-                    logger.warning(f"akshare fallback 获取K线数据依然为空 {code}")
+                    logger.warning(f"获取K线数据依然为空 {code}")
                     return None
             
             # 同时获取不复权数据用于计算
             if fqt != 0:
-                df_unadj = ef.stock.get_quote_history(
-                    code,
-                    beg=start_date.replace("-", ""),
-                    end=end_date.replace("-", ""),
-                    fqt=0  # 不复权
-                )
-                if df_unadj is None or df_unadj.empty:
+                df_unadj = None
+                if code.startswith(("1", "5")):
                     import akshare as ak
                     df_unadj = ak.fund_etf_hist_em(
                         symbol=code,
@@ -205,6 +217,21 @@ class CNStockDataSource(DataSource):
                         end_date=end_date.replace("-", ""),
                         adjust=""
                     )
+                
+                if df_unadj is None or df_unadj.empty:
+                    df_unadj = ef.stock.get_quote_history(
+                        code,
+                        beg=start_date.replace("-", ""),
+                        end=end_date.replace("-", ""),
+                        fqt=0  # 不复权
+                    )
+                
+                if df_unadj is None or df_unadj.empty:
+                    import akshare as ak
+                    if code.startswith(("1", "5")):
+                        df_unadj = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""), adjust="")
+                    else:
+                        df_unadj = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""), adjust="")
             else:
                 df_unadj = df
             
@@ -309,47 +336,51 @@ class CNStockDataSource(DataSource):
     def _fetch_realtime_sync(self, code: str) -> Optional[Dict]:
         """同步获取实时数据"""
         try:
+            # 对于 ETF，避免调用 ak.fund_etf_category_sina，因为它会拉取全量 1000+ 条数据导致超时
             if code.startswith(("1", "5")):
-                import akshare as ak
-                df = ak.fund_etf_category_sina(symbol="ETF基金")
-                if df is not None and not df.empty:
-                    match = df[df["代码"].str.endswith(code)]
-                    if not match.empty:
-                        row = match.iloc[-1]
-                        info = {
-                            "股票简称": row.get("名称", ""),
-                            "最新价": row.get("最新价", 0),
-                            "总股本": 0.0,
-                            "总市值": 0.0,
-                            "流通市值": 0.0,
-                            "动态市盈率": 0.0,
-                        }
-                        return {"info": info}
+                snapshot = ef.stock.get_quote_snapshot(code)
+                if snapshot is not None and not snapshot.empty:
+                    info = {
+                        "股票简称": str(snapshot.get("名称", "")),
+                        "最新价": float(snapshot.get("最新价", 0)),
+                        "总股本": 0.0,
+                        "总市值": 0.0,
+                        "流通市值": 0.0,
+                        "动态市盈率": 0.0,
+                    }
+                    return {"info": info}
                 return None
                 
             info_series = ef.stock.get_base_info(code)
             if info_series is None or info_series.empty:
+                # 即使 base_info 失败，尝试用 snapshot 保底
+                snapshot = ef.stock.get_quote_snapshot(code)
+                if snapshot is not None and not snapshot.empty:
+                    info = {
+                        "股票简称": str(snapshot.get("名称", "")),
+                        "最新价": float(snapshot.get("最新价", 0)),
+                        "总股本": 0.0,
+                        "总市值": 0.0,
+                        "流通市值": 0.0,
+                        "动态市盈率": 0.0,
+                    }
+                    return {"info": info}
                 return None
             
             info = {
                 "股票简称": info_series.get("股票名称", ""),
+                "动态市盈率": self._safe_float(info_series.get("市盈率(动)", 0)),
             }
             
             snapshot = ef.stock.get_quote_snapshot(code)
             if snapshot is not None and not snapshot.empty:
-                latest_price = snapshot.get("最新价", 0)
-                total_market_val = info_series.get("总市值", 0)
+                latest_price = self._safe_float(snapshot.get("最新价", 0))
+                total_market_val = self._safe_float(info_series.get("总市值", 0))
                 if latest_price > 0:
                     info["总股本"] = total_market_val / latest_price
                 info["最新价"] = latest_price
                 info["总市值"] = total_market_val
-                info["流通市值"] = info_series.get("流通市值", 0)
-            
-            rt_quotes = ef.stock.get_realtime_quotes()
-            if rt_quotes is not None and not rt_quotes.empty:
-                match = rt_quotes[rt_quotes['股票代码'] == code]
-                if not match.empty:
-                    info["动态市盈率"] = match.iloc[0].get("动态市盈率", 0)
+                info["流通市值"] = self._safe_float(info_series.get("流通市值", 0))
             
             return {"info": info}
         except Exception as e:
