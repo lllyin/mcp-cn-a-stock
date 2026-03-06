@@ -1,5 +1,5 @@
 [project]
-name = "qtf-mcp"
+name = "cn-stock-mcp"
 version = "0.2.0"
 description = "A股数据 MCP 服务，支持多种数据源"
 readme = "README.md"
@@ -11,7 +11,7 @@ dependencies = [
     "numpy>=1.26.0",
     "click>=8.3.1",
     "python-dotenv>=1.2.1",
-    "akshare-proxy-patch==0.2.7",
+    "akshare-proxy-patch==0.2.9",
     "efinance>=0.5.5.2",
 ]
 
@@ -22,4 +22,4 @@ dev = [
 ]
 
 [project.scripts]
-qtf-mcp = "main:main"
+cn-stock-mcp = "main:main"

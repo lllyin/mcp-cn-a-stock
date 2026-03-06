@@ -71,7 +71,7 @@ AKSHARE_PROXY_PORT=50
 
 ```bash
 # 使用 uv 运行
-uv run qtf-mcp --transport http
+uv run cn-stock-mcp --transport http
 
 # 或者直接运行 python
 python3 main.py --transport http
