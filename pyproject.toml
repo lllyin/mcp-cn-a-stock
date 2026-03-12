@@ -23,3 +23,7 @@ dev = [
 
 [project.scripts]
 cn-stock-mcp = "main:main"
+
+[tool.setuptools]
+packages = ["qtf_mcp"]
+py-modules = ["main", "data"]
