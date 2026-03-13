@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
 
 # A股数据 MCP 服务启动脚本
-# 日志目录: /var/log/cn-stock-mcp/
-
 set -e
-
-# 配置
-APP_NAME="cn-stock-mcp"
-LOG_DIR="/var/log/cn-stock-mcp"
-LOG_FILE="$LOG_DIR/cn-stock-mcp.log"
-PID_FILE="/tmp/cn-stock-mcp.pid"
-PORT=8686
-
-# 创建日志目录
-mkdir -p "$LOG_DIR"
 
 # 获取脚本所在目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# 配置
+APP_NAME="cn-stock-mcp"
+LOG_DIR="$SCRIPT_DIR/logs"
+LOG_FILE="$LOG_DIR/cn-stock-mcp.log"
+PID_FILE="$SCRIPT_DIR/cn-stock-mcp.pid"
+PORT=8686
+
+# 创建日志目录
+mkdir -p "$LOG_DIR"
 
 # 激活虚拟环境
 if [ -f ".venv/bin/activate" ]; then
@@ -44,7 +42,14 @@ fi
 echo "正在启动 $APP_NAME 服务..."
 echo "日志文件: $LOG_FILE"
 
-nohup cn-stock-mcp --transport http > "$LOG_FILE" 2>&1 &
+# 如果未通过 pip install -e . 安装，则直接使用 python main.py
+if command -v cn-stock-mcp >/dev/null 2>&1; then
+    EXEC_CMD="cn-stock-mcp"
+else
+    EXEC_CMD="python main.py"
+fi
+
+nohup $EXEC_CMD --transport http --port $PORT > "$LOG_FILE" 2>&1 &
 PID=$!
 echo $PID > "$PID_FILE"
 
@@ -57,7 +62,7 @@ if ps -p "$PID" > /dev/null 2>&1; then
     echo "   PID: $PID"
     echo "   访问地址: http://localhost:$PORT/cnstock/mcp"
     echo "   查看日志: tail -f $LOG_FILE"
-    echo "   停止服务: kill $PID"
+    echo "   停止服务: ./stop.sh"
 else
     echo "❌ 服务启动失败，请检查日志: $LOG_FILE"
     rm -f "$PID_FILE"

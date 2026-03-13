@@ -14,5 +14,6 @@ wheels/
 # uv.lock
 
 log.txt
+/logs/
 
 libs
