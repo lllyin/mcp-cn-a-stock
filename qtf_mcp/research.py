@@ -271,11 +271,16 @@ def build_fund_flow(field: tuple[str, str], data: Dict[str, ndarray]) -> str:
         return ""
 
     kind = field[0]
-    amount = value_amount[-1] / 1e8  # 转换为亿
-    ratio = abs(value_ratio[-1])
-    in_out = "净流入" if amount > 0 else "净流出"
-    amount = abs(amount)
-    return f"- {kind} {in_out}: {amount:.2f}亿, 占比: {ratio:.2%}"
+    raw_amount = value_amount[-1]
+    ratio = value_ratio[-1]
+    
+    # 自动转换单位：超过1亿显示亿，否则显示万
+    if abs(raw_amount) >= 1e8:
+        amount_str = f"{raw_amount / 1e8:.2f}亿"
+    else:
+        amount_str = f"{raw_amount / 1e4:.2f}万"
+        
+    return f"今日{kind}净流入: {amount_str}  {kind}净占比: {ratio:.2%}"
 
 
 def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> None:
@@ -361,11 +366,20 @@ def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> Non
 
     print("## 资金流向", file=fp)
     has_fund_flow = False
-    for field in FUND_FLOW_FIELDS:
-        value = build_fund_flow(field, data)
-        if value:
-            print(value, file=fp)
+    # 分类独立成行展示，更美观
+    fields = [
+        ("主力", "A"),
+        ("超大单", "XL"),
+        ("大单", "L"),
+        ("中单", "M"),
+        ("小单", "S"),
+    ]
+    for field_name, field_id in fields:
+        val = build_fund_flow((field_name, field_id), data)
+        if val:
+            print(f"- {val}", file=fp)
             has_fund_flow = True
+
     if not has_fund_flow:
         print("- 暂无资金流向数据", file=fp)
     print("", file=fp)

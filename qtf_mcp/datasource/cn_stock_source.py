@@ -339,10 +339,19 @@ class CNStockDataSource(DataSource):
             return None
         try:
             import akshare as ak
+            df = None
             if is_index:
-                df = ak.stock_market_fund_flow()
+                if symbol == "SH000001":  # 上证
+                    df = ak.stock_market_fund_flow(market="sh")
+                elif symbol == "SZ399001":  # 深证
+                    df = ak.stock_market_fund_flow(market="sz")
+                elif symbol == "SZ399006":  # 创业板
+                    df = ak.stock_market_fund_flow(market="cy")
+                # 对于科创50 (SH000688) 等暂无直接对应的单指数 API，保持 df = None
             else:
-                df = ak.stock_individual_fund_flow(stock=code, market="sh" if code.startswith("6") else "sz")
+                # 个股
+                exchange = "sh" if code.startswith("6") else "sz"
+                df = ak.stock_individual_fund_flow(stock=code, market=exchange)
             
             if df is None or df.empty:
                 return None
@@ -531,10 +540,25 @@ class CNStockDataSource(DataSource):
                 try:
                     latest = df.iloc[-1] if len(df) > 0 else None
                     if latest is not None:
-                        if "主力净流入-净额" in df.columns:
-                            stock_data.fund_main_amount = np.array([latest.get("主力净流入-净额", 0)], dtype=np.float64)
-                        if "主力净流入-净占比" in df.columns:
-                            stock_data.fund_main_ratio = np.array([latest.get("主力净流入-净占比", 0) / 100], dtype=np.float64)
+                        # 字段映射表：(DataFrame字段名, StockData属性名, 是否为占比)
+                        fields = [
+                            ("主力净流入-净额", "fund_main_amount", False),
+                            ("主力净流入-净占比", "fund_main_ratio", True),
+                            ("超大单净流入-净额", "fund_xl_amount", False),
+                            ("超大单净流入-净占比", "fund_xl_ratio", True),
+                            ("大单净流入-净额", "fund_l_amount", False),
+                            ("大单净流入-净占比", "fund_l_ratio", True),
+                            ("中单净流入-净额", "fund_m_amount", False),
+                            ("中单净流入-净占比", "fund_m_ratio", True),
+                            ("小单净流入-净额", "fund_s_amount", False),
+                            ("小单净流入-净占比", "fund_s_ratio", True),
+                        ]
+                        for df_col, attr, is_ratio in fields:
+                            if df_col in df.columns:
+                                val = latest.get(df_col, 0)
+                                if is_ratio:
+                                    val = val / 100.0  # 转换为 0.0-1.0
+                                setattr(stock_data, attr, np.array([val], dtype=np.float64))
                 except Exception as e:
                     logger.warning(f"处理资金流向数据失败: {e}")
         
