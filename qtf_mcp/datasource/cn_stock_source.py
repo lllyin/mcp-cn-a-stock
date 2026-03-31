@@ -156,10 +156,15 @@ class CNStockDataSource(DataSource):
         return result
     
     def _fetch_kline_sync(
-        self, code: str, start_date: str, end_date: str, adjust: str = "qfq"
+        self, code: str, start_date: str, end_date: str, adjust: str = "qfq", symbol: str = None
     ) -> Optional[Dict]:
         """同步获取K线数据"""
         try:
+            from ..symbols import get_symbol_name
+            symbol_name = get_symbol_name(symbol) if symbol else ""
+            is_index = ("指数" in symbol_name) if symbol_name else False
+            query_code = symbol_name if is_index else code
+
             # 映射复权类型
             adj_map = {"qfq": 1, "hfq": 2, "none": 0}
             fqt = adj_map.get(adjust, 1)
@@ -182,7 +187,7 @@ class CNStockDataSource(DataSource):
             if df is None or df.empty:
                 # 使用 efinance 获取日K线
                 df = ef.stock.get_quote_history(
-                    code,
+                    query_code,
                     beg=start_date.replace("-", ""),
                     end=end_date.replace("-", ""),
                     fqt=fqt
@@ -198,6 +203,8 @@ class CNStockDataSource(DataSource):
                 # 判断是股票还是基金
                 if code.startswith(("1", "5")):
                     df = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""), adjust=ak_adj)
+                elif is_index:
+                    df = ak.index_zh_a_hist(symbol=code, period="daily", start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""))
                 else:
                     df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""), adjust=ak_adj)
                 
@@ -220,7 +227,7 @@ class CNStockDataSource(DataSource):
                 
                 if df_unadj is None or df_unadj.empty:
                     df_unadj = ef.stock.get_quote_history(
-                        code,
+                        query_code,
                         beg=start_date.replace("-", ""),
                         end=end_date.replace("-", ""),
                         fqt=0  # 不复权
@@ -230,6 +237,8 @@ class CNStockDataSource(DataSource):
                     import akshare as ak
                     if code.startswith(("1", "5")):
                         df_unadj = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""), adjust="")
+                    elif is_index:
+                        df_unadj = ak.index_zh_a_hist(symbol=code, period="daily", start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""))
                     else:
                         df_unadj = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""), adjust="")
             else:
@@ -251,7 +260,7 @@ class CNStockDataSource(DataSource):
         简单获取 K 线数据（同步方法，返回简化的字典格式）
         """
         code, market = self._symbol_to_akshare(symbol)
-        kline_data = self._fetch_kline_sync(code, start_date, end_date, adjust)
+        kline_data = self._fetch_kline_sync(code, start_date, end_date, adjust, symbol)
         
         if kline_data is None:
             return None
@@ -290,9 +299,11 @@ class CNStockDataSource(DataSource):
             self.fetch_kline_simple_sync, symbol, start_date, end_date, adjust
         )
     
-    def _fetch_finance_sync(self, code: str) -> Optional[Dict]:
+    def _fetch_finance_sync(self, code: str, symbol: str = None) -> Optional[Dict]:
         """同步获取财务数据"""
-        if code.startswith(("1", "5")):
+        from ..symbols import get_symbol_name
+        symbol_name = get_symbol_name(symbol) if symbol else ""
+        if code.startswith(("1", "5")) or ("指数" in symbol_name):
             return None
         try:
             import akshare as ak
@@ -304,13 +315,21 @@ class CNStockDataSource(DataSource):
             logger.warning(f"获取财务数据失败 {code}: {e}")
             return None
     
-    def _fetch_fund_flow_sync(self, code: str) -> Optional[Dict]:
+    def _fetch_fund_flow_sync(self, code: str, symbol: str = None) -> Optional[Dict]:
         """同步获取资金流向数据"""
+        from ..symbols import get_symbol_name
+        symbol_name = get_symbol_name(symbol) if symbol else ""
+        is_index = ("指数" in symbol_name) if symbol_name else False
+        
         if code.startswith(("1", "5")):
             return None
         try:
             import akshare as ak
-            df = ak.stock_individual_fund_flow(stock=code, market="sh" if code.startswith("6") else "sz")
+            if is_index:
+                df = ak.stock_market_fund_flow()
+            else:
+                df = ak.stock_individual_fund_flow(stock=code, market="sh" if code.startswith("6") else "sz")
+            
             if df is None or df.empty:
                 return None
             return {"fund_flow": df}
@@ -320,6 +339,8 @@ class CNStockDataSource(DataSource):
     
     def _fetch_dividend_sync(self, code: str) -> Optional[Dict]:
         """同步获取分红数据"""
+        # Note: dividend sync isn't passed symbol, but wait, does fetch_stock_data pass symbol?
+        # Let me see. We need to optionally pass symbol to dividend_sync.
         if code.startswith(("1", "5")):
             return None
         try:
@@ -333,7 +354,7 @@ class CNStockDataSource(DataSource):
             logger.warning(f"获取分红数据失败 {code}: {e}")
             return None
     
-    def _fetch_realtime_sync(self, code: str) -> Optional[Dict]:
+    def _fetch_realtime_sync(self, code: str, symbol: str = None) -> Optional[Dict]:
         """同步获取实时数据"""
         try:
             # 对于 ETF，避免调用 ak.fund_etf_category_sina，因为它会拉取全量 1000+ 条数据导致超时
@@ -351,10 +372,15 @@ class CNStockDataSource(DataSource):
                     return {"info": info}
                 return None
                 
-            info_series = ef.stock.get_base_info(code)
+            from ..symbols import get_symbol_name
+            symbol_name = get_symbol_name(symbol) if symbol else ""
+            is_index = ("指数" in symbol_name) if symbol_name else False
+            query_code = symbol_name if is_index else code
+                
+            info_series = ef.stock.get_base_info(query_code)
             if info_series is None or info_series.empty:
                 # 即使 base_info 失败，尝试用 snapshot 保底
-                snapshot = ef.stock.get_quote_snapshot(code)
+                snapshot = ef.stock.get_quote_snapshot(query_code)
                 if snapshot is not None and not snapshot.empty:
                     info = {
                         "股票简称": str(snapshot.get("名称", "")),
@@ -372,7 +398,7 @@ class CNStockDataSource(DataSource):
                 "动态市盈率": self._safe_float(info_series.get("市盈率(动)", 0)),
             }
             
-            snapshot = ef.stock.get_quote_snapshot(code)
+            snapshot = ef.stock.get_quote_snapshot(query_code)
             if snapshot is not None and not snapshot.empty:
                 latest_price = self._safe_float(snapshot.get("最新价", 0))
                 total_market_val = self._safe_float(info_series.get("总市值", 0))
@@ -407,10 +433,10 @@ class CNStockDataSource(DataSource):
         """获取股票完整数据"""
         code, market = self._symbol_to_akshare(symbol)
         
-        kline_future = _run_in_executor(self._fetch_kline_sync, code, start_date, end_date)
-        finance_future = _run_in_executor(self._fetch_finance_sync, code)
-        fund_flow_future = _run_in_executor(self._fetch_fund_flow_sync, code)
-        realtime_future = _run_in_executor(self._fetch_realtime_sync, code)
+        kline_future = _run_in_executor(self._fetch_kline_sync, code, start_date, end_date, "qfq", symbol)
+        finance_future = _run_in_executor(self._fetch_finance_sync, code, symbol)
+        fund_flow_future = _run_in_executor(self._fetch_fund_flow_sync, code, symbol)
+        realtime_future = _run_in_executor(self._fetch_realtime_sync, code, symbol)
         
         kline_data, finance_data, fund_flow_data, realtime_data = await asyncio.gather(
             kline_future, finance_future, fund_flow_future, realtime_future

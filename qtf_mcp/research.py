@@ -273,7 +273,7 @@ def build_fund_flow(field: tuple[str, str], data: Dict[str, ndarray]) -> str:
     kind = field[0]
     amount = value_amount[-1] / 1e8  # 转换为亿
     ratio = abs(value_ratio[-1])
-    in_out = "流入" if amount > 0 else "流出"
+    in_out = "净流入" if amount > 0 else "净流出"
     amount = abs(amount)
     return f"- {kind} {in_out}: {amount:.2f}亿, 占比: {ratio:.2%}"
 
