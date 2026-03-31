@@ -279,8 +279,10 @@ def build_fund_flow(field: tuple[str, str], data: Dict[str, ndarray]) -> str:
         amount_str = f"{raw_amount / 1e8:.2f}亿"
     else:
         amount_str = f"{raw_amount / 1e4:.2f}万"
-        
-    return f"今日{kind}净流入: {amount_str}  {kind}净占比: {ratio:.2%}"
+    
+    # 针对大盘数据增加前缀标识（沪深两市），解决歧义
+    prefix = "沪深两市" if data.get("IS_MARKET", False) else "今日"
+    return f"{prefix}{kind}净流入: {amount_str}  {kind}净占比: {ratio:.2%}"
 
 
 def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> None:

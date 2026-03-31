@@ -340,14 +340,13 @@ class CNStockDataSource(DataSource):
         try:
             import akshare as ak
             df = None
+            is_market = False
             if is_index:
-                if symbol == "SH000001":  # 上证
-                    df = ak.stock_market_fund_flow(market="sh")
-                elif symbol == "SZ399001":  # 深证
-                    df = ak.stock_market_fund_flow(market="sz")
-                elif symbol == "SZ399006":  # 创业板
-                    df = ak.stock_market_fund_flow(market="cy")
-                # 对于科创50 (SH000688) 等暂无直接对应的单指数 API，保持 df = None
+                # 仅针对三大核心指数返回“沪深两市”大盘资金流向
+                if symbol in ["SH000001", "SZ399001", "SZ399006"]:
+                    df = ak.stock_market_fund_flow()
+                    is_market = True
+                # 其他指数（如科创50）保持 df = None
             else:
                 # 个股
                 exchange = "sh" if code.startswith("6") else "sz"
@@ -355,7 +354,7 @@ class CNStockDataSource(DataSource):
             
             if df is None or df.empty:
                 return None
-            return {"fund_flow": df}
+            return {"fund_flow": df, "is_market": is_market}
         except Exception as e:
             logger.warning(f"获取资金流向数据失败 {code}: {e}")
             return None
@@ -536,6 +535,7 @@ class CNStockDataSource(DataSource):
         
         if fund_flow_data and "fund_flow" in fund_flow_data:
             df = fund_flow_data["fund_flow"]
+            stock_data.is_market = fund_flow_data.get("is_market", False)
             if not df.empty:
                 try:
                     latest = df.iloc[-1] if len(df) > 0 else None

@@ -69,6 +69,9 @@ class StockData:
     # 行业板块
     sectors: List[str] = field(default_factory=list)
     
+    # 是否为市场大盘数据（用于区分资金流向）
+    is_market: bool = False
+    
     def to_dict(self) -> Dict[str, np.ndarray]:
         """
         转换为兼容旧 API 的字典格式
@@ -78,6 +81,7 @@ class StockData:
         result: Dict[str, np.ndarray] = {
             # 基本信息
             "NAME": self.name,  # type: ignore
+            "IS_MARKET": self.is_market, # type: ignore
             
             # K线数据
             "DATE": self.date,
