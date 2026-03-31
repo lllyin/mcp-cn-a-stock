@@ -17,6 +17,19 @@ import efinance as ef
 from ..config import AKSHARE_PROXY_IP, AKSHARE_PROXY_PASSWORD, AKSHARE_PROXY_PORT
 from .base import DataSource, StockData
 
+
+def check_is_index(symbol: str, name: str) -> bool:
+    """判定是否为指数的辅助函数"""
+    if not symbol:
+        return False
+    # 1. 名字中包含“指数”
+    if name and "指数" in name:
+        return True
+    # 2. 识别标准指数前缀：沪市SH000, 深市SZ39, 中证SH93
+    if symbol.startswith(("SH000", "SZ39", "SH93")):
+        return True
+    return False
+
 # Initialize the proxy patch to improve reliability of AkShare API calls,
 # especially for Eastmoney interfaces (push2his.eastmoney.com etc.)
 akshare_proxy_patch.install_patch(AKSHARE_PROXY_IP, AKSHARE_PROXY_PASSWORD, AKSHARE_PROXY_PORT)
@@ -162,8 +175,9 @@ class CNStockDataSource(DataSource):
         try:
             from ..symbols import get_symbol_name
             symbol_name = get_symbol_name(symbol) if symbol else ""
-            is_index = ("指数" in symbol_name) if symbol_name else False
-            query_code = symbol_name if is_index else code
+            is_index = check_is_index(symbol, symbol_name)
+            # 对指数优先使用名称查询 (解决科创50等代码冲突问题)
+            query_code = symbol_name if (is_index and symbol_name) else (symbol if is_index else code)
 
             # 映射复权类型
             adj_map = {"qfq": 1, "hfq": 2, "none": 0}
@@ -303,7 +317,7 @@ class CNStockDataSource(DataSource):
         """同步获取财务数据"""
         from ..symbols import get_symbol_name
         symbol_name = get_symbol_name(symbol) if symbol else ""
-        if code.startswith(("1", "5")) or ("指数" in symbol_name):
+        if code.startswith(("1", "5")) or check_is_index(symbol, symbol_name):
             return None
         try:
             import akshare as ak
@@ -319,7 +333,7 @@ class CNStockDataSource(DataSource):
         """同步获取资金流向数据"""
         from ..symbols import get_symbol_name
         symbol_name = get_symbol_name(symbol) if symbol else ""
-        is_index = ("指数" in symbol_name) if symbol_name else False
+        is_index = check_is_index(symbol, symbol_name)
         
         if code.startswith(("1", "5")):
             return None
@@ -371,11 +385,11 @@ class CNStockDataSource(DataSource):
                     }
                     return {"info": info}
                 return None
-                
             from ..symbols import get_symbol_name
             symbol_name = get_symbol_name(symbol) if symbol else ""
-            is_index = ("指数" in symbol_name) if symbol_name else False
-            query_code = symbol_name if is_index else code
+            is_index = check_is_index(symbol, symbol_name)
+            # 对指数优先使用名称查询
+            query_code = symbol_name if (is_index and symbol_name) else (symbol if is_index else code)
                 
             info_series = ef.stock.get_base_info(query_code)
             if info_series is None or info_series.empty:
