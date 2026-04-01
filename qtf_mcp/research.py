@@ -366,24 +366,36 @@ def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> Non
         print(f"- {p}日均额(亿): {amt_for_mean[-p:].mean():.2f}", file=fp)
     print("", file=fp)
 
+    # 资金流向部分
     print("## 资金流向", file=fp)
-    has_fund_flow = False
-    # 分类独立成行展示，更美观
-    fields = [
-        ("主力", "A"),
-        ("超大单", "XL"),
-        ("大单", "L"),
-        ("中单", "M"),
-        ("小单", "S"),
-    ]
-    for field_name, field_id in fields:
-        val = build_fund_flow((field_name, field_id), data)
-        if val:
-            print(f"- {val}", file=fp)
-            has_fund_flow = True
-
-    if not has_fund_flow:
-        print("- 暂无资金流向数据", file=fp)
+    
+    from datetime import datetime
+    now_time = datetime.now().time()
+    # 强制判定交易时间: 09:15 - 15:15
+    is_trading = (now_time.hour == 9 and now_time.minute >= 15) or (10 <= now_time.hour <= 14) or (now_time.hour == 15 and now_time.minute <= 15)
+    
+    if is_trading:
+        # 交易时间内统一展示引导链接
+        print("暂时无法获取实时资金流向，", file=fp)
+        if data.get("IS_MARKET", False):
+            print("- 请打开 https://data.eastmoney.com/zjlx/dpzjlx.html 获取大盘资金实时流向", file=fp)
+        else:
+            # 提取代码纯数字部分合成 URL
+            code = "".join([c for c in symbol if c.isdigit()])
+            print(f"- 请打开 https://data.eastmoney.com/zjlx/{code}.html 获取个股资金实时流向", file=fp)
+    else:
+        # 非交易时段展示详情数据
+        has_fund_flow = False
+        fields = [
+            ("主力", "A"), ("超大单", "XL"), ("大单", "L"), ("中单", "M"), ("小单", "S"),
+        ]
+        for field_name, field_id in fields:
+            val = build_fund_flow((field_name, field_id), data)
+            if val:
+                print(f"- {val}", file=fp)
+                has_fund_flow = True
+        if not has_fund_flow:
+            print("- 暂无资金流向数据", file=fp)
     print("", file=fp)
 
     # 换手率计算
