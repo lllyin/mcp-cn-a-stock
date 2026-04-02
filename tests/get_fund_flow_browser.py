@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from playwright.async_api import async_playwright
 
 async def get_fund_flow_browser(symbols: list) -> str:
@@ -94,9 +95,14 @@ async def get_fund_flow_browser(symbols: list) -> str:
 
 # --- 本地测试代码 ---
 if __name__ == "__main__":
+    t0 = time.time()
     print("--- 正在测试：查询单个大盘 ---")
     print(asyncio.run(get_fund_flow_browser(["dpzjlx"])))
+    print(f"✅ 单个大盘查询耗时: {time.time() - t0:.2f}s")
     
+    t1 = time.time()
     print("\n--- 正在测试：批量查询大盘与多个个股 ---")
     watchlist = ["dpzjlx", "000333", "600900", "300750"]
     print(asyncio.run(get_fund_flow_browser(watchlist)))
+    print(f"🚀 批量查询 ({len(watchlist)} 个) 总耗时: {time.time() - t1:.2f}s")
+    print(f"整体执行总用时: {time.time() - t0:.2f}s")
