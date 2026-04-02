@@ -1,7 +1,8 @@
 import datetime
 from io import StringIO
-from typing import Literal
+from typing import Literal, Dict, List
 
+from pydantic import BaseModel, Field
 from mcp.server.fastmcp import Context, FastMCP
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
@@ -10,7 +11,18 @@ from . import research
 from .datasource import get_datasource
 
 
-async def fetch_batch_reports(symbol_str: str, mode: str, host: str) -> dict:
+# --- Output Models for MCP Inspector Schema ---
+
+class BatchReportResponse(BaseModel):
+    """批量报表响应模型"""
+    symbols_count: int = Field(..., description="成功处理并返回报表的证券标的数量")
+    timestamp: str = Field(..., description="报告生成时间 (YYYY-MM-DD HH:MM:SS)")
+    reports: Dict[str, str] = Field(..., description="成功生成的报表集合 (键为代码，值为 Markdown 文本)")
+    errors: Dict[str, str] = Field(..., description="发生错误的标的信息 (键为代码，值为错误详情)")
+
+# -----------------------------------------------
+
+async def fetch_batch_reports(symbol_str: str, mode: str, host: str) -> BatchReportResponse:
     """批量获取并生成报告的核心驱动程序"""
     # 1. 预处理：分拆并限流（上限4个）
     raw_symbols = [s.strip().upper() for s in symbol_str.split(',') if s.strip()]
@@ -55,7 +67,7 @@ async def fetch_batch_reports(symbol_str: str, mode: str, host: str) -> dict:
     # 并发执行所有标的的任务
     import asyncio
     await asyncio.gather(*[process_item(s) for s in raw_symbols])
-    return output
+    return BatchReportResponse(**output)
 
 
 class QtfMCP(FastMCP):
@@ -74,7 +86,7 @@ mcp_app = QtfMCP(
   stateless_http=True,
 )
 @mcp_app.tool()
-async def brief(symbol: str, ctx: Context) -> dict:
+async def brief(symbol: str, ctx: Context) -> BatchReportResponse:
   """Get brief information and fund flow for input stock symbol(s) (Batch Supported).
   Includes:
   - basic data
@@ -84,14 +96,14 @@ async def brief(symbol: str, ctx: Context) -> dict:
     symbol (str): Stock symbol or comma-separated list (up to 4), e.g., "SZ300308,SH000001"
 
   Returns:
-    A JSON object with Batch structure (reports/errors).
+    A BatchReportResponse object containing multiple reports or errors.
   """
   who = ctx.request_context.request.client.host  # type: ignore
   return await fetch_batch_reports(symbol, "brief", who)
 
 
 @mcp_app.tool()
-async def medium(symbol: str, ctx: Context) -> dict:
+async def medium(symbol: str, ctx: Context) -> BatchReportResponse:
   """Get medium information for input stock symbol(s) (Batch Supported).
   Includes:
   - basic data
@@ -102,14 +114,14 @@ async def medium(symbol: str, ctx: Context) -> dict:
     symbol (str): Stock symbol or comma-separated list (up to 4), e.g., "SZ300308,SH000001"
 
   Returns:
-    A JSON object following the same batch structure (reports/errors).
+    A BatchReportResponse object containing multiple reports or errors.
   """
   who = ctx.request_context.request.client.host  # type: ignore
   return await fetch_batch_reports(symbol, "medium", who)
 
 
 @mcp_app.tool()
-async def full(symbol: str, ctx: Context) -> dict:
+async def full(symbol: str, ctx: Context) -> BatchReportResponse:
   """Get full information for input stock symbol(s) (Batch Supported).
   Includes:
   - basic data
@@ -121,7 +133,7 @@ async def full(symbol: str, ctx: Context) -> dict:
     symbol (str): Stock symbol or comma-separated list (up to 4), e.g., "SZ300308,SH000001"
 
   Returns:
-    A JSON object following the same batch structure (reports/errors).
+    A BatchReportResponse object containing multiple reports or errors.
   """
   who = ctx.request_context.request.client.host  # type: ignore
   return await fetch_batch_reports(symbol, "full", who)
