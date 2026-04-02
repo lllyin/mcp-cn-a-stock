@@ -22,11 +22,19 @@ def check_is_index(symbol: str, name: str) -> bool:
     """判定是否为指数的辅助函数"""
     if not symbol:
         return False
-    # 1. 名字中包含“指数”
-    if name and "指数" in name:
+    # 1. 名字中包含“指数” (增加类型校验防止 float 类型报错)
+    if name and isinstance(name, str) and "指数" in name:
         return True
-    # 2. 识别标准指数前缀：沪市SH000, 深市SZ39, 中证SH93
-    if symbol.startswith(("SH000", "SZ39", "SH93")):
+    # 2. 识别标准指数前缀
+    # 沪市指数：通常以 SH000xxx 或 SH93xxxx 开头
+    # 特别注意：沪市 000xxx 段只有少数是指数，其余可能是误输入的深市代码
+    if symbol.startswith("SH000"):
+        # 常见沪市指数白名单
+        if symbol in ["SH000001", "SH000300", "SH000016", "SH000905"]:
+            return True
+        # 如果不是常见指数且名字里没带指数，则大概率是误输入的深市标的
+        return False
+    if symbol.startswith(("SZ39", "SH93")):
         return True
     return False
 
@@ -85,22 +93,42 @@ class CNStockDataSource(DataSource):
     
     def _symbol_to_akshare(self, symbol: str) -> tuple[str, str]:
         """
-        将内部格式转换为 akshare 格式
+        将内部格式转换为 akshare 格式，并增加自动纠偏逻辑
         
-        SH600000 -> ("600000", "sh")
-        SZ000001 -> ("000001", "sz")
+        SH000333 -> ("000333", "sz") # 自动识别归属
         """
-        if symbol.startswith("SH"):
-            return symbol[2:], "sh"
-        elif symbol.startswith("SZ"):
-            return symbol[2:], "sz"
-        else:
-            # 尝试根据代码推断交易所
-            code = symbol
-            if code.startswith("6"):
-                return code, "sh"
+        code = "".join([c for c in symbol if c.isdigit()])
+        if not code:
+            return "", "sh"
+            
+        # 智能识别归属：优先根据代码开头的特征判断
+        # 600/601/603/605/688 -> SH
+        if code.startswith(("60", "68", "90")):
+            market = "sh"
+        # 000/001/002/300/301 -> SZ (除非是 SH000xxx 且在指数列表里)
+        elif code.startswith(("00", "20", "30")):
+            # 对 000 段位进行细分：个股 vs 指数
+            if symbol.upper().startswith("SH") and code.startswith("000"):
+                # 只有几个特定的核心指数保留 SH 前缀
+                if code in ["000001", "000300", "000016", "000905"]:
+                    market = "sh"
+                else:
+                    # 如果不是知名指数，即便写了 SH，也纠正为 SZ（如 SH000333 -> SZ000333）
+                    market = "sz"
             else:
-                return code, "sz"
+                market = "sz"
+        elif code.startswith(("1", "5")): # 基金/ETF
+            if code.startswith("5"): market = "sh"
+            else: market = "sz"
+        else:
+            # 兜底：保留用户指定的前缀
+            market = "sh" if symbol.upper().startswith("SH") else "sz"
+            
+        return code, market
+
+    def _get_canonical_symbol(self, code: str, market: str) -> str:
+        """返回规范化的代码格式"""
+        return f"{market.upper()}{code}"
     
     def _akshare_to_symbol(self, code: str, market: str = "") -> str:
         """
@@ -454,17 +482,18 @@ class CNStockDataSource(DataSource):
     ) -> StockData:
         """获取股票完整数据"""
         code, market = self._symbol_to_akshare(symbol)
+        canonical_symbol = self._get_canonical_symbol(code, market)
         
-        kline_future = _run_in_executor(self._fetch_kline_sync, code, start_date, end_date, "qfq", symbol)
-        finance_future = _run_in_executor(self._fetch_finance_sync, code, symbol)
-        fund_flow_future = _run_in_executor(self._fetch_fund_flow_sync, code, symbol)
-        realtime_future = _run_in_executor(self._fetch_realtime_sync, code, symbol)
+        kline_future = _run_in_executor(self._fetch_kline_sync, code, start_date, end_date, "qfq", canonical_symbol)
+        finance_future = _run_in_executor(self._fetch_finance_sync, code, canonical_symbol)
+        fund_flow_future = _run_in_executor(self._fetch_fund_flow_sync, code, canonical_symbol)
+        realtime_future = _run_in_executor(self._fetch_realtime_sync, code, canonical_symbol)
         
         kline_data, finance_data, fund_flow_data, realtime_data = await asyncio.gather(
             kline_future, finance_future, fund_flow_future, realtime_future
         )
         
-        stock_data = StockData(symbol=symbol)
+        stock_data = StockData(symbol=canonical_symbol)
         
         if realtime_data and "info" in realtime_data:
             info = realtime_data["info"]

@@ -134,6 +134,9 @@ def build_basic_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> None:
     print("# 基本数据", file=fp)
     print("", file=fp)
     
+    # 优先使用纠偏后的规范代码
+    symbol = data.get("SYMBOL", symbol)
+    
     # 优先使用数据源返回的名称，否则从本地配置获取
     name = data.get("NAME", "")
     if not name:
