@@ -40,7 +40,7 @@ async def brief(symbol: str, ctx: Context) -> str:
   if len(raw_data) == 0:
     return "No data found for symbol: " + symbol
   research.build_basic_data(buf, symbol, raw_data)
-  research.build_trading_data(buf, symbol, raw_data)
+  await research.build_trading_data(buf, symbol, raw_data)
   """Get brief information for a given stock symbol"""
   return buf.getvalue()
 
@@ -60,7 +60,7 @@ async def medium(symbol: str, ctx: Context) -> str:
   if len(raw_data) == 0:
     return "No data found for symbol: " + symbol
   research.build_basic_data(buf, symbol, raw_data)
-  research.build_trading_data(buf, symbol, raw_data)
+  await research.build_trading_data(buf, symbol, raw_data)
   research.build_financial_data(buf, symbol, raw_data)
   return buf.getvalue()
 
@@ -81,7 +81,7 @@ async def full(symbol: str, ctx: Context) -> str:
   if len(raw_data) == 0:
     return "No data found for symbol: " + symbol
   research.build_basic_data(buf, symbol, raw_data)
-  research.build_trading_data(buf, symbol, raw_data)
+  await research.build_trading_data(buf, symbol, raw_data)
   research.build_financial_data(buf, symbol, raw_data)
   research.build_technical_data(buf, symbol, raw_data)
   return buf.getvalue()
