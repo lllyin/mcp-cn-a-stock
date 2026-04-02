@@ -2,82 +2,101 @@ import asyncio
 import json
 from playwright.async_api import async_playwright
 
-async def get_fund_flow_browser(symbol: str) -> str:
+async def get_fund_flow_browser(symbols: list) -> str:
     """
-    使用无头浏览器+精准DOM节点提取，获取东方财富资金流向（含动态标的名称）
+    使用无头浏览器批量获取东方财富资金流向
+    :param symbols: 代码列表，支持传单个如 ["000333"]，或多个 ["dpzjlx", "000333", "600900"]
     """
-    if symbol in ['000001', '399001', '399006', '000688', 'dpzjlx']:
-        url = "https://data.eastmoney.com/zjlx/dpzjlx.html"
-    else:
-        url = f"https://data.eastmoney.com/zjlx/{symbol}.html"
+    # 如果传入的是空列表，直接返回
+    if not symbols:
+        return json.dumps({}, ensure_ascii=False)
+
+    # 限制并发数为 3，防止服务器内存 OOM
+    semaphore = asyncio.Semaphore(3)
+    results = {}
 
     async with async_playwright() as p:
+        # 1. 只启动一次浏览器，极其节省 CPU
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36"
         )
-        page = await context.new_page()
 
-        try:
-            # 拦截无用资源，极速加载
-            await page.route("**/*.{png,jpg,jpeg,gif,css,woff,woff2}", lambda route: route.abort())
-            
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            
-            # 等待核心数据格子加载完毕
-            await page.wait_for_selector("td[data-field='f62']", timeout=10000)
-            await page.wait_for_timeout(500)
-
-            # 【新增提取标的名称】：精准狙击 class="title" 的容器
-            try:
-                # first 确保哪怕页面有多个 title 类，我们也只取最上面那个大标题
-                target_name = await page.locator(".title").first.inner_text()
-                target_name = target_name.strip()
-            except:
-                # 容错降级：如果提取失败，大盘显示"沪深两市"，个股显示代码
-                target_name = "沪深两市大盘" if url.endswith("dpzjlx.html") else symbol
-
-            # 提取数据的底层函数
-            async def get_val(field_id):
+        # 2. 定义单个任务的抓取逻辑
+        async def fetch_single(symbol: str):
+            async with semaphore:  # 拿到并发令牌后才执行
+                page = await context.new_page()
+                
+                url = "https://data.eastmoney.com/zjlx/dpzjlx.html" if symbol in ['000001', '399001', '399006', '000688', 'dpzjlx'] else f"https://data.eastmoney.com/zjlx/{symbol}.html"
+                
                 try:
-                    text = await page.locator(f"td[data-field='{field_id}']").inner_text()
-                    return text.strip() if text.strip() and text.strip() != "-" else "0"
-                except:
-                    return "0"
+                    # 拦截无用资源，极速加载
+                    await page.route("**/*.{png,jpg,jpeg,gif,css,woff,woff2}", lambda route: route.abort())
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    
+                    # 等待核心数据格子加载完毕
+                    await page.wait_for_selector("td[data-field='f62']", timeout=10000)
+                    await page.wait_for_timeout(500)
 
-            async def get_ratio(field_id):
-                text = await get_val(field_id)
-                try:
-                    return float(text.replace("%", ""))
-                except:
-                    return 0.0
+                    # 提取标的名称
+                    try:
+                        target_name = await page.locator(".title").first.inner_text()
+                        target_name = target_name.strip()
+                    except:
+                        target_name = "沪深两市大盘" if url.endswith("dpzjlx.html") else symbol
 
-            # 组装最终的结构化 JSON
-            result = {
-                "标的名称": target_name,   # <--- 动态提取的名字在这里！
-                "主力净流入": await get_val("f62"),
-                "主力净比(%)": await get_ratio("f184"),
-                "超大单净流入": await get_val("f66"),
-                "超大单净比(%)": await get_ratio("f69"),
-                "大单净流入": await get_val("f72"),
-                "大单净比(%)": await get_ratio("f75"),
-                "中单净流入": await get_val("f78"),
-                "中单净比(%)": await get_ratio("f81"),
-                "小单净流入": await get_val("f84"),
-                "小单净比(%)": await get_ratio("f87"),
-            }
+                    # 提取底层函数
+                    async def get_val(field_id):
+                        try:
+                            text = await page.locator(f"td[data-field='{field_id}']").inner_text()
+                            return text.strip() if text.strip() and text.strip() != "-" else "0"
+                        except:
+                            return "0"
 
-            return json.dumps(result, ensure_ascii=False, indent=2)
+                    async def get_ratio(field_id):
+                        text = await get_val(field_id)
+                        try:
+                            return float(text.replace("%", ""))
+                        except:
+                            return 0.0
 
-        except Exception as e:
-            return json.dumps({"error": f"抓取或解析失败: {str(e)}"}, ensure_ascii=False)
-        finally:
-            await browser.close()
+                    # 组装单只股票的结果
+                    results[symbol] = {
+                        "标的名称": target_name,
+                        "主力净流入": await get_val("f62"),
+                        "主力净比(%)": await get_ratio("f184"),
+                        "超大单净流入": await get_val("f66"),
+                        "超大单净比(%)": await get_ratio("f69"),
+                        "大单净流入": await get_val("f72"),
+                        "大单净比(%)": await get_ratio("f75"),
+                        "中单净流入": await get_val("f78"),
+                        "中单净比(%)": await get_ratio("f81"),
+                        "小单净流入": await get_val("f84"),
+                        "小单净比(%)": await get_ratio("f87"),
+                    }
+
+                except Exception as e:
+                    # 如果某只股票抓取失败，不影响其他股票，单独标记 error
+                    results[symbol] = {"error": f"抓取或解析失败: {str(e)}"}
+                finally:
+                    # 极其重要：抓完必须关闭当前标签页释放内存
+                    await page.close()
+
+        # 3. 将所有代码打包成任务，并发生效
+        tasks = [fetch_single(sym) for sym in symbols]
+        await asyncio.gather(*tasks)
+
+        # 4. 关闭浏览器
+        await browser.close()
+        
+        # 返回最终的字典对象转 JSON
+        return json.dumps(results, ensure_ascii=False, indent=2)
 
 # --- 本地测试代码 ---
 if __name__ == "__main__":
-    print("--- 正在获取 大盘 资金流 ---")
-    print(asyncio.run(get_fund_flow_browser("dpzjlx")))
+    print("--- 正在测试：查询单个大盘 ---")
+    print(asyncio.run(get_fund_flow_browser(["dpzjlx"])))
     
-    print("\n--- 正在获取 美的集团 (000333) 资金流 ---")
-    print(asyncio.run(get_fund_flow_browser("000333")))
+    print("\n--- 正在测试：批量查询大盘与多个个股 ---")
+    watchlist = ["dpzjlx", "000333", "600900", "300750"]
+    print(asyncio.run(get_fund_flow_browser(watchlist)))
