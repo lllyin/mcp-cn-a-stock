@@ -4,7 +4,7 @@ from playwright.async_api import async_playwright
 
 async def get_fund_flow_browser(symbol: str) -> str:
     """
-    使用无头浏览器+精准DOM节点提取，获取东方财富资金流向（最强稳定版）
+    使用无头浏览器+精准DOM节点提取，获取东方财富资金流向（含动态标的名称）
     """
     if symbol in ['000001', '399001', '399006', '000688', 'dpzjlx']:
         url = "https://data.eastmoney.com/zjlx/dpzjlx.html"
@@ -24,22 +24,27 @@ async def get_fund_flow_browser(symbol: str) -> str:
             
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             
-            # 【关键修改 1】：直接等待带有 f62 属性的格子出现，这比等文字靠谱得多
+            # 等待核心数据格子加载完毕
             await page.wait_for_selector("td[data-field='f62']", timeout=10000)
-            
-            # 给 JS 留 0.5 秒把数字渲染进 <span> 的时间
             await page.wait_for_timeout(500)
 
-            # 【关键修改 2】：封装一个狙击手函数，根据 data-field 直接拿 innerText
+            # 【新增提取标的名称】：精准狙击 class="title" 的容器
+            try:
+                # first 确保哪怕页面有多个 title 类，我们也只取最上面那个大标题
+                target_name = await page.locator(".title").first.inner_text()
+                target_name = target_name.strip()
+            except:
+                # 容错降级：如果提取失败，大盘显示"沪深两市"，个股显示代码
+                target_name = "沪深两市大盘" if url.endswith("dpzjlx.html") else symbol
+
+            # 提取数据的底层函数
             async def get_val(field_id):
                 try:
-                    # 抓取 <td data-field="xxx"> 里面的纯文本（会自动包含里面的 span 文字）
                     text = await page.locator(f"td[data-field='{field_id}']").inner_text()
                     return text.strip() if text.strip() and text.strip() != "-" else "0"
                 except:
                     return "0"
 
-            # 获取百分比并转换为 float
             async def get_ratio(field_id):
                 text = await get_val(field_id)
                 try:
@@ -47,9 +52,9 @@ async def get_fund_flow_browser(symbol: str) -> str:
                 except:
                     return 0.0
 
-            # 像拼积木一样直接获取数据，清清爽爽
+            # 组装最终的结构化 JSON
             result = {
-                "标的": "大盘" if url.endswith("dpzjlx.html") else symbol,
+                "标的名称": target_name,   # <--- 动态提取的名字在这里！
                 "主力净流入": await get_val("f62"),
                 "主力净比(%)": await get_ratio("f184"),
                 "超大单净流入": await get_val("f66"),
