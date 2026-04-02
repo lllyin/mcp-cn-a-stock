@@ -13,6 +13,7 @@ dependencies = [
     "python-dotenv>=1.2.1",
     "akshare-proxy-patch==0.2.9",
     "efinance>=0.5.5.2",
+    "playwright>=1.58.0",
 ]
 
 [project.optional-dependencies]
