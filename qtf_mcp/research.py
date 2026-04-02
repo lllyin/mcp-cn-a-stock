@@ -372,8 +372,8 @@ async def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) 
     
     from datetime import datetime
     now_time = datetime.now().time()
-    # 强制判定交易时间: 09:15 - 15:15
-    is_trading = (now_time.hour == 9 and now_time.minute >= 15) or (10 <= now_time.hour <= 14) or (now_time.hour == 15 and now_time.minute <= 15)
+    # 强制判定交易时间: 09:15 - 17:00 (延长至17:00以支持收盘后的即时汇总抓取)
+    is_trading = (now_time.hour == 9 and now_time.minute >= 15) or (10 <= now_time.hour <= 16)
     
     if is_trading:
         # 调用无头浏览器抓取实时数据
@@ -387,6 +387,8 @@ async def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) 
             if "error" in res:
                  print(f"- [实时抓取失败] {res['error']}", file=fp)
             elif res:
+                 # [增加] 显式输出抓取到的标的名称，方便交叉验证
+                 print(f"- 标的名称: {res.get('标的名称', '')}", file=fp)
                  prefix = "沪深两市" if data.get("IS_MARKET", False) else "今日"
                  # 按顺序对齐：主力, 超大单, 大单, 中单, 小单
                  field_configs = [
