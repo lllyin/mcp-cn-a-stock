@@ -75,11 +75,16 @@ mcp_app = QtfMCP(
 )
 @mcp_app.tool()
 async def brief(symbol: str, ctx: Context) -> dict:
-  """Get brief information for a given stock symbol(s), including
+  """Get brief information and fund flow for input stock symbol(s) (Batch Supported).
+  Includes:
   - basic data
-  - trading data
+  - trading data (including real-time fund flow)
+  
   Args:
     symbol (str): Stock symbol or comma-separated list (up to 4), e.g., "SZ300308,SH000001"
+
+  Returns:
+    A JSON object with Batch structure (reports/errors).
   """
   who = ctx.request_context.request.client.host  # type: ignore
   return await fetch_batch_reports(symbol, "brief", who)
@@ -87,12 +92,17 @@ async def brief(symbol: str, ctx: Context) -> dict:
 
 @mcp_app.tool()
 async def medium(symbol: str, ctx: Context) -> dict:
-  """Get medium information for a given stock symbol(s), including
+  """Get medium information for input stock symbol(s) (Batch Supported).
+  Includes:
   - basic data
-  - trading data
-  - financial data
+  - trading data (including real-time fund flow)
+  - financial data (abstract)
+
   Args:
     symbol (str): Stock symbol or comma-separated list (up to 4), e.g., "SZ300308,SH000001"
+
+  Returns:
+    A JSON object following the same batch structure (reports/errors).
   """
   who = ctx.request_context.request.client.host  # type: ignore
   return await fetch_batch_reports(symbol, "medium", who)
@@ -100,13 +110,18 @@ async def medium(symbol: str, ctx: Context) -> dict:
 
 @mcp_app.tool()
 async def full(symbol: str, ctx: Context) -> dict:
-  """Get full information for a given stock symbol(s), including
+  """Get full information for input stock symbol(s) (Batch Supported).
+  Includes:
   - basic data
-  - trading data
-  - financial data
-  - technical analysis data
+  - trading data (including real-time fund flow)
+  - financial data (comprehensive)
+  - technical analysis data (MACD, KDJ, etc.)
+
   Args:
     symbol (str): Stock symbol or comma-separated list (up to 4), e.g., "SZ300308,SH000001"
+
+  Returns:
+    A JSON object following the same batch structure (reports/errors).
   """
   who = ctx.request_context.request.client.host  # type: ignore
   return await fetch_batch_reports(symbol, "full", who)
