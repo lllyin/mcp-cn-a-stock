@@ -5,6 +5,7 @@ CN Stock 数据源实现
 """
 
 import asyncio
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -14,7 +15,7 @@ import numpy as np
 
 import akshare_proxy_patch
 import efinance as ef
-from ..config import AKSHARE_PROXY_IP, AKSHARE_PROXY_PASSWORD, AKSHARE_PROXY_PORT
+from ..config import AKSHARE_PROXY_IP, AKSHARE_PROXY_PASSWORD, AKSHARE_PROXY_PORT, SH_INDICES, SZ_INDICES
 from .base import DataSource, StockData
 
 
@@ -22,19 +23,21 @@ def check_is_index(symbol: str, name: str) -> bool:
     """判定是否为指数的辅助函数"""
     if not symbol:
         return False
-    # 1. 名字中包含“指数” (增加类型校验防止 float 类型报错)
-    if name and isinstance(name, str) and "指数" in name:
+    
+    market = symbol[:2].upper()
+    code = symbol[2:]
+    
+    # 1. 优先根据配置中的显式名单判定
+    if market == "SH" and code in SH_INDICES:
         return True
-    # 2. 识别标准指数前缀
-    # 沪市指数：通常以 SH000xxx 或 SH93xxxx 开头
-    # 特别注意：沪市 000xxx 段只有少数是指数，其余可能是误输入的深市代码
-    if symbol.startswith("SH000"):
-        # 常见沪市指数白名单
-        # 000001: 上证指数, 000300: 沪深300, 000016: 上证50, 000905: 中证500, 000688: 科创50, 000852: 中证1000
-        if symbol in ["SH000001", "SH000300", "SH000016", "SH000905", "SH000688", "SH000852"]:
-            return True
-        # 如果不是常见指数且名字里没带指数，则大概率是误输入的深市标的
-        return False
+    if market == "SZ" and code in SZ_INDICES:
+        return True
+        
+    # 2. 备选方案：通过名称猜测 (增加类型校验防止 float 类型报错)
+    if name and isinstance(name, str) and ("指数" in name or "Index" in name):
+        return True
+    
+    # 特别前缀处理
     if symbol.startswith(("SZ39", "SH93")):
         return True
     return False
@@ -110,9 +113,8 @@ class CNStockDataSource(DataSource):
         elif code.startswith(("00", "20", "30")):
             # 对 000 段位进行细分：个股 vs 指数
             if symbol.upper().startswith("SH") and code.startswith("000"):
-                # 扩充沪市核心指数名单
-                # 000001: 上证指数, 000300: 沪深300, 000016: 上证50, 000905: 中证500, 000688: 科创50, 000852: 中证1000
-                if code in ["000001", "000300", "000016", "000905", "000688", "000852"]:
+                # 检查是否在沪市核心指数名单中 (从 confs/indices.json 加载)
+                if code in SH_INDICES:
                     market = "sh"
                 else:
                     # 如果不是知名指数，即便写了 SH，也纠正为 SZ（如 SH000333 -> SZ000333）
