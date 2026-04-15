@@ -1,12 +1,73 @@
+import datetime
 from io import StringIO
-from typing import Literal
+from typing import Literal, Dict, List
 
+from pydantic import BaseModel, Field
 from mcp.server.fastmcp import Context, FastMCP
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
 
 from . import research
 from .datasource import get_datasource
+
+
+# --- Output Models for MCP Inspector Schema ---
+
+class BatchReportResponse(BaseModel):
+    """批量报表响应模型"""
+    symbols_count: int = Field(..., description="成功处理并返回报表的证券标的数量")
+    timestamp: str = Field(..., description="报告生成时间 (YYYY-MM-DD HH:MM:SS)")
+    reports: Dict[str, str] = Field(..., description="成功生成的报表集合 (键为代码，值为 Markdown 文本)")
+    errors: Dict[str, str] = Field(..., description="发生错误的标的信息 (键为代码，值为错误详情)")
+
+# -----------------------------------------------
+
+async def fetch_batch_reports(symbol_str: str, mode: str, host: str) -> BatchReportResponse:
+    """批量获取并生成报告的核心驱动程序"""
+    # 1. 预处理：分拆并限流（上限4个）
+    raw_symbols = [s.strip().upper() for s in symbol_str.split(',') if s.strip()]
+    if len(raw_symbols) > 4:
+        # TODO: 可以记录一下被截断的信息
+        raw_symbols = raw_symbols[:4]
+    
+    # 2. 准备容器
+    output = {
+        "symbols_count": len(raw_symbols),
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "reports": {},
+        "errors": {}
+    }
+
+    async def process_item(symbol: str):
+        try:
+            # 并行拉取基础行情
+            raw_data = await research.load_raw_data(symbol, None, host)
+            if not raw_data:
+                err_msg = f"未找到证券代码 {symbol} 的相关行情数据。"
+                output["errors"][symbol] = err_msg
+                output["reports"][symbol] = f"Error: {err_msg}"
+                return
+
+            buf = StringIO()
+            # 根据模式按需构建
+            research.build_basic_data(buf, symbol, raw_data)
+            await research.build_trading_data(buf, symbol, raw_data)
+            
+            if mode in ["medium", "full"]:
+                research.build_financial_data(buf, symbol, raw_data)
+            if mode == "full":
+                research.build_technical_data(buf, symbol, raw_data)
+            
+            output["reports"][symbol] = buf.getvalue()
+        except Exception as e:
+            err_msg = str(e)
+            output["errors"][symbol] = err_msg
+            output["reports"][symbol] = f"Error during processing: {err_msg}"
+
+    # 并发执行所有标的的任务
+    import asyncio
+    await asyncio.gather(*[process_item(s) for s in raw_symbols])
+    return BatchReportResponse(**output)
 
 
 class QtfMCP(FastMCP):
@@ -24,67 +85,58 @@ mcp_app = QtfMCP(
   streamable_http_path="/cnstock/mcp",
   stateless_http=True,
 )
+@mcp_app.tool()
+async def brief(symbol: str, ctx: Context) -> BatchReportResponse:
+  """Get brief information and fund flow for input stock symbol(s) (Batch Supported).
+  Includes:
+  - basic data
+  - trading data (including real-time fund flow)
+  
+  Args:
+    symbol (str): Stock symbol or comma-separated list (up to 4), e.g., "SZ300308,SH000001"
+
+  Returns:
+    A BatchReportResponse object containing multiple reports or errors.
+  """
+  who = ctx.request_context.request.client.host  # type: ignore
+  return await fetch_batch_reports(symbol, "brief", who)
 
 
 @mcp_app.tool()
-async def brief(symbol: str, ctx: Context) -> str:
-  """Get brief information for a given stock symbol, including
+async def medium(symbol: str, ctx: Context) -> BatchReportResponse:
+  """Get medium information for input stock symbol(s) (Batch Supported).
+  Includes:
   - basic data
-  - trading data
+  - trading data (including real-time fund flow)
+  - financial data (abstract)
+
   Args:
-    symbol (str): Stock symbol, must be in the format of "SH000001" or "SZ000001", you should infer user inputs like stock name to stock symbol
+    symbol (str): Stock symbol or comma-separated list (up to 4), e.g., "SZ300308,SH000001"
+
+  Returns:
+    A BatchReportResponse object containing multiple reports or errors.
   """
   who = ctx.request_context.request.client.host  # type: ignore
-  raw_data = await research.load_raw_data(symbol, None, who)
-  buf = StringIO()
-  if len(raw_data) == 0:
-    return "No data found for symbol: " + symbol
-  research.build_basic_data(buf, symbol, raw_data)
-  await research.build_trading_data(buf, symbol, raw_data)
-  """Get brief information for a given stock symbol"""
-  return buf.getvalue()
+  return await fetch_batch_reports(symbol, "medium", who)
 
 
 @mcp_app.tool()
-async def medium(symbol: str, ctx: Context) -> str:
-  """Get medium information for a given stock symbol, including
+async def full(symbol: str, ctx: Context) -> BatchReportResponse:
+  """Get full information for input stock symbol(s) (Batch Supported).
+  Includes:
   - basic data
-  - trading data
-  - financial data
+  - trading data (including real-time fund flow)
+  - financial data (comprehensive)
+  - technical analysis data (MACD, KDJ, etc.)
+
   Args:
-    symbol (str): Stock symbol, must be in the format of "SH000001" or "SZ000001", you infer convert user inputs like stock name to stock symbol
+    symbol (str): Stock symbol or comma-separated list (up to 4), e.g., "SZ300308,SH000001"
+
+  Returns:
+    A BatchReportResponse object containing multiple reports or errors.
   """
   who = ctx.request_context.request.client.host  # type: ignore
-  raw_data = await research.load_raw_data(symbol, None, who)
-  buf = StringIO()
-  if len(raw_data) == 0:
-    return "No data found for symbol: " + symbol
-  research.build_basic_data(buf, symbol, raw_data)
-  await research.build_trading_data(buf, symbol, raw_data)
-  research.build_financial_data(buf, symbol, raw_data)
-  return buf.getvalue()
-
-
-@mcp_app.tool()
-async def full(symbol: str, ctx: Context) -> str:
-  """Get full information for a given stock symbol, including
-  - basic data
-  - trading data
-  - financial data
-  - technical analysis data
-  Args:
-    symbol (str): Stock symbol, must be in the format of "SH000001" or "SZ000001", you should infer user inputs like stock name to stock symbol
-  """
-  who = ctx.request_context.request.client.host  # type: ignore
-  raw_data = await research.load_raw_data(symbol, None, who)
-  buf = StringIO()
-  if len(raw_data) == 0:
-    return "No data found for symbol: " + symbol
-  research.build_basic_data(buf, symbol, raw_data)
-  await research.build_trading_data(buf, symbol, raw_data)
-  research.build_financial_data(buf, symbol, raw_data)
-  research.build_technical_data(buf, symbol, raw_data)
-  return buf.getvalue()
+  return await fetch_batch_reports(symbol, "full", who)
 
 
 @mcp_app.tool()

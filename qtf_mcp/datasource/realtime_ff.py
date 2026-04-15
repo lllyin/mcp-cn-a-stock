@@ -1,7 +1,10 @@
 import asyncio
 import json
+import os
 import time
 from playwright.async_api import async_playwright, Browser, BrowserContext
+
+from ..config import ALL_INDICES
 
 # ── 全局单例 ──────────────────────────────────────────────
 _playwright = None
@@ -108,11 +111,14 @@ async def fetch_single(symbol: str, context: BrowserContext) -> dict:
     async with SEMAPHORE:
         page = await context.new_page()
 
-        # 指数类页面走大盘资金流向
-        INDEX_SYMBOLS = {"000001", "399001", "399006", "000688", "dpzjlx"}
+        # 提取纯数字部分进行判断 (如 SH000001 -> 000001)
+        pure_code = "".join(filter(str.isdigit, symbol))
+        # 如果是特殊标识 'dpzjlx' 或者是已知的沪深指数代码，则走大盘页面模板
+        is_index_page = symbol == "dpzjlx" or pure_code in ALL_INDICES
+        
         url = (
             "https://data.eastmoney.com/zjlx/dpzjlx.html"
-            if symbol in INDEX_SYMBOLS
+            if is_index_page
             else f"https://data.eastmoney.com/zjlx/{symbol}.html"
         )
 

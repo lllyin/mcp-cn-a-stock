@@ -80,6 +80,7 @@ class StockData:
         """
         result: Dict[str, np.ndarray] = {
             # 基本信息
+            "SYMBOL": self.symbol, # type: ignore
             "NAME": self.name,  # type: ignore
             "IS_MARKET": self.is_market, # type: ignore
             
