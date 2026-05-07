@@ -48,14 +48,15 @@ wheels = [
 
 [[package]]
 name = "akshare-proxy-patch"
-version = "0.2.9"
+version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "curl-cffi" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/93/14/5d62fdb5d9a0a4c4150443ae93e52a3d37e29571f77e59381c62dd4b9cd4/akshare_proxy_patch-0.2.9.tar.gz", hash = "sha256:916dd52cff42dd32ec0d28fb129188d59c4b7a1085e750468960ec73cf2d39b2", size = 4313, upload-time = "2026-03-05T22:45:11.92Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/73/19/f9380062399149d07114d3cc8a37859c4199b010bce7bab81689b098ae4b/akshare_proxy_patch-0.4.1.tar.gz", hash = "sha256:ffbcd1ed71fee959e8f6e75e123aec22a3a5230ea5ed398d62aa746e8ba3ef43", size = 6191, upload-time = "2026-05-07T02:29:20.460Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c3/2e/0bf114db6a5e68e8b73cadf12abf7b2a40c6498b89a5ba27d3269b8b6484/akshare_proxy_patch-0.2.9-py3-none-any.whl", hash = "sha256:266deabfb61287e3c6928bc418aeb59b0d4a66de3bcbfdb5a118b77fe489017f", size = 4339, upload-time = "2026-03-05T22:45:10.726Z" },
+    { url = "https://files.pythonhosted.org/packages/73/89/516b1a90dae2334a7c0c35b9f672267c8cff74b78f7c11a0c8fdf0269993/akshare_proxy_patch-0.4.1-py3-none-any.whl", hash = "sha256:719353778ab08dcc2c93056a329e99dd6d5968491cd77dcb20ba3ea21949230e", size = 7045, upload-time = "2026-05-07T02:29:19.242Z" },
 ]
 
 [[package]]
@@ -285,7 +286,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "akshare", specifier = ">=1.17.94" },
-    { name = "akshare-proxy-patch", specifier = "==0.2.9" },
+    { name = "akshare-proxy-patch", specifier = "==0.4.1" },
     { name = "click", specifier = ">=8.3.1" },
     { name = "efinance", specifier = ">=0.5.5.2" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.22" },
