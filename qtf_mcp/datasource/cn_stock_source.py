@@ -14,9 +14,10 @@ from typing import Dict, List, Optional
 import numpy as np
 
 import akshare_proxy_patch
-import efinance as ef
-from ..config import AKSHARE_PROXY_IP, AKSHARE_PROXY_PASSWORD, AKSHARE_PROXY_PORT, SH_INDICES, SZ_INDICES
+from ..config import AKSHARE_PROXY_IP, AKSHARE_PROXY_PASSWORD, AKSHARE_PROXY_RETRY, SH_INDICES, SZ_INDICES
 from .base import DataSource, StockData
+
+logger = logging.getLogger("qtf_mcp")
 
 
 def check_is_index(symbol: str, name: str) -> bool:
@@ -44,13 +45,26 @@ def check_is_index(symbol: str, name: str) -> bool:
 
 # Initialize the proxy patch to improve reliability of AkShare API calls,
 # especially for Eastmoney interfaces (push2his.eastmoney.com etc.)
-akshare_proxy_patch.install_patch(AKSHARE_PROXY_IP, AKSHARE_PROXY_PASSWORD, AKSHARE_PROXY_PORT)
+akshare_proxy_patch.install_patch(
+    AKSHARE_PROXY_IP,
+    auth_token=AKSHARE_PROXY_PASSWORD,
+    retry=AKSHARE_PROXY_RETRY,
+    hook_domains=[
+        "fund.eastmoney.com",
+        "push2.eastmoney.com",
+        "push2his.eastmoney.com",
+        "emweb.securities.eastmoney.com",
+    ],
+)
 
-print(f"AKSHARE_PROXY_IP: {AKSHARE_PROXY_IP}")
-print(f"AKSHARE_PROXY_PASSWORD: {AKSHARE_PROXY_PASSWORD}")
-print(f"AKSHARE_PROXY_PORT: {AKSHARE_PROXY_PORT}")
+logger.info(
+    "AkShare proxy patch installed: gateway=%s token_configured=%s retry=%s",
+    AKSHARE_PROXY_IP,
+    bool(AKSHARE_PROXY_PASSWORD),
+    AKSHARE_PROXY_RETRY,
+)
 
-logger = logging.getLogger("qtf_mcp")
+import efinance as ef
 
 # 线程池用于执行同步的调用
 _executor = ThreadPoolExecutor(max_workers=4)

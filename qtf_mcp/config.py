@@ -9,9 +9,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # AkShare Proxy Patch Configuration
-AKSHARE_PROXY_IP = os.getenv("AKSHARE_PROXY_IP")
-AKSHARE_PROXY_PASSWORD = os.getenv("AKSHARE_PROXY_PASSWORD")
-AKSHARE_PROXY_PORT = int(os.getenv("AKSHARE_PROXY_PORT", "0"))
+AKSHARE_PROXY_IP = os.getenv("AKSHARE_PROXY_GATEWAY") or os.getenv("AKSHARE_PROXY_IP")
+AKSHARE_PROXY_PASSWORD = os.getenv("AKSHARE_PROXY_TOKEN") or os.getenv("AKSHARE_PROXY_PASSWORD")
+AKSHARE_PROXY_RETRY = int(os.getenv("AKSHARE_PROXY_RETRY", os.getenv("AKSHARE_PROXY_PORT", "30")))
+# Backward-compatible alias. Historically this variable was named PORT, but
+# akshare-proxy-patch treats the third argument as retry count.
+AKSHARE_PROXY_PORT = AKSHARE_PROXY_RETRY
 
 # --- Market Indices Configuration ---
 import json
