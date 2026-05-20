@@ -1,4 +1,6 @@
 import datetime
+import logging
+import time
 from io import StringIO
 from typing import Literal, Dict, List
 
@@ -9,6 +11,8 @@ from starlette.middleware.cors import CORSMiddleware
 
 from . import research
 from .datasource import get_datasource
+
+logger = logging.getLogger("qtf_mcp")
 
 
 # --- Output Models for MCP Inspector Schema ---
@@ -29,6 +33,9 @@ async def fetch_batch_reports(symbol_str: str, mode: str, host: str) -> BatchRep
     if len(raw_symbols) > 4:
         # TODO: 可以记录一下被截断的信息
         raw_symbols = raw_symbols[:4]
+    symbols_label = ",".join(raw_symbols)
+    start_time = time.time()
+    logger.info("Starting %s query: %s", mode, symbols_label)
     
     # 2. 准备容器
     output = {
@@ -66,7 +73,11 @@ async def fetch_batch_reports(symbol_str: str, mode: str, host: str) -> BatchRep
 
     # 并发执行所有标的的任务
     import asyncio
-    await asyncio.gather(*[process_item(s) for s in raw_symbols])
+    try:
+        await asyncio.gather(*[process_item(s) for s in raw_symbols])
+    finally:
+        elapsed = time.time() - start_time
+        logger.info("Finished %s query: %s, cost %.2fs", mode, symbols_label, elapsed)
     return BatchReportResponse(**output)
 
 
