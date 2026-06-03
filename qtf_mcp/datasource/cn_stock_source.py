@@ -58,10 +58,11 @@ akshare_proxy_patch.install_patch(
 )
 
 logger.info(
-    "AkShare proxy patch installed: gateway=%s token_configured=%s retry=%s",
+    "AkShare proxy patch installed: gateway=%s token_configured=%s retry=%s version=%s",
     AKSHARE_PROXY_IP,
     bool(AKSHARE_PROXY_PASSWORD),
     AKSHARE_PROXY_RETRY,
+    akshare_proxy_patch.__version__,
 )
 
 import efinance as ef
