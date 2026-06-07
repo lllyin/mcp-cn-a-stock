@@ -2,7 +2,7 @@ import datetime
 import logging
 import time
 from io import StringIO
-from typing import Literal, Dict, List
+from typing import Literal, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 from mcp.server.fastmcp import Context, FastMCP
@@ -23,6 +23,69 @@ class BatchReportResponse(BaseModel):
     timestamp: str = Field(..., description="报告生成时间 (YYYY-MM-DD HH:MM:SS)")
     reports: Dict[str, str] = Field(..., description="成功生成的报表集合 (键为代码，值为 Markdown 文本)")
     errors: Dict[str, str] = Field(..., description="发生错误的标的信息 (键为代码，值为错误详情)")
+
+
+class KDJIndicator(BaseModel):
+    """KDJ indicator values."""
+    k: Optional[float] = Field(None, description="K value")
+    d: Optional[float] = Field(None, description="D value")
+    j: Optional[float] = Field(None, description="J value")
+
+
+class MACDIndicator(BaseModel):
+    """MACD indicator values."""
+    dif: Optional[float] = Field(None, description="DIF value")
+    dea: Optional[float] = Field(None, description="DEA value")
+    histogram: Optional[float] = Field(None, description="DIF - DEA")
+
+
+class RSIIndicator(BaseModel):
+    """RSI indicator values."""
+    rsi6: Optional[float] = Field(None, description="6-period RSI")
+    rsi12: Optional[float] = Field(None, description="12-period RSI")
+    rsi24: Optional[float] = Field(None, description="24-period RSI")
+
+
+class BBandsIndicator(BaseModel):
+    """Bollinger Bands indicator values."""
+    upper: Optional[float] = Field(None, description="Upper band")
+    middle: Optional[float] = Field(None, description="Middle band")
+    lower: Optional[float] = Field(None, description="Lower band")
+
+
+class OHLCData(BaseModel):
+    """Daily OHLCV values."""
+    open: Optional[float] = Field(None, description="Open price")
+    close: Optional[float] = Field(None, description="Close price")
+    high: Optional[float] = Field(None, description="High price")
+    low: Optional[float] = Field(None, description="Low price")
+    volume: Optional[float] = Field(None, description="Trading volume")
+
+
+class TechnicalIndicatorItem(BaseModel):
+    """Technical indicators for one trading day."""
+    date: str = Field(..., description="Trading date in YYYY-MM-DD format")
+    ohlc: OHLCData = Field(..., description="Daily OHLCV values")
+    kdj: Optional[KDJIndicator] = Field(None, description="KDJ values")
+    macd: Optional[MACDIndicator] = Field(None, description="MACD values")
+    rsi: Optional[RSIIndicator] = Field(None, description="RSI values")
+    bbands: Optional[BBandsIndicator] = Field(None, description="Bollinger Bands values")
+
+
+class TechnicalReport(BaseModel):
+    """Machine-readable technical indicator report for one symbol."""
+    symbol: str = Field(..., description="Normalized stock symbol")
+    name: str = Field("", description="Stock name")
+    quote_date: Optional[str] = Field(None, description="Latest trading date in YYYY-MM-DD format")
+    indicators: List[TechnicalIndicatorItem] = Field(default_factory=list, description="Recent technical indicators")
+
+
+class BatchTechnicalResponse(BaseModel):
+    """Batch technical indicator response."""
+    symbols_count: int = Field(..., description="Number of requested symbols after applying batch limit")
+    timestamp: str = Field(..., description="Report generation time (YYYY-MM-DD HH:MM:SS)")
+    reports: Dict[str, TechnicalReport] = Field(..., description="Technical reports keyed by normalized symbol")
+    errors: Dict[str, str] = Field(..., description="Errors keyed by input or normalized symbol")
 
 # -----------------------------------------------
 
@@ -79,6 +142,66 @@ async def fetch_batch_reports(symbol_str: str, mode: str, host: str) -> BatchRep
         elapsed = time.time() - start_time
         logger.info("Finished %s query: %s, cost %.2fs", mode, symbols_label, elapsed)
     return BatchReportResponse(**output)
+
+
+async def fetch_technical_reports(
+    symbol_str: str,
+    days: int = 30,
+    fields: str = "all",
+    include_derived: bool = True,
+    host: str = "",
+) -> BatchTechnicalResponse:
+    """Fetch machine-readable technical indicator reports."""
+    raw_symbols = [s.strip().upper() for s in symbol_str.split(',') if s.strip()]
+    if len(raw_symbols) > 4:
+        raw_symbols = raw_symbols[:4]
+
+    symbols_label = ",".join(raw_symbols)
+    start_time = time.time()
+    logger.info("Starting tech query: %s", symbols_label)
+
+    output = {
+        "symbols_count": len(raw_symbols),
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "reports": {},
+        "errors": {},
+    }
+
+    async def process_item(symbol: str):
+        try:
+            raw_data = await research.load_raw_data(symbol, None, host)
+            if not raw_data:
+                output["errors"][symbol] = f"未找到证券代码 {symbol} 的相关行情数据。"
+                return
+
+            report_symbol = str(raw_data.get("SYMBOL", symbol))
+            indicators = research.get_technical_indicators(
+                raw_data,
+                days=days,
+                fields=fields,
+                include_derived=include_derived,
+            )
+            if not indicators:
+                output["errors"][report_symbol] = f"未找到证券代码 {report_symbol} 的技术指标数据。"
+                return
+
+            output["reports"][report_symbol] = TechnicalReport(
+                symbol=report_symbol,
+                name=str(raw_data.get("NAME", "")),
+                quote_date=indicators[0]["date"] if indicators else None,
+                indicators=indicators,
+            )
+        except Exception as e:
+            output["errors"][symbol] = str(e)
+
+    import asyncio
+    try:
+        await asyncio.gather(*[process_item(s) for s in raw_symbols])
+    finally:
+        elapsed = time.time() - start_time
+        logger.info("Finished tech query: %s, cost %.2fs", symbols_label, elapsed)
+
+    return BatchTechnicalResponse(**output)
 
 
 class QtfMCP(FastMCP):
@@ -148,6 +271,30 @@ async def full(symbol: str, ctx: Context) -> BatchReportResponse:
   """
   who = ctx.request_context.request.client.host  # type: ignore
   return await fetch_batch_reports(symbol, "full", who)
+
+
+@mcp_app.tool()
+async def tech(
+  symbol: str,
+  days: int = 30,
+  fields: str = "all",
+  include_derived: bool = True,
+  ctx: Context = None,  # type: ignore
+) -> BatchTechnicalResponse:
+  """Get machine-readable technical indicators for input stock symbol(s).
+  Returns strict JSON objects instead of Markdown. Supports batch mode.
+
+  Args:
+    symbol (str): Stock symbol or comma-separated list (up to 4), e.g., "SZ002463,SH688981".
+    days (int): Recent N trading days to return. Default is 30.
+    fields (str): Indicator groups to include: all, or comma-separated values from macd,kdj,rsi,bbands.
+    include_derived (bool): Include macd.histogram = dif - dea when true.
+
+  Returns:
+    A BatchTechnicalResponse object containing JSON technical reports or errors.
+  """
+  who = ctx.request_context.request.client.host if ctx else ""  # type: ignore
+  return await fetch_technical_reports(symbol, days, fields, include_derived, who)
 
 
 @mcp_app.tool()

@@ -64,6 +64,113 @@ def compute_macd(close: ndarray, fast: int = 12, slow: int = 26, signal: int = 9
     return macd, signal_line
 
 
+TECHNICAL_FIELDS = ("kdj", "macd", "rsi", "bbands")
+
+
+def parse_technical_fields(fields: str = "all") -> list[str]:
+    """Parse requested technical indicator groups."""
+    if not fields or fields.strip().lower() == "all":
+        return list(TECHNICAL_FIELDS)
+
+    requested = []
+    for field in fields.split(","):
+        item = field.strip().lower()
+        if item in TECHNICAL_FIELDS and item not in requested:
+            requested.append(item)
+    return requested or list(TECHNICAL_FIELDS)
+
+
+def _json_number(value) -> float | None:
+    """Convert numpy/talib values to JSON-safe numbers."""
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return None
+    if np.isnan(val) or np.isinf(val):
+        return None
+    return val
+
+
+def get_technical_indicators(
+    data: Dict[str, ndarray],
+    days: int = 30,
+    fields: str = "all",
+    include_derived: bool = True,
+) -> list[dict]:
+    """Return machine-readable technical indicators for recent trading days."""
+    if "CLOSE" not in data or "DATE" not in data:
+        return []
+
+    close = data["CLOSE"]
+    high = data.get("HIGH", close)
+    low = data.get("LOW", close)
+    open_ = data.get("OPEN", close)
+    volume = data.get("VOLUME", np.full_like(close, np.nan))
+    dates = data["DATE"]
+
+    if len(close) == 0 or len(dates) == 0:
+        return []
+
+    requested_fields = parse_technical_fields(fields)
+    days = max(1, int(days or 30))
+
+    kdj_k, kdj_d, kdj_j = compute_kdj(close, high, low, 9, 3, 3)
+    macd_diff, macd_dea = compute_macd(close, 12, 26, 9)
+    rsi_6 = talib.RSI(close, timeperiod=6)
+    rsi_12 = talib.RSI(close, timeperiod=12)
+    rsi_24 = talib.RSI(close, timeperiod=24)
+    bb_upper, bb_middle, bb_lower = talib.BBANDS(close, matype=talib.MA_Type.T3)
+
+    formatted_dates = [
+        datetime.datetime.fromtimestamp(d / 1e9).strftime("%Y-%m-%d") for d in dates
+    ]
+
+    indicators = []
+    start = max(0, len(formatted_dates) - days)
+    for i in range(len(formatted_dates) - 1, start - 1, -1):
+        item: dict = {
+            "date": formatted_dates[i],
+            "ohlc": {
+                "open": _json_number(open_[i]),
+                "close": _json_number(close[i]),
+                "high": _json_number(high[i]),
+                "low": _json_number(low[i]),
+                "volume": _json_number(volume[i]),
+            },
+        }
+        if "kdj" in requested_fields:
+            item["kdj"] = {
+                "k": _json_number(kdj_k[i]),
+                "d": _json_number(kdj_d[i]),
+                "j": _json_number(kdj_j[i]),
+            }
+        if "macd" in requested_fields:
+            dif = _json_number(macd_diff[i])
+            dea = _json_number(macd_dea[i])
+            macd = {
+                "dif": dif,
+                "dea": dea,
+            }
+            if include_derived:
+                macd["histogram"] = None if dif is None or dea is None else dif - dea
+            item["macd"] = macd
+        if "rsi" in requested_fields:
+            item["rsi"] = {
+                "rsi6": _json_number(rsi_6[i]),
+                "rsi12": _json_number(rsi_12[i]),
+                "rsi24": _json_number(rsi_24[i]),
+            }
+        if "bbands" in requested_fields:
+            item["bbands"] = {
+                "upper": _json_number(bb_upper[i]),
+                "middle": _json_number(bb_middle[i]),
+                "lower": _json_number(bb_lower[i]),
+            }
+        indicators.append(item)
+
+    return indicators
+
+
 async def load_raw_data(
     symbol: str, end_date=None, who: str = ""
 ) -> Dict[str, ndarray]:
@@ -460,45 +567,47 @@ def build_technical_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> N
     print("# 技术指标(最近30日)", file=fp)
     print("", file=fp)
 
-    # 使用自定义的 KDJ 和 MACD 函数
-    kdj_k, kdj_d, kdj_j = compute_kdj(close, high, low, 9, 3, 3)
-    macd_diff, macd_dea = compute_macd(close, 12, 26, 9)
-
-    rsi_6 = talib.RSI(close, timeperiod=6)
-    rsi_12 = talib.RSI(close, timeperiod=12)
-    rsi_24 = talib.RSI(close, timeperiod=24)
-
-    bb_upper, bb_middle, bb_lower = talib.BBANDS(close, matype=talib.MA_Type.T3)
-
-    date = [
-        datetime.datetime.fromtimestamp(d / 1e9).strftime("%Y-%m-%d") for d in data["DATE"]
-    ]
+    indicators = get_technical_indicators(data, days=30, include_derived=False)
     columns = [
-        ("日期", date),
-        ("KDJ.K", kdj_k),
-        ("KDJ.D", kdj_d),
-        ("KDJ.J", kdj_j),
-        ("MACD DIF", macd_diff),
-        ("MACD DEA", macd_dea),
-        ("RSI(6)", rsi_6),
-        ("RSI(12)", rsi_12),
-        ("RSI(24)", rsi_24),
-        ("BBands Upper", bb_upper),
-        ("BBands Middle", bb_middle),
-        ("BBands Lower", bb_lower),
+        "日期",
+        "KDJ.K",
+        "KDJ.D",
+        "KDJ.J",
+        "MACD DIF",
+        "MACD DEA",
+        "RSI(6)",
+        "RSI(12)",
+        "RSI(24)",
+        "BBands Upper",
+        "BBands Middle",
+        "BBands Lower",
     ]
-    print("| " + " | ".join([c[0] for c in columns]) + " |", file=fp)
+    print("| " + " | ".join(columns) + " |", file=fp)
     print("| --- " * len(columns) + "|", file=fp)
-    for i in range(-1, max(-len(date), -31), -1):
-        values = []
-        for c in columns[1:]:
-            val = c[1][i]
-            if np.isnan(val):
-                values.append("N/A")
-            else:
-                values.append(f"{val:.2f}")
+
+    def format_value(value: float | None) -> str:
+        return "N/A" if value is None else f"{value:.2f}"
+
+    for item in indicators:
+        kdj = item["kdj"]
+        macd = item["macd"]
+        rsi = item["rsi"]
+        bbands = item["bbands"]
+        values = [
+            format_value(kdj["k"]),
+            format_value(kdj["d"]),
+            format_value(kdj["j"]),
+            format_value(macd["dif"]),
+            format_value(macd["dea"]),
+            format_value(rsi["rsi6"]),
+            format_value(rsi["rsi12"]),
+            format_value(rsi["rsi24"]),
+            format_value(bbands["upper"]),
+            format_value(bbands["middle"]),
+            format_value(bbands["lower"]),
+        ]
         print(
-            "| " + date[i] + "|" + " | ".join(values) + " |",
+            "| " + item["date"] + "|" + " | ".join(values) + " |",
             file=fp,
         )
     print("", file=fp)

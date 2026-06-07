@@ -24,17 +24,18 @@
 - **财务数据**：近年的主要财务指标（净利润、营收、ROE、EPS、NAV 等）。
 - **技术指标**：实时计算 KDJ、MACD、RSI、布林带等常用指标。
 
-这些数据通过以下三个 MCP 工具提供，**所有工具均支持逗号分隔的批量输入（上限 4 个）**：
+这些数据通过以下 MCP 工具提供，**所有工具均支持逗号分隔的批量输入（上限 4 个）**：
 
 - `brief`: 提供股票基本信息、当日行情及 **实时资金流向**。
 - `medium`: 在 `brief` 基础上增加主要财务数据摘要。
 - `full`: 提供最完整的数据，包括详细财务报表及实时技术指标 (KDJ, MACD 等)。
+- `tech`: 返回严格 JSON 格式的技术指标数据，包含 KDJ、MACD、RSI、布林带，供外部程序直接计算 trend-state。
 
 - [查询结果展示: 兆易创新 (SH603986) 全量分析报告](docs/SH603986-full.md)
 
 ## 批量查询指引
 
-所有核心工具 (`brief`, `medium`, `full`) 均支持批量模式。
+所有核心工具 (`brief`, `medium`, `full`, `tech`) 均支持批量模式。
 
 ### 1. 调用方式
 在证券代码参数中，使用 **半角逗号** 分隔多个代码：
@@ -46,7 +47,31 @@
 - `errors`: 一个字典，包含查询失败的代码及其原因。
 - `symbols_count`: 成功生成的报告数量。
 
-### 3. 智能纠偏 (Symbol Healing)
+`tech` 工具返回机器可读的 JSON 对象，`reports` 的值不是 Markdown 字符串，而是包含 `symbol`、`name`、`quote_date` 和 `indicators` 数组的结构化对象。每个 `indicators` 条目包含当日 `ohlc` 和技术指标数据，数值字段均为 number 或 null。
+
+### 3. 技术指标 JSON
+
+单标的调用：
+
+```bash
+export MCPORTER_CONFIG=~/.openclaw/workspace/config/mcporter.json
+mcporter call cn-stock tech symbol=SZ002463 days=30
+```
+
+批量调用：
+
+```bash
+export MCPORTER_CONFIG=~/.openclaw/workspace/config/mcporter.json
+mcporter call cn-stock tech symbol=SZ002463,SZ300502,SH688981 days=30
+```
+
+筛选指标：
+
+```bash
+mcporter call cn-stock tech symbol=SZ002463 days=30 fields=macd,kdj include_derived=true
+```
+
+### 4. 智能纠偏 (Symbol Healing)
 如果你输入了错误的市场前缀（例如将美的集团 `SZ000333` 误输入为 `SH000333`），系统会自动识别归属并返回 **规范化后的正确代码**，确保数据分析不中断。
 
 ## 开发与运行
