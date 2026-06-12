@@ -113,3 +113,48 @@ async def test_tech_output_does_not_contain_markdown_table(monkeypatch):
 
     assert "| --- |" not in payload
     assert "技术指标" not in payload
+
+
+@pytest.mark.asyncio
+async def test_tech_passes_query_date_to_loader(monkeypatch):
+    seen = {}
+
+    async def fake_load_raw_data(symbol, end_date=None, who=""):
+        seen["end_date"] = end_date
+        return _make_raw_data("SZ002463")
+
+    monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
+
+    response = await app_module.fetch_technical_reports(
+        "SZ002463",
+        days=1,
+        date="2026-06-05",
+    )
+
+    assert response.errors == {}
+    assert seen["end_date"] == "2026-06-05"
+
+
+@pytest.mark.asyncio
+async def test_markdown_batch_passes_query_date_to_loader(monkeypatch):
+    seen = {}
+
+    async def fake_load_raw_data(symbol, end_date=None, who=""):
+        seen["end_date"] = end_date
+        return _make_raw_data("SZ002463")
+
+    async def fake_build_trading_data(fp, symbol, data):
+        print("# trading", file=fp)
+
+    monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
+    monkeypatch.setattr(app_module.research, "build_trading_data", fake_build_trading_data)
+
+    response = await app_module.fetch_batch_reports(
+        "SZ002463",
+        "brief",
+        "",
+        date="2026-06-05",
+    )
+
+    assert response.errors == {}
+    assert seen["end_date"] == "2026-06-05"

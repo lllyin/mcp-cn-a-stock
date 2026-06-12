@@ -89,7 +89,7 @@ class BatchTechnicalResponse(BaseModel):
 
 # -----------------------------------------------
 
-async def fetch_batch_reports(symbol_str: str, mode: str, host: str) -> BatchReportResponse:
+async def fetch_batch_reports(symbol_str: str, mode: str, host: str, date: Optional[str] = None) -> BatchReportResponse:
     """批量获取并生成报告的核心驱动程序"""
     # 1. 预处理：分拆并限流（上限4个）
     raw_symbols = [s.strip().upper() for s in symbol_str.split(',') if s.strip()]
@@ -98,7 +98,8 @@ async def fetch_batch_reports(symbol_str: str, mode: str, host: str) -> BatchRep
         raw_symbols = raw_symbols[:4]
     symbols_label = ",".join(raw_symbols)
     start_time = time.time()
-    logger.info("Starting %s query: %s", mode, symbols_label)
+    date_label = f", date={date}" if date else ""
+    logger.info("Starting %s query: %s%s", mode, symbols_label, date_label)
     
     # 2. 准备容器
     output = {
@@ -111,7 +112,7 @@ async def fetch_batch_reports(symbol_str: str, mode: str, host: str) -> BatchRep
     async def process_item(symbol: str):
         try:
             # 并行拉取基础行情
-            raw_data = await research.load_raw_data(symbol, None, host)
+            raw_data = await research.load_raw_data(symbol, date, host)
             if not raw_data:
                 err_msg = f"未找到证券代码 {symbol} 的相关行情数据。"
                 output["errors"][symbol] = err_msg
@@ -140,7 +141,7 @@ async def fetch_batch_reports(symbol_str: str, mode: str, host: str) -> BatchRep
         await asyncio.gather(*[process_item(s) for s in raw_symbols])
     finally:
         elapsed = time.time() - start_time
-        logger.info("Finished %s query: %s, cost %.2fs", mode, symbols_label, elapsed)
+        logger.info("Finished %s query: %s%s, cost %.2fs", mode, symbols_label, date_label, elapsed)
     return BatchReportResponse(**output)
 
 
@@ -149,6 +150,7 @@ async def fetch_technical_reports(
     days: int = 30,
     fields: str = "all",
     include_derived: bool = True,
+    date: Optional[str] = None,
     host: str = "",
 ) -> BatchTechnicalResponse:
     """Fetch machine-readable technical indicator reports."""
@@ -158,7 +160,8 @@ async def fetch_technical_reports(
 
     symbols_label = ",".join(raw_symbols)
     start_time = time.time()
-    logger.info("Starting tech query: %s", symbols_label)
+    date_label = f", date={date}" if date else ""
+    logger.info("Starting tech query: %s%s", symbols_label, date_label)
 
     output = {
         "symbols_count": len(raw_symbols),
@@ -169,7 +172,7 @@ async def fetch_technical_reports(
 
     async def process_item(symbol: str):
         try:
-            raw_data = await research.load_raw_data(symbol, None, host)
+            raw_data = await research.load_raw_data(symbol, date, host)
             if not raw_data:
                 output["errors"][symbol] = f"未找到证券代码 {symbol} 的相关行情数据。"
                 return
@@ -199,7 +202,7 @@ async def fetch_technical_reports(
         await asyncio.gather(*[process_item(s) for s in raw_symbols])
     finally:
         elapsed = time.time() - start_time
-        logger.info("Finished tech query: %s, cost %.2fs", symbols_label, elapsed)
+        logger.info("Finished tech query: %s%s, cost %.2fs", symbols_label, date_label, elapsed)
 
     return BatchTechnicalResponse(**output)
 
@@ -220,7 +223,7 @@ mcp_app = QtfMCP(
   stateless_http=True,
 )
 @mcp_app.tool()
-async def brief(symbol: str, ctx: Context) -> BatchReportResponse:
+async def brief(symbol: str, date: Optional[str] = None, ctx: Context = None) -> BatchReportResponse:  # type: ignore
   """Get brief information and fund flow for input stock symbol(s) (Batch Supported).
   Includes:
   - basic data
@@ -228,16 +231,17 @@ async def brief(symbol: str, ctx: Context) -> BatchReportResponse:
   
   Args:
     symbol (str): Stock symbol or comma-separated list (up to 4), e.g., "SZ300308,SH000001"
+    date (str, optional): Query cutoff date in YYYY-MM-DD format. Defaults to latest available trading day.
 
   Returns:
     A BatchReportResponse object containing multiple reports or errors.
   """
-  who = ctx.request_context.request.client.host  # type: ignore
-  return await fetch_batch_reports(symbol, "brief", who)
+  who = ctx.request_context.request.client.host if ctx else ""  # type: ignore
+  return await fetch_batch_reports(symbol, "brief", who, date)
 
 
 @mcp_app.tool()
-async def medium(symbol: str, ctx: Context) -> BatchReportResponse:
+async def medium(symbol: str, date: Optional[str] = None, ctx: Context = None) -> BatchReportResponse:  # type: ignore
   """Get medium information for input stock symbol(s) (Batch Supported).
   Includes:
   - basic data
@@ -246,16 +250,17 @@ async def medium(symbol: str, ctx: Context) -> BatchReportResponse:
 
   Args:
     symbol (str): Stock symbol or comma-separated list (up to 4), e.g., "SZ300308,SH000001"
+    date (str, optional): Query cutoff date in YYYY-MM-DD format. Defaults to latest available trading day.
 
   Returns:
     A BatchReportResponse object containing multiple reports or errors.
   """
-  who = ctx.request_context.request.client.host  # type: ignore
-  return await fetch_batch_reports(symbol, "medium", who)
+  who = ctx.request_context.request.client.host if ctx else ""  # type: ignore
+  return await fetch_batch_reports(symbol, "medium", who, date)
 
 
 @mcp_app.tool()
-async def full(symbol: str, ctx: Context) -> BatchReportResponse:
+async def full(symbol: str, date: Optional[str] = None, ctx: Context = None) -> BatchReportResponse:  # type: ignore
   """Get full information for input stock symbol(s) (Batch Supported).
   Includes:
   - basic data
@@ -265,12 +270,13 @@ async def full(symbol: str, ctx: Context) -> BatchReportResponse:
 
   Args:
     symbol (str): Stock symbol or comma-separated list (up to 4), e.g., "SZ300308,SH000001"
+    date (str, optional): Query cutoff date in YYYY-MM-DD format. Defaults to latest available trading day.
 
   Returns:
     A BatchReportResponse object containing multiple reports or errors.
   """
-  who = ctx.request_context.request.client.host  # type: ignore
-  return await fetch_batch_reports(symbol, "full", who)
+  who = ctx.request_context.request.client.host if ctx else ""  # type: ignore
+  return await fetch_batch_reports(symbol, "full", who, date)
 
 
 @mcp_app.tool()
@@ -279,6 +285,7 @@ async def tech(
   days: int = 30,
   fields: str = "all",
   include_derived: bool = True,
+  date: Optional[str] = None,
   ctx: Context = None,  # type: ignore
 ) -> BatchTechnicalResponse:
   """Get machine-readable technical indicators for input stock symbol(s).
@@ -289,12 +296,13 @@ async def tech(
     days (int): Recent N trading days to return. Default is 30.
     fields (str): Indicator groups to include: all, or comma-separated values from macd,kdj,rsi,bbands.
     include_derived (bool): Include macd.histogram = dif - dea when true.
+    date (str, optional): Query cutoff date in YYYY-MM-DD format. Defaults to latest available trading day.
 
   Returns:
     A BatchTechnicalResponse object containing JSON technical reports or errors.
   """
   who = ctx.request_context.request.client.host if ctx else ""  # type: ignore
-  return await fetch_technical_reports(symbol, days, fields, include_derived, who)
+  return await fetch_technical_reports(symbol, days, fields, include_derived, date, who)
 
 
 @mcp_app.tool()

@@ -29,7 +29,7 @@
 - `brief`: 提供股票基本信息、当日行情及 **实时资金流向**。
 - `medium`: 在 `brief` 基础上增加主要财务数据摘要。
 - `full`: 提供最完整的数据，包括详细财务报表及实时技术指标 (KDJ, MACD 等)。
-- `tech`: 返回严格 JSON 格式的技术指标数据，包含 KDJ、MACD、RSI、布林带，供外部程序直接计算 trend-state。
+- `tech`: 返回严格 JSON 格式的技术指标数据，包含 KDJ、MACD、RSI、布林带
 
 - [查询结果展示: 兆易创新 (SH603986) 全量分析报告](docs/SH603986-full.md)
 
@@ -40,6 +40,8 @@
 ### 1. 调用方式
 在证券代码参数中，使用 **半角逗号** 分隔多个代码：
 `symbol="SZ300308,SH600000,SZ000333"`
+
+默认查询最新可用行情。`brief`、`medium`、`full`、`tech` 支持可选 `date=YYYY-MM-DD` 参数，用于以指定日期为截止日生成报告；如果指定日期不是交易日，底层 K 线通常会返回该日期前最近一个交易日。
 
 ### 2. 返回结构
 服务将返回一个结构化的 JSON 对象：
@@ -69,6 +71,13 @@ mcporter call cn-stock tech symbol=SZ002463,SZ300502,SH688981 days=30
 
 ```bash
 mcporter call cn-stock tech symbol=SZ002463 days=30 fields=macd,kdj include_derived=true
+```
+
+查询指定日期：
+
+```bash
+mcporter call cn-stock brief symbol=SZ002463 date=2026-06-05
+mcporter call cn-stock tech symbol=SZ002463 days=30 date=2026-06-05
 ```
 
 ### 4. 智能纠偏 (Symbol Healing)

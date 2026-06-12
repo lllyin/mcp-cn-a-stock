@@ -175,6 +175,7 @@ async def load_raw_data(
     symbol: str, end_date=None, who: str = ""
 ) -> Dict[str, ndarray]:
     """加载股票原始数据"""
+    is_historical_query = end_date is not None
     if end_date is None:
         end_date = datetime.datetime.now() + datetime.timedelta(days=1)
     if type(end_date) == str:
@@ -182,9 +183,13 @@ async def load_raw_data(
 
     start_date = end_date - datetime.timedelta(days=365 * 2)
 
-    return await load_data_msd(
+    data = await load_data_msd(
         symbol, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"), 0, who
     )
+    if data and is_historical_query:
+        data["QUERY_DATE"] = end_date.strftime("%Y-%m-%d")  # type: ignore
+        data["IS_HISTORICAL_QUERY"] = True  # type: ignore
+    return data
 
 
 def is_stock(symbol: str) -> bool:
@@ -479,58 +484,63 @@ async def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) 
 
     # 资金流向部分
     print("## 资金流向", file=fp)
-    
-    from datetime import datetime
-    now_time = datetime.now().time()
-    # 强制判定交易时间: 09:15 - 17:00 (延长至17:00以支持收盘后的即时汇总抓取)
-    is_trading = (now_time.hour == 9 and now_time.minute >= 15) or (10 <= now_time.hour <= 16)
-    
-    if is_trading:
-        # 调用无头浏览器抓取实时数据
-        import json
-        target_code = "dpzjlx" if data.get("IS_MARKET", False) else "".join([c for c in symbol if c.isdigit()])
-        try:
-            json_str = await get_fund_flow([target_code])
-            results = json.loads(json_str)
-            res = results.get(target_code, {})
-            
-            if "error" in res:
-                 print(f"- [实时抓取失败] {res['error']}", file=fp)
-            elif res:
-                 # [增加] 显式输出抓取到的标的名称，方便交叉验证
-                 print(f"- 标的名称: {res.get('标的名称', '')}", file=fp)
-                 prefix = "沪深两市" if data.get("IS_MARKET", False) else "今日"
-                 # 按顺序对齐：主力, 超大单, 大单, 中单, 小单
-                 field_configs = [
-                     ("主力", "主力净流入", "主力净比(%)"),
-                     ("超大单", "超大单净流入", "超大单净比(%)"),
-                     ("大单", "大单净流入", "大单净比(%)"),
-                     ("中单", "中单净流入", "中单净比(%)"),
-                     ("小单", "小单净流入", "小单净比(%)"),
-                 ]
-                 for name, amt_key, ratio_key in field_configs:
-                     if amt_key in res:
-                         amount_str = res[amt_key]
-                         ratio = res.get(ratio_key, 0.0) / 100.0  # 修正百分比倍数
-                         print(f"- {prefix}{name}净流入: {amount_str}  {name}净占比: {ratio:.2%}", file=fp)
-            else:
-                 print("- 盘中实时数据暂时不可用", file=fp)
-        except Exception as e:
-            print(f"- [实时调用异常] {str(e)}", file=fp)
+
+    if data.get("IS_HISTORICAL_QUERY", False):
+        print("- 指定日期查询暂不展示实时资金流向", file=fp)
+        print("", file=fp)
     else:
-        # 非交易时段展示详情数据
-        has_fund_flow = False
-        fields = [
-            ("主力", "A"), ("超大单", "XL"), ("大单", "L"), ("中单", "M"), ("小单", "S"),
-        ]
-        for field_name, field_id in fields:
-            val = build_fund_flow((field_name, field_id), data)
-            if val:
-                print(f"- {val}", file=fp)
-                has_fund_flow = True
-        if not has_fund_flow:
-            print("- 暂无资金流向数据", file=fp)
-    print("", file=fp)
+    
+        from datetime import datetime
+        now_time = datetime.now().time()
+        # 强制判定交易时间: 09:15 - 17:00 (延长至17:00以支持收盘后的即时汇总抓取)
+        is_trading = (now_time.hour == 9 and now_time.minute >= 15) or (10 <= now_time.hour <= 16)
+        
+        if is_trading:
+            # 调用无头浏览器抓取实时数据
+            import json
+            target_code = "dpzjlx" if data.get("IS_MARKET", False) else "".join([c for c in symbol if c.isdigit()])
+            try:
+                json_str = await get_fund_flow([target_code])
+                results = json.loads(json_str)
+                res = results.get(target_code, {})
+                
+                if "error" in res:
+                     print(f"- [实时抓取失败] {res['error']}", file=fp)
+                elif res:
+                     # [增加] 显式输出抓取到的标的名称，方便交叉验证
+                     print(f"- 标的名称: {res.get('标的名称', '')}", file=fp)
+                     prefix = "沪深两市" if data.get("IS_MARKET", False) else "今日"
+                     # 按顺序对齐：主力, 超大单, 大单, 中单, 小单
+                     field_configs = [
+                         ("主力", "主力净流入", "主力净比(%)"),
+                         ("超大单", "超大单净流入", "超大单净比(%)"),
+                         ("大单", "大单净流入", "大单净比(%)"),
+                         ("中单", "中单净流入", "中单净比(%)"),
+                         ("小单", "小单净流入", "小单净比(%)"),
+                     ]
+                     for name, amt_key, ratio_key in field_configs:
+                         if amt_key in res:
+                             amount_str = res[amt_key]
+                             ratio = res.get(ratio_key, 0.0) / 100.0  # 修正百分比倍数
+                             print(f"- {prefix}{name}净流入: {amount_str}  {name}净占比: {ratio:.2%}", file=fp)
+                else:
+                     print("- 盘中实时数据暂时不可用", file=fp)
+            except Exception as e:
+                print(f"- [实时调用异常] {str(e)}", file=fp)
+        else:
+            # 非交易时段展示详情数据
+            has_fund_flow = False
+            fields = [
+                ("主力", "A"), ("超大单", "XL"), ("大单", "L"), ("中单", "M"), ("小单", "S"),
+            ]
+            for field_name, field_id in fields:
+                val = build_fund_flow((field_name, field_id), data)
+                if val:
+                    print(f"- {val}", file=fp)
+                    has_fund_flow = True
+            if not has_fund_flow:
+                print("- 暂无资金流向数据", file=fp)
+        print("", file=fp)
 
     # 换手率计算
     fcap = data.get("FCAP", np.array([]))
