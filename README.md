@@ -47,6 +47,7 @@
 服务将返回一个结构化的 JSON 对象：
 - `reports`: 一个字典，键为证券代码，值为该标的的 Markdown 格式详细报告。
 - `errors`: 一个字典，包含查询失败的代码及其原因。
+- `warnings`: 一个数组，包含非致命警告，例如批量查询超过 4 个标的时被跳过的代码。
 - `symbols_count`: 成功生成的报告数量。
 
 `tech` 工具返回机器可读的 JSON 对象，`reports` 的值不是 Markdown 字符串，而是包含 `symbol`、`name`、`quote_date` 和 `indicators` 数组的结构化对象。每个 `indicators` 条目包含当日 `ohlc` 和技术指标数据，数值字段均为 number 或 null。

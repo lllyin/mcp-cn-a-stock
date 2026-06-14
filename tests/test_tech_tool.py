@@ -158,3 +158,52 @@ async def test_markdown_batch_passes_query_date_to_loader(monkeypatch):
 
     assert response.errors == {}
     assert seen["end_date"] == "2026-06-05"
+
+
+@pytest.mark.asyncio
+async def test_tech_batch_limit_adds_warning(monkeypatch):
+    seen_symbols = []
+
+    async def fake_load_raw_data(symbol, end_date=None, who=""):
+        seen_symbols.append(symbol)
+        return _make_raw_data(symbol)
+
+    monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
+
+    response = await app_module.fetch_technical_reports(
+        "SZ000001,SZ000002,SZ000003,SZ000004,SZ000005",
+        days=1,
+    )
+
+    assert response.symbols_count == 4
+    assert seen_symbols == ["SZ000001", "SZ000002", "SZ000003", "SZ000004"]
+    assert len(response.warnings) == 1
+    assert "批量查询最多支持 4 个标的" in response.warnings[0]
+    assert "SZ000005" in response.warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_markdown_batch_limit_adds_warning(monkeypatch):
+    seen_symbols = []
+
+    async def fake_load_raw_data(symbol, end_date=None, who=""):
+        seen_symbols.append(symbol)
+        return _make_raw_data(symbol)
+
+    async def fake_build_trading_data(fp, symbol, data):
+        print("# trading", file=fp)
+
+    monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
+    monkeypatch.setattr(app_module.research, "build_trading_data", fake_build_trading_data)
+
+    response = await app_module.fetch_batch_reports(
+        "SZ000001,SZ000002,SZ000003,SZ000004,SZ000005",
+        "brief",
+        "",
+    )
+
+    assert response.symbols_count == 4
+    assert seen_symbols == ["SZ000001", "SZ000002", "SZ000003", "SZ000004"]
+    assert len(response.warnings) == 1
+    assert "批量查询最多支持 4 个标的" in response.warnings[0]
+    assert "SZ000005" in response.warnings[0]

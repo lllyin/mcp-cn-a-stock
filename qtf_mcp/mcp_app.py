@@ -23,6 +23,7 @@ class BatchReportResponse(BaseModel):
     timestamp: str = Field(..., description="报告生成时间 (YYYY-MM-DD HH:MM:SS)")
     reports: Dict[str, str] = Field(..., description="成功生成的报表集合 (键为代码，值为 Markdown 文本)")
     errors: Dict[str, str] = Field(..., description="发生错误的标的信息 (键为代码，值为错误详情)")
+    warnings: List[str] = Field(default_factory=list, description="非致命警告信息")
 
 
 class KDJIndicator(BaseModel):
@@ -86,6 +87,7 @@ class BatchTechnicalResponse(BaseModel):
     timestamp: str = Field(..., description="Report generation time (YYYY-MM-DD HH:MM:SS)")
     reports: Dict[str, TechnicalReport] = Field(..., description="Technical reports keyed by normalized symbol")
     errors: Dict[str, str] = Field(..., description="Errors keyed by input or normalized symbol")
+    warnings: List[str] = Field(default_factory=list, description="Non-fatal warning messages")
 
 # -----------------------------------------------
 
@@ -93,8 +95,13 @@ async def fetch_batch_reports(symbol_str: str, mode: str, host: str, date: Optio
     """批量获取并生成报告的核心驱动程序"""
     # 1. 预处理：分拆并限流（上限4个）
     raw_symbols = [s.strip().upper() for s in symbol_str.split(',') if s.strip()]
+    warnings = []
     if len(raw_symbols) > 4:
-        # TODO: 可以记录一下被截断的信息
+        skipped_symbols = raw_symbols[4:]
+        warnings.append(
+            f"批量查询最多支持 4 个标的；本次仅处理前 4 个，超出的 {len(skipped_symbols)} 个标的不会返回结果："
+            f"{','.join(skipped_symbols)}"
+        )
         raw_symbols = raw_symbols[:4]
     symbols_label = ",".join(raw_symbols)
     start_time = time.time()
@@ -106,7 +113,8 @@ async def fetch_batch_reports(symbol_str: str, mode: str, host: str, date: Optio
         "symbols_count": len(raw_symbols),
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "reports": {},
-        "errors": {}
+        "errors": {},
+        "warnings": warnings,
     }
 
     async def process_item(symbol: str):
@@ -155,7 +163,13 @@ async def fetch_technical_reports(
 ) -> BatchTechnicalResponse:
     """Fetch machine-readable technical indicator reports."""
     raw_symbols = [s.strip().upper() for s in symbol_str.split(',') if s.strip()]
+    warnings = []
     if len(raw_symbols) > 4:
+        skipped_symbols = raw_symbols[4:]
+        warnings.append(
+            f"批量查询最多支持 4 个标的；本次仅处理前 4 个，超出的 {len(skipped_symbols)} 个标的不会返回结果："
+            f"{','.join(skipped_symbols)}"
+        )
         raw_symbols = raw_symbols[:4]
 
     symbols_label = ",".join(raw_symbols)
@@ -168,6 +182,7 @@ async def fetch_technical_reports(
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "reports": {},
         "errors": {},
+        "warnings": warnings,
     }
 
     async def process_item(symbol: str):
