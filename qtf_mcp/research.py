@@ -401,7 +401,99 @@ def build_fund_flow(field: tuple[str, str], data: Dict[str, ndarray]) -> str:
     return f"{prefix}{kind}净流入: {amount_str}  {kind}净占比: {ratio:.2%}"
 
 
-async def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> None:
+def format_fund_flow_amount(value) -> str:
+    """Format fund-flow amount with Chinese market units."""
+    val = _json_number(value)
+    if val is None:
+        return "--"
+    if abs(val) >= 1e8:
+        return f"{val / 1e8:.2f}亿"
+    return f"{val / 1e4:.2f}万"
+
+
+def format_fund_flow_percent(value) -> str:
+    """Format an internal ratio value as a percentage string."""
+    val = _json_number(value)
+    if val is None:
+        return "--"
+    return f"{val:.2%}"
+
+
+def format_fund_flow_price(value) -> str:
+    val = _json_number(value)
+    if val is None:
+        return "--"
+    return f"{val:.2f}"
+
+
+def build_historical_fund_flow_data(fp: TextIO, data: Dict[str, ndarray], limit: int = 15) -> None:
+    """构建历史资金流向表格"""
+    fund_flow = data.get("_DS_FUND_FLOW")
+    if not fund_flow:
+        return
+
+    dates = fund_flow.get("DATE", np.array([], dtype=np.int64))
+    if len(dates) == 0:
+        return
+
+    query_date = data.get("QUERY_DATE")
+    indices = list(range(len(dates)))
+    if query_date:
+        try:
+            query_dt = datetime.datetime.strptime(str(query_date)[:10], "%Y-%m-%d")
+            query_ns = int(query_dt.timestamp() * 1e9)
+            indices = [idx for idx in indices if dates[idx] <= query_ns]
+        except ValueError:
+            pass
+
+    indices = indices[-limit:][::-1]
+    if not indices:
+        return
+
+    print("## 历史资金流向", file=fp)
+    print("", file=fp)
+    print(
+        "| 日期 | 收盘价 | 涨跌幅 | 主力净流入 | 主力占比 | 超大单净流入 | 超大单占比 | 大单净流入 | 大单占比 | 中单净流入 | 中单占比 | 小单净流入 | 小单占比 |",
+        file=fp,
+    )
+    print(
+        "| ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |",
+        file=fp,
+    )
+
+    for idx in indices:
+        def value_for(key: str):
+            values = fund_flow.get(key)
+            if values is None or len(values) <= idx:
+                return np.nan
+            return values[idx]
+
+        date_str = datetime.datetime.fromtimestamp(dates[idx] / 1e9).strftime("%Y-%m-%d")
+        row = [
+            date_str,
+            format_fund_flow_price(value_for("CLOSE")),
+            format_fund_flow_percent(value_for("PCT_CHG")),
+            format_fund_flow_amount(value_for("A_A")),
+            format_fund_flow_percent(value_for("A_R")),
+            format_fund_flow_amount(value_for("XL_A")),
+            format_fund_flow_percent(value_for("XL_R")),
+            format_fund_flow_amount(value_for("L_A")),
+            format_fund_flow_percent(value_for("L_R")),
+            format_fund_flow_amount(value_for("M_A")),
+            format_fund_flow_percent(value_for("M_R")),
+            format_fund_flow_amount(value_for("S_A")),
+            format_fund_flow_percent(value_for("S_R")),
+        ]
+        print(f"| {' | '.join(row)} |", file=fp)
+    print("", file=fp)
+
+
+async def build_trading_data(
+    fp: TextIO,
+    symbol: str,
+    data: Dict[str, ndarray],
+    include_historical_fund_flow: bool = False,
+) -> None:
     """构建交易数据部分"""
     if "CLOSE" not in data or len(data["CLOSE"]) == 0:
         return
@@ -541,6 +633,9 @@ async def build_trading_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) 
             if not has_fund_flow:
                 print("- 暂无资金流向数据", file=fp)
         print("", file=fp)
+
+    if include_historical_fund_flow:
+        build_historical_fund_flow_data(fp, data)
 
     # 换手率计算
     fcap = data.get("FCAP", np.array([]))

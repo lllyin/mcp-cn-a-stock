@@ -405,6 +405,53 @@ class CNStockDataSource(DataSource):
         except Exception as e:
             logger.warning(f"获取资金流向数据失败 {code}: {e}")
             return None
+
+    def _build_fund_flow_history(self, df, symbol: str, is_market: bool) -> Optional[Dict[str, np.ndarray]]:
+        """Convert AkShare fund-flow rows to the internal report dataset."""
+        if df is None or df.empty or "日期" not in df.columns:
+            return None
+
+        close_col = "收盘价"
+        pct_col = "涨跌幅"
+        if is_market:
+            if symbol in {"SZ399001", "SZ399006"}:
+                close_col = "深证-收盘价"
+                pct_col = "深证-涨跌幅"
+            else:
+                close_col = "上证-收盘价"
+                pct_col = "上证-涨跌幅"
+
+        def to_float_array(column: str, scale: float = 1.0) -> np.ndarray:
+            if column not in df.columns:
+                return np.full(len(df), np.nan, dtype=np.float64)
+            values = []
+            for value in df[column].tolist():
+                try:
+                    values.append(float(value) * scale)
+                except (TypeError, ValueError):
+                    values.append(np.nan)
+            return np.array(values, dtype=np.float64)
+
+        try:
+            dates = np.array([self._date_to_ns(d) for d in df["日期"]], dtype=np.int64)
+        except Exception:
+            return None
+
+        return {
+            "DATE": dates,
+            "CLOSE": to_float_array(close_col),
+            "PCT_CHG": to_float_array(pct_col, 0.01),
+            "A_A": to_float_array("主力净流入-净额"),
+            "A_R": to_float_array("主力净流入-净占比", 0.01),
+            "XL_A": to_float_array("超大单净流入-净额"),
+            "XL_R": to_float_array("超大单净流入-净占比", 0.01),
+            "L_A": to_float_array("大单净流入-净额"),
+            "L_R": to_float_array("大单净流入-净占比", 0.01),
+            "M_A": to_float_array("中单净流入-净额"),
+            "M_R": to_float_array("中单净流入-净占比", 0.01),
+            "S_A": to_float_array("小单净流入-净额"),
+            "S_R": to_float_array("小单净流入-净占比", 0.01),
+        }
     
     def _fetch_dividend_sync(self, code: str) -> Optional[Dict]:
         """同步获取分红数据"""
@@ -586,6 +633,9 @@ class CNStockDataSource(DataSource):
             stock_data.is_market = fund_flow_data.get("is_market", False)
             if not df.empty:
                 try:
+                    stock_data.fund_flow_history = self._build_fund_flow_history(
+                        df, canonical_symbol, stock_data.is_market
+                    )
                     latest = df.iloc[-1] if len(df) > 0 else None
                     if latest is not None:
                         # 字段映射表：(DataFrame字段名, StockData属性名, 是否为占比)

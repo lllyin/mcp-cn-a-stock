@@ -130,7 +130,15 @@ async def fetch_batch_reports(symbol_str: str, mode: str, host: str, date: Optio
             buf = StringIO()
             # 根据模式按需构建
             research.build_basic_data(buf, symbol, raw_data)
-            await research.build_trading_data(buf, symbol, raw_data)
+            if mode == "full":
+                await research.build_trading_data(
+                    buf,
+                    symbol,
+                    raw_data,
+                    include_historical_fund_flow=True,
+                )
+            else:
+                await research.build_trading_data(buf, symbol, raw_data)
             
             if mode in ["medium", "full"]:
                 research.build_financial_data(buf, symbol, raw_data)

@@ -3,11 +3,13 @@
 """
 
 import datetime
+from io import StringIO
 
 import numpy as np
 import pytest
 
 from qtf_mcp.research import (
+    build_historical_fund_flow_data,
     compute_kdj,
     compute_macd,
     est_fin_ratio,
@@ -177,6 +179,71 @@ class TestYearlyFinIndex:
         assert yearly_fin_index(dates) == -1
 
 
+class TestHistoricalFundFlow:
+    """测试历史资金流向表格"""
+
+    def _date_ns(self, value: str) -> int:
+        dt = datetime.datetime.strptime(value, "%Y-%m-%d")
+        return int(dt.timestamp() * 1e9)
+
+    def test_build_historical_fund_flow_table(self):
+        data = {
+            "_DS_FUND_FLOW": {
+                "DATE": np.array(
+                    [
+                        self._date_ns("2026-06-01"),
+                        self._date_ns("2026-06-02"),
+                    ],
+                    dtype=np.int64,
+                ),
+                "CLOSE": np.array([15.53, 15.49], dtype=np.float64),
+                "PCT_CHG": np.array([-0.0208, -0.0026], dtype=np.float64),
+                "A_A": np.array([-52399200.0, -153000000.0], dtype=np.float64),
+                "A_R": np.array([-0.0271, -0.1045], dtype=np.float64),
+                "XL_A": np.array([-111000000.0, -116000000.0], dtype=np.float64),
+                "XL_R": np.array([-0.0572, -0.0795], dtype=np.float64),
+                "L_A": np.array([58401900.0, -36656100.0], dtype=np.float64),
+                "L_R": np.array([0.0302, -0.0251], dtype=np.float64),
+                "M_A": np.array([4474600.0, 22523400.0], dtype=np.float64),
+                "M_R": np.array([0.0023, 0.0154], dtype=np.float64),
+                "S_A": np.array([47924700.0, 130000000.0], dtype=np.float64),
+                "S_R": np.array([0.0247, 0.0891], dtype=np.float64),
+            }
+        }
+        fp = StringIO()
+
+        build_historical_fund_flow_data(fp, data)
+
+        output = fp.getvalue()
+        assert "## 历史资金流向" in output
+        assert "| 日期 | 收盘价 | 涨跌幅 | 主力净流入 | 主力占比 |" in output
+        assert "| 2026-06-02 | 15.49 | -0.26% | -1.53亿 | -10.45% |" in output
+        assert "| 2026-06-01 | 15.53 | -2.08% | -5239.92万 | -2.71% |" in output
+
+    def test_build_historical_fund_flow_respects_query_date(self):
+        data = {
+            "QUERY_DATE": "2026-06-01",
+            "_DS_FUND_FLOW": {
+                "DATE": np.array(
+                    [
+                        self._date_ns("2026-06-01"),
+                        self._date_ns("2026-06-02"),
+                    ],
+                    dtype=np.int64,
+                ),
+                "CLOSE": np.array([15.53, 15.49], dtype=np.float64),
+                "PCT_CHG": np.array([-0.0208, -0.0026], dtype=np.float64),
+            },
+        }
+        fp = StringIO()
+
+        build_historical_fund_flow_data(fp, data)
+
+        output = fp.getvalue()
+        assert "2026-06-01" in output
+        assert "2026-06-02" not in output
+
+
 class TestComputeKDJ:
     """测试 compute_kdj 函数"""
 
@@ -280,4 +347,3 @@ class TestComputeMACD:
         # 在下降趋势的后半段，DIF 应该为负
         valid_dif = dif[~np.isnan(dif)]
         assert valid_dif[-1] < 0
-

@@ -207,3 +207,43 @@ async def test_markdown_batch_limit_adds_warning(monkeypatch):
     assert len(response.warnings) == 1
     assert "批量查询最多支持 4 个标的" in response.warnings[0]
     assert "SZ000005" in response.warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_full_enables_historical_fund_flow(monkeypatch):
+    seen = {}
+
+    async def fake_load_raw_data(symbol, end_date=None, who=""):
+        return _make_raw_data(symbol)
+
+    async def fake_build_trading_data(fp, symbol, data, include_historical_fund_flow=False):
+        seen["include_historical_fund_flow"] = include_historical_fund_flow
+        print("# trading", file=fp)
+
+    monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
+    monkeypatch.setattr(app_module.research, "build_trading_data", fake_build_trading_data)
+
+    response = await app_module.fetch_batch_reports("SZ002463", "full", "")
+
+    assert response.errors == {}
+    assert seen["include_historical_fund_flow"] is True
+
+
+@pytest.mark.asyncio
+async def test_medium_keeps_historical_fund_flow_disabled(monkeypatch):
+    seen = {}
+
+    async def fake_load_raw_data(symbol, end_date=None, who=""):
+        return _make_raw_data(symbol)
+
+    async def fake_build_trading_data(fp, symbol, data, include_historical_fund_flow=False):
+        seen["include_historical_fund_flow"] = include_historical_fund_flow
+        print("# trading", file=fp)
+
+    monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
+    monkeypatch.setattr(app_module.research, "build_trading_data", fake_build_trading_data)
+
+    response = await app_module.fetch_batch_reports("SZ002463", "medium", "")
+
+    assert response.errors == {}
+    assert seen["include_historical_fund_flow"] is False

@@ -168,6 +168,21 @@ class TestStockDataToDict:
         np.testing.assert_array_equal(d["XL_A"], [5e7])
         np.testing.assert_array_equal(d["XL_R"], [0.08])
 
+    def test_fund_flow_history_dataset(self):
+        """历史资金流向数据集"""
+        history = {
+            "DATE": np.array([1, 2], dtype=np.int64),
+            "CLOSE": np.array([10.0, 11.0], dtype=np.float64),
+            "A_A": np.array([1e8, -2e8], dtype=np.float64),
+        }
+        data = StockData(symbol="SH600000", fund_flow_history=history)
+
+        d = data.to_dict()
+
+        assert "_DS_FUND_FLOW" in d
+        np.testing.assert_array_equal(d["_DS_FUND_FLOW"]["DATE"], [1, 2])
+        np.testing.assert_array_equal(d["_DS_FUND_FLOW"]["A_A"], [1e8, -2e8])
+
     def test_given_cash_and_share(self):
         """分红送股数据"""
         data = StockData(
@@ -253,4 +268,3 @@ class TestStockDataComplete:
         # 验证财务数据
         fin, period = d["_DS_FINANCE"]
         assert len(fin["DATE"]) == 1
-

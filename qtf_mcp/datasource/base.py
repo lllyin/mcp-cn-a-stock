@@ -65,6 +65,7 @@ class StockData:
     fund_m_ratio: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))       # 中单净占比
     fund_s_amount: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))      # 小单净额
     fund_s_ratio: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))       # 小单净占比
+    fund_flow_history: Optional[Dict[str, np.ndarray]] = None
     
     # 行业板块
     sectors: List[str] = field(default_factory=list)
@@ -144,6 +145,8 @@ class StockData:
                 },
                 "1q",
             )  # type: ignore
+        if self.fund_flow_history:
+            result["_DS_FUND_FLOW"] = self.fund_flow_history  # type: ignore
         
         return result
     
@@ -210,4 +213,3 @@ class DataSource(ABC):
         子类可以重写此方法以适配不同数据源的代码格式
         """
         return symbol
-
