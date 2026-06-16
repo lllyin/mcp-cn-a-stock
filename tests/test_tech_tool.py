@@ -216,17 +216,30 @@ async def test_full_enables_historical_fund_flow(monkeypatch):
     async def fake_load_raw_data(symbol, end_date=None, who=""):
         return _make_raw_data(symbol)
 
-    async def fake_build_trading_data(fp, symbol, data, include_historical_fund_flow=False):
+    async def fake_build_trading_data(
+        fp,
+        symbol,
+        data,
+        include_historical_fund_flow=False,
+        historical_fund_flow_limit=15,
+    ):
         seen["include_historical_fund_flow"] = include_historical_fund_flow
+        seen["historical_fund_flow_limit"] = historical_fund_flow_limit
         print("# trading", file=fp)
 
     monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
     monkeypatch.setattr(app_module.research, "build_trading_data", fake_build_trading_data)
 
-    response = await app_module.fetch_batch_reports("SZ002463", "full", "")
+    response = await app_module.fetch_batch_reports(
+        "SZ002463",
+        "full",
+        "",
+        fund_flow_limit=3,
+    )
 
     assert response.errors == {}
     assert seen["include_historical_fund_flow"] is True
+    assert seen["historical_fund_flow_limit"] == 3
 
 
 @pytest.mark.asyncio
@@ -236,8 +249,15 @@ async def test_medium_keeps_historical_fund_flow_disabled(monkeypatch):
     async def fake_load_raw_data(symbol, end_date=None, who=""):
         return _make_raw_data(symbol)
 
-    async def fake_build_trading_data(fp, symbol, data, include_historical_fund_flow=False):
+    async def fake_build_trading_data(
+        fp,
+        symbol,
+        data,
+        include_historical_fund_flow=False,
+        historical_fund_flow_limit=15,
+    ):
         seen["include_historical_fund_flow"] = include_historical_fund_flow
+        seen["historical_fund_flow_limit"] = historical_fund_flow_limit
         print("# trading", file=fp)
 
     monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
@@ -247,3 +267,4 @@ async def test_medium_keeps_historical_fund_flow_disabled(monkeypatch):
 
     assert response.errors == {}
     assert seen["include_historical_fund_flow"] is False
+    assert seen["historical_fund_flow_limit"] == 15

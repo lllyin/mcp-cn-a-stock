@@ -91,7 +91,13 @@ class BatchTechnicalResponse(BaseModel):
 
 # -----------------------------------------------
 
-async def fetch_batch_reports(symbol_str: str, mode: str, host: str, date: Optional[str] = None) -> BatchReportResponse:
+async def fetch_batch_reports(
+    symbol_str: str,
+    mode: str,
+    host: str,
+    date: Optional[str] = None,
+    fund_flow_limit: int = 15,
+) -> BatchReportResponse:
     """批量获取并生成报告的核心驱动程序"""
     # 1. 预处理：分拆并限流（上限4个）
     raw_symbols = [s.strip().upper() for s in symbol_str.split(',') if s.strip()]
@@ -136,6 +142,7 @@ async def fetch_batch_reports(symbol_str: str, mode: str, host: str, date: Optio
                     symbol,
                     raw_data,
                     include_historical_fund_flow=True,
+                    historical_fund_flow_limit=fund_flow_limit,
                 )
             else:
                 await research.build_trading_data(buf, symbol, raw_data)
@@ -246,7 +253,12 @@ mcp_app = QtfMCP(
   stateless_http=True,
 )
 @mcp_app.tool()
-async def brief(symbol: str, date: Optional[str] = None, ctx: Context = None) -> BatchReportResponse:  # type: ignore
+async def brief(
+  symbol: str,
+  date: Optional[str] = None,
+  fund_flow_limit: Optional[int] = None,
+  ctx: Context = None,
+) -> BatchReportResponse:  # type: ignore
   """Get brief information and fund flow for input stock symbol(s) (Batch Supported).
   Includes:
   - basic data
@@ -255,6 +267,7 @@ async def brief(symbol: str, date: Optional[str] = None, ctx: Context = None) ->
   Args:
     symbol (str): Stock symbol or comma-separated list (up to 4), e.g., "SZ300308,SH000001"
     date (str, optional): Query cutoff date in YYYY-MM-DD format. Defaults to latest available trading day.
+    fund_flow_limit (int, optional): Ignored; only the full tool uses this parameter.
 
   Returns:
     A BatchReportResponse object containing multiple reports or errors.
@@ -264,7 +277,12 @@ async def brief(symbol: str, date: Optional[str] = None, ctx: Context = None) ->
 
 
 @mcp_app.tool()
-async def medium(symbol: str, date: Optional[str] = None, ctx: Context = None) -> BatchReportResponse:  # type: ignore
+async def medium(
+  symbol: str,
+  date: Optional[str] = None,
+  fund_flow_limit: Optional[int] = None,
+  ctx: Context = None,
+) -> BatchReportResponse:  # type: ignore
   """Get medium information for input stock symbol(s) (Batch Supported).
   Includes:
   - basic data
@@ -274,6 +292,7 @@ async def medium(symbol: str, date: Optional[str] = None, ctx: Context = None) -
   Args:
     symbol (str): Stock symbol or comma-separated list (up to 4), e.g., "SZ300308,SH000001"
     date (str, optional): Query cutoff date in YYYY-MM-DD format. Defaults to latest available trading day.
+    fund_flow_limit (int, optional): Ignored; only the full tool uses this parameter.
 
   Returns:
     A BatchReportResponse object containing multiple reports or errors.
@@ -283,7 +302,12 @@ async def medium(symbol: str, date: Optional[str] = None, ctx: Context = None) -
 
 
 @mcp_app.tool()
-async def full(symbol: str, date: Optional[str] = None, ctx: Context = None) -> BatchReportResponse:  # type: ignore
+async def full(
+  symbol: str,
+  date: Optional[str] = None,
+  fund_flow_limit: int = 15,
+  ctx: Context = None,
+) -> BatchReportResponse:  # type: ignore
   """Get full information for input stock symbol(s) (Batch Supported).
   Includes:
   - basic data
@@ -294,12 +318,13 @@ async def full(symbol: str, date: Optional[str] = None, ctx: Context = None) -> 
   Args:
     symbol (str): Stock symbol or comma-separated list (up to 4), e.g., "SZ300308,SH000001"
     date (str, optional): Query cutoff date in YYYY-MM-DD format. Defaults to latest available trading day.
+    fund_flow_limit (int, optional): Number of historical fund-flow rows to show. Defaults to 15.
 
   Returns:
     A BatchReportResponse object containing multiple reports or errors.
   """
   who = ctx.request_context.request.client.host if ctx else ""  # type: ignore
-  return await fetch_batch_reports(symbol, "full", who, date)
+  return await fetch_batch_reports(symbol, "full", who, date, fund_flow_limit=fund_flow_limit)
 
 
 @mcp_app.tool()

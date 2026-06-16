@@ -41,7 +41,7 @@
 在证券代码参数中，使用 **半角逗号** 分隔多个代码：
 `symbol="SZ300308,SH600000,SZ000333"`
 
-默认查询最新可用行情。`brief`、`medium`、`full`、`tech` 支持可选 `date=YYYY-MM-DD` 参数，用于以指定日期为截止日生成报告；如果指定日期不是交易日，底层 K 线通常会返回该日期前最近一个交易日。
+默认查询最新可用行情。`brief`、`medium`、`full`、`tech` 支持可选 `date=YYYY-MM-DD` 参数，用于以指定日期为截止日生成报告；如果指定日期不是交易日，底层 K 线通常会返回该日期前最近一个交易日。`fund_flow_limit` 用于控制 `full` 的 `## 历史资金流向` 表格展示条数，默认 15 条；传给 `brief` 或 `medium` 时会被忽略。
 
 ### 2. 返回结构
 服务将返回一个结构化的 JSON 对象：
@@ -79,6 +79,12 @@ mcporter call cn-stock tech symbol=SZ002463 days=30 fields=macd,kdj include_deri
 ```bash
 mcporter call cn-stock brief symbol=SZ002463 date=2026-06-05
 mcporter call cn-stock tech symbol=SZ002463 days=30 date=2026-06-05
+```
+
+指定 `full` 历史资金流向条数：
+
+```bash
+mcporter call cn-stock full symbol=SZ002463 fund_flow_limit=30
 ```
 
 ### 4. 智能纠偏 (Symbol Healing)

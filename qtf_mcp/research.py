@@ -428,6 +428,10 @@ def format_fund_flow_price(value) -> str:
 
 def build_historical_fund_flow_data(fp: TextIO, data: Dict[str, ndarray], limit: int = 15) -> None:
     """构建历史资金流向表格"""
+    limit = int(limit or 0)
+    if limit <= 0:
+        return
+
     fund_flow = data.get("_DS_FUND_FLOW")
     if not fund_flow:
         return
@@ -493,6 +497,7 @@ async def build_trading_data(
     symbol: str,
     data: Dict[str, ndarray],
     include_historical_fund_flow: bool = False,
+    historical_fund_flow_limit: int = 15,
 ) -> None:
     """构建交易数据部分"""
     if "CLOSE" not in data or len(data["CLOSE"]) == 0:
@@ -635,7 +640,7 @@ async def build_trading_data(
         print("", file=fp)
 
     if include_historical_fund_flow:
-        build_historical_fund_flow_data(fp, data)
+        build_historical_fund_flow_data(fp, data, limit=historical_fund_flow_limit)
 
     # 换手率计算
     fcap = data.get("FCAP", np.array([]))
