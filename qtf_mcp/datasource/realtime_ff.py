@@ -63,6 +63,39 @@ PARSE_JS = """
 """
 
 
+INDEX_FUND_FLOW_URLS = {
+    "000001": "https://data.eastmoney.com/zjlx/zs000001.html",
+    "399001": "https://data.eastmoney.com/zjlx/zs399001.html",
+    "399006": "https://data.eastmoney.com/zjlx/zs399006.html",
+}
+
+INDEX_FUND_FLOW_NAMES = {
+    "000001": "上证指数",
+    "399001": "深证成指",
+    "399006": "创业板指",
+}
+
+
+def get_fund_flow_url(symbol: str) -> str | None:
+    """Return the Eastmoney fund-flow page URL for a stock or index."""
+    pure_code = "".join(filter(str.isdigit, symbol))
+    if pure_code in INDEX_FUND_FLOW_URLS:
+        return INDEX_FUND_FLOW_URLS[pure_code]
+    if symbol == "dpzjlx":
+        return "https://data.eastmoney.com/zjlx/dpzjlx.html"
+    if pure_code in ALL_INDICES:
+        return None
+    return f"https://data.eastmoney.com/zjlx/{symbol}.html"
+
+
+def get_fund_flow_display_name(symbol: str, parsed_name: str) -> str:
+    """Return a stable display name for fund-flow output."""
+    pure_code = "".join(filter(str.isdigit, symbol))
+    if pure_code in INDEX_FUND_FLOW_NAMES:
+        return INDEX_FUND_FLOW_NAMES[pure_code]
+    return parsed_name or symbol
+
+
 # ── Browser 单例管理 ──────────────────────────────────────
 async def get_context() -> BrowserContext:
     global _playwright, _browser, _context
@@ -109,18 +142,11 @@ async def close_browser():
 # ── 单个 Symbol 抓取 ──────────────────────────────────────
 async def fetch_single(symbol: str, context: BrowserContext) -> dict:
     async with SEMAPHORE:
-        page = await context.new_page()
+        url = get_fund_flow_url(symbol)
+        if url is None:
+            return {"error": "暂无实时资金流向", "url": ""}
 
-        # 提取纯数字部分进行判断 (如 SH000001 -> 000001)
-        pure_code = "".join(filter(str.isdigit, symbol))
-        # 如果是特殊标识 'dpzjlx' 或者是已知的沪深指数代码，则走大盘页面模板
-        is_index_page = symbol == "dpzjlx" or pure_code in ALL_INDICES
-        
-        url = (
-            "https://data.eastmoney.com/zjlx/dpzjlx.html"
-            if is_index_page
-            else f"https://data.eastmoney.com/zjlx/{symbol}.html"
-        )
+        page = await context.new_page()
 
         try:
             # 拦截无用资源，降低带宽和 CPU 消耗
@@ -151,7 +177,7 @@ async def fetch_single(symbol: str, context: BrowserContext) -> dict:
                     return 0.0
 
             return {
-                "标的名称":      raw["name"] or symbol,
+                "标的名称":      get_fund_flow_display_name(symbol, raw["name"]),
                 "主力净流入":    raw["f62"],
                 "主力净比(%)":   to_ratio(raw["f184"]),
                 "超大单净流入":  raw["f66"],

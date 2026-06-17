@@ -387,11 +387,8 @@ class CNStockDataSource(DataSource):
             df = None
             is_market = False
             if is_index:
-                # 仅针对三大核心指数返回“沪深两市”大盘资金流向
-                if symbol in ["SH000001", "SZ399001", "SZ399006"]:
-                    df = ak.stock_market_fund_flow()
-                    is_market = True
-                # 其他指数（如科创50）保持 df = None
+                exchange = "sh" if symbol.startswith("SH") else "sz"
+                df = ak.stock_individual_fund_flow(stock=code, market=exchange)
             else:
                 # 个股
                 exchange = "sh" if code.startswith("6") else "sz"

@@ -6,13 +6,14 @@
 
 import datetime
 from io import StringIO
-from typing import Dict, TextIO
+from typing import Dict, Optional, TextIO
 
 import numpy as np
 import talib
 from numpy import ndarray
 
 from .datafeed import load_data_msd
+from .config import ALL_INDICES
 from .datasource.realtime_ff import get_fund_flow
 from .symbols import symbol_with_name
 
@@ -492,6 +493,28 @@ def build_historical_fund_flow_data(fp: TextIO, data: Dict[str, ndarray], limit:
     print("", file=fp)
 
 
+CORE_REALTIME_FUND_FLOW_INDICES = {"000001", "399001", "399006"}
+
+
+def get_realtime_fund_flow_target(symbol: str, data: Dict[str, ndarray]) -> Optional[str]:
+    """Return the realtime fund-flow target code for Eastmoney page scraping."""
+    pure_code = "".join([c for c in symbol if c.isdigit()])
+    if pure_code in ALL_INDICES:
+        if pure_code in CORE_REALTIME_FUND_FLOW_INDICES:
+            return pure_code
+        return None
+    if data.get("IS_MARKET", False):
+        return "dpzjlx"
+    return pure_code
+
+
+def get_realtime_fund_flow_prefix(target_code: str, data: Dict[str, ndarray]) -> str:
+    """Return the display prefix for realtime fund-flow rows."""
+    if data.get("IS_MARKET", False) and target_code == "dpzjlx":
+        return "沪深两市"
+    return "今日"
+
+
 async def build_trading_data(
     fp: TextIO,
     symbol: str,
@@ -595,35 +618,38 @@ async def build_trading_data(
         if is_trading:
             # 调用无头浏览器抓取实时数据
             import json
-            target_code = "dpzjlx" if data.get("IS_MARKET", False) else "".join([c for c in symbol if c.isdigit()])
-            try:
-                json_str = await get_fund_flow([target_code])
-                results = json.loads(json_str)
-                res = results.get(target_code, {})
-                
-                if "error" in res:
-                     print(f"- [实时抓取失败] {res['error']}", file=fp)
-                elif res:
-                     # [增加] 显式输出抓取到的标的名称，方便交叉验证
-                     print(f"- 标的名称: {res.get('标的名称', '')}", file=fp)
-                     prefix = "沪深两市" if data.get("IS_MARKET", False) else "今日"
-                     # 按顺序对齐：主力, 超大单, 大单, 中单, 小单
-                     field_configs = [
-                         ("主力", "主力净流入", "主力净比(%)"),
-                         ("超大单", "超大单净流入", "超大单净比(%)"),
-                         ("大单", "大单净流入", "大单净比(%)"),
-                         ("中单", "中单净流入", "中单净比(%)"),
-                         ("小单", "小单净流入", "小单净比(%)"),
-                     ]
-                     for name, amt_key, ratio_key in field_configs:
-                         if amt_key in res:
-                             amount_str = res[amt_key]
-                             ratio = res.get(ratio_key, 0.0) / 100.0  # 修正百分比倍数
-                             print(f"- {prefix}{name}净流入: {amount_str}  {name}净占比: {ratio:.2%}", file=fp)
-                else:
-                     print("- 盘中实时数据暂时不可用", file=fp)
-            except Exception as e:
-                print(f"- [实时调用异常] {str(e)}", file=fp)
+            target_code = get_realtime_fund_flow_target(symbol, data)
+            if target_code is None:
+                print("- 暂无实时资金流向", file=fp)
+            else:
+                try:
+                    json_str = await get_fund_flow([target_code])
+                    results = json.loads(json_str)
+                    res = results.get(target_code, {})
+                    
+                    if "error" in res:
+                         print(f"- [实时抓取失败] {res['error']}", file=fp)
+                    elif res:
+                         # [增加] 显式输出抓取到的标的名称，方便交叉验证
+                         print(f"- 标的名称: {res.get('标的名称', '')}", file=fp)
+                         prefix = get_realtime_fund_flow_prefix(target_code, data)
+                         # 按顺序对齐：主力, 超大单, 大单, 中单, 小单
+                         field_configs = [
+                             ("主力", "主力净流入", "主力净比(%)"),
+                             ("超大单", "超大单净流入", "超大单净比(%)"),
+                             ("大单", "大单净流入", "大单净比(%)"),
+                             ("中单", "中单净流入", "中单净比(%)"),
+                             ("小单", "小单净流入", "小单净比(%)"),
+                         ]
+                         for name, amt_key, ratio_key in field_configs:
+                             if amt_key in res:
+                                 amount_str = res[amt_key]
+                                 ratio = res.get(ratio_key, 0.0) / 100.0  # 修正百分比倍数
+                                 print(f"- {prefix}{name}净流入: {amount_str}  {name}净占比: {ratio:.2%}", file=fp)
+                    else:
+                         print("- 盘中实时数据暂时不可用", file=fp)
+                except Exception as e:
+                    print(f"- [实时调用异常] {str(e)}", file=fp)
         else:
             # 非交易时段展示详情数据
             has_fund_flow = False

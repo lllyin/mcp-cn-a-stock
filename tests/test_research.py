@@ -14,6 +14,8 @@ from qtf_mcp.research import (
     compute_macd,
     est_fin_ratio,
     filter_sector,
+    get_realtime_fund_flow_prefix,
+    get_realtime_fund_flow_target,
     is_stock,
     yearly_fin_index,
 )
@@ -242,6 +244,32 @@ class TestHistoricalFundFlow:
         output = fp.getvalue()
         assert "2026-06-01" in output
         assert "2026-06-02" not in output
+
+
+class TestRealtimeFundFlowTarget:
+    """测试实时资金流向抓取目标"""
+
+    def test_market_indices_use_specific_index_code(self):
+        data = {"IS_MARKET": True}
+
+        assert get_realtime_fund_flow_target("SH000001", data) == "000001"
+        assert get_realtime_fund_flow_target("SZ399001", data) == "399001"
+        assert get_realtime_fund_flow_target("SZ399006", data) == "399006"
+
+    def test_indices_without_realtime_page_return_none(self):
+        assert get_realtime_fund_flow_target("SH000688", {"IS_MARKET": False}) is None
+        assert get_realtime_fund_flow_target("SH000688", {"IS_MARKET": True}) is None
+
+    def test_stock_uses_plain_code(self):
+        assert get_realtime_fund_flow_target("SZ300308", {"IS_MARKET": False}) == "300308"
+
+    def test_specific_index_prefix_uses_today(self):
+        assert get_realtime_fund_flow_prefix("000001", {"IS_MARKET": True}) == "今日"
+        assert get_realtime_fund_flow_prefix("399001", {"IS_MARKET": True}) == "今日"
+        assert get_realtime_fund_flow_prefix("399006", {"IS_MARKET": True}) == "今日"
+
+    def test_market_page_prefix_keeps_market_label(self):
+        assert get_realtime_fund_flow_prefix("dpzjlx", {"IS_MARKET": True}) == "沪深两市"
 
 
 class TestComputeKDJ:
