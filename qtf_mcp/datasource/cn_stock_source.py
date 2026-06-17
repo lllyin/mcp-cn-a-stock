@@ -382,8 +382,6 @@ class CNStockDataSource(DataSource):
         symbol_name = get_symbol_name(symbol) if symbol else ""
         is_index = check_is_index(symbol, symbol_name)
         
-        if code.startswith(("1", "5")):
-            return None
         try:
             import akshare as ak
             df = None
