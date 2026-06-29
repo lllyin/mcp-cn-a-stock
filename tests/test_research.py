@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from qtf_mcp.research import (
+    build_trading_data,
     build_historical_fund_flow_data,
     compute_kdj,
     compute_macd,
@@ -19,6 +20,19 @@ from qtf_mcp.research import (
     is_stock,
     yearly_fin_index,
 )
+
+
+@pytest.mark.asyncio
+async def test_trading_data_includes_open_price(sample_stock_data_dict):
+    """交易数据使用已有 K 线数据展示当日开盘价。"""
+    data = dict(sample_stock_data_dict)
+    data["IS_HISTORICAL_QUERY"] = True
+    fp = StringIO()
+
+    await build_trading_data(fp, "SZ000001", data)
+
+    expected = f"开盘: {data['OPEN'][-1]:.3f}"
+    assert expected in fp.getvalue()
 
 
 class TestIsStock:

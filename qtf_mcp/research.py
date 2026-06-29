@@ -543,6 +543,7 @@ async def build_trading_data(
     
     high = data.get("HIGH", close)
     low = data.get("LOW", close)
+    open_ = data.get("OPEN", close)
 
     periods = list(filter(lambda n: n <= len(close), [5, 20, 60, 120, 240]))
 
@@ -550,7 +551,11 @@ async def build_trading_data(
     print("", file=fp)
 
     print("## 价格", file=fp)
-    print(f"- 当日: {close[-1]:.3f} 最高: {high[-1]:.3f} 最低: {low[-1]:.3f}", file=fp)
+    print(
+        f"- 当日: {close[-1]:.3f} 开盘: {open_[-1]:.3f} "
+        f"最高: {high[-1]:.3f} 最低: {low[-1]:.3f}",
+        file=fp,
+    )
     for p in periods:
         print(
             f"- {p}日均价: {close[-p:].mean():.3f} 最高: {high[-p:].max():.3f} 最低: {low[-p:].min():.3f}",
