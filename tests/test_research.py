@@ -17,7 +17,10 @@ from qtf_mcp.research import (
     filter_sector,
     get_realtime_fund_flow_prefix,
     get_realtime_fund_flow_target,
+    has_realtime_fund_flow_values,
+    has_today_fund_flow_from_api,
     is_stock,
+    print_api_fund_flow_if_today,
     yearly_fin_index,
 )
 
@@ -284,6 +287,49 @@ class TestRealtimeFundFlowTarget:
 
     def test_market_page_prefix_keeps_market_label(self):
         assert get_realtime_fund_flow_prefix("dpzjlx", {"IS_MARKET": True}) == "沪深两市"
+
+
+class TestRealtimeFundFlowFallback:
+    """测试实时资金流向 API fallback"""
+
+    @staticmethod
+    def _date_ns(date_str: str) -> int:
+        dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+        return int(dt.timestamp() * 1e9)
+
+    def test_api_fallback_requires_latest_row_to_be_today(self):
+        data = {
+            "_DS_FUND_FLOW": {
+                "DATE": np.array([self._date_ns("2026-07-05")], dtype=np.int64),
+            }
+        }
+
+        assert has_today_fund_flow_from_api(data, datetime.date(2026, 7, 6)) is False
+
+        data["_DS_FUND_FLOW"]["DATE"] = np.array(
+            [self._date_ns("2026-07-06")], dtype=np.int64
+        )
+        assert has_today_fund_flow_from_api(data, datetime.date(2026, 7, 6)) is True
+
+    def test_api_fallback_prints_existing_fund_flow_fields(self):
+        data = {
+            "_DS_FUND_FLOW": {
+                "DATE": np.array([self._date_ns("2026-07-06")], dtype=np.int64),
+            },
+            "A_A": np.array([123456789.0], dtype=np.float64),
+            "A_R": np.array([0.1234], dtype=np.float64),
+        }
+        fp = StringIO()
+
+        printed = print_api_fund_flow_if_today(fp, data, datetime.date(2026, 7, 6))
+
+        assert printed is True
+        assert "今日主力净流入: 1.23亿" in fp.getvalue()
+        assert "主力净占比: 12.34%" in fp.getvalue()
+
+    def test_realtime_zero_values_are_treated_as_empty(self):
+        assert has_realtime_fund_flow_values({"主力净流入": "0.00万"}) is False
+        assert has_realtime_fund_flow_values({"主力净流入": "1.23亿"}) is True
 
 
 class TestComputeKDJ:

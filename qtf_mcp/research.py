@@ -402,6 +402,55 @@ def build_fund_flow(field: tuple[str, str], data: Dict[str, ndarray]) -> str:
     return f"{prefix}{kind}净流入: {amount_str}  {kind}净占比: {ratio:.2%}"
 
 
+def has_today_fund_flow_from_api(data: Dict[str, ndarray], today: Optional[datetime.date] = None) -> bool:
+    """Return whether AkShare fund-flow history has a latest row for today."""
+    fund_flow = data.get("_DS_FUND_FLOW")
+    if not fund_flow:
+        return False
+
+    dates = fund_flow.get("DATE", np.array([], dtype=np.int64))
+    if len(dates) == 0:
+        return False
+
+    if today is None:
+        today = datetime.datetime.now().date()
+
+    try:
+        latest_date = datetime.datetime.fromtimestamp(dates[-1] / 1e9).date()
+    except Exception:
+        return False
+    return latest_date == today
+
+
+def print_api_fund_flow_if_today(
+    fp: TextIO,
+    data: Dict[str, ndarray],
+    today: Optional[datetime.date] = None,
+) -> bool:
+    """Print latest AkShare fund-flow fields if they are dated today."""
+    if not has_today_fund_flow_from_api(data, today):
+        return False
+
+    has_fund_flow = False
+    for field in FUND_FLOW_FIELDS:
+        val = build_fund_flow(field, data)
+        if val:
+            print(f"- {val}", file=fp)
+            has_fund_flow = True
+    return has_fund_flow
+
+
+def has_realtime_fund_flow_values(res: dict) -> bool:
+    """Return whether Playwright realtime scraping yielded any non-placeholder amount."""
+    amount_keys = ["主力净流入", "超大单净流入", "大单净流入", "中单净流入", "小单净流入"]
+    placeholders = {"", "-", "--", "0", "0.0", "0.00", "0万", "0.00万", "0亿", "0.00亿"}
+    for key in amount_keys:
+        value = str(res.get(key, "")).strip()
+        if value not in placeholders:
+            return True
+    return False
+
+
 def format_fund_flow_amount(value) -> str:
     """Format fund-flow amount with Chinese market units."""
     val = _json_number(value)
@@ -625,7 +674,8 @@ async def build_trading_data(
             import json
             target_code = get_realtime_fund_flow_target(symbol, data)
             if target_code is None:
-                print("- 暂无实时资金流向", file=fp)
+                if not print_api_fund_flow_if_today(fp, data):
+                    print("- 暂无实时资金流向", file=fp)
             else:
                 try:
                     json_str = await get_fund_flow([target_code])
@@ -633,28 +683,34 @@ async def build_trading_data(
                     res = results.get(target_code, {})
                     
                     if "error" in res:
-                         print(f"- [实时抓取失败] {res['error']}", file=fp)
+                         if not print_api_fund_flow_if_today(fp, data):
+                             print(f"- [实时抓取失败] {res['error']}", file=fp)
                     elif res:
-                         # [增加] 显式输出抓取到的标的名称，方便交叉验证
-                         print(f"- 标的名称: {res.get('标的名称', '')}", file=fp)
-                         prefix = get_realtime_fund_flow_prefix(target_code, data)
-                         # 按顺序对齐：主力, 超大单, 大单, 中单, 小单
-                         field_configs = [
-                             ("主力", "主力净流入", "主力净比(%)"),
-                             ("超大单", "超大单净流入", "超大单净比(%)"),
-                             ("大单", "大单净流入", "大单净比(%)"),
-                             ("中单", "中单净流入", "中单净比(%)"),
-                             ("小单", "小单净流入", "小单净比(%)"),
-                         ]
-                         for name, amt_key, ratio_key in field_configs:
-                             if amt_key in res:
-                                 amount_str = res[amt_key]
-                                 ratio = res.get(ratio_key, 0.0) / 100.0  # 修正百分比倍数
-                                 print(f"- {prefix}{name}净流入: {amount_str}  {name}净占比: {ratio:.2%}", file=fp)
+                         if not has_realtime_fund_flow_values(res) and print_api_fund_flow_if_today(fp, data):
+                             pass
+                         else:
+                             # [增加] 显式输出抓取到的标的名称，方便交叉验证
+                             print(f"- 标的名称: {res.get('标的名称', '')}", file=fp)
+                             prefix = get_realtime_fund_flow_prefix(target_code, data)
+                             # 按顺序对齐：主力, 超大单, 大单, 中单, 小单
+                             field_configs = [
+                                 ("主力", "主力净流入", "主力净比(%)"),
+                                 ("超大单", "超大单净流入", "超大单净比(%)"),
+                                 ("大单", "大单净流入", "大单净比(%)"),
+                                 ("中单", "中单净流入", "中单净比(%)"),
+                                 ("小单", "小单净流入", "小单净比(%)"),
+                             ]
+                             for name, amt_key, ratio_key in field_configs:
+                                 if amt_key in res:
+                                     amount_str = res[amt_key]
+                                     ratio = res.get(ratio_key, 0.0) / 100.0  # 修正百分比倍数
+                                     print(f"- {prefix}{name}净流入: {amount_str}  {name}净占比: {ratio:.2%}", file=fp)
                     else:
-                         print("- 盘中实时数据暂时不可用", file=fp)
+                         if not print_api_fund_flow_if_today(fp, data):
+                             print("- 盘中实时数据暂时不可用", file=fp)
                 except Exception as e:
-                    print(f"- [实时调用异常] {str(e)}", file=fp)
+                    if not print_api_fund_flow_if_today(fp, data):
+                        print(f"- [实时调用异常] {str(e)}", file=fp)
         else:
             # 非交易时段展示详情数据
             has_fund_flow = False
