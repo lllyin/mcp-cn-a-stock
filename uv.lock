@@ -21,7 +21,7 @@ wheels = [
 
 [[package]]
 name = "akshare"
-version = "1.18.30"
+version = "1.18.81"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "akracer", marker = "sys_platform == 'linux'" },
@@ -41,9 +41,9 @@ dependencies = [
     { name = "urllib3" },
     { name = "xlrd" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5c/68/52055c3bdf5ff2c66be3dcaef16bbdeb413bea6726e615eb164b7685be2a/akshare-1.18.30.tar.gz", hash = "sha256:dabc38ddd9e8e5f70df6369954aaf54e2b588e157647f5bd6042f1cd82e1c180", size = 862478, upload-time = "2026-02-25T16:24:06.6Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1c/3e/6cac7cfb3e0bb01bf5e934325903a6fdcdebce1b24d461a306bcf060c2e9/akshare-1.18.81.tar.gz", hash = "sha256:8ee306d3f147b15975f69b5194c1e4ee7c9302de0f6a2a10622dc2a3c7cc8c24", size = 895574, upload-time = "2026-07-29T03:12:40.032Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/cb/73/239cc89f02bb2443ec8ac8a8fcec63cdd8bba51c4e204f097e2ad0f836e5/akshare-1.18.30-py3-none-any.whl", hash = "sha256:32fd22a7e504256beff4cc47219382332d624c488cc72bece5d080c0c4675a29", size = 1083996, upload-time = "2026-02-25T16:24:05Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/b3/bbb2b8e4d03f73cc75b4428602cf83ecd9f531b50774fe0ee60cae498e8f/akshare-1.18.81-py3-none-any.whl", hash = "sha256:a4de966cc4428d95d2c925df0389109cd26cb2fc1916f65d28c50390448b84f9", size = 1119493, upload-time = "2026-07-29T03:12:38.575Z" },
 ]
 
 [[package]]
@@ -285,10 +285,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "akshare", specifier = ">=1.17.94" },
+    { name = "akshare", specifier = "==1.18.81" },
     { name = "akshare-proxy-patch", specifier = "==0.5.0" },
     { name = "click", specifier = ">=8.3.1" },
-    { name = "efinance", specifier = ">=0.5.5.2" },
+    { name = "efinance", specifier = "==0.5.9" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.22" },
     { name = "numpy", specifier = ">=1.26.0" },
     { name = "playwright", specifier = ">=1.58.0" },
@@ -395,7 +395,7 @@ wheels = [
 
 [[package]]
 name = "efinance"
-version = "0.5.5.2"
+version = "0.5.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -407,9 +407,9 @@ dependencies = [
     { name = "rich" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/1b/72/3b988c02cf674c13d7313003baa653c5f1f5549548d639b42a03bf5cd081/efinance-0.5.5.2.tar.gz", hash = "sha256:5e0c8e3e7cda5088c0070cf9dd9f67b787e050f249662cb236f3c15b2705f1af", size = 90818, upload-time = "2025-03-15T06:35:04.784Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/07/c8/0d5469a882293bdf3c8ebfa4dbe419a2d22f7a841b935aeff985ab13fa86/efinance-0.5.9.tar.gz", hash = "sha256:4a0d68768b2c6ef19836b4805b501abe446c35b90176070a38c7a693ef1dea22", size = 93060, upload-time = "2026-07-17T07:44:36.276Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/42/00/6b1de704c2c40ce52b0f97469af35c6a03490ac737a528997beb6c9a105e/efinance-0.5.5.2-py3-none-any.whl", hash = "sha256:ad20bec5f9879497a451dae0e097de5baa196005fae8f54fad22c57cc5f2f526", size = 73608, upload-time = "2025-03-15T06:35:02.607Z" },
+    { url = "https://files.pythonhosted.org/packages/d0/fb/114f3afe037e4a802ddceb7bdbcf2ff76a4a2c119c476b3ab14d66dcab34/efinance-0.5.9-py3-none-any.whl", hash = "sha256:787b4068eac2d0757a39c8f6f652067892586af24fa3795eb15268fac20a8b11", size = 75347, upload-time = "2026-07-17T07:44:34.787Z" },
 ]
 
 [[package]]
