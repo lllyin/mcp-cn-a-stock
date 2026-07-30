@@ -11,6 +11,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 from . import research
 from .datasource import get_datasource
+from .datasource.market_breadth import get_market_breadth
 
 logger = logging.getLogger("qtf_mcp")
 
@@ -88,6 +89,27 @@ class BatchTechnicalResponse(BaseModel):
     reports: Dict[str, TechnicalReport] = Field(..., description="Technical reports keyed by normalized symbol")
     errors: Dict[str, str] = Field(..., description="Errors keyed by input or normalized symbol")
     warnings: List[str] = Field(default_factory=list, description="Non-fatal warning messages")
+
+
+class MarketBreadthBucketResponse(BaseModel):
+    """Number of stocks in one percentage-change range."""
+    range: str = Field(..., description="Percentage-change range")
+    count: int = Field(..., description="Number of stocks in this range")
+
+
+class MarketBreadthResponse(BaseModel):
+    """Whole-market rise/fall distribution."""
+    source: str = Field(..., description="Data source that produced this response")
+    fetched_at: str = Field(..., description="Fetch time in Asia/Shanghai")
+    trade_date: Optional[str] = Field(None, description="Latest trading date when provided by the source")
+    market_time: Optional[str] = Field(None, description="Latest intraday sample time when provided by the source")
+    up_count: int = Field(..., description="Number of rising A-share stocks")
+    down_count: int = Field(..., description="Number of falling A-share stocks")
+    flat_count: int = Field(..., description="Number of unchanged A-share stocks")
+    limit_up_count: Optional[int] = Field(None, description="Number of limit-up stocks")
+    limit_down_count: Optional[int] = Field(None, description="Number of limit-down stocks")
+    distribution: List[MarketBreadthBucketResponse] = Field(..., description="Ten percentage-change ranges")
+    warnings: List[str] = Field(default_factory=list, description="Fallback or partial-data warnings")
 
 # -----------------------------------------------
 
@@ -455,3 +477,33 @@ async def kline_range(
     )
   
   return buf.getvalue()
+
+
+@mcp_app.tool()
+async def market_breadth(ctx: Context = None) -> MarketBreadthResponse:  # type: ignore
+  """获取全 A 股上涨、下跌、平盘、涨跌停家数和涨跌幅分布。
+
+  Get whole-market A-share breadth, including rise/fall/flat counts,
+  limit-up/limit-down counts, and ten percentage-change ranges.
+
+  Returns:
+    A structured MarketBreadthResponse. The source field identifies the
+    provider used; warnings describe fallback or partial data.
+  """
+  data = await get_market_breadth()
+  return MarketBreadthResponse(
+    source=data.source,
+    fetched_at=data.fetched_at,
+    trade_date=data.trade_date,
+    market_time=data.market_time,
+    up_count=data.up_count,
+    down_count=data.down_count,
+    flat_count=data.flat_count,
+    limit_up_count=data.limit_up_count,
+    limit_down_count=data.limit_down_count,
+    distribution=[
+      MarketBreadthBucketResponse(range=bucket.label, count=bucket.count)
+      for bucket in data.distribution
+    ],
+    warnings=list(data.warnings),
+  )

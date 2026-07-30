@@ -24,12 +24,13 @@
 - **财务数据**：近年的主要财务指标（净利润、营收、ROE、EPS、NAV 等）。
 - **技术指标**：实时计算 KDJ、MACD、RSI、布林带等常用指标。
 
-这些数据通过以下 MCP 工具提供，**所有工具均支持逗号分隔的批量输入（上限 4 个）**：
+这些数据通过以下 MCP 工具提供。股票类工具 `brief`、`medium`、`full`、`tech` 支持逗号分隔的批量输入（上限 4 个）；`market_breadth` 为全市场查询，无需证券代码：
 
 - `brief`: 提供股票基本信息、当日行情及 **实时资金流向**。
 - `medium`: 在 `brief` 基础上增加主要财务数据摘要。
 - `full`: 提供最完整的数据，包括详细财务报表及实时技术指标 (KDJ, MACD 等)。
 - `tech`: 返回严格 JSON 格式的技术指标数据，包含 KDJ、MACD、RSI、布林带
+- `market_breadth`: 返回全市场上涨、下跌、平盘、涨跌停家数及十档涨跌幅分布。
 
 - [查询结果展示: 兆易创新 (SH603986) 全量分析报告](docs/SH603986-full.md)
 
@@ -127,11 +128,11 @@ AKSHARE_PROXY_PORT=50
 ### 3. 启动服务
 
 ```bash
-# 使用 uv 运行
-uv run cn-stock-mcp --transport http
+# 后台启动并记录服务 PID
+./start.sh
 
-# 或者直接运行 python
-python3 main.py --transport http
+# 停止服务及本项目启动的虚拟显示
+./stop.sh
 ```
 
 服务默认运行在 `http://localhost:8686/cnstock/mcp`。

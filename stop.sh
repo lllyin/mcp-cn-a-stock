@@ -7,6 +7,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 PID_FILE="$SCRIPT_DIR/cn-stock-mcp.pid"
+XVFB_PID_FILE="$SCRIPT_DIR/cn-stock-mcp-xvfb.pid"
+
+stop_managed_xvfb() {
+    if [ ! -f "$XVFB_PID_FILE" ]; then
+        return
+    fi
+
+    read -r XVFB_PID XVFB_DISPLAY < "$XVFB_PID_FILE" || true
+    XVFB_COMMAND=$(ps -p "$XVFB_PID" -o args= 2>/dev/null || true)
+    if [ -n "$XVFB_DISPLAY" ] && [[ "$XVFB_COMMAND" == *"Xvfb $XVFB_DISPLAY "* ]]; then
+        echo "正在停止项目虚拟显示 (PID: $XVFB_PID)..."
+        kill "$XVFB_PID" 2>/dev/null || true
+    fi
+    rm -f "$XVFB_PID_FILE"
+}
+
+SERVICE_STOPPED=false
 
 if [ -f "$PID_FILE" ]; then
     PID=$(cat "$PID_FILE")
@@ -20,16 +37,19 @@ if [ -f "$PID_FILE" ]; then
             if ! ps -p "$PID" > /dev/null 2>&1; then
                 echo "✅ 服务已停止"
                 rm -f "$PID_FILE"
-                exit 0
+                SERVICE_STOPPED=true
+                break
             fi
             sleep 1
         done
         
         # 强制终止
-        echo "强制终止进程..."
-        kill -9 "$PID" 2>/dev/null || true
-        rm -f "$PID_FILE"
-        echo "✅ 服务已强制停止"
+        if [ "$SERVICE_STOPPED" = false ]; then
+            echo "强制终止进程..."
+            kill -9 "$PID" 2>/dev/null || true
+            rm -f "$PID_FILE"
+            echo "✅ 服务已强制停止"
+        fi
     else
         echo "服务未运行"
         rm -f "$PID_FILE"
@@ -53,3 +73,5 @@ else
         echo "服务未运行"
     fi
 fi
+
+stop_managed_xvfb
