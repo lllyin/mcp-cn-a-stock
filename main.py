@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 import logging
+from importlib.metadata import PackageNotFoundError, version as package_version
 
 logging.basicConfig(level=logging.WARN, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -21,6 +22,20 @@ from qtf_mcp import mcp_app
 from qtf_mcp.symbols import load_symbols
 
 
+def log_market_data_versions() -> None:
+    versions = {}
+    for package_name in ("akshare", "efinance"):
+        try:
+            versions[package_name] = package_version(package_name)
+        except PackageNotFoundError:
+            versions[package_name] = "unknown"
+    logger.info(
+        "Market data library versions: akshare=%s efinance=%s",
+        versions["akshare"],
+        versions["efinance"],
+    )
+
+
 @click.command()
 @click.option("--port", default=8686, help="Port to listen on for SSE")
 @click.option(
@@ -31,6 +46,7 @@ from qtf_mcp.symbols import load_symbols
 )
 def main(port: int, transport: str) -> int:
     """启动 A股数据 MCP 服务"""
+    log_market_data_versions()
     load_symbols()
     if transport == "http":
         transport = "streamable-http"

@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import stat
 from types import SimpleNamespace
 
 import pandas as pd
@@ -62,7 +63,7 @@ def make_data(source: str = "test") -> MarketBreadthData:
 def test_parse_tonghuashun_market_breadth():
     result = parse_tonghuashun_market_breadth(TONGHUASHUN_PAYLOAD)
 
-    assert result.source == "tonghuashun_playwright"
+    assert result.source == "tonghuashun_web"
     assert result.trade_date is None
     assert result.up_count == 1768
     assert result.down_count == 3635
@@ -87,6 +88,19 @@ def test_build_tonghuashun_auth_keeps_only_v_cookie_and_user_agent():
     )
 
 
+def test_auth_cache_round_trip_uses_private_permissions(tmp_path):
+    cache_path = tmp_path / "runtime" / "tonghuashun-auth.json"
+    provider = TonghuashunPlaywrightProvider(auth_cache_path=cache_path)
+    auth = TonghuashunAuth("persisted-token", "Chrome persisted agent")
+
+    provider._save_cached_auth_sync(auth)
+
+    assert provider._load_cached_auth_sync() == auth
+    assert stat.S_IMODE(cache_path.stat().st_mode) == 0o600
+    assert "persisted-token" in cache_path.read_text(encoding="utf-8")
+    provider.close()
+
+
 def test_browser_sandbox_is_only_disabled_explicitly(monkeypatch):
     monkeypatch.delenv("CN_STOCK_CHROME_NO_SANDBOX", raising=False)
     assert "--no-sandbox" not in _tonghuashun_browser_args()
@@ -101,6 +115,7 @@ def test_parse_tonghuashun_market_breadth_uses_explicit_source_date():
     result = parse_tonghuashun_market_breadth(payload)
 
     assert result.trade_date == "2026-07-30"
+
 
 @pytest.mark.asyncio
 async def test_bootstrap_auth_closes_browser(monkeypatch):
@@ -182,11 +197,44 @@ async def test_provider_reuses_cached_auth_for_http_requests(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_provider_refreshes_auth_once_after_403(monkeypatch):
-    provider = TonghuashunPlaywrightProvider()
+async def test_provider_reuses_persisted_auth_after_restart(monkeypatch, tmp_path):
+    cache_path = tmp_path / "tonghuashun-auth.json"
+    original_provider = TonghuashunPlaywrightProvider(auth_cache_path=cache_path)
+    original_provider._save_cached_auth_sync(
+        TonghuashunAuth("persisted-token", "Chrome persisted agent"),
+    )
+    original_provider.close()
+
+    restarted_provider = TonghuashunPlaywrightProvider(auth_cache_path=cache_path)
+
+    async def unexpected_bootstrap():
+        raise AssertionError("persisted auth should avoid Playwright")
+
+    monkeypatch.setattr(restarted_provider, "_bootstrap_auth", unexpected_bootstrap)
+    monkeypatch.setattr(
+        restarted_provider,
+        "_request_payload_sync",
+        lambda auth: TONGHUASHUN_PAYLOAD,
+    )
+
+    result = await restarted_provider.fetch()
+
+    assert result.source == "tonghuashun_web"
+    assert restarted_provider._auth == TonghuashunAuth(
+        "persisted-token",
+        "Chrome persisted agent",
+    )
+    restarted_provider.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_refreshes_auth_once_after_403(monkeypatch, tmp_path):
+    cache_path = tmp_path / "tonghuashun-auth.json"
+    provider = TonghuashunPlaywrightProvider(auth_cache_path=cache_path)
     stale_auth = TonghuashunAuth("stale-token", "Chrome stale agent")
     fresh_auth = TonghuashunAuth("fresh-token", "Chrome fresh agent")
     provider._auth = stale_auth
+    provider._save_cached_auth_sync(stale_auth)
     bootstrap_count = 0
     request_auth = []
 
@@ -209,12 +257,53 @@ async def test_provider_refreshes_auth_once_after_403(monkeypatch):
     assert result.up_count == 1768
     assert bootstrap_count == 1
     assert request_auth == [stale_auth, fresh_auth]
+    assert provider._load_cached_auth_sync() == fresh_auth
     provider.close()
 
 
 @pytest.mark.asyncio
-async def test_concurrent_provider_requests_bootstrap_once(monkeypatch):
-    provider = TonghuashunPlaywrightProvider()
+async def test_provider_ignores_rejected_cache_when_deletion_fails(monkeypatch, tmp_path):
+    cache_path = tmp_path / "tonghuashun-auth.json"
+    provider = TonghuashunPlaywrightProvider(auth_cache_path=cache_path)
+    stale_auth = TonghuashunAuth("stale-token", "Chrome stale agent")
+    fresh_auth = TonghuashunAuth("fresh-token", "Chrome fresh agent")
+    provider._auth = stale_auth
+    provider._save_cached_auth_sync(stale_auth)
+    bootstrap_count = 0
+    request_auth = []
+
+    async def fake_bootstrap():
+        nonlocal bootstrap_count
+        bootstrap_count += 1
+        return fresh_auth
+
+    def fake_request(auth):
+        request_auth.append(auth)
+        if auth == stale_auth:
+            raise TonghuashunAuthError("HTTP 403")
+        return TONGHUASHUN_PAYLOAD
+
+    def failed_delete(auth):
+        raise OSError("cache is read-only")
+
+    monkeypatch.setattr(provider, "_bootstrap_auth", fake_bootstrap)
+    monkeypatch.setattr(provider, "_request_payload_sync", fake_request)
+    monkeypatch.setattr(provider, "_delete_cached_auth_if_stale_sync", failed_delete)
+
+    result = await provider.fetch()
+
+    assert result.up_count == 1768
+    assert bootstrap_count == 1
+    assert request_auth == [stale_auth, fresh_auth]
+    assert provider._load_cached_auth_sync() == fresh_auth
+    provider.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_provider_requests_bootstrap_once(monkeypatch, tmp_path):
+    provider = TonghuashunPlaywrightProvider(
+        auth_cache_path=tmp_path / "tonghuashun-auth.json",
+    )
     bootstrap_count = 0
 
     async def fake_bootstrap():
@@ -238,8 +327,43 @@ async def test_concurrent_provider_requests_bootstrap_once(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_provider_cools_down_after_failure(monkeypatch):
-    provider = TonghuashunPlaywrightProvider(cooldown_seconds=300)
+async def test_provider_instances_share_persisted_auth(monkeypatch, tmp_path):
+    cache_path = tmp_path / "tonghuashun-auth.json"
+    providers = [
+        TonghuashunPlaywrightProvider(auth_cache_path=cache_path),
+        TonghuashunPlaywrightProvider(auth_cache_path=cache_path),
+    ]
+    bootstrap_count = 0
+
+    async def fake_bootstrap():
+        nonlocal bootstrap_count
+        bootstrap_count += 1
+        await asyncio.sleep(0.01)
+        return TonghuashunAuth("shared-token", "Chrome test agent")
+
+    for provider in providers:
+        monkeypatch.setattr(provider, "_bootstrap_auth", fake_bootstrap)
+        monkeypatch.setattr(
+            provider,
+            "_request_payload_sync",
+            lambda auth: TONGHUASHUN_PAYLOAD,
+        )
+
+    results = await asyncio.gather(*(provider.fetch() for provider in providers))
+
+    assert bootstrap_count == 1
+    assert [result.up_count for result in results] == [1768, 1768]
+    assert providers[0]._auth == providers[1]._auth
+    for provider in providers:
+        provider.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_cools_down_after_failure(monkeypatch, tmp_path):
+    provider = TonghuashunPlaywrightProvider(
+        cooldown_seconds=300,
+        auth_cache_path=tmp_path / "tonghuashun-auth.json",
+    )
     clock = [1000.0]
     bootstrap_count = 0
 
@@ -261,6 +385,33 @@ async def test_provider_cools_down_after_failure(monkeypatch):
     with pytest.raises(RuntimeError, match="browser unavailable"):
         await provider.fetch()
     assert bootstrap_count == 2
+    provider.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_replaces_corrupt_auth_cache(monkeypatch, tmp_path):
+    cache_path = tmp_path / "tonghuashun-auth.json"
+    cache_path.write_text("not-json", encoding="utf-8")
+    provider = TonghuashunPlaywrightProvider(auth_cache_path=cache_path)
+    bootstrap_count = 0
+    fresh_auth = TonghuashunAuth("fresh-token", "Chrome fresh agent")
+
+    async def fake_bootstrap():
+        nonlocal bootstrap_count
+        bootstrap_count += 1
+        return fresh_auth
+
+    monkeypatch.setattr(provider, "_bootstrap_auth", fake_bootstrap)
+    monkeypatch.setattr(
+        provider,
+        "_request_payload_sync",
+        lambda auth: TONGHUASHUN_PAYLOAD,
+    )
+
+    await provider.fetch()
+
+    assert bootstrap_count == 1
+    assert provider._load_cached_auth_sync() == fresh_auth
     provider.close()
 
 

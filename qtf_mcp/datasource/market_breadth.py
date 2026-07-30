@@ -1,17 +1,24 @@
 import asyncio
+import fcntl
 import json
+import logging
 import os
 import re
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, replace
 from datetime import date, datetime
+from pathlib import Path
 from typing import Iterable, Optional, Protocol, Sequence
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 from playwright.async_api import Browser, Playwright, async_playwright
+
+
+logger = logging.getLogger("qtf_mcp")
 
 
 MARKET_BREADTH_RANGES = (
@@ -93,6 +100,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _default_auth_cache_path() -> Path:
+    configured = os.getenv("CN_STOCK_TONGHUASHUN_AUTH_FILE")
+    if configured:
+        return Path(configured).expanduser()
+    return Path(__file__).resolve().parents[2] / ".runtime" / "tonghuashun-auth.json"
+
+
 def _build_buckets(counts: Iterable[int]) -> tuple[MarketBreadthBucket, ...]:
     values = [int(value) for value in counts]
     if len(values) != len(MARKET_BREADTH_RANGES):
@@ -164,7 +178,7 @@ def parse_tonghuashun_market_breadth(payload: dict) -> MarketBreadthData:
 
     times = (payload.get("zdt_data") or {}).get("zd_time") or []
     return MarketBreadthData(
-        source="tonghuashun_playwright",
+        source="tonghuashun_web",
         fetched_at=_now_shanghai(),
         trade_date=_extract_tonghuashun_trade_date(payload),
         up_count=up_count,
@@ -203,15 +217,17 @@ def _tonghuashun_browser_args() -> list[str]:
 
 
 class TonghuashunPlaywrightProvider:
-    name = "tonghuashun_playwright"
+    name = "tonghuashun_web"
     page_url = "https://q.10jqka.com.cn/"
     api_url = "https://q.10jqka.com.cn/api.php?t=indexflash&"
 
     def __init__(
         self,
         cooldown_seconds: Optional[float] = None,
+        auth_cache_path: Optional[str | os.PathLike[str]] = None,
     ) -> None:
         self._auth: TonghuashunAuth | None = None
+        self._rejected_auth: TonghuashunAuth | None = None
         self._auth_lock = asyncio.Lock()
         self._session = requests.Session()
         self._session_lock = threading.Lock()
@@ -222,6 +238,92 @@ class TonghuashunPlaywrightProvider:
         )
         self._cooldown_until = 0.0
         self._last_failure: Optional[str] = None
+        self._auth_cache_path = (
+            Path(auth_cache_path).expanduser()
+            if auth_cache_path is not None
+            else _default_auth_cache_path()
+        )
+        self._auth_lock_path = self._auth_cache_path.with_suffix(
+            f"{self._auth_cache_path.suffix}.lock"
+        )
+
+    def _prepare_auth_cache_dir_sync(self) -> None:
+        parent = self._auth_cache_path.parent
+        if not parent.exists():
+            parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    def _load_cached_auth_sync(self) -> TonghuashunAuth | None:
+        try:
+            with self._auth_cache_path.open("r", encoding="utf-8") as cache_file:
+                payload = json.load(cache_file)
+            if not isinstance(payload, dict):
+                return None
+            if payload.get("version") != 1:
+                return None
+            return _build_tonghuashun_auth(
+                [{"name": "v", "value": payload.get("v_cookie", "")}],
+                str(payload.get("user_agent", "")),
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError, TonghuashunAuthError):
+            return None
+
+    def _save_cached_auth_sync(self, auth: TonghuashunAuth) -> None:
+        self._prepare_auth_cache_dir_sync()
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=".tonghuashun-auth-",
+            dir=self._auth_cache_path.parent,
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as cache_file:
+                json.dump(
+                    {
+                        "version": 1,
+                        "v_cookie": auth.v_cookie,
+                        "user_agent": auth.user_agent,
+                        "saved_at": _now_shanghai(),
+                    },
+                    cache_file,
+                    ensure_ascii=False,
+                )
+                cache_file.flush()
+                os.fsync(cache_file.fileno())
+            os.replace(temporary_path, self._auth_cache_path)
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+
+    def _acquire_auth_file_lock_sync(self):
+        self._prepare_auth_cache_dir_sync()
+        fd = os.open(self._auth_lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.fchmod(fd, 0o600)
+        lock_file = os.fdopen(fd, "r+")
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        return lock_file
+
+    @staticmethod
+    def _release_auth_file_lock_sync(lock_file) -> None:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
+
+    def _delete_cached_auth_if_stale_sync(self, stale_auth: TonghuashunAuth) -> None:
+        lock_file = self._acquire_auth_file_lock_sync()
+        try:
+            if self._load_cached_auth_sync() == stale_auth:
+                try:
+                    self._auth_cache_path.unlink()
+                except FileNotFoundError:
+                    pass
+        finally:
+            self._release_auth_file_lock_sync(lock_file)
 
     @staticmethod
     async def _launch_browser(playwright: Playwright) -> Browser:
@@ -265,13 +367,46 @@ class TonghuashunPlaywrightProvider:
             return self._auth
         async with self._auth_lock:
             if self._auth is None:
-                self._auth = await self._bootstrap_auth()
+                cached_auth = await asyncio.to_thread(self._load_cached_auth_sync)
+                if cached_auth is not None and cached_auth != self._rejected_auth:
+                    self._auth = cached_auth
+                    self._rejected_auth = None
+                    return self._auth
+
+                lock_file = None
+                try:
+                    lock_file = await asyncio.to_thread(self._acquire_auth_file_lock_sync)
+                    cached_auth = await asyncio.to_thread(self._load_cached_auth_sync)
+                    if cached_auth is not None and cached_auth != self._rejected_auth:
+                        self._auth = cached_auth
+                    else:
+                        self._auth = await self._bootstrap_auth()
+                        try:
+                            await asyncio.to_thread(self._save_cached_auth_sync, self._auth)
+                        except OSError as exc:
+                            logger.warning("Unable to persist Tonghuashun auth cache: %s", exc)
+                    self._rejected_auth = None
+                except OSError as exc:
+                    logger.warning("Unable to lock Tonghuashun auth cache: %s", exc)
+                    self._auth = await self._bootstrap_auth()
+                    self._rejected_auth = None
+                finally:
+                    if lock_file is not None:
+                        await asyncio.to_thread(self._release_auth_file_lock_sync, lock_file)
             return self._auth
 
     async def _invalidate_auth(self, stale_auth: TonghuashunAuth) -> None:
+        invalidated = False
         async with self._auth_lock:
             if self._auth == stale_auth:
                 self._auth = None
+                self._rejected_auth = stale_auth
+                invalidated = True
+        if invalidated:
+            try:
+                await asyncio.to_thread(self._delete_cached_auth_if_stale_sync, stale_auth)
+            except OSError as exc:
+                logger.warning("Unable to remove stale Tonghuashun auth cache: %s", exc)
 
     def _request_payload_sync(self, auth: TonghuashunAuth) -> dict:
         headers = {
