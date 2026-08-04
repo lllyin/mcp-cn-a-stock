@@ -1,173 +1,288 @@
-# A 股数据 MCP 服务 (CnStock)
+# A 股数据 MCP 服务（CnStock）
 
-这是一个为大模型提供的 A 股数据 MCP (Model Context Protocol) 服务。
+CnStock 是一个面向大模型和 MCP 客户端的 A 股数据服务。
+提供股票、指数和场内 ETF 的行情、财务、资金流、技术指标、K 线与全市场涨跌分布数据。
+
+项目基于 [elsejj/mcp-cn-a-stock](https://github.com/elsejj/mcp-cn-a-stock) 改造，使用 [AkShare](https://github.com/akfamily/akshare) 和 [efinance](https://github.com/nelsonie/efinance) 作为公开数据源，不依赖原项目的私有 API。
 
 ## 项目亮点
 
-- **基于开源库**：本仓库基于 [elsejj/mcp-cn-a-stock](https://github.com/elsejj/mcp-cn-a-stock) 修改，核心改进是将原有的私有数据源替换为基于 [AkShare](https://github.com/akfamily/akshare) 和 [efinance](https://github.com/nelsonie/efinance) 的开源数据接口，**不再依赖内部私有API**。
-- **数据全面**：覆盖沪深京全市场股票及 **场内 ETF 基金**。
+- 覆盖沪深京股票、主要指数和场内 ETF。
+- 支持 Markdown 报告和适合程序消费的严格 JSON 输出。
+- `brief`、`medium`、`full`、`tech` 单次最多并行查询 4 个标的。
+- 支持指定历史截止日期，非交易日自动使用最近可用行情。
+- 自动纠正错误市场前缀，例如将 `SH000333` 规范为 `SZ000333`。
+- 内置 KDJ、MACD、RSI、布林带等技术指标。
+- 使用有界并发控制同步数据请求，适合 Ubuntu 2 核 4G 等小型服务器。
+- 全市场涨跌分布支持数据源回退、短时缓存和同请求合并。
 
-## 主要改进点
+## MCP 工具
 
-1. **数据源迁移**：由 `AkShare` 和 `efinance` 提供数据，无需私有 API。
-2. **算法对齐**：优化了 KDJ 和振幅算法，数据与主流交易 APP 保持一致指标。
-3. **批量查询支持**：核心工具支持批量查询 (单次上限 4 个)，极大提升多股分析效率。
-4. **智能纠偏 (Healing)**：内置市场前缀自动校准功能 (e.g. SH000333 -> SZ000333)。
-5. **输出规格化**：采用 Pydantic 定义结构化 JSON，支持 MCP Inspector 完整 Schema。
+| 工具 | 返回格式 | 用途 |
+| --- | --- | --- |
+| `brief` | JSON 外壳 + Markdown 报告 | 基本信息、行情和资金流 |
+| `medium` | JSON 外壳 + Markdown 报告 | 在 `brief` 基础上增加财务摘要 |
+| `full` | JSON 外壳 + Markdown 报告 | 完整财务、历史资金流和技术分析 |
+| `tech` | 严格 JSON | OHLCV、KDJ、MACD、RSI、布林带 |
+| `kline_daily` | Markdown | 指定交易日的 K 线 |
+| `kline_range` | Markdown 表格 | 指定日期区间的 K 线 |
+| `market_breadth` | 严格 JSON | 全市场涨跌家数、涨跌停和十档分布 |
 
-## 功能特性
+完整报告示例：[兆易创新 SH603986](docs/SH603986-full.md)。
 
-支持 A 股和场内 ETF 行情查询，目前为大模型提供以下维度的数据：
+## 环境要求
 
-- **基本信息**：股票代码、名称、所属行业概念、总市值、流通市值等。
-- **行情数据**：实时价格、成交量、换手率，以及历史 K 线统计。
-- **财务数据**：近年的主要财务指标（净利润、营收、ROE、EPS、NAV 等）。
-- **技术指标**：实时计算 KDJ、MACD、RSI、布林带等常用指标。
+- Python 3.12 或更高版本。
+- Linux、macOS；生产部署推荐 Ubuntu。
+- 推荐使用 [uv](https://docs.astral.sh/uv/) 管理依赖。
+- 可访问 AkShare、efinance 使用的公开行情接口。
+- AkShare Proxy Patch 账号可选，但推荐用于提高东财接口稳定性。
+- `market_breadth` 首选数据源需要 Chromium；不可用时会回退到 efinance。
 
-这些数据通过以下 MCP 工具提供。股票类工具 `brief`、`medium`、`full`、`tech` 支持逗号分隔的批量输入（上限 4 个）；`market_breadth` 为全市场查询，无需证券代码：
+## 快速安装
 
-- `brief`: 提供股票基本信息、当日行情及 **实时资金流向**。
-- `medium`: 在 `brief` 基础上增加主要财务数据摘要。
-- `full`: 提供最完整的数据，包括详细财务报表及实时技术指标 (KDJ, MACD 等)。
-- `tech`: 返回严格 JSON 格式的技术指标数据，包含 KDJ、MACD、RSI、布林带
-- `market_breadth`: 返回全市场上涨、下跌、平盘、涨跌停家数及十档涨跌幅分布。
+### 1. 获取代码
 
-- [查询结果展示: 兆易创新 (SH603986) 全量分析报告](docs/SH603986-full.md)
+```bash
+git clone https://github.com/lllyin/mcp-cn-a-stock.git
+cd mcp-cn-a-stock
+```
 
-## 批量查询指引
+### 2. 创建环境并安装依赖
 
-所有核心工具 (`brief`, `medium`, `full`, `tech`) 均支持批量模式。
+使用 uv：
 
-### 1. 调用方式
-在证券代码参数中，使用 **半角逗号** 分隔多个代码：
-`symbol="SZ300308,SH600000,SZ000333"`
+```bash
+uv sync
+source .venv/bin/activate
+```
 
-默认查询最新可用行情。`brief`、`medium`、`full`、`tech` 支持可选 `date=YYYY-MM-DD` 参数，用于以指定日期为截止日生成报告；如果指定日期不是交易日，底层 K 线通常会返回该日期前最近一个交易日。`fund_flow_limit` 用于控制 `full` 的 `## 历史资金流向` 表格展示条数，默认 15 条；传给 `brief` 或 `medium` 时会被忽略。
+或使用标准 venv 和 pip：
 
-### 2. 返回结构
-服务将返回一个结构化的 JSON 对象：
-- `reports`: 一个字典，键为证券代码，值为该标的的 Markdown 格式详细报告。
-- `errors`: 一个字典，包含查询失败的代码及其原因。
-- `warnings`: 一个数组，包含非致命警告，例如批量查询超过 4 个标的时被跳过的代码。
-- `symbols_count`: 成功生成的报告数量。
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install .
+```
 
-`tech` 工具返回机器可读的 JSON 对象，`reports` 的值不是 Markdown 字符串，而是包含 `symbol`、`name`、`quote_date` 和 `indicators` 数组的结构化对象。每个 `indicators` 条目包含当日 `ohlc` 和技术指标数据，数值字段均为 number 或 null。
+### 3. 安装可选浏览器依赖
 
-### 3. 技术指标 JSON
+需要同花顺全市场涨跌分布时安装 Chromium：
 
-单标的调用：
+```bash
+playwright install chromium
+```
+
+Ubuntu 可使用 Playwright 安装浏览器所需的系统依赖：
+
+```bash
+playwright install --with-deps chromium
+```
+
+无桌面的 Ubuntu 可额外安装 `xvfb`。`start.sh` 会在没有 `DISPLAY` 时自动启动并管理
+一个项目专用的 Xvfb；未安装也不影响其他工具，`market_breadth` 会尝试备用数据源。
+
+## 配置
+
+在项目根目录创建 `.env`：
+
+```env
+# AkShare Proxy Patch，可选但推荐
+AKSHARE_PROXY_GATEWAY=你的代理网关
+AKSHARE_PROXY_TOKEN=你的访问令牌
+AKSHARE_PROXY_RETRY=30
+
+# 同步行情 I/O 并发，以下是默认值
+CN_STOCK_DATA_FETCH_MAX_WORKERS=8
+CN_STOCK_DATA_FETCH_MAX_IN_FLIGHT=16
+```
+
+兼容旧变量名 `AKSHARE_PROXY_IP`、`AKSHARE_PROXY_PASSWORD` 和
+`AKSHARE_PROXY_PORT`。其中 `PORT` 历史上表示重试次数，不是网络端口；新部署建议使用
+含义明确的 `GATEWAY`、`TOKEN`、`RETRY`。
+
+Ubuntu 2 核 4G 建议先保持默认的 `8/16`。提高数值会增加上游压力，并不保证降低延迟。
+参数含义和调优方法见[技术实现说明](docs/technical-details.md)。
+
+## 启动和停止
+
+推荐通过脚本后台运行：
+
+```bash
+./start.sh
+```
+
+默认 MCP 地址：
+
+```text
+http://localhost:8686/cnstock/mcp
+```
+
+查看日志：
+
+```bash
+tail -f logs/cn-stock-mcp.log
+```
+
+日志启动时会输出当前版本，例如：
+
+```text
+cn-stock-mcp version=1.1.0
+```
+
+停止服务：
+
+```bash
+./stop.sh
+```
+
+也可以前台运行并选择 transport：
+
+```bash
+cn-stock-mcp --transport http --port 8686
+cn-stock-mcp --transport stdio
+cn-stock-mcp --transport sse --port 8686
+```
+
+## 使用 mcporter 调用
+
+以下示例假设 `mcporter` 已配置名为 `cn-stock` 的服务：
 
 ```bash
 export MCPORTER_CONFIG=~/.openclaw/workspace/config/mcporter.json
+```
+
+查询简要、财务和完整报告：
+
+```bash
+mcporter call cn-stock brief symbol=SH600000
+mcporter call cn-stock medium symbol=SZ000333
+mcporter call cn-stock full symbol=SH603986 fund_flow_limit=30
+```
+
+单次批量查询，标的之间使用半角逗号：
+
+```bash
+mcporter call cn-stock brief symbol=SH600000,SZ000333,SZ300750,SH688981
+```
+
+超过 4 个标的时只处理前 4 个，其余代码会写入响应的 `warnings`。
+
+查询机器可读技术指标：
+
+```bash
 mcporter call cn-stock tech symbol=SZ002463 days=30
+mcporter call cn-stock tech symbol=SZ002463,SH688981 days=10
+mcporter call cn-stock tech symbol=SZ002463 fields=macd,kdj include_derived=true
 ```
 
-批量调用：
-
-```bash
-export MCPORTER_CONFIG=~/.openclaw/workspace/config/mcporter.json
-mcporter call cn-stock tech symbol=SZ002463,SZ300502,SH688981 days=30
-```
-
-筛选指标：
-
-```bash
-mcporter call cn-stock tech symbol=SZ002463 days=30 fields=macd,kdj include_derived=true
-```
-
-查询指定日期：
+查询指定历史截止日期：
 
 ```bash
 mcporter call cn-stock brief symbol=SZ002463 date=2026-06-05
 mcporter call cn-stock tech symbol=SZ002463 days=30 date=2026-06-05
 ```
 
-指定 `full` 历史资金流向条数：
+查询单日或区间 K 线：
 
 ```bash
-mcporter call cn-stock full symbol=SZ002463 fund_flow_limit=30
+mcporter call cn-stock kline_daily symbol=SH603986 date=2026-05-29 adjust=qfq
+mcporter call cn-stock kline_range symbol=SH603986 start_date=2026-05-22 end_date=2026-05-29
 ```
 
-### 4. 智能纠偏 (Symbol Healing)
-如果你输入了错误的市场前缀（例如将美的集团 `SZ000333` 误输入为 `SH000333`），系统会自动识别归属并返回 **规范化后的正确代码**，确保数据分析不中断。
+`adjust` 可选 `qfq`（前复权）、`hfq`（后复权）和 `none`（不复权）。
 
-## 开发与运行
-
-### 1. 环境准备
-
-建议使用 Python 3.12+ 编译环境（本说明以 Python 3.13 为例）。
+查询全市场涨跌分布：
 
 ```bash
-# 克隆仓库
-git clone git@github.com:lllyin/mcp-cn-a-stock.git
-cd mcp-cn-a-stock
-
-# 创建虚拟环境 (.venv)
-python3.13 -m venv .venv
-
-# 激活虚拟环境
-source .venv/bin/activate
-
-# 安装依赖 (推荐使用 uv)
-uv sync
-
-# 或者使用 pip
-pip install .
+mcporter call cn-stock market_breadth
 ```
 
-### 2. 配置说明
+## 返回结构
 
-在项目根目录下创建 `.env` 文件，配置 [AkShare Proxy Patch](https://github.com/helloYie/akshare-proxy-patch)（用于提高东财接口稳定性）：
+`brief`、`medium`、`full` 的顶层响应包含：
 
-```env
-AKSHARE_PROXY_IP=你的代理IP
-AKSHARE_PROXY_PASSWORD=你的代理密码
-AKSHARE_PROXY_PORT=50
-# 同步行情请求线程池大小，默认 8；需结合上游容量压测调整
-CN_STOCK_DATA_FETCH_MAX_WORKERS=8
-# 同时运行或排入执行器的数据任务上限，2C4G 建议保持 16
-CN_STOCK_DATA_FETCH_MAX_IN_FLIGHT=16
+- `reports`：以规范化证券代码为键的 Markdown 报告。
+- `errors`：以证券代码为键的错误信息。
+- `warnings`：批量截断、数据回退等非致命提醒。
+- `symbols_count`：应用批量上限后的标的数量。
+- `timestamp`：报告生成时间。
+
+`tech` 使用相同的批量外壳，但 `reports` 的值是结构化对象，包含 `symbol`、`name`、
+`quote_date` 和按日期排列的 `indicators`。不可计算或缺失的指标使用 JSON `null`。
+
+`market_breadth` 返回 `source`、抓取时间、涨跌和平盘家数、涨跌停家数、十档涨跌幅分布
+及回退警告。调用方应读取 `source` 和 `warnings`，不要假设每次都来自同一提供方。
+
+## MCP 客户端接入
+
+支持 Streamable HTTP 的客户端填写：
+
+```text
+名称: cn-stock
+类型: streamableHttp
+地址: http://localhost:8686/cnstock/mcp
 ```
 
-### 3. 启动服务
+CherryStudio 中进入“设置 → MCP 设置 → 添加服务器”，选择
+“可流式传输的 HTTP（streamableHttp）”并填写上述地址。
 
-```bash
-# 后台启动并记录服务 PID
-./start.sh
+![CherryStudio MCP 配置](docs/cherrystudio.jpg)
 
-# 停止服务及本项目启动的虚拟显示
-./stop.sh
-```
+其他客户端的操作示例见[让 DeepSeek 通过 MCP 分析股票](docs/let-your-deepseek-analyze-stock-by-mcp.md)。
 
-服务默认运行在 `http://localhost:8686/cnstock/mcp`。
+## 调试与测试
 
-### 4. 调试与测试
-
-使用 MCP Inspector 进行交互式调试：
+使用 MCP Inspector：
 
 ```bash
 npx @modelcontextprotocol/inspector --url http://localhost:8686/cnstock/mcp
 ```
 
-## 客户端接入
+运行单元测试：
 
-你可以将此服务接入常用的 MCP 客户端（如 Claude Desktop, CherryStudio, DeepChat 等）。
+```bash
+uv sync --extra dev
+pytest tests --ignore=tests/test_akshare_source.py
+```
 
-### CherryStudio 配置示例
+查看版本：
 
-1. 进入 **设置 -> MCP 设置 -> 添加服务器**。
-2. 类型选择 `可流式传输的HTTP(streamableHttp)`，地址填入 `http://localhost:8686/cnstock/mcp`。
+```bash
+python -c "from qtf_mcp import __version__; print(__version__)"
+```
 
-![cherrystudio](docs/cherrystudio.jpg)
+## 常见问题
 
-## 免责申明
+**首次调用较慢**
 
-本项目利用开源社区接口尽可能的保障数据准确可用, 但不对因数据延迟或错误产生的任何交易决策负任何责任。股市有风险，入市需谨慎。
+首次请求可能包含模块初始化、浏览器启动、认证刷新或上游连接建立。请结合
+`logs/cn-stock-mcp.log` 中的分段耗时判断，不要只比较单次冷启动。
+
+**指定日期没有数据**
+
+周末和节假日通常返回截止日期之前最近一个交易日的数据；代码错误或标的尚未上市时可能返回空结果。
+
+**`market_breadth` 出现 fallback warning**
+
+首选数据源认证失败、处于冷却期或浏览器不可用时会自动回退。响应仍可使用，但应关注
+`source`、`trade_date` 和 `warnings`。
+
+**批量请求被截断**
+
+每次 tool 调用最多处理 4 个标的。需要更多标的时由客户端拆分请求，并控制并发，避免集中冲击上游接口。
+
+## 更多文档
+
+- [技术实现说明](docs/technical-details.md)
+- [完整报告示例](docs/SH603986-full.md)
+- [DeepChat 使用示例](docs/let-your-deepseek-analyze-stock-by-mcp.md)
+
+## 免责声明
+
+本项目使用第三方公开数据接口，无法保证数据始终实时、完整或准确。项目输出不构成投资建议，
+请勿将其作为交易决策的唯一依据。股市有风险，入市需谨慎。
 
 ## 许可证
 
-基于原项目协议，本项目采用 MIT 许可证。
-
-## 联系方式
-
-如有问题或建议，欢迎提交 Issue。
+基于原项目协议，本项目采用 MIT 许可证。问题和建议请通过 GitHub Issue 提交。
