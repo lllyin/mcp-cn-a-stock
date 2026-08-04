@@ -4,7 +4,7 @@
 支持多种数据源的统一接口，方便切换不同的行情数据提供商。
 """
 
-from .base import DataSource, StockData
+from .base import DataSource, FetchRequirements, StockData
 from .cn_stock_source import CNStockDataSource
 
 # 默认使用 CNStock 数据源
@@ -25,6 +25,7 @@ def set_datasource(source: DataSource) -> None:
 
 __all__ = [
     "DataSource",
+    "FetchRequirements",
     "StockData",
     "CNStockDataSource",
     "get_datasource",

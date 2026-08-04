@@ -14,6 +14,7 @@ from numpy import ndarray
 
 from .datafeed import load_data_msd
 from .config import ALL_INDICES
+from .datasource.base import FetchRequirements
 from .datasource.realtime_ff import get_fund_flow
 from .symbols import symbol_with_name
 
@@ -173,7 +174,10 @@ def get_technical_indicators(
 
 
 async def load_raw_data(
-    symbol: str, end_date=None, who: str = ""
+    symbol: str,
+    end_date=None,
+    who: str = "",
+    requirements: Optional[FetchRequirements] = None,
 ) -> Dict[str, ndarray]:
     """加载股票原始数据"""
     is_historical_query = end_date is not None
@@ -185,7 +189,12 @@ async def load_raw_data(
     start_date = end_date - datetime.timedelta(days=365 * 2)
 
     data = await load_data_msd(
-        symbol, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"), 0, who
+        symbol,
+        start_date.strftime("%Y-%m-%d"),
+        end_date.strftime("%Y-%m-%d"),
+        0,
+        who,
+        requirements=requirements,
     )
     if data and is_historical_query:
         data["QUERY_DATE"] = end_date.strftime("%Y-%m-%d")  # type: ignore

@@ -16,6 +16,8 @@ wheels/
 log.txt
 /logs/
 /.runtime/
+/benchmarks/
+/private/
 
 libs
 *.pid

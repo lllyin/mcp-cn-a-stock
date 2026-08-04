@@ -7,11 +7,12 @@
 import json
 import logging
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
 from .datasource import get_datasource
+from .datasource.base import FetchRequirements
 
 logger = logging.getLogger("qtf_mcp")
 
@@ -38,7 +39,12 @@ def get_stock_sector() -> Dict[str, List[str]]:
 
 
 async def load_data_msd(
-    symbol: str, start_date: str, end_date: str, n: int = 0, who: str = ""
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    n: int = 0,
+    who: str = "",
+    requirements: Optional[FetchRequirements] = None,
 ) -> Dict[str, np.ndarray]:
     """
     获取单只股票的数据
@@ -58,7 +64,9 @@ async def load_data_msd(
     t1 = time.time()
 
     datasource = get_datasource()
-    stock_data = await datasource.fetch_stock_data(symbol, start_date, end_date)
+    stock_data = await datasource.fetch_stock_data_with_requirements(
+        symbol, start_date, end_date, requirements=requirements
+    )
 
     t2 = time.time()
     logger.info(f"{who} [{datasource.name}] fetch data cost {t2 - t1:.2f}s, symbol: {symbol}")

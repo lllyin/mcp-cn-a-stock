@@ -2,6 +2,7 @@
 Technical indicator JSON tool tests.
 """
 
+import asyncio
 import datetime
 import importlib
 import json
@@ -39,7 +40,7 @@ def _dump_json(response):
 
 @pytest.mark.asyncio
 async def test_tech_single_symbol_returns_json(monkeypatch):
-    async def fake_load_raw_data(symbol, end_date=None, who=""):
+    async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
         return _make_raw_data("SZ002463", "沪电股份")
 
     monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
@@ -60,7 +61,7 @@ async def test_tech_single_symbol_returns_json(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_tech_batch_symbols_return_json(monkeypatch):
-    async def fake_load_raw_data(symbol, end_date=None, who=""):
+    async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
         return _make_raw_data(symbol)
 
     monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
@@ -73,8 +74,22 @@ async def test_tech_batch_symbols_return_json(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_tech_batch_preserves_input_order_when_fetches_finish_out_of_order(monkeypatch):
+    async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
+        if symbol == "SZ000001":
+            await asyncio.sleep(0.01)
+        return _make_raw_data(symbol)
+
+    monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
+
+    response = await app_module.fetch_technical_reports("SZ000001,SZ000002", days=1)
+
+    assert list(response.reports) == ["SZ000001", "SZ000002"]
+
+
+@pytest.mark.asyncio
 async def test_tech_missing_indicator_values_are_null(monkeypatch):
-    async def fake_load_raw_data(symbol, end_date=None, who=""):
+    async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
         return _make_raw_data("SZ002463", n=35)
 
     monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
@@ -90,7 +105,7 @@ async def test_tech_missing_indicator_values_are_null(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_tech_query_failure_enters_errors(monkeypatch):
-    async def fake_load_raw_data(symbol, end_date=None, who=""):
+    async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
         return {}
 
     monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
@@ -103,7 +118,7 @@ async def test_tech_query_failure_enters_errors(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_tech_output_does_not_contain_markdown_table(monkeypatch):
-    async def fake_load_raw_data(symbol, end_date=None, who=""):
+    async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
         return _make_raw_data("SZ002463")
 
     monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
@@ -119,8 +134,9 @@ async def test_tech_output_does_not_contain_markdown_table(monkeypatch):
 async def test_tech_passes_query_date_to_loader(monkeypatch):
     seen = {}
 
-    async def fake_load_raw_data(symbol, end_date=None, who=""):
+    async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
         seen["end_date"] = end_date
+        seen["requirements"] = requirements
         return _make_raw_data("SZ002463")
 
     monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
@@ -133,13 +149,17 @@ async def test_tech_passes_query_date_to_loader(monkeypatch):
 
     assert response.errors == {}
     assert seen["end_date"] == "2026-06-05"
+    assert seen["requirements"].finance is False
+    assert seen["requirements"].fund_flow is False
+    assert seen["requirements"].realtime is True
+    assert seen["requirements"].unadjusted_kline is False
 
 
 @pytest.mark.asyncio
 async def test_markdown_batch_passes_query_date_to_loader(monkeypatch):
     seen = {}
 
-    async def fake_load_raw_data(symbol, end_date=None, who=""):
+    async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
         seen["end_date"] = end_date
         return _make_raw_data("SZ002463")
 
@@ -164,7 +184,7 @@ async def test_markdown_batch_passes_query_date_to_loader(monkeypatch):
 async def test_tech_batch_limit_adds_warning(monkeypatch):
     seen_symbols = []
 
-    async def fake_load_raw_data(symbol, end_date=None, who=""):
+    async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
         seen_symbols.append(symbol)
         return _make_raw_data(symbol)
 

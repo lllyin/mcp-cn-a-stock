@@ -18,8 +18,12 @@ logger.setLevel(logging.DEBUG)
 
 import click
 
-from qtf_mcp import mcp_app
+from qtf_mcp import __version__, mcp_app
 from qtf_mcp.symbols import load_symbols
+
+
+def log_application_version() -> None:
+    logger.info("cn-stock-mcp version=%s", __version__)
 
 
 def log_market_data_versions() -> None:
@@ -46,6 +50,7 @@ def log_market_data_versions() -> None:
 )
 def main(port: int, transport: str) -> int:
     """启动 A股数据 MCP 服务"""
+    log_application_version()
     log_market_data_versions()
     load_symbols()
     if transport == "http":

@@ -123,6 +123,10 @@ pip install .
 AKSHARE_PROXY_IP=你的代理IP
 AKSHARE_PROXY_PASSWORD=你的代理密码
 AKSHARE_PROXY_PORT=50
+# 同步行情请求线程池大小，默认 8；需结合上游容量压测调整
+CN_STOCK_DATA_FETCH_MAX_WORKERS=8
+# 同时运行或排入执行器的数据任务上限，2C4G 建议保持 16
+CN_STOCK_DATA_FETCH_MAX_IN_FLIGHT=16
 ```
 
 ### 3. 启动服务

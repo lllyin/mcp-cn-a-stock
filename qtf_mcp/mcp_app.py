@@ -11,6 +11,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 from . import research
 from .datasource import get_datasource
+from .datasource.base import FetchRequirements
 from .datasource.market_breadth import get_market_breadth
 
 logger = logging.getLogger("qtf_mcp")
@@ -224,10 +225,17 @@ async def fetch_technical_reports(
 
     async def process_item(symbol: str):
         try:
-            raw_data = await research.load_raw_data(symbol, date, host)
+            raw_data = await research.load_raw_data(
+                symbol,
+                date,
+                host,
+                requirements=FetchRequirements.technical(),
+            )
             if not raw_data:
-                output["errors"][symbol] = f"未找到证券代码 {symbol} 的相关行情数据。"
-                return
+                return None, (
+                    symbol,
+                    f"未找到证券代码 {symbol} 的相关行情数据。",
+                )
 
             report_symbol = str(raw_data.get("SYMBOL", symbol))
             indicators = research.get_technical_indicators(
@@ -237,21 +245,31 @@ async def fetch_technical_reports(
                 include_derived=include_derived,
             )
             if not indicators:
-                output["errors"][report_symbol] = f"未找到证券代码 {report_symbol} 的技术指标数据。"
-                return
+                return None, (
+                    report_symbol,
+                    f"未找到证券代码 {report_symbol} 的技术指标数据。",
+                )
 
-            output["reports"][report_symbol] = TechnicalReport(
-                symbol=report_symbol,
-                name=str(raw_data.get("NAME", "")),
-                quote_date=indicators[0]["date"] if indicators else None,
-                indicators=indicators,
-            )
+            return (
+                report_symbol,
+                TechnicalReport(
+                    symbol=report_symbol,
+                    name=str(raw_data.get("NAME", "")),
+                    quote_date=indicators[0]["date"] if indicators else None,
+                    indicators=indicators,
+                ),
+            ), None
         except Exception as e:
-            output["errors"][symbol] = str(e)
+            return None, (symbol, str(e))
 
     import asyncio
     try:
-        await asyncio.gather(*[process_item(s) for s in raw_symbols])
+        results = await asyncio.gather(*[process_item(s) for s in raw_symbols])
+        for report, error in results:
+            if report:
+                output["reports"][report[0]] = report[1]
+            if error:
+                output["errors"][error[0]] = error[1]
     finally:
         elapsed = time.time() - start_time
         logger.info("Finished tech query: %s%s, cost %.2fs", symbols_label, date_label, elapsed)

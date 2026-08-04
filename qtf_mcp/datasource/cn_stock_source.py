@@ -7,6 +7,7 @@ CN Stock 数据源实现
 import asyncio
 import json
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -14,8 +15,16 @@ from typing import Dict, List, Optional
 import numpy as np
 
 import akshare_proxy_patch
-from ..config import AKSHARE_PROXY_IP, AKSHARE_PROXY_PASSWORD, AKSHARE_PROXY_RETRY, SH_INDICES, SZ_INDICES
-from .base import DataSource, StockData
+from ..config import (
+    AKSHARE_PROXY_IP,
+    AKSHARE_PROXY_PASSWORD,
+    AKSHARE_PROXY_RETRY,
+    DATA_FETCH_MAX_IN_FLIGHT,
+    DATA_FETCH_MAX_WORKERS,
+    SH_INDICES,
+    SZ_INDICES,
+)
+from .base import DataSource, FetchRequirements, StockData
 
 logger = logging.getLogger("qtf_mcp")
 
@@ -68,13 +77,69 @@ logger.info(
 import efinance as ef
 
 # 线程池用于执行同步的调用
-_executor = ThreadPoolExecutor(max_workers=4)
+_executor = ThreadPoolExecutor(
+    max_workers=DATA_FETCH_MAX_WORKERS,
+    thread_name_prefix="cn-stock-data",
+)
+_DATA_FETCH_SLOTS_ATTR = "_cn_stock_data_fetch_slots"
 
 
-def _run_in_executor(func, *args):
-    """在线程池中运行同步函数"""
-    loop = asyncio.get_event_loop()
-    return loop.run_in_executor(_executor, func, *args)
+def _get_data_fetch_slots() -> asyncio.Semaphore:
+    """Return a limiter owned by the current event loop."""
+    loop = asyncio.get_running_loop()
+    slots = getattr(loop, _DATA_FETCH_SLOTS_ATTR, None)
+    if slots is None:
+        slots = asyncio.Semaphore(DATA_FETCH_MAX_IN_FLIGHT)
+        setattr(loop, _DATA_FETCH_SLOTS_ATTR, slots)
+    return slots
+
+
+def _release_data_fetch_slot(slots: asyncio.Semaphore, future: asyncio.Future) -> None:
+    slots.release()
+    if not future.cancelled():
+        future.exception()
+
+
+def _execute_timed(func, args, requested_at, submitted_at):
+    started_at = time.perf_counter()
+    try:
+        return func(*args)
+    finally:
+        logger.debug(
+            "Data task %s admission=%.3fs queue=%.3fs service=%.3fs",
+            func.__name__,
+            submitted_at - requested_at,
+            started_at - submitted_at,
+            time.perf_counter() - started_at,
+        )
+
+
+async def _run_in_executor(func, *args):
+    """在有界线程池中运行同步函数。"""
+    requested_at = time.perf_counter()
+    slots = _get_data_fetch_slots()
+    await slots.acquire()
+    submitted_at = time.perf_counter()
+    loop = asyncio.get_running_loop()
+    try:
+        future = loop.run_in_executor(
+            _executor,
+            _execute_timed,
+            func,
+            args,
+            requested_at,
+            submitted_at,
+        )
+    except BaseException:
+        slots.release()
+        raise
+
+    # A cancelled MCP request cannot stop a synchronous network call that is
+    # already running. Keep its permit until the executor future truly ends.
+    future.add_done_callback(
+        lambda completed: _release_data_fetch_slot(slots, completed)
+    )
+    return await asyncio.shield(future)
 
 
 class CNStockDataSource(DataSource):
@@ -216,7 +281,13 @@ class CNStockDataSource(DataSource):
         return result
     
     def _fetch_kline_sync(
-        self, code: str, start_date: str, end_date: str, adjust: str = "qfq", symbol: str = None
+        self,
+        code: str,
+        start_date: str,
+        end_date: str,
+        adjust: str = "qfq",
+        symbol: str = None,
+        include_unadjusted: bool = True,
     ) -> Optional[Dict]:
         """同步获取K线数据"""
         try:
@@ -274,7 +345,7 @@ class CNStockDataSource(DataSource):
                     return None
             
             # 同时获取不复权数据用于计算
-            if fqt != 0:
+            if fqt != 0 and include_unadjusted:
                 df_unadj = None
                 if code.startswith(("1", "5")):
                     import akshare as ak
@@ -321,7 +392,14 @@ class CNStockDataSource(DataSource):
         简单获取 K 线数据（同步方法，返回简化的字典格式）
         """
         code, market = self._symbol_to_akshare(symbol)
-        kline_data = self._fetch_kline_sync(code, start_date, end_date, adjust, symbol)
+        kline_data = self._fetch_kline_sync(
+            code,
+            start_date,
+            end_date,
+            adjust,
+            symbol,
+            False,
+        )
         
         if kline_data is None:
             return None
@@ -542,17 +620,53 @@ class CNStockDataSource(DataSource):
         end_date: str,
     ) -> StockData:
         """获取股票完整数据"""
+        return await self.fetch_stock_data_with_requirements(symbol, start_date, end_date)
+
+    async def fetch_stock_data_with_requirements(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        requirements: Optional[FetchRequirements] = None,
+    ) -> StockData:
+        """按工具需求获取股票数据。"""
+        requirements = requirements or FetchRequirements()
         code, market = self._symbol_to_akshare(symbol)
         canonical_symbol = self._get_canonical_symbol(code, market)
-        
-        kline_future = _run_in_executor(self._fetch_kline_sync, code, start_date, end_date, "qfq", canonical_symbol)
-        finance_future = _run_in_executor(self._fetch_finance_sync, code, canonical_symbol)
-        fund_flow_future = _run_in_executor(self._fetch_fund_flow_sync, code, canonical_symbol)
-        realtime_future = _run_in_executor(self._fetch_realtime_sync, code, canonical_symbol)
-        
-        kline_data, finance_data, fund_flow_data, realtime_data = await asyncio.gather(
-            kline_future, finance_future, fund_flow_future, realtime_future
-        )
+
+        task_specs = [
+            (
+                "kline",
+                _run_in_executor(
+                    self._fetch_kline_sync,
+                    code,
+                    start_date,
+                    end_date,
+                    "qfq",
+                    canonical_symbol,
+                    requirements.unadjusted_kline,
+                ),
+            )
+        ]
+        if requirements.finance:
+            task_specs.append(
+                ("finance", _run_in_executor(self._fetch_finance_sync, code, canonical_symbol))
+            )
+        if requirements.fund_flow:
+            task_specs.append(
+                ("fund_flow", _run_in_executor(self._fetch_fund_flow_sync, code, canonical_symbol))
+            )
+        if requirements.realtime:
+            task_specs.append(
+                ("realtime", _run_in_executor(self._fetch_realtime_sync, code, canonical_symbol))
+            )
+
+        task_results = await asyncio.gather(*(future for _, future in task_specs))
+        fetched = dict(zip((name for name, _ in task_specs), task_results))
+        kline_data = fetched.get("kline")
+        finance_data = fetched.get("finance")
+        fund_flow_data = fetched.get("fund_flow")
+        realtime_data = fetched.get("realtime")
         
         stock_data = StockData(symbol=canonical_symbol)
         

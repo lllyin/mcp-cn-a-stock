@@ -11,6 +11,20 @@ from typing import Dict, List, Optional
 import numpy as np
 
 
+@dataclass(frozen=True)
+class FetchRequirements:
+    """Select data needed by a tool without changing the default full fetch."""
+
+    finance: bool = True
+    fund_flow: bool = True
+    realtime: bool = True
+    unadjusted_kline: bool = True
+
+    @classmethod
+    def technical(cls) -> "FetchRequirements":
+        return cls(finance=False, fund_flow=False, realtime=True, unadjusted_kline=False)
+
+
 @dataclass
 class StockData:
     """
@@ -182,11 +196,20 @@ class DataSource(ABC):
             symbol: 股票代码，格式如 "SH600000" 或 "SZ000001"
             start_date: 开始日期，格式 "YYYY-MM-DD"
             end_date: 结束日期，格式 "YYYY-MM-DD"
-            
         Returns:
             StockData 对象
         """
         pass
+
+    async def fetch_stock_data_with_requirements(
+        self,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        requirements: Optional[FetchRequirements] = None,
+    ) -> StockData:
+        """Fetch selected data, falling back to the legacy full-fetch contract."""
+        return await self.fetch_stock_data(symbol, start_date, end_date)
     
     @abstractmethod
     async def fetch_stock_list(self) -> List[Dict[str, str]]:

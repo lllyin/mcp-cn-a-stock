@@ -16,6 +16,16 @@ AKSHARE_PROXY_RETRY = int(os.getenv("AKSHARE_PROXY_RETRY", os.getenv("AKSHARE_PR
 # akshare-proxy-patch treats the third argument as retry count.
 AKSHARE_PROXY_PORT = AKSHARE_PROXY_RETRY
 
+# Synchronous AkShare/efinance calls are I/O bound. Keep the executor bounded,
+# while allowing deployments to tune it for their upstream capacity.
+DATA_FETCH_MAX_WORKERS = max(1, int(os.getenv("CN_STOCK_DATA_FETCH_MAX_WORKERS", "8")))
+# Bound submitted and running work separately from the executor's unbounded
+# internal queue. The default keeps one queued task per worker at saturation.
+DATA_FETCH_MAX_IN_FLIGHT = max(
+    1,
+    int(os.getenv("CN_STOCK_DATA_FETCH_MAX_IN_FLIGHT", "16")),
+)
+
 # --- Market Indices Configuration ---
 import json
 _CONF_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "confs"))
