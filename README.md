@@ -95,6 +95,9 @@ AKSHARE_PROXY_RETRY=30
 # 同步行情 I/O 并发，以下是默认值
 CN_STOCK_DATA_FETCH_MAX_WORKERS=8
 CN_STOCK_DATA_FETCH_MAX_IN_FLIGHT=16
+CN_STOCK_BATCH_QUERY_CONCURRENCY=2
+CN_STOCK_FINANCE_CACHE_TTL_SECONDS=21600
+CN_STOCK_FINANCE_CACHE_MAX_ENTRIES=512
 ```
 
 兼容旧变量名 `AKSHARE_PROXY_IP`、`AKSHARE_PROXY_PASSWORD` 和
@@ -102,6 +105,11 @@ CN_STOCK_DATA_FETCH_MAX_IN_FLIGHT=16
 含义明确的 `GATEWAY`、`TOKEN`、`RETRY`。
 
 Ubuntu 2 核 4G 建议先保持默认的 `8/16`。提高数值会增加上游压力，并不保证降低延迟。
+交易时段的 `brief/medium/full` 都以 Playwright 为实时资金流来源；仅同时进行中的
+同标的 Playwright 请求会合并，完成后的新请求仍会重新获取实时数据。
+成功且非空的财务摘要默认缓存 6 小时；缓存命中不会提交线程池任务。
+`brief/medium/full` 共用最多 2 个活跃批次的准入限制。财务缓存每次访问清理过期项，
+超过 512 个标的时淘汰最早缓存，避免进程长期运行时无限增长。
 参数含义和调优方法见[技术实现说明](docs/technical-details.md)。
 
 ## 启动和停止

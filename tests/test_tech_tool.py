@@ -10,6 +10,8 @@ import json
 import numpy as np
 import pytest
 
+from qtf_mcp.datasource.base import FetchRequirements
+
 app_module = importlib.import_module("qtf_mcp.mcp_app")
 
 
@@ -206,7 +208,7 @@ async def test_tech_batch_limit_adds_warning(monkeypatch):
 async def test_markdown_batch_limit_adds_warning(monkeypatch):
     seen_symbols = []
 
-    async def fake_load_raw_data(symbol, end_date=None, who=""):
+    async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
         seen_symbols.append(symbol)
         return _make_raw_data(symbol)
 
@@ -233,7 +235,7 @@ async def test_markdown_batch_limit_adds_warning(monkeypatch):
 async def test_full_enables_historical_fund_flow(monkeypatch):
     seen = {}
 
-    async def fake_load_raw_data(symbol, end_date=None, who=""):
+    async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
         return _make_raw_data(symbol)
 
     async def fake_build_trading_data(
@@ -266,7 +268,7 @@ async def test_full_enables_historical_fund_flow(monkeypatch):
 async def test_medium_keeps_historical_fund_flow_disabled(monkeypatch):
     seen = {}
 
-    async def fake_load_raw_data(symbol, end_date=None, who=""):
+    async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
         return _make_raw_data(symbol)
 
     async def fake_build_trading_data(
@@ -288,3 +290,97 @@ async def test_medium_keeps_historical_fund_flow_disabled(monkeypatch):
     assert response.errors == {}
     assert seen["include_historical_fund_flow"] is False
     assert seen["historical_fund_flow_limit"] == 15
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["brief", "medium", "full"])
+async def test_markdown_reports_preserve_all_datasource_requirements(monkeypatch, mode):
+    seen = {}
+
+    async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
+        seen["requirements"] = requirements
+        return _make_raw_data(symbol)
+
+    async def fake_build_trading_data(fp, symbol, data, **kwargs):
+        print("# trading", file=fp)
+
+    monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
+    monkeypatch.setattr(app_module.research, "build_trading_data", fake_build_trading_data)
+
+    response = await app_module.fetch_batch_reports("SZ002463", mode, "")
+
+    assert response.errors == {}
+    assert seen["requirements"] == FetchRequirements()
+
+
+@pytest.mark.asyncio
+async def test_report_modes_share_batch_concurrency_limit(monkeypatch):
+    active = 0
+    max_active = 0
+
+    async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return _make_raw_data(symbol)
+
+    async def fake_build_trading_data(fp, symbol, data, **kwargs):
+        print("# trading", file=fp)
+
+    monkeypatch.setattr(app_module, "BATCH_QUERY_CONCURRENCY", 2)
+    monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
+    monkeypatch.setattr(app_module.research, "build_trading_data", fake_build_trading_data)
+
+    responses = await asyncio.gather(
+        app_module.fetch_batch_reports("SZ000001", "brief", ""),
+        app_module.fetch_batch_reports("SZ000002", "medium", ""),
+        app_module.fetch_batch_reports("SZ000003", "full", ""),
+    )
+
+    assert max_active == 2
+    assert all(response.errors == {} for response in responses)
+
+
+@pytest.mark.asyncio
+async def test_batch_admission_queued_cancellation_does_not_leak_permit():
+    admission = app_module.BatchQueryAdmission(1)
+    await admission.acquire()
+    queued = asyncio.create_task(admission.acquire())
+    await asyncio.sleep(0)
+
+    queued.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await queued
+    admission.release()
+
+    await asyncio.wait_for(admission.acquire(), timeout=0.1)
+    assert admission.active == 1
+    assert admission.waiting == 0
+    admission.release()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_report_releases_batch_permit(monkeypatch):
+    admission = app_module.BatchQueryAdmission(1)
+    started = asyncio.Event()
+
+    async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(app_module, "_get_batch_query_admission", lambda: admission)
+    monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
+
+    request = asyncio.create_task(
+        app_module.fetch_batch_reports("SZ000001", "brief", "")
+    )
+    await started.wait()
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    assert admission.active == 0
+    await asyncio.wait_for(admission.acquire(), timeout=0.1)
+    admission.release()

@@ -1,10 +1,14 @@
 import asyncio
 import json
+import logging
 import os
 import time
 from playwright.async_api import async_playwright, Browser, BrowserContext
 
 from ..config import ALL_INDICES
+from ..observability import log_context
+
+logger = logging.getLogger("qtf_mcp")
 
 # ── 全局单例 ──────────────────────────────────────────────
 _playwright = None
@@ -14,6 +18,7 @@ _lock = asyncio.Lock()
 
 # 2C4G 建议并发数不超过 2
 SEMAPHORE = asyncio.Semaphore(2)
+_inflight: dict[str, asyncio.Task[dict]] = {}
 
 # 需要拦截的无用资源
 BLOCKED_PATTERNS = [
@@ -141,7 +146,11 @@ async def close_browser():
 
 # ── 单个 Symbol 抓取 ──────────────────────────────────────
 async def fetch_single(symbol: str, context: BrowserContext) -> dict:
-    async with SEMAPHORE:
+    wait_started_at = time.perf_counter()
+    await SEMAPHORE.acquire()
+    semaphore_wait = time.perf_counter() - wait_started_at
+    service_started_at = time.perf_counter()
+    try:
         url = get_fund_flow_url(symbol)
         if url is None:
             return {"error": "暂无实时资金流向", "url": ""}
@@ -195,6 +204,59 @@ async def fetch_single(symbol: str, context: BrowserContext) -> dict:
 
         finally:
             await page.close()  # page 用完立即释放，context/browser 保留复用
+    finally:
+        SEMAPHORE.release()
+        request_id, tool, _ = log_context()
+        logger.info(
+            "Realtime fund flow page request_id=%s tool=%s symbol=%s "
+            "semaphore_wait=%.3fs service=%.3fs",
+            request_id,
+            tool,
+            symbol,
+            semaphore_wait,
+            time.perf_counter() - service_started_at,
+        )
+
+
+async def _fetch_single_with_context(symbol: str) -> dict:
+    context = await get_context()
+    return await fetch_single(symbol, context)
+
+
+def _complete_inflight(symbol: str, task: asyncio.Task[dict]) -> None:
+    """Remove a completed shared fetch from the in-flight registry."""
+    if _inflight.get(symbol) is task:
+        _inflight.pop(symbol, None)
+    if not task.cancelled():
+        task.exception()
+
+
+async def fetch_single_shared(symbol: str) -> dict:
+    """Deduplicate only simultaneous live fetches for the same symbol."""
+    request_id, tool, _ = log_context()
+    task = _inflight.get(symbol)
+    role = "follower"
+    if task is None or task.done():
+        task = asyncio.create_task(_fetch_single_with_context(symbol))
+        _inflight[symbol] = task
+        task.add_done_callback(lambda completed, key=symbol: _complete_inflight(key, completed))
+        role = "leader"
+
+    started_at = time.perf_counter()
+    # Shield the shared fetch so an HTTP disconnect does not cancel the work;
+    # a concurrent request can still receive the same fresh result.
+    result = await asyncio.shield(task)
+    logger.info(
+        "Realtime fund flow result request_id=%s tool=%s symbol=%s "
+        "singleflight_role=%s wait=%.3fs outcome=%s",
+        request_id,
+        tool,
+        symbol,
+        role,
+        time.perf_counter() - started_at,
+        "error" if "error" in result else "success",
+    )
+    return result
 
 
 # ── 主入口 ────────────────────────────────────────────────
@@ -206,8 +268,7 @@ async def get_fund_flow(symbols: list) -> str:
     if not symbols:
         return json.dumps({}, ensure_ascii=False)
 
-    context = await get_context()
-    tasks = [fetch_single(sym, context) for sym in symbols]
+    tasks = [fetch_single_shared(sym) for sym in symbols]
     raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     results = {}
@@ -217,5 +278,4 @@ async def get_fund_flow(symbols: list) -> str:
         else:
             results[sym] = res
 
-    print(results)
     return json.dumps(results, ensure_ascii=False, indent=2)

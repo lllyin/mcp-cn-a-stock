@@ -7,6 +7,7 @@ CN Stock 数据源实现
 import asyncio
 import json
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -21,10 +22,13 @@ from ..config import (
     AKSHARE_PROXY_RETRY,
     DATA_FETCH_MAX_IN_FLIGHT,
     DATA_FETCH_MAX_WORKERS,
+    FINANCE_CACHE_MAX_ENTRIES,
+    FINANCE_CACHE_TTL_SECONDS,
     SH_INDICES,
     SZ_INDICES,
 )
 from .base import DataSource, FetchRequirements, StockData
+from ..observability import log_context
 
 logger = logging.getLogger("qtf_mcp")
 
@@ -82,6 +86,9 @@ _executor = ThreadPoolExecutor(
     thread_name_prefix="cn-stock-data",
 )
 _DATA_FETCH_SLOTS_ATTR = "_cn_stock_data_fetch_slots"
+_FINANCE_INFLIGHT_ATTR = "_cn_stock_finance_inflight"
+_finance_cache: dict[str, tuple[float, Dict]] = {}
+_finance_cache_lock = threading.Lock()
 
 
 def _get_data_fetch_slots() -> asyncio.Semaphore:
@@ -100,14 +107,58 @@ def _release_data_fetch_slot(slots: asyncio.Semaphore, future: asyncio.Future) -
         future.exception()
 
 
-def _execute_timed(func, args, requested_at, submitted_at):
+def _get_finance_inflight() -> dict[str, asyncio.Task[Optional[Dict]]]:
+    """Return the current event loop's finance singleflight registry."""
+    loop = asyncio.get_running_loop()
+    inflight = getattr(loop, _FINANCE_INFLIGHT_ATTR, None)
+    if inflight is None:
+        inflight = {}
+        setattr(loop, _FINANCE_INFLIGHT_ATTR, inflight)
+    return inflight
+
+
+def _complete_finance_inflight(
+    inflight: dict[str, asyncio.Task[Optional[Dict]]],
+    cache_key: str,
+    task: asyncio.Task[Optional[Dict]],
+) -> None:
+    if inflight.get(cache_key) is task:
+        inflight.pop(cache_key, None)
+    if not task.cancelled():
+        task.exception()
+
+
+def _prune_finance_cache(now: float, *, reserve_entry: bool = False) -> tuple[int, int]:
+    """Remove expired and oldest finance entries while holding the cache lock."""
+    expired_codes = [
+        code
+        for code, (cached_at, _) in _finance_cache.items()
+        if now - cached_at > FINANCE_CACHE_TTL_SECONDS
+    ]
+    for code in expired_codes:
+        _finance_cache.pop(code, None)
+
+    evicted = 0
+    target_size = FINANCE_CACHE_MAX_ENTRIES - 1 if reserve_entry else FINANCE_CACHE_MAX_ENTRIES
+    while len(_finance_cache) > target_size:
+        oldest_code = min(_finance_cache, key=lambda code: _finance_cache[code][0])
+        _finance_cache.pop(oldest_code, None)
+        evicted += 1
+    return len(expired_codes), evicted
+
+
+def _execute_timed(func, args, requested_at, submitted_at, request_id, tool, symbol):
     started_at = time.perf_counter()
     try:
         return func(*args)
     finally:
         logger.debug(
-            "Data task %s admission=%.3fs queue=%.3fs service=%.3fs",
+            "Data task %s request_id=%s tool=%s symbol=%s "
+            "admission=%.3fs queue=%.3fs service=%.3fs",
             func.__name__,
+            request_id,
+            tool,
+            symbol,
             submitted_at - requested_at,
             started_at - submitted_at,
             time.perf_counter() - started_at,
@@ -120,6 +171,7 @@ async def _run_in_executor(func, *args):
     slots = _get_data_fetch_slots()
     await slots.acquire()
     submitted_at = time.perf_counter()
+    request_id, tool, symbol = log_context()
     loop = asyncio.get_running_loop()
     try:
         future = loop.run_in_executor(
@@ -129,6 +181,9 @@ async def _run_in_executor(func, *args):
             args,
             requested_at,
             submitted_at,
+            request_id,
+            tool,
+            symbol,
         )
     except BaseException:
         slots.release()
@@ -453,6 +508,98 @@ class CNStockDataSource(DataSource):
         except Exception as e:
             logger.warning(f"获取财务数据失败 {code}: {e}")
             return None
+
+    async def _fetch_finance_cached(self, code: str, symbol: str) -> Optional[Dict]:
+        """Return a copied finance result without submitting cache hits to the executor."""
+        cache_key = symbol.upper()
+        now = time.monotonic()
+        if FINANCE_CACHE_TTL_SECONDS > 0:
+            with _finance_cache_lock:
+                expired, _ = _prune_finance_cache(now)
+                cached = _finance_cache.get(cache_key)
+                if cached is not None and now - cached[0] <= FINANCE_CACHE_TTL_SECONDS:
+                    cached_at, cached_result = cached
+                    result = {"finance": cached_result["finance"].copy(deep=True)}
+                else:
+                    result = None
+                cache_size = len(_finance_cache)
+            if result is not None:
+                request_id, tool, _ = log_context()
+                logger.debug(
+                    "Finance cache request_id=%s tool=%s symbol=%s "
+                    "cache=hit age=%.1fs size=%s expired=%s",
+                    request_id,
+                    tool,
+                    symbol,
+                    now - cached_at,
+                    cache_size,
+                    expired,
+                )
+                return result
+
+        request_id, tool, _ = log_context()
+        inflight = _get_finance_inflight()
+        task = inflight.get(cache_key)
+        role = "follower"
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._fetch_and_cache_finance(code, symbol, cache_key)
+            )
+            inflight[cache_key] = task
+            task.add_done_callback(
+                lambda completed, registry=inflight, key=cache_key: _complete_finance_inflight(
+                    registry,
+                    key,
+                    completed,
+                )
+            )
+            role = "leader"
+
+        wait_started_at = time.perf_counter()
+        result = await asyncio.shield(task)
+        logger.debug(
+            "Finance cache request_id=%s tool=%s symbol=%s cache=miss "
+            "singleflight_role=%s wait=%.3fs",
+            request_id,
+            tool,
+            symbol,
+            role,
+            time.perf_counter() - wait_started_at,
+        )
+        if result is None or "finance" not in result or result["finance"].empty:
+            return result
+        return {"finance": result["finance"].copy(deep=True)}
+
+    async def _fetch_and_cache_finance(
+        self,
+        code: str,
+        symbol: str,
+        cache_key: str,
+    ) -> Optional[Dict]:
+        """Fetch and publish finance data even if the original caller disconnects."""
+        result = await _run_in_executor(self._fetch_finance_sync, code, symbol)
+        if result is None or "finance" not in result or result["finance"].empty:
+            return result
+
+        if FINANCE_CACHE_TTL_SECONDS > 0:
+            with _finance_cache_lock:
+                expired, evicted = _prune_finance_cache(
+                    time.monotonic(),
+                    reserve_entry=cache_key not in _finance_cache,
+                )
+                _finance_cache[cache_key] = (
+                    time.monotonic(),
+                    {"finance": result["finance"].copy(deep=True)},
+                )
+                cache_size = len(_finance_cache)
+            if expired or evicted:
+                logger.debug(
+                    "Finance cache cleanup expired=%s evicted=%s size=%s",
+                    expired,
+                    evicted,
+                    cache_size,
+                )
+        return {"finance": result["finance"].copy(deep=True)}
     
     def _fetch_fund_flow_sync(self, code: str, symbol: str = None) -> Optional[Dict]:
         """同步获取资金流向数据"""
@@ -650,7 +797,7 @@ class CNStockDataSource(DataSource):
         ]
         if requirements.finance:
             task_specs.append(
-                ("finance", _run_in_executor(self._fetch_finance_sync, code, canonical_symbol))
+                ("finance", self._fetch_finance_cached(code, canonical_symbol))
             )
         if requirements.fund_flow:
             task_specs.append(

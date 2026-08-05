@@ -376,6 +376,12 @@ def today_volume_est_ratio(data: Dict[str, ndarray], now: int = 0) -> float:
         return 1
 
 
+def is_realtime_fund_flow_window(now: Optional[datetime.datetime] = None) -> bool:
+    """Return whether reports should use the Playwright live fund-flow source."""
+    now_time = (now or datetime.datetime.now()).time()
+    return (now_time.hour == 9 and now_time.minute >= 15) or (10 <= now_time.hour <= 16)
+
+
 FUND_FLOW_FIELDS = [
     ("主力", "A"),
     ("超大单", "XL"),
@@ -673,10 +679,8 @@ async def build_trading_data(
         print("", file=fp)
     else:
     
-        from datetime import datetime
-        now_time = datetime.now().time()
-        # 强制判定交易时间: 09:15 - 17:00 (延长至17:00以支持收盘后的即时汇总抓取)
-        is_trading = (now_time.hour == 9 and now_time.minute >= 15) or (10 <= now_time.hour <= 16)
+        # 09:15 - 17:00 uses Playwright because the AkShare fund-flow feed lags.
+        is_trading = is_realtime_fund_flow_window()
         
         if is_trading:
             # 调用无头浏览器抓取实时数据

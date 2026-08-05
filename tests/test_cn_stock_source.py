@@ -354,3 +354,164 @@ def test_small_index_fund_flow_is_enabled(monkeypatch):
     assert history is not None
     assert history["CLOSE"][0] == 1730.99
     assert history["PCT_CHG"][0] == 0.0382
+
+
+@pytest.mark.asyncio
+async def test_finance_cache_hit_bypasses_executor_and_returns_copy(monkeypatch):
+    datasource = CNStockDataSource()
+    calls = 0
+    source_module._finance_cache.clear()
+
+    async def fake_run_in_executor(func, *args):
+        nonlocal calls
+        calls += 1
+        return {"finance": pd.DataFrame([{"报告期": "2025-12-31", "净利润": "1亿"}])}
+
+    monkeypatch.setattr(source_module, "_run_in_executor", fake_run_in_executor)
+
+    first = await datasource._fetch_finance_cached("600001", "SH600001")
+    first["finance"].loc[0, "净利润"] = "已修改"
+    second = await datasource._fetch_finance_cached("600001", "SH600001")
+
+    assert calls == 1
+    assert second["finance"].loc[0, "净利润"] == "1亿"
+    assert first["finance"] is not second["finance"]
+
+
+@pytest.mark.asyncio
+async def test_finance_cold_cache_singleflight(monkeypatch):
+    datasource = CNStockDataSource()
+    calls = 0
+    release = asyncio.Event()
+    source_module._finance_cache.clear()
+
+    async def fake_run_in_executor(func, *args):
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        return {"finance": pd.DataFrame([{"净利润": "1亿"}])}
+
+    monkeypatch.setattr(source_module, "_run_in_executor", fake_run_in_executor)
+
+    first = asyncio.create_task(datasource._fetch_finance_cached("600002", "SH600002"))
+    second = asyncio.create_task(datasource._fetch_finance_cached("600002", "SH600002"))
+    await asyncio.sleep(0)
+    release.set()
+    first_result, second_result = await asyncio.gather(first, second)
+
+    assert calls == 1
+    assert first_result["finance"].equals(second_result["finance"])
+    assert first_result["finance"] is not second_result["finance"]
+
+
+@pytest.mark.asyncio
+async def test_finance_background_fetch_populates_cache_after_caller_cancellation(monkeypatch):
+    datasource = CNStockDataSource()
+    release = asyncio.Event()
+    source_module._finance_cache.clear()
+
+    async def fake_run_in_executor(func, *args):
+        await release.wait()
+        return {"finance": pd.DataFrame([{"净利润": "1亿"}])}
+
+    monkeypatch.setattr(source_module, "_run_in_executor", fake_run_in_executor)
+
+    caller = asyncio.create_task(
+        datasource._fetch_finance_cached("600004", "SH600004")
+    )
+    await asyncio.sleep(0)
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    release.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert source_module._finance_cache["SH600004"][1]["finance"].empty is False
+
+
+@pytest.mark.asyncio
+async def test_finance_cache_separates_markets_for_same_code(monkeypatch):
+    datasource = CNStockDataSource()
+    calls = []
+    source_module._finance_cache.clear()
+
+    async def fake_run_in_executor(func, code, symbol):
+        calls.append(symbol)
+        return {"finance": pd.DataFrame([{"市场": symbol[:2]}])}
+
+    monkeypatch.setattr(source_module, "_run_in_executor", fake_run_in_executor)
+
+    sh_result = await datasource._fetch_finance_cached("000001", "SH000001")
+    sz_result = await datasource._fetch_finance_cached("000001", "SZ000001")
+
+    assert calls == ["SH000001", "SZ000001"]
+    assert sh_result["finance"].loc[0, "市场"] == "SH"
+    assert sz_result["finance"].loc[0, "市场"] == "SZ"
+
+
+@pytest.mark.asyncio
+async def test_finance_cache_expiry_refetches(monkeypatch):
+    datasource = CNStockDataSource()
+    calls = 0
+    source_module._finance_cache.clear()
+    monkeypatch.setattr(source_module, "FINANCE_CACHE_TTL_SECONDS", 21600)
+    source_module._finance_cache["SH600001"] = (
+        100.0,
+        {"finance": pd.DataFrame([{"净利润": "旧值"}])},
+    )
+
+    async def fake_run_in_executor(func, *args):
+        nonlocal calls
+        calls += 1
+        return {"finance": pd.DataFrame([{"净利润": "新值"}])}
+
+    monkeypatch.setattr(source_module.time, "monotonic", lambda: 100.0 + 21601)
+    monkeypatch.setattr(source_module, "_run_in_executor", fake_run_in_executor)
+
+    result = await datasource._fetch_finance_cached("600001", "SH600001")
+
+    assert calls == 1
+    assert result["finance"].loc[0, "净利润"] == "新值"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("upstream_result", [None, {"finance": pd.DataFrame()}])
+async def test_finance_cache_does_not_store_failed_or_empty_results(monkeypatch, upstream_result):
+    datasource = CNStockDataSource()
+    source_module._finance_cache.clear()
+
+    async def fake_run_in_executor(func, *args):
+        return upstream_result
+
+    monkeypatch.setattr(source_module, "_run_in_executor", fake_run_in_executor)
+
+    await datasource._fetch_finance_cached("600001", "SH600001")
+
+    assert "SH600001" not in source_module._finance_cache
+
+
+@pytest.mark.asyncio
+async def test_finance_cache_prunes_expired_and_oldest_entries(monkeypatch):
+    datasource = CNStockDataSource()
+    source_module._finance_cache.clear()
+    monkeypatch.setattr(source_module, "FINANCE_CACHE_TTL_SECONDS", 21600)
+    monkeypatch.setattr(source_module, "FINANCE_CACHE_MAX_ENTRIES", 2)
+    monkeypatch.setattr(source_module.time, "monotonic", lambda: 30000.0)
+    source_module._finance_cache.update(
+        {
+            "expired": (1.0, {"finance": pd.DataFrame([{"值": 1}])}),
+            "older": (29000.0, {"finance": pd.DataFrame([{"值": 2}])}),
+            "newer": (29500.0, {"finance": pd.DataFrame([{"值": 3}])}),
+        }
+    )
+
+    async def fake_run_in_executor(func, *args):
+        return {"finance": pd.DataFrame([{"值": 4}])}
+
+    monkeypatch.setattr(source_module, "_run_in_executor", fake_run_in_executor)
+
+    await datasource._fetch_finance_cached("fresh", "SH600003")
+
+    assert set(source_module._finance_cache) == {"newer", "SH600003"}

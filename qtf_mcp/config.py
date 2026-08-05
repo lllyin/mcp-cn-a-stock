@@ -26,6 +26,23 @@ DATA_FETCH_MAX_IN_FLIGHT = max(
     int(os.getenv("CN_STOCK_DATA_FETCH_MAX_IN_FLIGHT", "16")),
 )
 
+# Bound concurrent report batches before they fan out into data and browser work.
+BATCH_QUERY_CONCURRENCY = max(
+    1,
+    int(os.getenv("CN_STOCK_BATCH_QUERY_CONCURRENCY", "2")),
+)
+
+# Financial abstracts normally change only after periodic reports are published.
+# Cache successful results to keep recurring batch scans off the upstream API.
+FINANCE_CACHE_TTL_SECONDS = max(
+    0.0,
+    float(os.getenv("CN_STOCK_FINANCE_CACHE_TTL_SECONDS", "21600")),
+)
+FINANCE_CACHE_MAX_ENTRIES = max(
+    1,
+    int(os.getenv("CN_STOCK_FINANCE_CACHE_MAX_ENTRIES", "512")),
+)
+
 # --- Market Indices Configuration ---
 import json
 _CONF_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "confs"))

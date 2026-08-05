@@ -96,6 +96,9 @@ AkShare 和 efinance 的主要接口是同步网络调用。服务通过进程�
 | --- | ---: | --- |
 | `CN_STOCK_DATA_FETCH_MAX_WORKERS` | 8 | 同时执行同步数据任务的线程数 |
 | `CN_STOCK_DATA_FETCH_MAX_IN_FLIGHT` | 16 | 已运行和已提交任务的总上限 |
+| `CN_STOCK_BATCH_QUERY_CONCURRENCY` | 2 | `brief/medium/full` 共享的活跃批次数上限 |
+| `CN_STOCK_FINANCE_CACHE_TTL_SECONDS` | 21600 | 成功且非空的财务摘要缓存时间 |
+| `CN_STOCK_FINANCE_CACHE_MAX_ENTRIES` | 512 | 财务缓存最大标的数，超过后淘汰最早项 |
 
 Python 的 `ThreadPoolExecutor` 内部队列没有业务级上限，因此服务在提交前使用事件循环所属的
 `asyncio.Semaphore` 做 admission control。达到上限后的请求以轻量协程等待，不会继续向线程池
@@ -104,13 +107,24 @@ Python 的 `ThreadPoolExecutor` 内部队列没有业务级上限，因此服务
 客户端取消或超时时，已经运行的同步网络调用无法被 Python 安全中断。此时 permit 会一直保留到
 底层 future 真正结束，防止调用方通过反复超时绕过并发上限。
 
-每个同步任务在 DEBUG 日志中记录：
+每个同步任务在 DEBUG 日志中记录 `request_id`、`tool`、`symbol` 和：
 
 - `admission`：等待进入有界执行器的时间。
 - `queue`：提交后在线程池队列等待的时间。
 - `service`：同步函数实际执行时间。
 
 这些指标用于区分服务端排队与上游接口耗时，不会进入 MCP 响应。
+
+财务摘要缓存会在线程池提交前检查。命中时直接返回 DataFrame 深拷贝，并记录
+`Finance cache ... cache=hit age=...`；并发冷请求通过 singleflight 合并。失败或空结果不会缓存。
+每次访问都会清理超过 TTL 的条目，达到容量上限时淘汰最早缓存；设置 TTL 为 `0` 可禁用。
+
+`brief/medium/full` 在数据任务展开前共用批量准入控制。日志分别记录 `queued`、
+`admitted`、`released` 以及 `queue/service/total`，用于判断入口排队和实际执行耗时。
+
+Playwright 实时资金流额外记录 `semaphore_wait`、`service` 和 `singleflight_role`。
+HTTP 层记录响应字节数、是否完成发送及 `client_disconnected`，
+用来区分工具计算慢与调用端先关闭连接。
 
 ### Ubuntu 2 核 4G 建议
 

@@ -1,6 +1,8 @@
+import asyncio
 import datetime
 import logging
 import time
+import uuid
 from io import StringIO
 from typing import Literal, Dict, List, Optional
 
@@ -8,13 +10,53 @@ from pydantic import BaseModel, Field
 from mcp.server.fastmcp import Context, FastMCP
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import research
 from .datasource import get_datasource
 from .datasource.base import FetchRequirements
 from .datasource.market_breadth import get_market_breadth
+from .config import BATCH_QUERY_CONCURRENCY
+from .observability import bind_log_context, http_trace_id_var
 
 logger = logging.getLogger("qtf_mcp")
+_active_report_requests = 0
+_BATCH_QUERY_ADMISSION_ATTR = "_cn_stock_batch_query_admission"
+
+
+class BatchQueryAdmission:
+    """Event-loop-owned admission control shared by all report modes."""
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self.active = 0
+        self.waiting = 0
+        self._semaphore = asyncio.Semaphore(limit)
+
+    async def acquire(self) -> float:
+        started_at = time.perf_counter()
+        self.waiting += 1
+        try:
+            await self._semaphore.acquire()
+        except BaseException:
+            self.waiting -= 1
+            raise
+        self.waiting -= 1
+        self.active += 1
+        return time.perf_counter() - started_at
+
+    def release(self) -> None:
+        self.active -= 1
+        self._semaphore.release()
+
+
+def _get_batch_query_admission() -> BatchQueryAdmission:
+    loop = asyncio.get_running_loop()
+    admission = getattr(loop, _BATCH_QUERY_ADMISSION_ATTR, None)
+    if admission is None or admission.limit != BATCH_QUERY_CONCURRENCY:
+        admission = BatchQueryAdmission(BATCH_QUERY_CONCURRENCY)
+        setattr(loop, _BATCH_QUERY_ADMISSION_ATTR, admission)
+    return admission
 
 
 # --- Output Models for MCP Inspector Schema ---
@@ -114,12 +156,23 @@ class MarketBreadthResponse(BaseModel):
 
 # -----------------------------------------------
 
+
+def _new_trace_id(ctx: Context | None) -> str:
+    """Build a process-unique trace ID even when stateless MCP IDs repeat."""
+    mcp_request_id = ctx.request_id if ctx else "direct"
+    http_trace_id = http_trace_id_var.get()
+    if http_trace_id != "-":
+        return f"{http_trace_id}-{mcp_request_id}"
+    return f"{mcp_request_id}-{uuid.uuid4().hex[:8]}"
+
+
 async def fetch_batch_reports(
     symbol_str: str,
     mode: str,
     host: str,
     date: Optional[str] = None,
     fund_flow_limit: int = 15,
+    request_id: str = "",
 ) -> BatchReportResponse:
     """批量获取并生成报告的核心驱动程序"""
     # 1. 预处理：分拆并限流（上限4个）
@@ -135,7 +188,50 @@ async def fetch_batch_reports(
     symbols_label = ",".join(raw_symbols)
     start_time = time.time()
     date_label = f", date={date}" if date else ""
-    logger.info("Starting %s query: %s%s", mode, symbols_label, date_label)
+    requirements = FetchRequirements()
+    admission = _get_batch_query_admission()
+    waiting_before = admission.waiting
+    active_before = admission.active
+    if active_before >= admission.limit:
+        logger.info(
+            "Batch query queued request_id=%s tool=%s symbols=%s "
+            "active=%s waiting=%s limit=%s",
+            request_id or "-",
+            mode,
+            symbols_label,
+            active_before,
+            waiting_before + 1,
+            admission.limit,
+        )
+    queue_seconds = await admission.acquire()
+    service_started_at = time.perf_counter()
+    logger.info(
+        "Batch query admitted request_id=%s tool=%s symbols=%s "
+        "queue=%.3fs active=%s waiting=%s limit=%s",
+        request_id or "-",
+        mode,
+        symbols_label,
+        queue_seconds,
+        admission.active,
+        admission.waiting,
+        admission.limit,
+    )
+
+    global _active_report_requests
+    _active_report_requests += 1
+    logger.info(
+        "Starting %s query request_id=%s symbols=%s%s active=%s "
+        "fetch_finance=%s fetch_fund_flow=%s fetch_realtime=%s fetch_unadjusted=%s",
+        mode,
+        request_id or "-",
+        symbols_label,
+        date_label,
+        _active_report_requests,
+        requirements.finance,
+        requirements.fund_flow,
+        requirements.realtime,
+        requirements.unadjusted_kline,
+    )
     
     # 2. 准备容器
     output = {
@@ -147,48 +243,105 @@ async def fetch_batch_reports(
     }
 
     async def process_item(symbol: str):
-        try:
-            # 并行拉取基础行情
-            raw_data = await research.load_raw_data(symbol, date, host)
-            if not raw_data:
-                err_msg = f"未找到证券代码 {symbol} 的相关行情数据。"
-                output["errors"][symbol] = err_msg
-                output["reports"][symbol] = f"Error: {err_msg}"
-                return
-
-            buf = StringIO()
-            # 根据模式按需构建
-            research.build_basic_data(buf, symbol, raw_data)
-            if mode == "full":
-                await research.build_trading_data(
-                    buf,
+        with bind_log_context(request_id=request_id or "-", tool=mode, symbol=symbol):
+            symbol_started_at = time.perf_counter()
+            try:
+                # 并行拉取基础行情
+                raw_started_at = time.perf_counter()
+                raw_data = await research.load_raw_data(
                     symbol,
-                    raw_data,
-                    include_historical_fund_flow=True,
-                    historical_fund_flow_limit=fund_flow_limit,
+                    date,
+                    host,
+                    requirements=requirements,
                 )
-            else:
-                await research.build_trading_data(buf, symbol, raw_data)
-            
-            if mode in ["medium", "full"]:
-                research.build_financial_data(buf, symbol, raw_data)
-            if mode == "full":
-                research.build_technical_data(buf, symbol, raw_data)
-            
-            output["reports"][symbol] = buf.getvalue()
-        except Exception as e:
-            err_msg = str(e)
-            output["errors"][symbol] = err_msg
-            output["reports"][symbol] = f"Error during processing: {err_msg}"
+                raw_elapsed = time.perf_counter() - raw_started_at
+                if not raw_data:
+                    err_msg = f"未找到证券代码 {symbol} 的相关行情数据。"
+                    output["errors"][symbol] = err_msg
+                    output["reports"][symbol] = f"Error: {err_msg}"
+                    return
+
+                render_started_at = time.perf_counter()
+                buf = StringIO()
+                # 根据模式按需构建
+                research.build_basic_data(buf, symbol, raw_data)
+                if mode == "full":
+                    await research.build_trading_data(
+                        buf,
+                        symbol,
+                        raw_data,
+                        include_historical_fund_flow=True,
+                        historical_fund_flow_limit=fund_flow_limit,
+                    )
+                else:
+                    await research.build_trading_data(buf, symbol, raw_data)
+
+                if mode in ["medium", "full"]:
+                    research.build_financial_data(buf, symbol, raw_data)
+                if mode == "full":
+                    research.build_technical_data(buf, symbol, raw_data)
+
+                output["reports"][symbol] = buf.getvalue()
+                logger.info(
+                    "Finished symbol request_id=%s tool=%s symbol=%s "
+                    "raw_data=%.3fs render=%.3fs total=%.3fs chars=%s",
+                    request_id or "-",
+                    mode,
+                    symbol,
+                    raw_elapsed,
+                    time.perf_counter() - render_started_at,
+                    time.perf_counter() - symbol_started_at,
+                    len(output["reports"][symbol]),
+                )
+            except Exception as e:
+                err_msg = str(e)
+                output["errors"][symbol] = err_msg
+                output["reports"][symbol] = f"Error during processing: {err_msg}"
+                logger.warning(
+                    "Failed symbol request_id=%s tool=%s symbol=%s elapsed=%.3fs error=%s",
+                    request_id or "-",
+                    mode,
+                    symbol,
+                    time.perf_counter() - symbol_started_at,
+                    err_msg,
+                )
 
     # 并发执行所有标的的任务
-    import asyncio
     try:
-        await asyncio.gather(*[process_item(s) for s in raw_symbols])
+        with bind_log_context(request_id=request_id or "-", tool=mode):
+            await asyncio.gather(*[process_item(s) for s in raw_symbols])
+        return BatchReportResponse(**output)
     finally:
         elapsed = time.time() - start_time
-        logger.info("Finished %s query: %s%s, cost %.2fs", mode, symbols_label, date_label, elapsed)
-    return BatchReportResponse(**output)
+        _active_report_requests -= 1
+        response_chars = sum(len(report) for report in output["reports"].values())
+        logger.info(
+            "Finished %s query request_id=%s symbols=%s%s cost=%.2fs "
+            "active=%s reports=%s errors=%s response_chars=%s",
+            mode,
+            request_id or "-",
+            symbols_label,
+            date_label,
+            elapsed,
+            _active_report_requests,
+            len(output["reports"]),
+            len(output["errors"]),
+            response_chars,
+        )
+        admission.release()
+        logger.info(
+            "Batch query released request_id=%s tool=%s symbols=%s "
+            "queue=%.3fs service=%.3fs total=%.3fs active=%s waiting=%s limit=%s",
+            request_id or "-",
+            mode,
+            symbols_label,
+            queue_seconds,
+            time.perf_counter() - service_started_at,
+            time.time() - start_time,
+            admission.active,
+            admission.waiting,
+            admission.limit,
+        )
 
 
 async def fetch_technical_reports(
@@ -262,7 +415,6 @@ async def fetch_technical_reports(
         except Exception as e:
             return None, (symbol, str(e))
 
-    import asyncio
     try:
         results = await asyncio.gather(*[process_item(s) for s in raw_symbols])
         for report, error in results:
@@ -277,11 +429,88 @@ async def fetch_technical_reports(
     return BatchTechnicalResponse(**output)
 
 
+class RequestLifecycleLogMiddleware:
+  """Log HTTP completion and disconnects around Streamable HTTP requests."""
+
+  def __init__(self, app: ASGIApp):
+    self.app = app
+
+  async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+    if scope["type"] != "http":
+      await self.app(scope, receive, send)
+      return
+
+    http_trace_id = uuid.uuid4().hex[:12]
+    started_at = time.perf_counter()
+    disconnected = False
+    response_started = False
+    response_finished = False
+    status_code = 0
+    response_bytes = 0
+
+    async def receive_with_disconnect_log() -> Message:
+      nonlocal disconnected
+      message = await receive()
+      if message["type"] == "http.disconnect" and not disconnected:
+        disconnected = True
+        if not response_finished:
+          logger.warning(
+            "HTTP client disconnected before response finished "
+            "http_trace_id=%s method=%s path=%s elapsed=%.3fs "
+            "response_started=%s response_bytes=%s",
+            http_trace_id,
+            scope.get("method", ""),
+            scope.get("path", ""),
+            time.perf_counter() - started_at,
+            response_started,
+            response_bytes,
+          )
+      return message
+
+    async def send_with_metrics(message: Message) -> None:
+      nonlocal response_started, response_finished, status_code, response_bytes
+      await send(message)
+      if message["type"] == "http.response.start":
+        response_started = True
+        status_code = message["status"]
+      elif message["type"] == "http.response.body":
+        response_bytes += len(message.get("body", b""))
+        if not message.get("more_body", False):
+          response_finished = True
+
+    outcome = "success"
+    try:
+      with bind_log_context(http_trace_id=http_trace_id):
+        await self.app(scope, receive_with_disconnect_log, send_with_metrics)
+      if disconnected and not response_finished:
+        outcome = "client_disconnected"
+    except BaseException:
+      outcome = "error"
+      raise
+    finally:
+      logger.info(
+        "HTTP request finished http_trace_id=%s method=%s path=%s status=%s "
+        "elapsed=%.3fs response_started=%s response_finished=%s "
+        "response_bytes=%s disconnected=%s outcome=%s",
+        http_trace_id,
+        scope.get("method", ""),
+        scope.get("path", ""),
+        status_code,
+        time.perf_counter() - started_at,
+        response_started,
+        response_finished,
+        response_bytes,
+        disconnected,
+        outcome,
+      )
+
+
 class QtfMCP(FastMCP):
 
   def streamable_http_app(self) -> Starlette:
     super_app = super().streamable_http_app()
     super_app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+    super_app.add_middleware(RequestLifecycleLogMiddleware)
     return super_app
 
 # Create an MCP server
@@ -313,7 +542,13 @@ async def brief(
     A BatchReportResponse object containing multiple reports or errors.
   """
   who = ctx.request_context.request.client.host if ctx else ""  # type: ignore
-  return await fetch_batch_reports(symbol, "brief", who, date)
+  return await fetch_batch_reports(
+    symbol,
+    "brief",
+    who,
+    date,
+    request_id=_new_trace_id(ctx),
+  )
 
 
 @mcp_app.tool()
@@ -338,7 +573,13 @@ async def medium(
     A BatchReportResponse object containing multiple reports or errors.
   """
   who = ctx.request_context.request.client.host if ctx else ""  # type: ignore
-  return await fetch_batch_reports(symbol, "medium", who, date)
+  return await fetch_batch_reports(
+    symbol,
+    "medium",
+    who,
+    date,
+    request_id=_new_trace_id(ctx),
+  )
 
 
 @mcp_app.tool()
@@ -364,7 +605,14 @@ async def full(
     A BatchReportResponse object containing multiple reports or errors.
   """
   who = ctx.request_context.request.client.host if ctx else ""  # type: ignore
-  return await fetch_batch_reports(symbol, "full", who, date, fund_flow_limit=fund_flow_limit)
+  return await fetch_batch_reports(
+    symbol,
+    "full",
+    who,
+    date,
+    fund_flow_limit=fund_flow_limit,
+    request_id=_new_trace_id(ctx),
+  )
 
 
 @mcp_app.tool()
