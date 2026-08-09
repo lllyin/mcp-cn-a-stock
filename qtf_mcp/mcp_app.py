@@ -245,6 +245,8 @@ async def fetch_batch_reports(
     async def process_item(symbol: str):
         with bind_log_context(request_id=request_id or "-", tool=mode, symbol=symbol):
             symbol_started_at = time.perf_counter()
+            # 实时资金流抓取与基础行情并行，避免浏览器排队叠加在数据拉取之后
+            prefetch = research.start_realtime_fund_flow_prefetch(symbol, date)
             try:
                 # 并行拉取基础行情
                 raw_started_at = time.perf_counter()
@@ -272,9 +274,15 @@ async def fetch_batch_reports(
                         raw_data,
                         include_historical_fund_flow=True,
                         historical_fund_flow_limit=fund_flow_limit,
+                        realtime_fund_flow=prefetch,
                     )
                 else:
-                    await research.build_trading_data(buf, symbol, raw_data)
+                    await research.build_trading_data(
+                        buf,
+                        symbol,
+                        raw_data,
+                        realtime_fund_flow=prefetch,
+                    )
 
                 if mode in ["medium", "full"]:
                     research.build_financial_data(buf, symbol, raw_data)
@@ -305,6 +313,9 @@ async def fetch_batch_reports(
                     time.perf_counter() - symbol_started_at,
                     err_msg,
                 )
+            finally:
+                if prefetch is not None:
+                    prefetch.discard()
 
     # 并发执行所有标的的任务
     try:

@@ -165,7 +165,7 @@ async def test_markdown_batch_passes_query_date_to_loader(monkeypatch):
         seen["end_date"] = end_date
         return _make_raw_data("SZ002463")
 
-    async def fake_build_trading_data(fp, symbol, data):
+    async def fake_build_trading_data(fp, symbol, data, **kwargs):
         print("# trading", file=fp)
 
     monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
@@ -212,7 +212,7 @@ async def test_markdown_batch_limit_adds_warning(monkeypatch):
         seen_symbols.append(symbol)
         return _make_raw_data(symbol)
 
-    async def fake_build_trading_data(fp, symbol, data):
+    async def fake_build_trading_data(fp, symbol, data, **kwargs):
         print("# trading", file=fp)
 
     monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
@@ -244,6 +244,7 @@ async def test_full_enables_historical_fund_flow(monkeypatch):
         data,
         include_historical_fund_flow=False,
         historical_fund_flow_limit=15,
+        **kwargs,
     ):
         seen["include_historical_fund_flow"] = include_historical_fund_flow
         seen["historical_fund_flow_limit"] = historical_fund_flow_limit
@@ -277,6 +278,7 @@ async def test_medium_keeps_historical_fund_flow_disabled(monkeypatch):
         data,
         include_historical_fund_flow=False,
         historical_fund_flow_limit=15,
+        **kwargs,
     ):
         seen["include_historical_fund_flow"] = include_historical_fund_flow
         seen["historical_fund_flow_limit"] = historical_fund_flow_limit

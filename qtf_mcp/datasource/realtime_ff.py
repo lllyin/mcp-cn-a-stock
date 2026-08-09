@@ -19,6 +19,8 @@ _lock = asyncio.Lock()
 # 2C4G 建议并发数不超过 2
 SEMAPHORE = asyncio.Semaphore(2)
 _inflight: dict[str, asyncio.Task[dict]] = {}
+_inflight_waiters: dict[str, int] = {}
+_inflight_keep_alive: dict[str, bool] = {}
 
 # 需要拦截的无用资源
 BLOCKED_PATTERNS = [
@@ -102,33 +104,58 @@ def get_fund_flow_display_name(symbol: str, parsed_name: str) -> str:
 
 
 # ── Browser 单例管理 ──────────────────────────────────────
+async def _close_started_browser(playwright, browser: Browser | None) -> None:
+    """关闭尚未发布为全局单例的浏览器资源。"""
+    if browser is not None:
+        try:
+            await browser.close()
+        except Exception:
+            logger.warning("清理未完成初始化的 Chromium 失败", exc_info=True)
+    if playwright is not None:
+        try:
+            await playwright.stop()
+        except Exception:
+            logger.warning("清理未完成初始化的 Playwright 失败", exc_info=True)
+
+
 async def get_context() -> BrowserContext:
     global _playwright, _browser, _context
     async with _lock:
         if _browser is None or not _browser.is_connected():
-            _playwright = await async_playwright().start()
-            _browser = await _playwright.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-gpu",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-extensions",
-                    "--disable-background-networking",
-                    "--disable-default-apps",
-                    "--no-first-run",
-                    "--mute-audio",
-                ],
-            )
-            _context = await _browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                java_script_enabled=True,
-                bypass_csp=True,
-            )
+            new_playwright = None
+            new_browser = None
+            try:
+                new_playwright = await async_playwright().start()
+                new_browser = await new_playwright.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--disable-gpu",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-extensions",
+                        "--disable-background-networking",
+                        "--disable-default-apps",
+                        "--no-first-run",
+                        "--mute-audio",
+                    ],
+                )
+                new_context = await new_browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                    java_script_enabled=True,
+                    bypass_csp=True,
+                )
+            except BaseException:
+                await _close_started_browser(new_playwright, new_browser)
+                raise
+
+            # 仅在完整初始化成功后发布，避免其他任务看到半初始化状态。
+            _playwright = new_playwright
+            _browser = new_browser
+            _context = new_context
         return _context
 
 
@@ -227,11 +254,17 @@ def _complete_inflight(symbol: str, task: asyncio.Task[dict]) -> None:
     """Remove a completed shared fetch from the in-flight registry."""
     if _inflight.get(symbol) is task:
         _inflight.pop(symbol, None)
+        _inflight_waiters.pop(symbol, None)
+        _inflight_keep_alive.pop(symbol, None)
     if not task.cancelled():
         task.exception()
 
 
-async def fetch_single_shared(symbol: str) -> dict:
+async def fetch_single_shared(
+    symbol: str,
+    *,
+    keep_alive_on_cancel: bool = True,
+) -> dict:
     """Deduplicate only simultaneous live fetches for the same symbol."""
     request_id, tool, _ = log_context()
     task = _inflight.get(symbol)
@@ -239,28 +272,57 @@ async def fetch_single_shared(symbol: str) -> dict:
     if task is None or task.done():
         task = asyncio.create_task(_fetch_single_with_context(symbol))
         _inflight[symbol] = task
+        _inflight_waiters[symbol] = 0
+        _inflight_keep_alive[symbol] = keep_alive_on_cancel
         task.add_done_callback(lambda completed, key=symbol: _complete_inflight(key, completed))
         role = "leader"
+    elif keep_alive_on_cancel:
+        # A normal request attaching to a prefetch promotes the shared task to
+        # the existing disconnect-safe behavior.
+        _inflight_keep_alive[symbol] = True
 
+    _inflight_waiters[symbol] = _inflight_waiters.get(symbol, 0) + 1
     started_at = time.perf_counter()
-    # Shield the shared fetch so an HTTP disconnect does not cancel the work;
-    # a concurrent request can still receive the same fresh result.
-    result = await asyncio.shield(task)
-    logger.info(
-        "Realtime fund flow result request_id=%s tool=%s symbol=%s "
-        "singleflight_role=%s wait=%.3fs outcome=%s",
-        request_id,
-        tool,
-        symbol,
-        role,
-        time.perf_counter() - started_at,
-        "error" if "error" in result else "success",
-    )
-    return result
+    try:
+        # Shield the shared fetch so cancelling one waiter never interrupts
+        # another waiter for the same symbol.
+        result = await asyncio.shield(task)
+        logger.info(
+            "Realtime fund flow result request_id=%s tool=%s symbol=%s "
+            "singleflight_role=%s wait=%.3fs outcome=%s",
+            request_id,
+            tool,
+            symbol,
+            role,
+            time.perf_counter() - started_at,
+            "error" if "error" in result else "success",
+        )
+        return result
+    finally:
+        if _inflight.get(symbol) is task:
+            remaining = max(0, _inflight_waiters.get(symbol, 1) - 1)
+            if remaining > 0:
+                _inflight_waiters[symbol] = remaining
+            else:
+                _inflight_waiters.pop(symbol, None)
+                if (
+                    not _inflight_keep_alive.get(symbol, True)
+                    and not task.done()
+                ):
+                    # Prefetch-only work has no consumer left. Remove it before
+                    # cancellation so a new request cannot attach to a task
+                    # that is already cancelling.
+                    _inflight.pop(symbol, None)
+                    _inflight_keep_alive.pop(symbol, None)
+                    task.cancel()
 
 
 # ── 主入口 ────────────────────────────────────────────────
-async def get_fund_flow(symbols: list) -> str:
+async def get_fund_flow(
+    symbols: list,
+    *,
+    keep_alive_on_cancel: bool = True,
+) -> str:
     """
     批量查询资金流向。返回 JSON 字符串以保持与测试版完全一致。
     symbols 示例: ["dpzjlx", "000333", "600900", "300750"]
@@ -268,7 +330,10 @@ async def get_fund_flow(symbols: list) -> str:
     if not symbols:
         return json.dumps({}, ensure_ascii=False)
 
-    tasks = [fetch_single_shared(sym) for sym in symbols]
+    tasks = [
+        fetch_single_shared(sym, keep_alive_on_cancel=keep_alive_on_cancel)
+        for sym in symbols
+    ]
     raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     results = {}

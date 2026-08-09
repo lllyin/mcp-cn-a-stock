@@ -4,7 +4,9 @@
 根据股票数据生成各类分析报告。
 """
 
+import asyncio
 import datetime
+from dataclasses import dataclass
 from io import StringIO
 from typing import Dict, Optional, TextIO
 
@@ -579,12 +581,58 @@ def get_realtime_fund_flow_prefix(target_code: str, data: Dict[str, ndarray]) ->
     return "今日"
 
 
+def resolve_realtime_fund_flow_target(symbol: str) -> Optional[str]:
+    """Resolve the scraping target from the symbol alone, before base data exists."""
+    return get_realtime_fund_flow_target(symbol, {})
+
+
+@dataclass
+class RealtimeFundFlowPrefetch:
+    """A live fund-flow scrape started in parallel with the base-data fetch."""
+
+    target_code: str
+    task: "asyncio.Task[str]"
+
+    def discard(self) -> None:
+        """Drop an unused prefetch without leaving an unretrieved task exception."""
+        if not self.task.done():
+            self.task.cancel()
+            return
+        if not self.task.cancelled():
+            self.task.exception()
+
+
+def start_realtime_fund_flow_prefetch(
+    symbol: str,
+    date: Optional[str] = None,
+) -> Optional[RealtimeFundFlowPrefetch]:
+    """Start the Eastmoney scrape early so it overlaps the base-data fetch.
+
+    Returns None whenever the report would not scrape at all; the decision is
+    re-made in build_trading_data, which stays authoritative.
+    """
+    if date is not None:
+        return None
+    if not is_realtime_fund_flow_window():
+        return None
+    target_code = resolve_realtime_fund_flow_target(symbol)
+    if target_code is None:
+        return None
+    return RealtimeFundFlowPrefetch(
+        target_code,
+        asyncio.create_task(
+            get_fund_flow([target_code], keep_alive_on_cancel=False)
+        ),
+    )
+
+
 async def build_trading_data(
     fp: TextIO,
     symbol: str,
     data: Dict[str, ndarray],
     include_historical_fund_flow: bool = False,
     historical_fund_flow_limit: int = 15,
+    realtime_fund_flow: Optional[RealtimeFundFlowPrefetch] = None,
 ) -> None:
     """构建交易数据部分"""
     if "CLOSE" not in data or len(data["CLOSE"]) == 0:
@@ -691,7 +739,13 @@ async def build_trading_data(
                     print("- 暂无实时资金流向", file=fp)
             else:
                 try:
-                    json_str = await get_fund_flow([target_code])
+                    if (
+                        realtime_fund_flow is not None
+                        and realtime_fund_flow.target_code == target_code
+                    ):
+                        json_str = await realtime_fund_flow.task
+                    else:
+                        json_str = await get_fund_flow([target_code])
                     results = json.loads(json_str)
                     res = results.get(target_code, {})
                     
