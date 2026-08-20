@@ -6,6 +6,8 @@
 
 import asyncio
 import datetime
+import inspect
+import logging
 import sys
 import types
 
@@ -242,3 +244,57 @@ async def test_tech_params_are_not_conflated(tmp_path, deterministic_render):
     b = await mcp_app.fetch_technical_reports("SH600000", days=60)
     assert deterministic_render["count"] == 2
     assert len(a.reports["SH600000"].indicators) != len(b.reports["SH600000"].indicators)
+
+
+# --- 命中日志 -----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["brief", "medium", "full"])
+async def test_report_cache_hit_is_logged(mode, tmp_path, caplog, deterministic_render):
+    install_cache(tmp_path)
+    await mcp_app.fetch_batch_reports("SH600000", mode, "test")
+
+    caplog.set_level(logging.INFO, logger="qtf_mcp")
+    await mcp_app.fetch_batch_reports("SH600000", mode, "test")
+
+    hits = [r for r in caplog.records if "Report cache hit" in r.getMessage()]
+    assert len(hits) == 1
+    message = hits[0].getMessage()
+    assert f"tool={mode}" in message
+    assert "symbol=SH600000" in message
+    assert "epoch=" in message
+
+
+@pytest.mark.asyncio
+async def test_tech_cache_hit_is_logged(tmp_path, caplog, deterministic_render):
+    install_cache(tmp_path)
+    await mcp_app.fetch_technical_reports("SH600000", days=30)
+
+    caplog.set_level(logging.INFO, logger="qtf_mcp")
+    await mcp_app.fetch_technical_reports("SH600000", days=30)
+
+    hits = [r for r in caplog.records if "Report cache hit" in r.getMessage()]
+    assert len(hits) == 1
+    assert "tool=tech" in hits[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_every_cached_tool_logs_its_hit():
+    """接入缓存的工具必须同时打命中日志。
+
+    否则运维只能靠翻取数日志反推缓存是否生效——压测时就踩过这个坑。
+    """
+    missing = []
+    for name in (
+        "fetch_batch_reports",
+        "fetch_technical_reports",
+        "kline_daily",
+        "kline_range",
+    ):
+        fn = getattr(mcp_app, name)
+        fn = getattr(fn, "fn", fn)  # FastMCP 会包装工具函数
+        source = inspect.getsource(fn)
+        if "report_cache.get" in source and "Report cache hit" not in source:
+            missing.append(name)
+    assert missing == [], f"以下工具接入了缓存但没有命中日志: {missing}"

@@ -429,6 +429,7 @@ async def fetch_technical_reports(
     report_cache = get_report_cache()
 
     async def process_item(symbol: str):
+        symbol_started_at = time.perf_counter()
         try:
             cache_key = build_key(
                 "tech",
@@ -446,6 +447,15 @@ async def fetch_technical_reports(
             cached = report_cache.get(cache_key)
             if cached is not None:
                 report = TechnicalReport(**cached)
+                logger.info(
+                    "Report cache hit tool=tech symbol=%s epoch=%s phase=%s "
+                    "elapsed=%.3fs indicators=%s",
+                    symbol,
+                    cache_key.epoch,
+                    cache_key.phase,
+                    time.perf_counter() - symbol_started_at,
+                    len(report.indicators),
+                )
                 return (report.symbol, report), None
 
             raw_data = await research.load_raw_data(
@@ -734,6 +744,7 @@ async def kline_daily(
   """
   datasource = get_datasource()
   report_cache = get_report_cache()
+  started_at = time.perf_counter()
   cache_key = build_key(
     "kline_daily",
     symbol,
@@ -742,6 +753,15 @@ async def kline_daily(
   )
   cached = report_cache.get(cache_key)
   if cached is not None:
+    logger.info(
+      "Report cache hit tool=kline_daily symbol=%s epoch=%s phase=%s "
+      "elapsed=%.3fs chars=%s",
+      symbol,
+      cache_key.epoch,
+      cache_key.phase,
+      time.perf_counter() - started_at,
+      len(cached),
+    )
     return cached
 
   result = await datasource.fetch_kline_simple(symbol, date, date, adjust)
@@ -798,6 +818,7 @@ async def kline_range(
   """
   datasource = get_datasource()
   report_cache = get_report_cache()
+  started_at = time.perf_counter()
   cache_key = build_key(
     "kline_range",
     symbol,
@@ -806,6 +827,15 @@ async def kline_range(
   )
   cached = report_cache.get(cache_key)
   if cached is not None:
+    logger.info(
+      "Report cache hit tool=kline_range symbol=%s epoch=%s phase=%s "
+      "elapsed=%.3fs chars=%s",
+      symbol,
+      cache_key.epoch,
+      cache_key.phase,
+      time.perf_counter() - started_at,
+      len(cached),
+    )
     return cached
 
   result = await datasource.fetch_kline_simple(symbol, start_date, end_date, adjust)

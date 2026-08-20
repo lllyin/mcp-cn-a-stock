@@ -1,6 +1,6 @@
 [project]
 name = "cn-stock-mcp"
-version = "1.1.0"
+version = "1.2.0"
 description = "A股数据 MCP 服务，支持多种数据源"
 readme = "README.md"
 requires-python = ">=3.12"

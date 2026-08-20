@@ -169,7 +169,7 @@ tail -f logs/cn-stock-mcp.log
 日志启动时会输出当前版本，例如：
 
 ```text
-cn-stock-mcp version=1.1.0
+cn-stock-mcp version=1.2.0
 ```
 
 停止服务：
