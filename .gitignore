@@ -21,3 +21,4 @@ log.txt
 
 libs
 *.pid
+.env*
