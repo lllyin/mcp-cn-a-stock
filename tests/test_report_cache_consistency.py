@@ -279,6 +279,54 @@ async def test_tech_cache_hit_is_logged(tmp_path, caplog, deterministic_render):
     assert "tool=tech" in hits[0].getMessage()
 
 
+# --- 缓存故障不得损坏响应 -----------------------------------------------
+
+
+class ExplodingCache(ReportCache):
+    """读写都抛异常的缓存，用于验证故障隔离。"""
+
+    def _get(self, key):
+        raise RuntimeError("cache read exploded")
+
+    def _put(self, key, value):
+        raise RuntimeError("cache write exploded")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["brief", "full"])
+async def test_cache_faults_do_not_damage_reports(mode, tmp_path, caplog, deterministic_render):
+    """写入发生在报告生成之后；写失败绝不能把好报告变成错误。"""
+    install_cache(tmp_path, enabled=False)
+    baseline = await mcp_app.fetch_batch_reports("SH600000", mode, "test")
+
+    cache_module.set_report_cache(
+        ExplodingCache(enabled=True, disk_enabled=False, directory=str(tmp_path / "boom"))
+    )
+    caplog.set_level(logging.WARNING, logger="qtf_mcp")
+    broken = await mcp_app.fetch_batch_reports("SH600000", mode, "test")
+
+    assert broken.errors == {}
+    assert broken.reports["SH600000"] == baseline.reports["SH600000"]
+    # 证明故障缓存确实被调用过，测试不是空过
+    faults = [r for r in caplog.records if "Report cache" in r.getMessage()]
+    assert any("read failed" in r.getMessage() or "lookup failed" in r.getMessage() for r in faults)
+    assert any("write failed" in r.getMessage() for r in faults)
+
+
+@pytest.mark.asyncio
+async def test_cache_faults_do_not_break_tech(tmp_path, deterministic_render):
+    install_cache(tmp_path, enabled=False)
+    baseline = await mcp_app.fetch_technical_reports("SH600000", days=30)
+
+    cache_module.set_report_cache(
+        ExplodingCache(enabled=True, disk_enabled=False, directory=str(tmp_path / "boom"))
+    )
+    broken = await mcp_app.fetch_technical_reports("SH600000", days=30)
+
+    assert broken.errors == {}
+    assert broken.reports["SH600000"].model_dump() == baseline.reports["SH600000"].model_dump()
+
+
 @pytest.mark.asyncio
 async def test_every_cached_tool_logs_its_hit():
     """接入缓存的工具必须同时打命中日志。

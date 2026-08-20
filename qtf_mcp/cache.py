@@ -413,6 +413,20 @@ class ReportCache:
     # -- public API ------------------------------------------------------
 
     def get(self, key: CacheKey) -> Optional[Any]:
+        """Return a cached value, or None. Never raises.
+
+        A cache fault must degrade to a miss: call sites sit inside the
+        per-symbol try blocks, so an exception here would turn a serviceable
+        request into a reported error.
+        """
+        try:
+            return self._get(key)
+        except Exception:
+            logger.warning("Report cache read failed tool=%s symbol=%s",
+                           key.tool, key.symbol, exc_info=True)
+            return None
+
+    def _get(self, key: CacheKey) -> Optional[Any]:
         if not self.enabled:
             return None
         digest = key.digest()
@@ -443,6 +457,20 @@ class ReportCache:
         return loaded[2]
 
     def put(self, key: CacheKey, value: Any) -> None:
+        """Store a value. Never raises.
+
+        Call sites store *after* the response has been rendered, and several sit
+        inside a try block that converts exceptions into a per-symbol error, so a
+        write fault here would discard a report that was already produced
+        successfully.
+        """
+        try:
+            self._put(key, value)
+        except Exception:
+            logger.warning("Report cache write failed tool=%s symbol=%s",
+                           key.tool, key.symbol, exc_info=True)
+
+    def _put(self, key: CacheKey, value: Any) -> None:
         if not self.enabled or value is None:
             return
         if key.phase == PHASE_LIVE and self.live_ttl_seconds <= 0:
