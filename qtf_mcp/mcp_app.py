@@ -190,6 +190,80 @@ async def fetch_batch_reports(
     start_time = time.time()
     date_label = f", date={date}" if date else ""
     requirements = FetchRequirements()
+    report_cache = get_report_cache()
+
+    def _probe_cache(symbol: str):
+        """Return (cache_key, cached_report, started_at). Never raises.
+
+        缓存自身故障只能降级为一次未命中，不能冒泡成整批失败。
+        """
+        started_at = time.perf_counter()
+        cache_key = None
+        try:
+            cache_key = build_key(
+                mode,
+                symbol,
+                {"date": date, "fund_flow_limit": fund_flow_limit},
+                query_date=date,
+            )
+            cached_report = report_cache.get(cache_key)
+        except Exception:
+            logger.warning(
+                "Report cache lookup failed request_id=%s tool=%s symbol=%s",
+                request_id or "-",
+                mode,
+                symbol,
+                exc_info=True,
+            )
+            cached_report = None
+        return cache_key, cached_report, started_at
+
+    def _log_cache_hit(symbol: str, cache_key, cached_report, started_at) -> None:
+        logger.info(
+            "Report cache hit request_id=%s tool=%s symbol=%s "
+            "epoch=%s phase=%s elapsed=%.3fs chars=%s",
+            request_id or "-",
+            mode,
+            symbol,
+            cache_key.epoch,
+            cache_key.phase,
+            time.perf_counter() - started_at,
+            len(cached_report),
+        )
+
+    # 整批全命中的批次不做任何上游工作，让它去排 BATCH_QUERY_CONCURRENCY 的队会把
+    # 一次 0 秒的响应压到慢批次后面——回放显示约 39% 的批次是整批全命中。
+    # 这一轮探测只用于"能否跳过准入"的判定：命中就地返回，不经历任何等待；
+    # 只要有一个标的未命中就整轮丢弃，由 process_item 在拿到准入之后重新探测。
+    # 否则盘中条目会按"排队前"的时刻判定新鲜度，实际陈旧度变成 TTL + 排队时长。
+    probes = [(s, _probe_cache(s)) for s in raw_symbols]
+
+    if raw_symbols and all(probe[1] is not None for _, probe in probes):
+        output = {
+            "symbols_count": len(raw_symbols),
+            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "reports": {s: probe[1] for s, probe in probes},
+            "errors": {},
+            "warnings": warnings,
+        }
+        with bind_log_context(request_id=request_id or "-", tool=mode):
+            for symbol, (cache_key, cached_report, started_at) in probes:
+                # 与未命中路径保持同样的关联字段，便于按 symbol 过滤日志
+                with bind_log_context(symbol=symbol):
+                    _log_cache_hit(symbol, cache_key, cached_report, started_at)
+            logger.info(
+                "Finished %s query request_id=%s symbols=%s%s cost=%.2fs "
+                "cache=all_hit admission=skipped reports=%s response_chars=%s",
+                mode,
+                request_id or "-",
+                symbols_label,
+                date_label,
+                time.time() - start_time,
+                len(output["reports"]),
+                sum(len(r) for r in output["reports"].values()),
+            )
+        return BatchReportResponse(**output)
+
     admission = _get_batch_query_admission()
     waiting_before = admission.waiting
     active_before = admission.active
@@ -243,44 +317,16 @@ async def fetch_batch_reports(
         "warnings": warnings,
     }
     # 响应外壳的 timestamp 始终重新生成，只有 reports 走缓存
-    report_cache = get_report_cache()
 
     async def process_item(symbol: str):
         with bind_log_context(request_id=request_id or "-", tool=mode, symbol=symbol):
             symbol_started_at = time.perf_counter()
-            # 缓存判定必须早于浏览器预取，否则命中仍会付出一次 Chromium 抓取。
-            # 缓存自身故障只能降级为一次未命中，不能冒泡成整批失败。
-            cache_key = None
-            try:
-                cache_key = build_key(
-                    mode,
-                    symbol,
-                    {"date": date, "fund_flow_limit": fund_flow_limit},
-                    query_date=date,
-                )
-                cached_report = report_cache.get(cache_key)
-            except Exception:
-                logger.warning(
-                    "Report cache lookup failed request_id=%s tool=%s symbol=%s",
-                    request_id or "-",
-                    mode,
-                    symbol,
-                    exc_info=True,
-                )
-                cached_report = None
+            # 拿到准入之后重新探测：命中判定必须反映真正开始干活的时刻，
+            # 否则盘中条目会带着排队时长一起变旧。命中不得再付出一次 Chromium 抓取。
+            cache_key, cached_report, probe_started_at = _probe_cache(symbol)
             if cached_report is not None:
                 output["reports"][symbol] = cached_report
-                logger.info(
-                    "Report cache hit request_id=%s tool=%s symbol=%s "
-                    "epoch=%s phase=%s elapsed=%.3fs chars=%s",
-                    request_id or "-",
-                    mode,
-                    symbol,
-                    cache_key.epoch,
-                    cache_key.phase,
-                    time.perf_counter() - symbol_started_at,
-                    len(cached_report),
-                )
+                _log_cache_hit(symbol, cache_key, cached_report, probe_started_at)
                 return
 
             # 实时资金流抓取与基础行情并行，避免浏览器排队叠加在数据拉取之后

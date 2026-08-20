@@ -164,6 +164,92 @@ async def test_partial_batch_hit_still_fetches_missing_symbol(tmp_path, determin
 
 
 @pytest.mark.asyncio
+async def test_all_hit_batch_does_not_consume_admission(tmp_path, deterministic_render):
+    """整批全命中不做任何上游工作，不应占用并发额度。
+
+    回归：缓存探测一度发生在 admission.acquire() 之后，于是一次 0 秒的响应会排在
+    慢批次后面。回放显示约 39% 的批次是整批全命中，全部白等一次队。
+    """
+    install_cache(tmp_path)
+    await mcp_app.fetch_batch_reports("SH600000", "brief", "test")
+    assert deterministic_render["count"] == 1
+
+    admission = mcp_app._get_batch_query_admission()
+    for _ in range(admission.limit):  # 占满额度，模拟慢批次正在跑
+        await admission.acquire()
+    try:
+        cached = await asyncio.wait_for(
+            mcp_app.fetch_batch_reports("SH600000", "brief", "test"), timeout=5
+        )
+    finally:
+        for _ in range(admission.limit):
+            admission.release()
+
+    assert cached.reports["SH600000"]
+    assert deterministic_render["count"] == 1, "全命中不应回源"
+
+
+@pytest.mark.asyncio
+async def test_partial_batch_hit_still_waits_for_admission(tmp_path, deterministic_render):
+    """有标的需要回源时必须照常走准入，绕开信号量会让并发上限失效。"""
+    install_cache(tmp_path)
+    await mcp_app.fetch_batch_reports("SH600000", "brief", "test")
+
+    admission = mcp_app._get_batch_query_admission()
+    for _ in range(admission.limit):
+        await admission.acquire()
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                mcp_app.fetch_batch_reports("SH600000,SH600001", "brief", "test"),
+                timeout=0.3,
+            )
+    finally:
+        for _ in range(admission.limit):
+            admission.release()
+
+
+@pytest.mark.asyncio
+async def test_partial_batch_revalidates_freshness_after_admission(
+    tmp_path, monkeypatch, deterministic_render
+):
+    """回归：拿到准入之前探到的命中，不能带着排队时长一起端出去。
+
+    盘中条目只有 TTL 这一道陈旧度约束。若在 acquire() 之前判定新鲜、排队之后才返回，
+    实际陈旧度就变成 TTL + 排队时长，把精心标定的 30 秒悄悄放大。
+    """
+    monkeypatch.setattr(
+        cache_module,
+        "market_phase",
+        lambda now=None: (cache_module.PHASE_LIVE, "live-test-epoch"),
+    )
+    clock = [1000.0]
+    monkeypatch.setattr(cache_module.time, "time", lambda: clock[0])
+
+    install_cache(tmp_path, live_ttl_seconds=30.0)
+    await mcp_app.fetch_batch_reports("SH600000", "brief", "test")
+    assert deterministic_render["count"] == 1
+
+    admission = mcp_app._get_batch_query_admission()
+    for _ in range(admission.limit):
+        await admission.acquire()
+
+    task = asyncio.create_task(
+        mcp_app.fetch_batch_reports("SH600000,SH600001", "brief", "test")
+    )
+    for _ in range(3):  # 让它完成准入前的探测并阻塞在信号量上
+        await asyncio.sleep(0)
+    clock[0] += 120  # 排队期间 TTL 过期
+    for _ in range(admission.limit):
+        admission.release()
+    await task
+
+    assert deterministic_render["count"] == 3, (
+        "SH600000 的条目已过期，必须重新回源，而不是端出排队前探到的快照"
+    )
+
+
+@pytest.mark.asyncio
 async def test_response_timestamp_is_regenerated(tmp_path, monkeypatch, deterministic_render):
     """报告正文可以复用，但响应外壳的生成时间必须是当次的。"""
     install_cache(tmp_path)

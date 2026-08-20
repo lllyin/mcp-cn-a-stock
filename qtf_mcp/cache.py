@@ -50,6 +50,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from .config import (
     REPORT_CACHE_DIR,
@@ -62,6 +63,8 @@ from .config import (
 from .version import __version__
 
 logger = logging.getLogger("qtf_mcp")
+
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 # Market phase boundaries in Asia/Shanghai wall clock. PRE_OPEN and BRANCH_FLIP
 # must stay aligned with research.is_realtime_fund_flow_window.
@@ -108,6 +111,19 @@ def _add(clock: datetime.time, delta: datetime.timedelta) -> datetime.time:
     return (datetime.datetime.combine(datetime.date(2000, 1, 1), clock) + delta).time()
 
 
+def _as_shanghai(now: Optional[datetime.datetime] = None) -> datetime.datetime:
+    """Normalize cache clock inputs to Asia/Shanghai.
+
+    Naive datetimes are the existing test/API convention and are interpreted as
+    Shanghai wall time; aware datetimes are converted explicitly so an Ubuntu
+    host configured for UTC cannot move market boundaries by eight hours.
+    """
+    current = datetime.datetime.now(SHANGHAI_TZ) if now is None else now
+    if current.tzinfo is None:
+        return current.replace(tzinfo=SHANGHAI_TZ)
+    return current.astimezone(SHANGHAI_TZ)
+
+
 def _clamp_settle(value: datetime.time) -> datetime.time:
     """Keep the settle boundary inside the range where an epoch stays coherent.
 
@@ -141,21 +157,36 @@ EVENING_SETTLE = _add(BRANCH_FLIP, BOUNDARY_BUFFER)
 
 
 def _render_fingerprint() -> str:
-    """Identify the rendering code, so a deploy cannot serve pre-deploy output.
+    """Identify the rendering inputs, so a deploy cannot serve pre-deploy output.
 
     The disk tier outlives restarts and a closed epoch runs for up to 64h, so
     without this a rendering fix shipped in the evening would stay invisible
     until the next session opened.
+
+    ``confs/indices.json`` is covered because it decides, through
+    ``config.ALL_INDICES``, whether a symbol renders down the index branch or
+    the stock branch (``research.get_realtime_fund_flow_target``). Editing it is
+    a rendering change even though no ``.py`` file moved.
     """
     parts = [__version__]
     here = os.path.dirname(os.path.abspath(__file__))
-    for name in ("research.py", "mcp_app.py", "cache.py"):
+    # (path, required): a missing source file is a broken install and should
+    # degrade to "always miss"; a missing optional config is a normal state and
+    # must hash to a stable marker, or the fingerprint would change every boot.
+    sources = [
+        (os.path.join(here, name), True)
+        for name in ("research.py", "mcp_app.py", "cache.py", "config.py")
+    ]
+    sources.append((os.path.join(here, os.pardir, "confs", "indices.json"), False))
+    for path, required in sources:
+        name = os.path.basename(path)
         try:
-            with open(os.path.join(here, name), "rb") as handle:
+            with open(path, "rb") as handle:
                 parts.append(hashlib.sha1(handle.read()).hexdigest())
         except OSError:
-            # A missing source file should degrade to "always miss", not crash.
-            parts.append(f"{name}:unreadable:{time.time()}")
+            parts.append(
+                f"{name}:unreadable:{time.time()}" if required else f"{name}:absent"
+            )
     return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
@@ -177,8 +208,9 @@ def market_phase(now: Optional[datetime.datetime] = None) -> tuple[str, str]:
     carry their own token so an entry written while a feed was still settling can
     never be served once the feed has settled.
     """
-    now = now or datetime.datetime.now()
-    day, clock = now.date(), now.time()
+    local_now = _as_shanghai(now)
+    day = local_now.date()
+    clock = local_now.replace(tzinfo=None).time()
 
     if day.weekday() >= 5 or clock < PRE_OPEN:
         return PHASE_CLOSED, f"closed-{_previous_weekday(day)}"
@@ -253,7 +285,7 @@ def build_key(
     ``query_date`` only fixes the fetch window; when it is absent the window
     comes from ``now() + 1 day``, so today's date goes in the key instead.
     """
-    now = now or datetime.datetime.now()
+    now = _as_shanghai(now)
     phase, epoch = market_phase(now)
     explicit = _parse_date(query_date)
     window = explicit.isoformat() if explicit else now.date().isoformat()

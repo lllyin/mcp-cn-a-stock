@@ -9,7 +9,18 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 import logging
+import warnings
 from importlib.metadata import PackageNotFoundError, version as package_version
+
+# stateless_http 每个请求新建一次会话，MCP SDK 不显式关闭 anyio 的内存流，靠 GC 回收，
+# 于是每个请求在 __del__ 里丢一条 ResourceWarning。实测一次 109 次调用的运行里，这些
+# 警告占了日志的一半（759/1527 行），把真正的 WARNING 淹没。只静音这一条已知噪声，
+# 其余 ResourceWarning 保持可见。
+warnings.filterwarnings(
+    "ignore",
+    message=r"Unclosed <MemoryObject(Receive|Send)Stream",
+    category=ResourceWarning,
+)
 
 logging.basicConfig(level=logging.WARN, format="%(asctime)s %(levelname)s %(message)s")
 

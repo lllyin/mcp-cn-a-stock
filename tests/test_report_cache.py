@@ -10,6 +10,7 @@ import json
 import os
 import time
 from io import StringIO
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -91,6 +92,28 @@ def test_live_and_lunch_are_different_epochs():
     _, live = market_phase(at(MONDAY, 10, 0))
     _, lunch = market_phase(at(MONDAY, 12, 0))
     assert live != lunch
+
+
+def test_aware_utc_clock_is_normalized_to_shanghai():
+    """Ubuntu hosts commonly use UTC; cache boundaries must remain China time."""
+    utc = ZoneInfo("UTC")
+    shanghai_open = datetime.datetime(2026, 8, 17, 1, 15, tzinfo=utc)
+    shanghai_before_open = datetime.datetime(2026, 8, 17, 1, 0, tzinfo=utc)
+
+    assert market_phase(shanghai_open)[0] == PHASE_LIVE  # 09:15 Shanghai
+    assert market_phase(shanghai_before_open)[0] == PHASE_CLOSED  # 09:00 Shanghai
+
+
+def test_aware_utc_clock_normalizes_cache_window_date():
+    utc = ZoneInfo("UTC")
+    key = build_key(
+        "brief",
+        "SH600000",
+        {},
+        now=datetime.datetime(2026, 8, 17, 16, 30, tzinfo=utc),
+    )
+
+    assert key.window == "2026-08-18"  # 00:30 on the next day in Shanghai
 
 
 # --- 结算缓冲可配 -------------------------------------------------------
@@ -489,23 +512,26 @@ def test_disk_sweep_retires_expired_epoch_dirs(tmp_path):
     assert not epoch_dir.exists()
 
 
-def test_disk_sweep_is_rate_limited(tmp_path):
+def test_disk_sweep_is_rate_limited(tmp_path, monkeypatch):
     """清理不能每次请求都跑：早期实现因纪元 token 交替而退化成每请求全目录扫描。"""
     directory = tmp_path / "cache"
     c = make_cache(tmp_path, disk_enabled=True, directory=str(directory))
     key = build_key("brief", "SH600000", {}, now=at(MONDAY, 18, 0))
     c.put(key, "x")
 
+    # cache_module.os 就是 os 本身，这里替换的是进程级的 os.listdir；
+    # 必须交给 monkeypatch 托管，否则用例中途抛异常会把桩留给后续用例。
     calls = []
     original = os.listdir
-    monkey = lambda p: (calls.append(p), original(p))[1]
-    cache_module.os.listdir = monkey
-    try:
-        for _ in range(20):
-            c.put(key, "x")
-            c.get(key)
-    finally:
-        cache_module.os.listdir = original
+
+    def spy(path):
+        calls.append(path)
+        return original(path)
+
+    monkeypatch.setattr(cache_module.os, "listdir", spy)
+    for _ in range(20):
+        c.put(key, "x")
+        c.get(key)
     assert calls == [], "保留期内不应重复扫描目录"
 
 
