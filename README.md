@@ -98,6 +98,14 @@ CN_STOCK_DATA_FETCH_MAX_IN_FLIGHT=16
 CN_STOCK_BATCH_QUERY_CONCURRENCY=2
 CN_STOCK_FINANCE_CACHE_TTL_SECONDS=21600
 CN_STOCK_FINANCE_CACHE_MAX_ENTRIES=512
+
+# 报告缓存，以下是默认值
+CN_STOCK_REPORT_CACHE_ENABLED=1
+CN_STOCK_REPORT_CACHE_LIVE_TTL_SECONDS=60
+CN_STOCK_REPORT_CACHE_SETTLE_HHMM=1530
+CN_STOCK_REPORT_CACHE_MAX_ENTRIES=512
+CN_STOCK_REPORT_CACHE_DISK_ENABLED=1
+CN_STOCK_REPORT_CACHE_DIR=.runtime/report-cache
 ```
 
 兼容旧变量名 `AKSHARE_PROXY_IP`、`AKSHARE_PROXY_PASSWORD` 和
@@ -111,6 +119,32 @@ Ubuntu 2 核 4G 建议先保持默认的 `8/16`。提高数值会增加上游压
 `brief/medium/full` 共用最多 2 个活跃批次的准入限制。财务缓存每次访问清理过期项，
 超过 512 个标的时淘汰最早缓存，避免进程长期运行时无限增长。
 参数含义和调优方法见[技术实现说明](docs/technical-details.md)。
+
+### 报告缓存
+
+按标的缓存已渲染的报告，用于降低代理积分消耗；命中与否不改变返回内容。
+缓存条目绑定"市场纪元"——只有在重新生成会得到同样字节的时间窗口内才会被复用：
+
+| 时段 | 复用行为 |
+|------|----------|
+| 09:15–11:30、13:00–SETTLE | 仅 `LIVE_TTL_SECONDS` 内复用，用于合并突发重复请求 |
+| 11:30–13:00 午间休市 | 纪元内完全复用 |
+| SETTLE–17:00 | 纪元内完全复用 |
+| 17:00–次日 09:15、周末 | 纪元内完全复用 |
+
+`CN_STOCK_REPORT_CACHE_ENABLED=0` 时缓存完全不参与调用链，可用于冷热对照压测。
+`CN_STOCK_REPORT_CACHE_LIVE_TTL_SECONDS=0` 则保留闭市复用、但盘中绝不复用。
+
+`CN_STOCK_REPORT_CACHE_SETTLE_HHMM` 是收盘后的结算缓冲终点，四位 HHMM。默认 `1530`：
+连续竞价 15:00 结束，但东财资金流页面要在收盘后几分钟才定稿，提前复用会把半结算的
+数字钉住整个盘后窗口。取值被夹在 `[1500, 1700]`，越界会记 WARNING 并夹到边界——早于
+15:00 会把仍在变动的盘中折进完全复用纪元，晚于 17:00 会让一个纪元横跨实时资金流的
+渲染分支翻转点（`research.is_realtime_fund_flow_window`）。
+
+磁盘层写在 `CN_STOCK_REPORT_CACHE_DIR`，用于跨重启保留闭市纪元的条目（傍晚纪元长达
+16 小时，周末达 64 小时）。进入新纪元时自动清理旧纪元目录。
+
+`market_breadth` 不走缓存：它以同花顺为主源，不消耗代理积分。
 
 ## 启动和停止
 

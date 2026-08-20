@@ -7,6 +7,22 @@ import datetime
 import numpy as np
 import pytest
 
+from qtf_mcp import cache as cache_module
+
+
+@pytest.fixture(autouse=True)
+def isolate_report_cache():
+    """默认关闭报告缓存，并隔离生产缓存目录。
+
+    缓存是一个可选层，断言"是否回源"的测试必须在关闭状态下运行；
+    需要缓存的测试自行调用 set_report_cache 覆盖。
+    """
+    cache_module.set_report_cache(
+        cache_module.ReportCache(enabled=False, disk_enabled=False)
+    )
+    yield
+    cache_module.set_report_cache(None)
+
 
 @pytest.fixture(scope="session")
 def sample_dates():

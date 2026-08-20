@@ -13,6 +13,7 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import research
+from .cache import build_key, get_report_cache, is_cacheable_report
 from .datasource import get_datasource
 from .datasource.base import FetchRequirements
 from .datasource.market_breadth import get_market_breadth
@@ -241,10 +242,47 @@ async def fetch_batch_reports(
         "errors": {},
         "warnings": warnings,
     }
+    # 响应外壳的 timestamp 始终重新生成，只有 reports 走缓存
+    report_cache = get_report_cache()
 
     async def process_item(symbol: str):
         with bind_log_context(request_id=request_id or "-", tool=mode, symbol=symbol):
             symbol_started_at = time.perf_counter()
+            # 缓存判定必须早于浏览器预取，否则命中仍会付出一次 Chromium 抓取。
+            # 缓存自身故障只能降级为一次未命中，不能冒泡成整批失败。
+            cache_key = None
+            try:
+                cache_key = build_key(
+                    mode,
+                    symbol,
+                    {"date": date, "fund_flow_limit": fund_flow_limit},
+                    query_date=date,
+                )
+                cached_report = report_cache.get(cache_key)
+            except Exception:
+                logger.warning(
+                    "Report cache lookup failed request_id=%s tool=%s symbol=%s",
+                    request_id or "-",
+                    mode,
+                    symbol,
+                    exc_info=True,
+                )
+                cached_report = None
+            if cached_report is not None:
+                output["reports"][symbol] = cached_report
+                logger.info(
+                    "Report cache hit request_id=%s tool=%s symbol=%s "
+                    "epoch=%s phase=%s elapsed=%.3fs chars=%s",
+                    request_id or "-",
+                    mode,
+                    symbol,
+                    cache_key.epoch,
+                    cache_key.phase,
+                    time.perf_counter() - symbol_started_at,
+                    len(cached_report),
+                )
+                return
+
             # 实时资金流抓取与基础行情并行，避免浏览器排队叠加在数据拉取之后
             prefetch = research.start_realtime_fund_flow_prefetch(symbol, date)
             try:
@@ -290,6 +328,8 @@ async def fetch_batch_reports(
                     research.build_technical_data(buf, symbol, raw_data)
 
                 output["reports"][symbol] = buf.getvalue()
+                if cache_key is not None and is_cacheable_report(output["reports"][symbol]):
+                    report_cache.put(cache_key, output["reports"][symbol])
                 logger.info(
                     "Finished symbol request_id=%s tool=%s symbol=%s "
                     "raw_data=%.3fs render=%.3fs total=%.3fs chars=%s",
@@ -386,9 +426,28 @@ async def fetch_technical_reports(
         "errors": {},
         "warnings": warnings,
     }
+    report_cache = get_report_cache()
 
     async def process_item(symbol: str):
         try:
+            cache_key = build_key(
+                "tech",
+                symbol,
+                {
+                    "days": days,
+                    "fields": fields,
+                    "include_derived": include_derived,
+                    "date": date,
+                },
+                query_date=date,
+            )
+            # 缓存故障（含旧版本残留的磁盘条目）只能降级为一次未命中，
+            # 不能让整批 gather 失败。
+            cached = report_cache.get(cache_key)
+            if cached is not None:
+                report = TechnicalReport(**cached)
+                return (report.symbol, report), None
+
             raw_data = await research.load_raw_data(
                 symbol,
                 date,
@@ -414,15 +473,14 @@ async def fetch_technical_reports(
                     f"未找到证券代码 {report_symbol} 的技术指标数据。",
                 )
 
-            return (
-                report_symbol,
-                TechnicalReport(
-                    symbol=report_symbol,
-                    name=str(raw_data.get("NAME", "")),
-                    quote_date=indicators[0]["date"] if indicators else None,
-                    indicators=indicators,
-                ),
-            ), None
+            report = TechnicalReport(
+                symbol=report_symbol,
+                name=str(raw_data.get("NAME", "")),
+                quote_date=indicators[0]["date"] if indicators else None,
+                indicators=indicators,
+            )
+            report_cache.put(cache_key, report.model_dump(mode="json"))
+            return (report_symbol, report), None
         except Exception as e:
             return None, (symbol, str(e))
 
@@ -675,8 +733,19 @@ async def kline_daily(
     该日期的K线数据，包含开盘价、收盘价、最高价、最低价、成交量、成交额等。
   """
   datasource = get_datasource()
+  report_cache = get_report_cache()
+  cache_key = build_key(
+    "kline_daily",
+    symbol,
+    {"date": date, "adjust": adjust},
+    query_date=date,
+  )
+  cached = report_cache.get(cache_key)
+  if cached is not None:
+    return cached
+
   result = await datasource.fetch_kline_simple(symbol, date, date, adjust)
-  
+
   if result is None or not result.get("data"):
     return f"未找到 {symbol} 在 {date} 的数据。可能是非交易日或股票代码有误。"
   
@@ -696,8 +765,10 @@ async def kline_daily(
   print(f"- 涨跌额: {data['涨跌额']:.2f}", file=buf)
   print(f"- 振幅: {data['振幅']:.2f}%", file=buf)
   print(f"- 换手率: {data['换手率']:.2f}%", file=buf)
-  
-  return buf.getvalue()
+
+  report = buf.getvalue()
+  report_cache.put(cache_key, report)
+  return report
 
 
 @mcp_app.tool()
@@ -726,8 +797,19 @@ async def kline_range(
     日期区间内的K线数据表格，包含每日的开高低收、成交量、涨跌幅等。
   """
   datasource = get_datasource()
+  report_cache = get_report_cache()
+  cache_key = build_key(
+    "kline_range",
+    symbol,
+    {"start_date": start_date, "end_date": end_date, "adjust": adjust},
+    query_date=end_date,
+  )
+  cached = report_cache.get(cache_key)
+  if cached is not None:
+    return cached
+
   result = await datasource.fetch_kline_simple(symbol, start_date, end_date, adjust)
-  
+
   if result is None or not result.get("data"):
     return f"未找到 {symbol} 在 {start_date} 至 {end_date} 期间的数据。"
   
@@ -752,8 +834,10 @@ async def kline_range(
       f"{item['涨跌幅']:.2f}% |",
       file=buf
     )
-  
-  return buf.getvalue()
+
+  report = buf.getvalue()
+  report_cache.put(cache_key, report)
+  return report
 
 
 @mcp_app.tool()
