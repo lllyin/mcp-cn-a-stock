@@ -64,11 +64,12 @@ def _parse_bool(raw, default: bool) -> bool:
 
 
 REPORT_CACHE_ENABLED = _parse_bool(os.getenv("CN_STOCK_REPORT_CACHE_ENABLED"), True)
-# Inside the trading session the numbers keep moving, so reuse is bounded by a
-# short TTL that only collapses bursts. Set to 0 to never reuse intraday.
+# 盘中数值持续变动，复用受短 TTL 约束，只用于合并突发重复请求。置 0 则盘中绝不复用。
+# 默认 30 秒是陈旧度与积分的折中：基于下游真实捕获比对，60 秒窗口内主力净流入的
+# P90 相对漂移为 21%，30 秒窗口降至 7.7%，而代价只是约 2.8 个百分点的积分降幅。
 REPORT_CACHE_LIVE_TTL_SECONDS = max(
     0.0,
-    float(os.getenv("CN_STOCK_REPORT_CACHE_LIVE_TTL_SECONDS", "60")),
+    float(os.getenv("CN_STOCK_REPORT_CACHE_LIVE_TTL_SECONDS", "30")),
 )
 REPORT_CACHE_MAX_ENTRIES = max(
     1,

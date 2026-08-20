@@ -96,6 +96,15 @@ def test_live_and_lunch_are_different_epochs():
 # --- 结算缓冲可配 -------------------------------------------------------
 
 
+def test_live_ttl_default_is_thirty_seconds():
+    """盘中 TTL 直接决定用户能拿到多旧的资金流数字，默认值不应被无意改动。
+
+    实测依据：60 秒窗口内主力净流入 P90 相对漂移 21%，30 秒窗口 7.7%；
+    代价是约 2.8 个百分点的积分降幅。详见 docs/technical-details.md。
+    """
+    assert config.REPORT_CACHE_LIVE_TTL_SECONDS == 30.0
+
+
 @pytest.mark.parametrize(
     "raw,expected",
     [

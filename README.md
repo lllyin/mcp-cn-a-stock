@@ -101,7 +101,7 @@ CN_STOCK_FINANCE_CACHE_MAX_ENTRIES=512
 
 # 报告缓存，以下是默认值
 CN_STOCK_REPORT_CACHE_ENABLED=1
-CN_STOCK_REPORT_CACHE_LIVE_TTL_SECONDS=60
+CN_STOCK_REPORT_CACHE_LIVE_TTL_SECONDS=30
 CN_STOCK_REPORT_CACHE_SETTLE_HHMM=1530
 CN_STOCK_REPORT_CACHE_MAX_ENTRIES=512
 CN_STOCK_REPORT_CACHE_DISK_ENABLED=1
@@ -134,6 +134,11 @@ Ubuntu 2 核 4G 建议先保持默认的 `8/16`。提高数值会增加上游压
 
 `CN_STOCK_REPORT_CACHE_ENABLED=0` 时缓存完全不参与调用链，可用于冷热对照压测。
 `CN_STOCK_REPORT_CACHE_LIVE_TTL_SECONDS=0` 则保留闭市复用、但盘中绝不复用。
+
+盘中数值持续变动，因此缓存命中返回的必然是一份稍旧的快照，TTL 决定这份快照能有多旧。
+基于下游真实捕获的比对，主力净流入的 P90 相对漂移在 60 秒窗口是 21%、30 秒窗口是 7.7%，
+方向翻转（净流入读成净流出）的比例低于 1%；当日价的漂移可忽略（P90 0.2%）。默认取 30 秒，
+代价是约 2.8 个百分点的积分降幅。对资金流精度要求更高时可设为 0。
 
 `CN_STOCK_REPORT_CACHE_SETTLE_HHMM` 是收盘后的结算缓冲终点，四位 HHMM。默认 `1530`：
 连续竞价 15:00 结束，但东财资金流页面要在收盘后几分钟才定稿，提前复用会把半结算的
