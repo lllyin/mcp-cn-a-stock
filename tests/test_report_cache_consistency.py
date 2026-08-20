@@ -329,20 +329,26 @@ async def test_cache_faults_do_not_break_tech(tmp_path, deterministic_render):
 
 @pytest.mark.asyncio
 async def test_every_cached_tool_logs_its_hit():
-    """接入缓存的工具必须同时打命中日志。
+    """接入缓存的工具必须同时打命中日志和未命中日志。
 
-    否则运维只能靠翻取数日志反推缓存是否生效——压测时就踩过这个坑。
+    只打命中日志会造成不对称：未命中时日志里什么都没有，运维只能靠 DEBUG 级的
+    取数记录反推——分析 19:07 那段日志时就因此把 53 次 kline 调用误判成"零调用"。
     """
+    LOG_MARKERS = {
+        "fetch_batch_reports": ("Report cache hit", "Finished symbol"),
+        "fetch_technical_reports": ("Report cache hit", "Finished tech query"),
+        "kline_daily": ("Report cache hit", "Finished kline_daily"),
+        "kline_range": ("Report cache hit", "Finished kline_range"),
+    }
     missing = []
-    for name in (
-        "fetch_batch_reports",
-        "fetch_technical_reports",
-        "kline_daily",
-        "kline_range",
-    ):
+    for name, (hit_marker, miss_marker) in LOG_MARKERS.items():
         fn = getattr(mcp_app, name)
         fn = getattr(fn, "fn", fn)  # FastMCP 会包装工具函数
         source = inspect.getsource(fn)
-        if "report_cache.get" in source and "Report cache hit" not in source:
-            missing.append(name)
-    assert missing == [], f"以下工具接入了缓存但没有命中日志: {missing}"
+        if "report_cache.get" not in source:
+            continue
+        if hit_marker not in source:
+            missing.append(f"{name}: 缺命中日志")
+        if miss_marker not in source:
+            missing.append(f"{name}: 缺未命中日志")
+    assert missing == [], f"日志缺失: {missing}"

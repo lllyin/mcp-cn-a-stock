@@ -533,7 +533,12 @@ class RequestLifecycleLogMiddleware:
       if message["type"] == "http.disconnect" and not disconnected:
         disconnected = True
         if not response_finished:
-          logger.warning(
+          # GET 是 Streamable HTTP 的 SSE 通道：它的响应永远不会正常结束，
+          # 客户端断开就是其正常终结方式。若一律告警，每个正常的客户端生命
+          # 周期都会产生一条 WARNING，真正被放弃的 POST 请求反而被淹没。
+          is_event_stream = scope.get("method") == "GET"
+          emit = logger.debug if is_event_stream else logger.warning
+          emit(
             "HTTP client disconnected before response finished "
             "http_trace_id=%s method=%s path=%s elapsed=%.3fs "
             "response_started=%s response_bytes=%s",
@@ -767,6 +772,14 @@ async def kline_daily(
   result = await datasource.fetch_kline_simple(symbol, date, date, adjust)
 
   if result is None or not result.get("data"):
+    logger.info(
+      "Finished kline_daily symbol=%s date=%s adjust=%s cache=miss "
+      "elapsed=%.3fs outcome=empty",
+      symbol,
+      date,
+      adjust,
+      time.perf_counter() - started_at,
+    )
     return f"未找到 {symbol} 在 {date} 的数据。可能是非交易日或股票代码有误。"
   
   data = result["data"][0]
@@ -788,6 +801,15 @@ async def kline_daily(
 
   report = buf.getvalue()
   report_cache.put(cache_key, report)
+  logger.info(
+    "Finished kline_daily symbol=%s date=%s adjust=%s cache=miss "
+    "elapsed=%.3fs chars=%s",
+    symbol,
+    date,
+    adjust,
+    time.perf_counter() - started_at,
+    len(report),
+  )
   return report
 
 
@@ -841,6 +863,15 @@ async def kline_range(
   result = await datasource.fetch_kline_simple(symbol, start_date, end_date, adjust)
 
   if result is None or not result.get("data"):
+    logger.info(
+      "Finished kline_range symbol=%s range=%s~%s adjust=%s cache=miss "
+      "elapsed=%.3fs outcome=empty",
+      symbol,
+      start_date,
+      end_date,
+      adjust,
+      time.perf_counter() - started_at,
+    )
     return f"未找到 {symbol} 在 {start_date} 至 {end_date} 期间的数据。"
   
   data_list = result["data"]
@@ -867,6 +898,17 @@ async def kline_range(
 
   report = buf.getvalue()
   report_cache.put(cache_key, report)
+  logger.info(
+    "Finished kline_range symbol=%s range=%s~%s adjust=%s cache=miss "
+    "elapsed=%.3fs rows=%s chars=%s",
+    symbol,
+    start_date,
+    end_date,
+    adjust,
+    time.perf_counter() - started_at,
+    len(data_list),
+    len(report),
+  )
   return report
 
 
