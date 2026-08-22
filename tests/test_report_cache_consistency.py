@@ -18,7 +18,7 @@ import qtf_mcp.mcp_app  # noqa: F401  确保子模块已加载
 from qtf_mcp import cache as cache_module
 from qtf_mcp import research
 from qtf_mcp.cache import ReportCache
-from qtf_mcp.datasource.base import StockData
+from qtf_mcp.datasource.base import FETCH_FAILURES_KEY, StockData
 
 # qtf_mcp/__init__.py 把 `mcp_app` 这个名字重绑定成了 QtfMCP 实例，
 # 因此必须从 sys.modules 取真正的模块对象。
@@ -291,6 +291,60 @@ async def test_empty_data_is_not_cached(tmp_path, monkeypatch):
     assert calls["count"] == 2, "空结果不应进入缓存"
     assert first.errors == second.errors
     cache_module.set_report_cache(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["brief", "medium", "full"])
+async def test_incomplete_source_report_is_not_cached(mode, tmp_path, monkeypatch):
+    """A partial fallback response stays usable but must be regenerated next time."""
+    calls = {"count": 0}
+    raw = build_raw_data()
+
+    async def incomplete_load(symbol, end_date=None, who="", requirements=None):
+        calls["count"] += 1
+        return dict(raw)
+
+    monkeypatch.setattr(research, "load_raw_data", incomplete_load)
+    monkeypatch.setattr(research, "is_realtime_fund_flow_window", lambda now=None: False)
+    monkeypatch.setattr(
+        research, "start_realtime_fund_flow_prefetch", lambda symbol, date=None: None
+    )
+
+    install_cache(tmp_path, enabled=False)
+    baseline = await mcp_app.fetch_batch_reports("SH600000", mode, "test")
+
+    raw[FETCH_FAILURES_KEY] = ["finance"]
+    cache = install_cache(tmp_path)
+
+    first = await mcp_app.fetch_batch_reports("SH600000", mode, "test")
+    second = await mcp_app.fetch_batch_reports("SH600000", mode, "test")
+
+    assert first.reports == baseline.reports
+    assert first.reports == second.reports
+    assert first.errors == second.errors == {}
+    assert calls["count"] == 3
+    assert cache.stores == 0
+
+
+@pytest.mark.asyncio
+async def test_incomplete_tech_report_is_not_cached(tmp_path, monkeypatch):
+    calls = {"count": 0}
+    raw = build_raw_data()
+    raw[FETCH_FAILURES_KEY] = ["realtime"]
+
+    async def incomplete_load(symbol, end_date=None, who="", requirements=None):
+        calls["count"] += 1
+        return dict(raw)
+
+    monkeypatch.setattr(research, "load_raw_data", incomplete_load)
+    cache = install_cache(tmp_path)
+
+    first = await mcp_app.fetch_technical_reports("SH600000", days=30)
+    second = await mcp_app.fetch_technical_reports("SH600000", days=30)
+
+    assert first.reports["SH600000"] == second.reports["SH600000"]
+    assert calls["count"] == 2
+    assert cache.stores == 0
 
 
 @pytest.mark.asyncio

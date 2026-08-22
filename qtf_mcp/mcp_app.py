@@ -15,7 +15,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from . import research
 from .cache import build_key, get_report_cache, is_cacheable_report
 from .datasource import get_datasource
-from .datasource.base import FetchRequirements
+from .datasource.base import FETCH_FAILURES_KEY, FetchRequirements
 from .datasource.market_breadth import get_market_breadth
 from .config import BATCH_QUERY_CONCURRENCY
 from .observability import bind_log_context, http_trace_id_var
@@ -374,8 +374,22 @@ async def fetch_batch_reports(
                     research.build_technical_data(buf, symbol, raw_data)
 
                 output["reports"][symbol] = buf.getvalue()
-                if cache_key is not None and is_cacheable_report(output["reports"][symbol]):
+                fetch_failures = tuple(raw_data.get(FETCH_FAILURES_KEY, ()))
+                if (
+                    cache_key is not None
+                    and not fetch_failures
+                    and is_cacheable_report(output["reports"][symbol])
+                ):
                     report_cache.put(cache_key, output["reports"][symbol])
+                elif fetch_failures:
+                    logger.info(
+                        "Report cache skipped request_id=%s tool=%s symbol=%s "
+                        "incomplete_sources=%s",
+                        request_id or "-",
+                        mode,
+                        symbol,
+                        ",".join(fetch_failures),
+                    )
                 logger.info(
                     "Finished symbol request_id=%s tool=%s symbol=%s "
                     "raw_data=%.3fs render=%.3fs total=%.3fs chars=%s",
@@ -535,7 +549,15 @@ async def fetch_technical_reports(
                 quote_date=indicators[0]["date"] if indicators else None,
                 indicators=indicators,
             )
-            report_cache.put(cache_key, report.model_dump(mode="json"))
+            fetch_failures = tuple(raw_data.get(FETCH_FAILURES_KEY, ()))
+            if not fetch_failures:
+                report_cache.put(cache_key, report.model_dump(mode="json"))
+            else:
+                logger.info(
+                    "Report cache skipped tool=tech symbol=%s incomplete_sources=%s",
+                    symbol,
+                    ",".join(fetch_failures),
+                )
             return (report_symbol, report), None
         except Exception as e:
             return None, (symbol, str(e))

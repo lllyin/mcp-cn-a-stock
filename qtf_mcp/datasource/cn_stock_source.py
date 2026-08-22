@@ -32,6 +32,13 @@ from ..observability import log_context
 
 logger = logging.getLogger("qtf_mcp")
 
+_FETCH_FAILURE_MARKER = "_fetch_failure"
+
+
+def _fetch_failure(source: str) -> Dict[str, str]:
+    """Return an internal sentinel for a source that failed or was unavailable."""
+    return {_FETCH_FAILURE_MARKER: source}
+
 
 def check_is_index(symbol: str, name: str) -> bool:
     """判定是否为指数的辅助函数"""
@@ -503,11 +510,11 @@ class CNStockDataSource(DataSource):
             import akshare as ak
             df = ak.stock_financial_abstract_ths(symbol=code)
             if df is None or df.empty:
-                return None
+                return _fetch_failure("finance")
             return {"finance": df}
         except Exception as e:
             logger.warning(f"获取财务数据失败 {code}: {e}")
-            return None
+            return _fetch_failure("finance")
 
     async def _fetch_finance_cached(self, code: str, symbol: str) -> Optional[Dict]:
         """Return a copied finance result without submitting cache hits to the executor."""
@@ -620,11 +627,11 @@ class CNStockDataSource(DataSource):
                 df = ak.stock_individual_fund_flow(stock=code, market=exchange)
             
             if df is None or df.empty:
-                return None
+                return _fetch_failure("fund_flow")
             return {"fund_flow": df, "is_market": is_market}
         except Exception as e:
             logger.warning(f"获取资金流向数据失败 {code}: {e}")
-            return None
+            return _fetch_failure("fund_flow")
 
     def _build_fund_flow_history(self, df, symbol: str, is_market: bool) -> Optional[Dict[str, np.ndarray]]:
         """Convert AkShare fund-flow rows to the internal report dataset."""
@@ -706,7 +713,7 @@ class CNStockDataSource(DataSource):
                         "动态市盈率": 0.0,
                     }
                     return {"info": info}
-                return None
+                return _fetch_failure("realtime")
             from ..symbols import get_symbol_name
             symbol_name = get_symbol_name(symbol) if symbol else ""
             is_index = check_is_index(symbol, symbol_name)
@@ -727,7 +734,7 @@ class CNStockDataSource(DataSource):
                         "动态市盈率": 0.0,
                     }
                     return {"info": info}
-                return None
+                return _fetch_failure("realtime")
             
             info = {
                 "股票简称": info_series.get("股票名称", ""),
@@ -747,7 +754,7 @@ class CNStockDataSource(DataSource):
             return {"info": info}
         except Exception as e:
             logger.warning(f"获取实时数据失败 {code}: {e}")
-            return None
+            return _fetch_failure("realtime")
     
     def _fetch_sector_sync(self, code: str) -> List[str]:
         """同步获取所属板块"""
@@ -816,6 +823,11 @@ class CNStockDataSource(DataSource):
         realtime_data = fetched.get("realtime")
         
         stock_data = StockData(symbol=canonical_symbol)
+        stock_data.fetch_failures = [
+            str(result[_FETCH_FAILURE_MARKER])
+            for result in fetched.values()
+            if isinstance(result, dict) and _FETCH_FAILURE_MARKER in result
+        ]
         
         if realtime_data and "info" in realtime_data:
             info = realtime_data["info"]
@@ -883,6 +895,7 @@ class CNStockDataSource(DataSource):
                         stock_data.net_profit = self._parse_numeric_column(df["净利润"])
                 except Exception as e:
                     logger.warning(f"处理财务数据失败: {e}")
+                    stock_data.fetch_failures.append("finance")
         
         if fund_flow_data and "fund_flow" in fund_flow_data:
             df = fund_flow_data["fund_flow"]
@@ -892,6 +905,8 @@ class CNStockDataSource(DataSource):
                     stock_data.fund_flow_history = self._build_fund_flow_history(
                         df, canonical_symbol, stock_data.is_market
                     )
+                    if stock_data.fund_flow_history is None:
+                        stock_data.fetch_failures.append("fund_flow")
                     latest = df.iloc[-1] if len(df) > 0 else None
                     if latest is not None:
                         # 字段映射表：(DataFrame字段名, StockData属性名, 是否为占比)
@@ -915,6 +930,9 @@ class CNStockDataSource(DataSource):
                                 setattr(stock_data, attr, np.array([val], dtype=np.float64))
                 except Exception as e:
                     logger.warning(f"处理资金流向数据失败: {e}")
+                    stock_data.fetch_failures.append("fund_flow")
+
+        stock_data.fetch_failures = list(dict.fromkeys(stock_data.fetch_failures))
         
         return stock_data
     

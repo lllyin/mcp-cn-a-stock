@@ -208,6 +208,55 @@ async def test_default_requirements_keep_complete_fetch_plan(monkeypatch):
     assert ("kline", True) in calls
 
 
+@pytest.mark.asyncio
+async def test_source_failure_is_propagated_for_cache_safety(monkeypatch):
+    datasource = CNStockDataSource()
+
+    def fake_kline(code, start_date, end_date, adjust, symbol, include_unadjusted):
+        frame = _sample_kline_frame()
+        return {"adjusted": frame, "unadj": frame, "adjust_type": adjust}
+
+    monkeypatch.setattr(datasource, "_fetch_kline_sync", fake_kline)
+    monkeypatch.setattr(
+        datasource,
+        "_fetch_finance_sync",
+        lambda code, symbol: source_module._fetch_failure("finance"),
+    )
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_sync", lambda code, symbol: None)
+    monkeypatch.setattr(
+        datasource,
+        "_fetch_realtime_sync",
+        lambda code, symbol: {"info": {"股票简称": "测试股票", "最新价": 10.2}},
+    )
+
+    result = await datasource.fetch_stock_data("SH600123", "2024-01-01", "2026-06-17")
+
+    assert result.fetch_failures == ["finance"]
+    assert result.to_dict()["_DS_FETCH_FAILURES"] == ["finance"]
+
+
+@pytest.mark.asyncio
+async def test_etf_unsupported_finance_is_not_a_fetch_failure(monkeypatch):
+    datasource = CNStockDataSource()
+
+    def fake_kline(code, start_date, end_date, adjust, symbol, include_unadjusted):
+        frame = _sample_kline_frame()
+        return {"adjusted": frame, "unadj": frame, "adjust_type": adjust}
+
+    monkeypatch.setattr(datasource, "_fetch_kline_sync", fake_kline)
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_sync", lambda code, symbol: None)
+    monkeypatch.setattr(
+        datasource,
+        "_fetch_realtime_sync",
+        lambda code, symbol: {"info": {"股票简称": "ETF", "最新价": 1.2}},
+    )
+
+    result = await datasource.fetch_stock_data("SZ159326", "2024-01-01", "2026-06-17")
+
+    assert result.fetch_failures == []
+    assert "_DS_FETCH_FAILURES" not in result.to_dict()
+
+
 def test_simple_kline_skips_unadjusted_copy(monkeypatch):
     datasource = CNStockDataSource()
     seen = {}

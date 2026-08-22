@@ -11,6 +11,9 @@ from typing import Dict, List, Optional
 import numpy as np
 
 
+FETCH_FAILURES_KEY = "_DS_FETCH_FAILURES"
+
+
 @dataclass(frozen=True)
 class FetchRequirements:
     """Select data needed by a tool without changing the default full fetch."""
@@ -86,6 +89,9 @@ class StockData:
     
     # 是否为市场大盘数据（用于区分资金流向）
     is_market: bool = False
+
+    # 取数层已降级返回的数据源；只用于阻止残缺报告进入跨请求缓存。
+    fetch_failures: List[str] = field(default_factory=list)
     
     def to_dict(self) -> Dict[str, np.ndarray]:
         """
@@ -161,6 +167,8 @@ class StockData:
             )  # type: ignore
         if self.fund_flow_history:
             result["_DS_FUND_FLOW"] = self.fund_flow_history  # type: ignore
+        if self.fetch_failures:
+            result[FETCH_FAILURES_KEY] = list(self.fetch_failures)  # type: ignore
         
         return result
     
