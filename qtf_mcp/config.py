@@ -9,7 +9,18 @@ from dotenv import load_dotenv
 # Load environment variables from .env file if it exists
 load_dotenv()
 
+_FALSEY = {"0", "false", "no", "off", "disabled", "none", ""}
+
+
+def _parse_bool(raw, default: bool) -> bool:
+    """Parse common operator spellings for an environment switch."""
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in _FALSEY
+
+
 # AkShare Proxy Patch Configuration
+AKSHARE_PROXY_ENABLED = _parse_bool(os.getenv("AKSHARE_PROXY_ENABLED"), True)
 AKSHARE_PROXY_IP = os.getenv("AKSHARE_PROXY_GATEWAY") or os.getenv("AKSHARE_PROXY_IP")
 AKSHARE_PROXY_PASSWORD = os.getenv("AKSHARE_PROXY_TOKEN") or os.getenv("AKSHARE_PROXY_PASSWORD")
 AKSHARE_PROXY_RETRY = int(os.getenv("AKSHARE_PROXY_RETRY", os.getenv("AKSHARE_PROXY_PORT", "30")))
@@ -48,21 +59,6 @@ FINANCE_CACHE_MAX_ENTRIES = max(
 # A rendered report is reusable only inside the market epoch that produced it,
 # so the cache never changes what a tool would return. Disabling the master
 # switch removes the cache from the call path entirely.
-_FALSEY = {"0", "false", "no", "off", "disabled", "none", ""}
-
-
-def _parse_bool(raw, default: bool) -> bool:
-    """Treat the usual spellings of "off" as off.
-
-    This is the emergency switch for a cache that can serve an unchanged report
-    for many hours, so an operator typing ``off`` or ``FALSE`` must not silently
-    get the opposite of what they intended.
-    """
-    if raw is None:
-        return default
-    return str(raw).strip().lower() not in _FALSEY
-
-
 REPORT_CACHE_ENABLED = _parse_bool(os.getenv("CN_STOCK_REPORT_CACHE_ENABLED"), True)
 # 盘中数值持续变动，复用受短 TTL 约束，只用于合并突发重复请求。置 0 则盘中绝不复用。
 # 默认 30 秒是陈旧度与积分的折中：基于下游真实捕获比对，60 秒窗口内主力净流入的

@@ -22,3 +22,4 @@ log.txt
 libs
 *.pid
 .env*
+!.env.example

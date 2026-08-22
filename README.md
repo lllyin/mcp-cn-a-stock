@@ -84,10 +84,17 @@ playwright install --with-deps chromium
 
 ## 配置
 
-在项目根目录创建 `.env`：
+复制示例配置后按需修改：
+
+```bash
+cp .env.example .env
+```
+
+主要配置如下：
 
 ```env
 # AkShare Proxy Patch，可选但推荐
+AKSHARE_PROXY_ENABLED=1
 AKSHARE_PROXY_GATEWAY=你的代理网关
 AKSHARE_PROXY_TOKEN=你的访问令牌
 AKSHARE_PROXY_RETRY=30
@@ -111,6 +118,8 @@ CN_STOCK_REPORT_CACHE_DIR=.runtime/report-cache
 兼容旧变量名 `AKSHARE_PROXY_IP`、`AKSHARE_PROXY_PASSWORD` 和
 `AKSHARE_PROXY_PORT`。其中 `PORT` 历史上表示重试次数，不是网络端口；新部署建议使用
 含义明确的 `GATEWAY`、`TOKEN`、`RETRY`。
+设置 `AKSHARE_PROXY_ENABLED=0` 后不会导入或安装代理插件，所有 AkShare 请求直接访问上游；
+修改后需要重启 MCP 服务。
 
 Ubuntu 2 核 4G 建议先保持默认的 `8/16`。提高数值会增加上游压力，并不保证降低延迟。
 交易时段的 `brief/medium/full` 都以 Playwright 为实时资金流来源；仅同时进行中的
