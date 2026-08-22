@@ -1,6 +1,4 @@
-"""
-AkShare 数据源单元测试
-"""
+"""CN Stock 数据源基础单元测试。"""
 
 import datetime
 
@@ -8,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from qtf_mcp.datasource.akshare_source import AkShareDataSource
+from qtf_mcp.datasource.cn_stock_source import CNStockDataSource
 
 
 class TestSymbolConversion:
@@ -16,7 +14,7 @@ class TestSymbolConversion:
 
     @pytest.fixture
     def datasource(self):
-        return AkShareDataSource()
+        return CNStockDataSource()
 
     def test_sh_to_akshare(self, datasource):
         """上海股票代码转换"""
@@ -82,7 +80,7 @@ class TestDateToNs:
 
     @pytest.fixture
     def datasource(self):
-        return AkShareDataSource()
+        return CNStockDataSource()
 
     def test_string_date(self, datasource):
         """字符串日期"""
@@ -124,7 +122,7 @@ class TestParseNumericColumn:
 
     @pytest.fixture
     def datasource(self):
-        return AkShareDataSource()
+        return CNStockDataSource()
 
     def test_plain_numbers(self, datasource):
         """普通数字"""
@@ -148,7 +146,7 @@ class TestParseNumericColumn:
         """百分比格式"""
         series = pd.Series(["24.00%", "15.50%", "-5.25%"])
         result = datasource._parse_numeric_column(series, is_percent=True)
-        np.testing.assert_array_almost_equal(result, [24.0, 15.5, -5.25])
+        np.testing.assert_array_almost_equal(result, [0.24, 0.155, -0.0525])
 
     def test_wan_unit(self, datasource):
         """万单位"""
@@ -203,6 +201,5 @@ class TestDataSourceName:
     """测试数据源名称"""
 
     def test_name(self):
-        ds = AkShareDataSource()
-        assert ds.name == "AkShare"
-
+        ds = CNStockDataSource()
+        assert ds.name == "CNStock"
