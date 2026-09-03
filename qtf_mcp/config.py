@@ -64,6 +64,26 @@ HTTP_IMPERSONATE_COOLDOWN = max(
 )
 
 
+# --- Upstream source breaker (qtf_mcp/datasource/cn_stock_source.py) ---
+# Eastmoney rate-limits per endpoint: on 2026-09-03 the K-line and fund-flow
+# endpoints on push2his refused this egress IP for over half an hour while the
+# host's other paths stayed reachable. Every request then burned the full
+# provider chain -- efinance retries, three impersonated attempts, AkShare
+# retries -- before reaching the Tencent fallback that served it in ~0.2s.
+# Skipping a source that is provably refusing saves 1.5-3.7s per request.
+SOURCE_BREAKER_ENABLED = _parse_bool(os.getenv("CN_STOCK_SOURCE_BREAKER_ENABLED"), True)
+# Consecutive failures before a source is skipped. Historical baseline is a
+# scattered ~1.5% failure rate, so three in a row is 0.003% by chance; a real
+# block produced 111 consecutive failures.
+SOURCE_BREAKER_THRESHOLD = max(1, int(os.getenv("CN_STOCK_SOURCE_BREAKER_THRESHOLD", "3")))
+# Cooldown before one request is allowed through to probe. Half-open probing
+# means this value only bounds recovery latency, not the cost of staying open.
+SOURCE_BREAKER_COOLDOWN_SECONDS = max(
+    1.0,
+    float(os.getenv("CN_STOCK_SOURCE_BREAKER_COOLDOWN_SECONDS", "120")),
+)
+
+
 class HttpModeError(ValueError):
     """Raised when an explicitly requested channel mode cannot be honoured."""
 

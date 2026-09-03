@@ -112,7 +112,7 @@ async def test_technical_requirements_skip_unused_sources(monkeypatch):
     datasource = CNStockDataSource()
     calls = []
 
-    def fake_kline(code, start_date, end_date, adjust, symbol, include_unadjusted):
+    def fake_kline(code, start_date, end_date, adjust, symbol, include_unadjusted, *args):
         calls.append(("kline", include_unadjusted))
         frame = _sample_kline_frame()
         return {"adjusted": frame, "unadj": frame, "adjust_type": adjust}
@@ -176,7 +176,7 @@ async def test_default_requirements_keep_complete_fetch_plan(monkeypatch):
     datasource = CNStockDataSource()
     calls = []
 
-    def fake_kline(code, start_date, end_date, adjust, symbol, include_unadjusted):
+    def fake_kline(code, start_date, end_date, adjust, symbol, include_unadjusted, *args):
         calls.append(("kline", include_unadjusted))
         frame = _sample_kline_frame()
         return {"adjusted": frame, "unadj": frame, "adjust_type": adjust}
@@ -213,7 +213,7 @@ async def test_default_requirements_keep_complete_fetch_plan(monkeypatch):
 async def test_source_failure_is_propagated_for_cache_safety(monkeypatch):
     datasource = CNStockDataSource()
 
-    def fake_kline(code, start_date, end_date, adjust, symbol, include_unadjusted):
+    def fake_kline(code, start_date, end_date, adjust, symbol, include_unadjusted, *args):
         frame = _sample_kline_frame()
         return {"adjusted": frame, "unadj": frame, "adjust_type": adjust}
 
@@ -240,7 +240,7 @@ async def test_source_failure_is_propagated_for_cache_safety(monkeypatch):
 async def test_etf_unsupported_finance_is_not_a_fetch_failure(monkeypatch):
     datasource = CNStockDataSource()
 
-    def fake_kline(code, start_date, end_date, adjust, symbol, include_unadjusted):
+    def fake_kline(code, start_date, end_date, adjust, symbol, include_unadjusted, *args):
         frame = _sample_kline_frame()
         return {"adjusted": frame, "unadj": frame, "adjust_type": adjust}
 
@@ -262,7 +262,7 @@ def test_simple_kline_skips_unadjusted_copy(monkeypatch):
     datasource = CNStockDataSource()
     seen = {}
 
-    def fake_kline(code, start_date, end_date, adjust, symbol, include_unadjusted):
+    def fake_kline(code, start_date, end_date, adjust, symbol, include_unadjusted, *args):
         seen["include_unadjusted"] = include_unadjusted
         frame = _sample_kline_frame()
         return {"adjusted": frame, "unadj": frame, "adjust_type": adjust}
@@ -287,7 +287,7 @@ def test_simple_kline_uses_tencent_fallback_after_provider_failure(monkeypatch):
     monkeypatch.setattr(
         datasource,
         "_fetch_tencent_kline_sync",
-        lambda code, start_date, end_date, adjust, symbol: _sample_kline_frame(),
+        lambda code, start_date, end_date, adjust, symbol, *args: _sample_kline_frame(),
     )
 
     result = datasource.fetch_kline_simple_sync(
@@ -642,7 +642,7 @@ def _tencent_frame(volume, amount=841972900.0, close=9.27, rows=3):
 
 def test_tencent_volume_in_shares_is_converted_to_lots():
     """sh600000 实测：volume 89,817,200 与 成交额/收盘价 同量级，即单位是股。"""
-    frame = source_module._normalize_tencent_volume(
+    frame = source_module._normalize_volume_to_lots(
         _tencent_frame(89817200.0), "600000"
     )
 
@@ -651,7 +651,7 @@ def test_tencent_volume_in_shares_is_converted_to_lots():
 
 def test_tencent_volume_already_in_lots_is_left_alone():
     """sz000333 实测：volume 148,596 约为 成交额/收盘价 的百分之一，已是手。"""
-    frame = source_module._normalize_tencent_volume(
+    frame = source_module._normalize_volume_to_lots(
         _tencent_frame(148596.0, amount=1302253100.0, close=87.25), "000333"
     )
 
@@ -661,7 +661,7 @@ def test_tencent_volume_already_in_lots_is_left_alone():
 def test_tencent_volume_decision_survives_close_vwap_gap():
     """用收盘价代替 VWAP 的误差远小于 100 倍的判定间隔。"""
     for close_bias in (0.9, 1.1):
-        frame = source_module._normalize_tencent_volume(
+        frame = source_module._normalize_volume_to_lots(
             _tencent_frame(89817200.0, close=9.27 * close_bias), "600000"
         )
         assert frame["成交量"].iloc[0] == pytest.approx(898172.0)
@@ -675,7 +675,7 @@ def test_tencent_volume_ignores_rows_without_turnover():
     frame.loc[0, ["成交量", "成交额"]] = 0.0
     frame.loc[1, "成交额"] = 0.0
 
-    result = source_module._normalize_tencent_volume(frame, "600000")
+    result = source_module._normalize_volume_to_lots(frame, "600000")
 
     assert result["成交量"].iloc[2] == pytest.approx(898172.0)
     assert result["成交量"].iloc[0] == pytest.approx(0.0)
@@ -684,7 +684,7 @@ def test_tencent_volume_ignores_rows_without_turnover():
 def test_tencent_volume_untouched_when_nothing_traded():
     frame = _tencent_frame(0.0, amount=0.0)
 
-    result = source_module._normalize_tencent_volume(frame, "600000")
+    result = source_module._normalize_volume_to_lots(frame, "600000")
 
     assert result["成交量"].tolist() == [0.0, 0.0, 0.0]
 
@@ -694,7 +694,7 @@ def test_tencent_volume_logs_an_unexpected_magnitude(caplog):
     import logging
 
     caplog.set_level(logging.WARNING, logger="qtf_mcp")
-    source_module._normalize_tencent_volume(_tencent_frame(89817200.0 / 8), "600000")
+    source_module._normalize_volume_to_lots(_tencent_frame(89817200.0 / 8), "600000")
 
     assert "成交量量级异常" in caplog.text
 
@@ -789,3 +789,346 @@ def test_tencent_fallback_returns_none_when_window_has_no_rows(monkeypatch):
         )
         is None
     )
+
+
+# --- 东财取数熔断 -----------------------------------------------------------
+
+
+@pytest.fixture
+def kline_breaker():
+    breaker = source_module._KLINE_BREAKER
+    breaker.reset()
+    yield breaker
+    breaker.reset()
+
+
+def _failing_eastmoney(monkeypatch, calls):
+    """让东财那一级必然失败，并记录被调用次数。"""
+
+    def boom(*args, **kwargs):
+        calls.append("eastmoney")
+        raise RuntimeError("push2his refused")
+
+    monkeypatch.setattr(source_module.ef.stock, "get_quote_history", boom)
+
+
+def test_breaker_opens_after_threshold_and_skips_eastmoney(monkeypatch, kline_breaker):
+    calls = []
+    _failing_eastmoney(monkeypatch, calls)
+    monkeypatch.setattr(
+        CNStockDataSource,
+        "_fetch_tencent_kline_sync",
+        lambda self, *a, **k: _sample_kline_frame(),
+    )
+    datasource = CNStockDataSource()
+
+    for _ in range(kline_breaker.threshold):
+        assert datasource._fetch_kline_sync(
+            "600000", "2026-09-01", "2026-09-03", "qfq", "SH600000", False
+        ) is not None
+    assert len(calls) == kline_breaker.threshold
+    assert kline_breaker.is_open is True
+
+    # 熔断后不再触碰东财，但仍然返回腾讯数据
+    for _ in range(5):
+        assert datasource._fetch_kline_sync(
+            "600000", "2026-09-01", "2026-09-03", "qfq", "SH600000", False
+        ) is not None
+    assert len(calls) == kline_breaker.threshold
+
+
+def test_breaker_stays_closed_below_threshold(monkeypatch, kline_breaker):
+    calls = []
+    _failing_eastmoney(monkeypatch, calls)
+    monkeypatch.setattr(
+        CNStockDataSource,
+        "_fetch_tencent_kline_sync",
+        lambda self, *a, **k: _sample_kline_frame(),
+    )
+    datasource = CNStockDataSource()
+
+    for _ in range(kline_breaker.threshold - 1):
+        datasource._fetch_kline_sync(
+            "600000", "2026-09-01", "2026-09-03", "qfq", "SH600000", False
+        )
+
+    assert kline_breaker.is_open is False
+    assert len(calls) == kline_breaker.threshold - 1
+
+
+def test_a_success_clears_the_failure_streak(monkeypatch, kline_breaker):
+    """零散失败不该累积成熔断——历史基线本来就有约 1.5% 的失败率。"""
+    outcomes = ["fail"] * (kline_breaker.threshold - 1) + ["ok"] + ["fail"] * (
+        kline_breaker.threshold - 1
+    )
+
+    def flaky(*args, **kwargs):
+        if outcomes.pop(0) == "fail":
+            raise RuntimeError("transient")
+        return _sample_kline_frame()
+
+    monkeypatch.setattr(source_module.ef.stock, "get_quote_history", flaky)
+    monkeypatch.setattr(
+        CNStockDataSource,
+        "_fetch_tencent_kline_sync",
+        lambda self, *a, **k: _sample_kline_frame(),
+    )
+    datasource = CNStockDataSource()
+
+    while outcomes:
+        datasource._fetch_kline_sync(
+            "600000", "2026-09-01", "2026-09-03", "qfq", "SH600000", False
+        )
+
+    assert kline_breaker.is_open is False
+
+
+def test_half_open_probe_closes_the_breaker_on_recovery(monkeypatch, kline_breaker):
+    calls = []
+    state = {"healthy": False}
+
+    def provider(*args, **kwargs):
+        calls.append("eastmoney")
+        if not state["healthy"]:
+            raise RuntimeError("push2his refused")
+        return _sample_kline_frame()
+
+    monkeypatch.setattr(source_module.ef.stock, "get_quote_history", provider)
+    monkeypatch.setattr(
+        CNStockDataSource,
+        "_fetch_tencent_kline_sync",
+        lambda self, *a, **k: _sample_kline_frame(),
+    )
+    datasource = CNStockDataSource()
+    fetch = lambda: datasource._fetch_kline_sync(
+        "600000", "2026-09-01", "2026-09-03", "qfq", "SH600000", False
+    )
+
+    for _ in range(kline_breaker.threshold):
+        fetch()
+    assert kline_breaker.is_open is True
+    opened_calls = len(calls)
+
+    # 冷却未到：所有请求都跳过东财
+    fetch()
+    assert len(calls) == opened_calls
+
+    # 冷却到期：只放行一个探测请求
+    kline_breaker._open_until = time.monotonic() - 0.001
+    state["healthy"] = True
+    fetch()
+    assert len(calls) == opened_calls + 1
+    assert kline_breaker.is_open is False
+
+    # 已恢复：后续请求正常走东财
+    fetch()
+    assert len(calls) == opened_calls + 2
+
+
+def test_failed_probe_buys_another_cooldown(monkeypatch, kline_breaker):
+    calls = []
+    _failing_eastmoney(monkeypatch, calls)
+    monkeypatch.setattr(
+        CNStockDataSource,
+        "_fetch_tencent_kline_sync",
+        lambda self, *a, **k: _sample_kline_frame(),
+    )
+    datasource = CNStockDataSource()
+    fetch = lambda: datasource._fetch_kline_sync(
+        "600000", "2026-09-01", "2026-09-03", "qfq", "SH600000", False
+    )
+
+    for _ in range(kline_breaker.threshold):
+        fetch()
+    kline_breaker._open_until = time.monotonic() - 0.001
+
+    fetch()  # 探测，仍然失败
+    assert len(calls) == kline_breaker.threshold + 1
+    assert kline_breaker.is_open is True
+
+    fetch()  # 新的冷却期内不再探测
+    assert len(calls) == kline_breaker.threshold + 1
+
+
+def test_breaker_can_be_disabled(monkeypatch, kline_breaker):
+    calls = []
+    _failing_eastmoney(monkeypatch, calls)
+    monkeypatch.setattr(
+        CNStockDataSource,
+        "_fetch_tencent_kline_sync",
+        lambda self, *a, **k: _sample_kline_frame(),
+    )
+    monkeypatch.setattr(source_module, "SOURCE_BREAKER_ENABLED", False)
+    datasource = CNStockDataSource()
+
+    for _ in range(kline_breaker.threshold + 3):
+        datasource._fetch_kline_sync(
+            "600000", "2026-09-01", "2026-09-03", "qfq", "SH600000", False
+        )
+
+    assert kline_breaker.is_open is False
+    assert len(calls) == kline_breaker.threshold + 3
+
+
+def test_skipped_fetch_returns_the_same_shape(monkeypatch, kline_breaker):
+    """跳过东财后的返回结构必须和正常路径一致。"""
+    monkeypatch.setattr(
+        CNStockDataSource,
+        "_fetch_tencent_kline_sync",
+        lambda self, *a, **k: _sample_kline_frame(),
+    )
+    datasource = CNStockDataSource()
+    kline_breaker._open_until = time.monotonic() + 60
+
+    result = datasource._fetch_kline_sync(
+        "600000", "2026-09-01", "2026-09-03", "qfq", "SH600000", True
+    )
+
+    assert set(result) == {"adjusted", "unadj", "adjust_type"}
+    assert result["adjust_type"] == "qfq"
+    assert not result["adjusted"].empty
+
+
+def test_breaker_does_not_touch_fund_flow_or_finance(monkeypatch, kline_breaker):
+    """熔断只覆盖 K 线；资金流和财务没有等价兜底，不能被跳过。"""
+    kline_breaker._open_until = time.monotonic() + 60
+    seen = []
+    monkeypatch.setattr(
+        source_module.CNStockDataSource,
+        "_fetch_fund_flow_sync",
+        lambda self, code, symbol=None: seen.append("fund_flow"),
+    )
+    monkeypatch.setattr(
+        source_module.CNStockDataSource,
+        "_fetch_finance_sync",
+        lambda self, code, symbol=None: seen.append("finance"),
+    )
+    datasource = CNStockDataSource()
+
+    datasource._fetch_fund_flow_sync("600000", "SH600000")
+    datasource._fetch_finance_sync("600000", "SH600000")
+
+    assert seen == ["fund_flow", "finance"]
+
+
+# --- 新浪第三级兜底 ---------------------------------------------------------
+
+
+def _sina_frame():
+    """新浪 stock_zh_a_daily 的原始列名与口径：volume 为股，turnover 为小数。"""
+    return pd.DataFrame(
+        {
+            "date": pd.date_range("2026-08-31", periods=3).date,
+            "open": [102.0, 102.5, 102.49],
+            "high": [103.0, 103.2, 103.59],
+            "low": [99.0, 99.5, 99.5],
+            "close": [102.0, 102.4, 102.29],
+            "volume": [2000000.0, 2500000.0, 2538601.0],
+            "amount": [204000000.0, 256000000.0, 258183863.0],
+            "outstanding_share": [139394050.0] * 3,
+            "turnover": [0.0143, 0.0179, 0.0182],
+        }
+    )
+
+
+def test_sina_fallback_serves_symbols_tencent_rejects(monkeypatch):
+    """腾讯对多数北交所代码抛 KeyError，新浪能取到，缺了这一级就会返回"未找到"。"""
+    import akshare
+
+    monkeypatch.setattr(
+        akshare, "stock_zh_a_hist_tx", lambda **k: (_ for _ in ()).throw(KeyError("day"))
+    )
+    monkeypatch.setattr(akshare, "stock_zh_a_daily", lambda **k: _sina_frame())
+
+    status = {}
+    frame = CNStockDataSource()._fetch_fallback_kline_sync(
+        "920438", "2026-09-01", "2026-09-03", "qfq", "BJ920438", status
+    )
+
+    assert frame is not None and not frame.empty
+    assert status.get("unsupported") is None
+    assert list(frame.columns) == source_module.FALLBACK_FRAME_COLUMNS
+
+
+def test_sina_volume_is_normalised_to_lots(monkeypatch):
+    import akshare
+
+    monkeypatch.setattr(
+        akshare, "stock_zh_a_hist_tx", lambda **k: (_ for _ in ()).throw(KeyError("day"))
+    )
+    monkeypatch.setattr(akshare, "stock_zh_a_daily", lambda **k: _sina_frame())
+
+    # 假数据的最后一行是 2026-09-02
+    frame = CNStockDataSource()._fetch_fallback_kline_sync(
+        "920438", "2026-09-02", "2026-09-02", "qfq", "BJ920438"
+    )
+
+    # 258,183,863 / 102.29 ≈ 2,524,038 股，说明原始列是股 → 应换成手
+    assert frame["成交量"].iloc[-1] == pytest.approx(25386.01)
+    assert frame["换手率"].iloc[-1] == pytest.approx(1.82, abs=0.01)
+
+
+def test_unsupported_only_when_every_fallback_rejects(monkeypatch):
+    import akshare
+
+    monkeypatch.setattr(
+        akshare, "stock_zh_a_hist_tx", lambda **k: (_ for _ in ()).throw(IndexError("oob"))
+    )
+    monkeypatch.setattr(
+        akshare, "stock_zh_a_daily", lambda **k: (_ for _ in ()).throw(KeyError("date"))
+    )
+
+    status = {}
+    assert CNStockDataSource()._fetch_fallback_kline_sync(
+        "113707", "2026-09-01", "2026-09-03", "qfq", "SZ113707", status
+    ) is None
+    assert status["unsupported"] is True
+
+
+def test_empty_window_is_not_reported_as_unsupported(monkeypatch):
+    """两个源都能服务这个标的、只是区间内没有交易，不能说成"不支持"。"""
+    import akshare
+
+    empty = pd.DataFrame()
+    monkeypatch.setattr(akshare, "stock_zh_a_hist_tx", lambda **k: empty)
+    monkeypatch.setattr(akshare, "stock_zh_a_daily", lambda **k: empty)
+
+    status = {}
+    assert CNStockDataSource()._fetch_fallback_kline_sync(
+        "600000", "2026-09-01", "2026-09-03", "qfq", "SH600000", status
+    ) is None
+    assert status.get("unsupported") is None
+
+
+def test_simple_kline_reports_unsupported_distinctly(monkeypatch):
+    import akshare
+
+    monkeypatch.setattr(source_module.ef.stock, "get_quote_history", lambda *a, **k: None)
+    monkeypatch.setattr(akshare, "stock_zh_a_hist", lambda **k: pd.DataFrame())
+    monkeypatch.setattr(
+        akshare, "stock_zh_a_hist_tx", lambda **k: (_ for _ in ()).throw(KeyError("day"))
+    )
+    monkeypatch.setattr(
+        akshare, "stock_zh_a_daily", lambda **k: (_ for _ in ()).throw(KeyError("date"))
+    )
+
+    result = CNStockDataSource().fetch_kline_simple_sync(
+        "BJ920438", "2026-09-01", "2026-09-03", "qfq"
+    )
+
+    assert result is not None
+    assert result["unsupported"] is True
+    assert result["data"] == []
+
+
+def test_simple_kline_returns_none_for_a_quiet_window(monkeypatch):
+    import akshare
+
+    monkeypatch.setattr(source_module.ef.stock, "get_quote_history", lambda *a, **k: None)
+    monkeypatch.setattr(akshare, "stock_zh_a_hist", lambda **k: pd.DataFrame())
+    monkeypatch.setattr(akshare, "stock_zh_a_hist_tx", lambda **k: pd.DataFrame())
+    monkeypatch.setattr(akshare, "stock_zh_a_daily", lambda **k: pd.DataFrame())
+
+    assert CNStockDataSource().fetch_kline_simple_sync(
+        "SH600000", "2026-09-01", "2026-09-03", "qfq"
+    ) is None

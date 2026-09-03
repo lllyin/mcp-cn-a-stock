@@ -24,11 +24,14 @@ from ..config import (
     DATA_FETCH_MAX_WORKERS,
     FINANCE_CACHE_MAX_ENTRIES,
     FINANCE_CACHE_TTL_SECONDS,
+    SOURCE_BREAKER_COOLDOWN_SECONDS,
+    SOURCE_BREAKER_ENABLED,
+    SOURCE_BREAKER_THRESHOLD,
     SH_INDICES,
     SZ_INDICES,
 )
 from .base import DataSource, FetchRequirements, StockData
-from .http_channel import install_http_channel
+from .http_channel import install_http_channel, installed_mode
 from ..observability import log_context
 
 logger = logging.getLogger("qtf_mcp")
@@ -41,14 +44,108 @@ def _fetch_failure(source: str) -> Dict[str, str]:
     return {_FETCH_FAILURE_MARKER: source}
 
 
-def _normalize_tencent_volume(frame, code: str):
-    """Return the Tencent frame with 成交量 expressed in 手.
+class SourceBreaker:
+    """Skip an upstream source that is provably refusing, with half-open probing.
 
-    AkShare's Tencent endpoint reports 成交量 in 股 for some code prefixes and
-    leaves it in 手 for the rest, so neither unit can be assumed. Decide from the
-    data instead: 成交额 / 收盘价 is the traded share count, which sits two
-    orders of magnitude away from the lot count. Using 收盘价 as a stand-in for
-    VWAP is off by a few percent at worst, far inside that gap.
+    Scoped to a provider step rather than a host or a URL: Eastmoney refuses per
+    endpoint (push2his serves its root while refusing /api/qt/stock/kline/get),
+    and the HTTP-channel hook only exists in impersonate mode, so keying lower
+    would make behaviour depend on the channel.
+
+    Once open, every request skips the source except one probe per cooldown, so
+    the cooldown bounds recovery latency instead of the cost of staying open.
+    """
+
+    def __init__(self, name: str, threshold: int, cooldown: float):
+        self.name = name
+        self.threshold = threshold
+        self.cooldown = cooldown
+        self._lock = threading.Lock()
+        self._failures = 0
+        self._open_until = 0.0
+        self._probing = False
+
+    @property
+    def is_open(self) -> bool:
+        with self._lock:
+            return self._open_until > 0.0
+
+    def should_skip(self) -> bool:
+        """Whether to bypass the source. Grants exactly one probe per cooldown."""
+        if not SOURCE_BREAKER_ENABLED:
+            return False
+        with self._lock:
+            if self._open_until <= 0.0:
+                return False
+            if time.monotonic() < self._open_until or self._probing:
+                return True
+            self._probing = True
+            return False
+
+    def record(self, *, success: bool) -> None:
+        """Account for an attempt that actually reached the source."""
+        if not SOURCE_BREAKER_ENABLED:
+            return
+        with self._lock:
+            reopened = False
+            recovered = False
+            if success:
+                recovered = self._open_until > 0.0
+                self._failures = 0
+                self._open_until = 0.0
+                self._probing = False
+            elif self._open_until > 0.0:
+                # A failed probe buys another cooldown rather than a new streak.
+                self._open_until = time.monotonic() + self.cooldown
+                self._probing = False
+            else:
+                self._failures += 1
+                if self._failures >= self.threshold:
+                    self._failures = 0
+                    self._open_until = time.monotonic() + self.cooldown
+                    reopened = True
+
+        if recovered:
+            logger.info("Source breaker closed source=%s", self.name)
+        elif reopened:
+            request_id, tool, symbol = log_context()
+            logger.warning(
+                "Source breaker opened source=%s channel=%s cooldown=%ss "
+                "request_id=%s tool=%s symbol=%s; using the fallback source",
+                self.name,
+                installed_mode(),
+                self.cooldown,
+                request_id,
+                tool,
+                symbol,
+            )
+
+    def reset(self) -> None:
+        with self._lock:
+            self._failures = 0
+            self._open_until = 0.0
+            self._probing = False
+
+
+# Only the K-line tier gets a breaker: it is the one with an equivalent
+# fallback. Historical fund flow has no per-symbol alternative, so skipping it
+# would return the same empty result without buying anything.
+_KLINE_BREAKER = SourceBreaker(
+    "eastmoney_kline",
+    SOURCE_BREAKER_THRESHOLD,
+    SOURCE_BREAKER_COOLDOWN_SECONDS,
+)
+
+
+def _normalize_volume_to_lots(frame, code: str, source: str = "腾讯"):
+    """Return the frame with 成交量 expressed in 手.
+
+    The fallback providers disagree on the unit -- AkShare's Tencent endpoint
+    reports 股 for some code prefixes and 手 for the rest, and Sina reports 股 --
+    so neither can be assumed. Decide from the data instead: 成交额 / 收盘价 is
+    the traded share count, which sits two orders of magnitude away from the lot
+    count. Using 收盘价 as a stand-in for VWAP is off by a few percent at worst,
+    far inside that gap. Validated against 1497 eastmoney-sourced trading days.
     """
     volume = frame["成交量"]
     usable = (volume > 0) & (frame["成交额"] > 0) & (frame["收盘"] > 0)
@@ -62,14 +159,16 @@ def _normalize_tencent_volume(frame, code: str):
     in_shares = ratio > 0.1
     if not 0.5 <= (ratio if in_shares else ratio * 100) <= 2.0:
         logger.warning(
-            "腾讯历史行情成交量量级异常 %s: ratio=%.4g，按%s处理",
+            "%s历史行情成交量量级异常 %s: ratio=%.4g，按%s处理",
+            source,
             code,
             ratio,
             "股" if in_shares else "手",
         )
     else:
         logger.debug(
-            "腾讯历史行情成交量单位 %s: ratio=%.4g unit=%s",
+            "%s历史行情成交量单位 %s: ratio=%.4g unit=%s",
+            source,
             code,
             ratio,
             "股" if in_shares else "手",
@@ -78,6 +177,60 @@ def _normalize_tencent_volume(frame, code: str):
         frame = frame.copy()
         frame["成交量"] = volume / 100
     return frame
+
+
+FALLBACK_FRAME_COLUMNS = [
+    "日期", "开盘", "收盘", "最高", "最低", "成交量", "成交额",
+    "振幅", "涨跌幅", "涨跌额", "换手率",
+]
+_FALLBACK_REQUIRED = ["日期", "开盘", "收盘", "最高", "最低", "成交量", "成交额"]
+# A provider that raises one of these has no series for the symbol at all, as
+# opposed to having none inside the requested window. Tencent raises KeyError
+# for most Beijing-exchange codes and IndexError for convertible bonds; Sina
+# raises KeyError or a JSON decode error. Telling the two apart is what lets the
+# tools say "数据源不支持" instead of the misleading "未找到...数据".
+_UNSUPPORTED_ERRORS = (KeyError, IndexError, ValueError)
+
+
+def _finalize_fallback_frame(frame, code: str, requested_start, source: str):
+    """Bring a fallback provider's frame to the shape the primary path produces."""
+    import pandas as pd
+
+    if any(column not in frame.columns for column in _FALLBACK_REQUIRED):
+        logger.warning("%s历史行情字段不完整 %s: %s", source, code, list(frame.columns))
+        return None
+    frame = frame.copy()
+    frame["日期"] = pd.to_datetime(frame["日期"], errors="coerce").dt.date
+    for column in _FALLBACK_REQUIRED[1:]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    previous_close = frame["收盘"].shift(1)
+    frame["涨跌额"] = (frame["收盘"] - previous_close).fillna(0.0)
+    frame["涨跌幅"] = ((frame["收盘"] / previous_close - 1) * 100).fillna(0.0)
+    frame["振幅"] = (((frame["最高"] - frame["最低"]) / previous_close) * 100).fillna(0.0)
+    if "换手率" in frame.columns:
+        # Both fallbacks report turnover as a fraction; the reports want percent.
+        frame["换手率"] = pd.to_numeric(frame["换手率"], errors="coerce").fillna(0.0) * 100
+    else:
+        frame["换手率"] = 0.0
+    frame = frame.dropna(subset=_FALLBACK_REQUIRED)
+    frame = _normalize_volume_to_lots(frame, code, source)
+    # 派生列算完再裁回请求区间，前置行只用于提供首行的前收盘价。
+    frame = frame[frame["日期"] >= requested_start]
+    if frame.empty:
+        return None
+    return frame[FALLBACK_FRAME_COLUMNS]
+
+
+def _market_prefixed_symbol(code: str, symbol: str = None) -> str:
+    """Return the lower-case market-prefixed code the fallback providers expect."""
+    normalized = (symbol or "").lower()
+    if normalized:
+        return normalized
+    if code.startswith(("4", "8", "92")):
+        return f"bj{code}"
+    if code.startswith(("6", "9")):
+        return f"sh{code}"
+    return f"sz{code}"
 
 
 def check_is_index(symbol: str, name: str) -> bool:
@@ -377,8 +530,16 @@ class CNStockDataSource(DataSource):
         adjust: str = "qfq",
         symbol: str = None,
         include_unadjusted: bool = True,
+        status: dict = None,
     ) -> Optional[Dict]:
         """同步获取K线数据"""
+        if _KLINE_BREAKER.should_skip():
+            # 东财这一级正在熔断，直接用兜底源，省掉必然失败的整条重试链。
+            return self._fallback_kline_result(
+                code, start_date, end_date, adjust, symbol, include_unadjusted, status
+            )
+
+        eastmoney_ok = True
         try:
             from ..symbols import get_symbol_name
             symbol_name = get_symbol_name(symbol) if symbol else ""
@@ -431,8 +592,9 @@ class CNStockDataSource(DataSource):
                 
                 if df is None or df.empty:
                     logger.warning(f"获取K线数据依然为空 {code}，尝试腾讯历史行情 fallback...")
-                    df = self._fetch_tencent_kline_sync(
-                        code, start_date, end_date, adjust, symbol
+                    eastmoney_ok = False
+                    df = self._fetch_fallback_kline_sync(
+                        code, start_date, end_date, adjust, symbol, status
                     )
                     if df is None or df.empty:
                         return None
@@ -475,23 +637,41 @@ class CNStockDataSource(DataSource):
                 "adjust_type": adjust,
             }
         except Exception as e:
-            logger.warning(f"获取K线数据失败 {code}: {e}；尝试腾讯历史行情 fallback...")
-            df = self._fetch_tencent_kline_sync(
-                code, start_date, end_date, adjust, symbol
+            eastmoney_ok = False
+            logger.warning(f"获取K线数据失败 {code}: {e}；尝试兜底数据源...")
+            return self._fallback_kline_result(
+                code, start_date, end_date, adjust, symbol, include_unadjusted, status
             )
-            if df is None or df.empty:
-                return None
-            if adjust != "none" and include_unadjusted:
-                df_unadj = self._fetch_tencent_kline_sync(
-                    code, start_date, end_date, "none", symbol
-                )
-            else:
-                df_unadj = df
-            return {
-                "adjusted": df,
-                "unadj": df_unadj if df_unadj is not None and not df_unadj.empty else df,
-                "adjust_type": adjust,
-            }
+        finally:
+            _KLINE_BREAKER.record(success=eastmoney_ok)
+
+    def _fallback_kline_result(
+        self,
+        code: str,
+        start_date: str,
+        end_date: str,
+        adjust: str,
+        symbol: str = None,
+        include_unadjusted: bool = True,
+        status: dict = None,
+    ) -> Optional[Dict]:
+        """Build the same result shape from the fallback providers alone."""
+        df = self._fetch_fallback_kline_sync(
+            code, start_date, end_date, adjust, symbol, status
+        )
+        if df is None or df.empty:
+            return None
+        if adjust != "none" and include_unadjusted:
+            df_unadj = self._fetch_fallback_kline_sync(
+                code, start_date, end_date, "none", symbol
+            )
+        else:
+            df_unadj = df
+        return {
+            "adjusted": df,
+            "unadj": df_unadj if df_unadj is not None and not df_unadj.empty else df,
+            "adjust_type": adjust,
+        }
 
     def _fetch_tencent_kline_sync(
         self,
@@ -500,20 +680,13 @@ class CNStockDataSource(DataSource):
         end_date: str,
         adjust: str,
         symbol: str = None,
+        status: dict = None,
     ):
         """Use AkShare's Tencent history only after existing providers fail."""
         try:
             import akshare as ak
-            import pandas as pd
 
-            normalized_symbol = (symbol or "").lower()
-            if not normalized_symbol:
-                if code.startswith(("4", "8", "92")):
-                    normalized_symbol = f"bj{code}"
-                elif code.startswith(("6", "9")):
-                    normalized_symbol = f"sh{code}"
-                else:
-                    normalized_symbol = f"sz{code}"
+            normalized_symbol = _market_prefixed_symbol(code, symbol)
             tx_adjust = "" if adjust == "none" else adjust
             # 派生列需要请求区间之前的那个交易日的收盘价，否则首行只能填 0，
             # 而 kline_daily 只请求一天，首行就是唯一一行。A 股最长假期约 8 个
@@ -543,30 +716,85 @@ class CNStockDataSource(DataSource):
             if any(column not in frame.columns for column in required):
                 logger.warning("腾讯历史行情字段不完整 %s: %s", code, list(frame.columns))
                 return None
-            frame["日期"] = pd.to_datetime(frame["日期"], errors="coerce").dt.date
-            for column in required[1:]:
-                frame[column] = pd.to_numeric(frame[column], errors="coerce")
-            previous_close = frame["收盘"].shift(1)
-            frame["涨跌额"] = (frame["收盘"] - previous_close).fillna(0.0)
-            frame["涨跌幅"] = ((frame["收盘"] / previous_close - 1) * 100).fillna(0.0)
-            frame["振幅"] = (((frame["最高"] - frame["最低"]) / previous_close) * 100).fillna(0.0)
-            if "换手率" in frame.columns:
-                frame["换手率"] = pd.to_numeric(frame["换手率"], errors="coerce").fillna(0.0) * 100
-            else:
-                frame["换手率"] = 0.0
-            frame = frame.dropna(subset=required)
-            frame = _normalize_tencent_volume(frame, code)
-            # 派生列算完再裁回请求区间，前置行只用于提供首行的前收盘价。
-            frame = frame[frame["日期"] >= requested_start]
-            if frame.empty:
-                return None
-            return frame[[
-                "日期", "开盘", "收盘", "最高", "最低", "成交量", "成交额",
-                "振幅", "涨跌幅", "涨跌额", "换手率",
-            ]]
+            return _finalize_fallback_frame(frame, code, requested_start, "腾讯")
         except Exception as error:
+            if status is not None and isinstance(error, _UNSUPPORTED_ERRORS):
+                status["tencent_unsupported"] = True
             logger.warning("腾讯历史行情 fallback 失败 %s: %s", code, error)
             return None
+
+    def _fetch_sina_kline_sync(
+        self,
+        code: str,
+        start_date: str,
+        end_date: str,
+        adjust: str,
+        symbol: str = None,
+        status: dict = None,
+    ):
+        """Last-resort history from Sina, which covers codes Tencent rejects.
+
+        Measured on 2026-09-03: Tencent raises KeyError for roughly half of the
+        Beijing-exchange codes queried, while Sina serves them, so without this
+        tier those symbols returned "未找到...数据" even though the data exists.
+        """
+        try:
+            import akshare as ak
+
+            normalized_symbol = _market_prefixed_symbol(code, symbol)
+            requested_start = datetime.strptime(start_date, "%Y-%m-%d").date()
+            fetch_start = (requested_start - timedelta(days=20)).strftime("%Y%m%d")
+            frame = ak.stock_zh_a_daily(
+                symbol=normalized_symbol,
+                start_date=fetch_start,
+                end_date=end_date.replace("-", ""),
+                adjust="" if adjust == "none" else adjust,
+            )
+            if frame is None or frame.empty:
+                return None
+            frame = frame.rename(columns={
+                "date": "日期",
+                "open": "开盘",
+                "close": "收盘",
+                "high": "最高",
+                "low": "最低",
+                "volume": "成交量",
+                "amount": "成交额",
+                "turnover": "换手率",
+            })
+            return _finalize_fallback_frame(frame, code, requested_start, "新浪")
+        except Exception as error:
+            if status is not None and isinstance(error, _UNSUPPORTED_ERRORS):
+                status["sina_unsupported"] = True
+            logger.warning("新浪历史行情 fallback 失败 %s: %s", code, error)
+            return None
+
+    def _fetch_fallback_kline_sync(
+        self,
+        code: str,
+        start_date: str,
+        end_date: str,
+        adjust: str,
+        symbol: str = None,
+        status: dict = None,
+    ):
+        """Try each fallback provider in turn, recording why they came up empty."""
+        local = {} if status is None else status
+        frame = self._fetch_tencent_kline_sync(
+            code, start_date, end_date, adjust, symbol, local
+        )
+        if frame is not None and not frame.empty:
+            return frame
+        frame = self._fetch_sina_kline_sync(
+            code, start_date, end_date, adjust, symbol, local
+        )
+        if frame is not None and not frame.empty:
+            return frame
+        if local.get("tencent_unsupported") and local.get("sina_unsupported"):
+            # Every fallback rejected the symbol itself, so this is a coverage
+            # gap rather than a quiet window.
+            local["unsupported"] = True
+        return None
     
     def fetch_kline_simple_sync(
         self, symbol: str, start_date: str, end_date: str, adjust: str = "qfq"
@@ -575,6 +803,7 @@ class CNStockDataSource(DataSource):
         简单获取 K 线数据（同步方法，返回简化的字典格式）
         """
         code, market = self._symbol_to_akshare(symbol)
+        status: dict = {}
         kline_data = self._fetch_kline_sync(
             code,
             start_date,
@@ -582,9 +811,13 @@ class CNStockDataSource(DataSource):
             adjust,
             symbol,
             False,
+            status,
         )
         
         if kline_data is None:
+            # 区分"兜底源都不支持这个标的"和"该区间没有交易数据"。
+            if status.get("unsupported"):
+                return {"symbol": symbol, "adjust": adjust, "data": [], "unsupported": True}
             return None
         
         df = kline_data["adjusted"]
