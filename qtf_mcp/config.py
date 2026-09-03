@@ -129,6 +129,16 @@ FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS = max(
     1.0,
     float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS", "300")),
 )
+# Risk control is a different failure from a slow or broken page. Eastmoney
+# answers /fflow/ requests with an immediate disconnect and expects a human to
+# clear a slider; clearance is granted per browser session, so retrying inside
+# the same process cannot succeed. Measured on 2026-09-03: after the slider was
+# cleared by hand that browser kept serving data for over ten minutes while
+# every freshly launched one stayed empty. Hence a much longer back-off.
+FUND_FLOW_PAGE_RISK_COOLDOWN_SECONDS = max(
+    1.0,
+    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_RISK_COOLDOWN_SECONDS", "1800")),
+)
 
 
 class HttpModeError(ValueError):

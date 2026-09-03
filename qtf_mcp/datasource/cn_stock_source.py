@@ -29,6 +29,7 @@ from ..config import (
     FUND_FLOW_PAGE_FALLBACK_ENABLED,
     FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD,
     FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS,
+    FUND_FLOW_PAGE_RISK_COOLDOWN_SECONDS,
     SOURCE_BREAKER_COOLDOWN_SECONDS,
     SOURCE_BREAKER_ENABLED,
     SOURCE_BREAKER_THRESHOLD,
@@ -92,10 +93,15 @@ class SourceBreaker:
             self._probing = True
             return False
 
-    def record(self, *, success: bool) -> None:
-        """Account for an attempt that actually reached the source."""
+    def record(self, *, success: bool, cooldown: Optional[float] = None) -> None:
+        """Account for an attempt that actually reached the source.
+
+        ``cooldown`` overrides the configured value for this outcome only, for
+        failures that are known to need a longer back-off than an ordinary one.
+        """
         if not SOURCE_BREAKER_ENABLED:
             return
+        effective_cooldown = self.cooldown if cooldown is None else cooldown
         with self._lock:
             reopened = False
             recovered = False
@@ -106,13 +112,13 @@ class SourceBreaker:
                 self._probing = False
             elif self._open_until > 0.0:
                 # A failed probe buys another cooldown rather than a new streak.
-                self._open_until = time.monotonic() + self.cooldown
+                self._open_until = time.monotonic() + effective_cooldown
                 self._probing = False
             else:
                 self._failures += 1
                 if self._failures >= self.threshold:
                     self._failures = 0
-                    self._open_until = time.monotonic() + self.cooldown
+                    self._open_until = time.monotonic() + effective_cooldown
                     reopened = True
 
         if recovered:
@@ -124,7 +130,7 @@ class SourceBreaker:
                 "request_id=%s tool=%s symbol=%s; using the fallback source",
                 self.name,
                 installed_mode(),
-                self.cooldown,
+                effective_cooldown,
                 request_id,
                 tool,
                 symbol,
@@ -1093,10 +1099,18 @@ class CNStockDataSource(DataSource):
             return None
 
         started_at = time.perf_counter()
-        try:
-            from . import realtime_ff
+        from . import realtime_ff
 
+        try:
             page = await realtime_ff.fetch_history_page(symbol)
+        except realtime_ff.FundFlowPageBlocked as e:
+            # 风控要求人过一次滑块，放行按浏览器会话给，本进程内重试不可能成功。
+            # 所以退避时间比普通失败长得多，否则只是按固定节奏反复撞墙。
+            logger.warning("资金流向页面被风控拦截 %s: %s", symbol, e)
+            _FUND_FLOW_PAGE_BREAKER.record(
+                success=False, cooldown=FUND_FLOW_PAGE_RISK_COOLDOWN_SECONDS
+            )
+            return None
         except Exception as e:
             logger.warning("资金流向页面兜底失败 %s: %s", symbol, e)
             _FUND_FLOW_PAGE_BREAKER.record(success=False)
