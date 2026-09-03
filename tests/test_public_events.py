@@ -1,3 +1,5 @@
+import importlib
+
 import pandas as pd
 import pytest
 
@@ -8,6 +10,8 @@ from qtf_mcp.datasource.public_events import (
     normalize_query_date,
     parse_public_event_sources,
 )
+
+events_module = importlib.import_module("qtf_mcp.datasource.public_events")
 
 
 class FakeAk:
@@ -277,3 +281,68 @@ async def test_public_event_requests_have_bounded_concurrency(monkeypatch):
         for _ in range(10)
     ])
     assert max_active == 3
+
+
+# --- max_rows_per_source 的默认值与上限 --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_row_cap_default_is_1000(monkeypatch):
+    seen = {}
+
+    def fake_sync(iso, compact, sources, lookback, keywords, cap, module, symbols):
+        seen["cap"] = cap
+        return events_module.PublicEventPoolResponse(
+            query_date=iso,
+            fetched_at="2026-09-03 00:00:00",
+            revision_safe=True,
+            sources_requested=list(sources),
+            source_statuses=[],
+            events=[],
+            warnings=[],
+        )
+
+    monkeypatch.setattr(events_module, "fetch_public_market_events_sync", fake_sync)
+
+    await events_module.get_public_market_events(date="2026-07-15", sources="lhb")
+
+    assert seen["cap"] == 1000
+
+
+@pytest.mark.asyncio
+async def test_row_cap_accepts_the_value_that_used_to_fail(monkeypatch):
+    """2026-09-03 有一次 max_rows_per_source=4000 因旧上限被拒。"""
+    seen = {}
+
+    def fake_sync(iso, compact, sources, lookback, keywords, cap, module, symbols):
+        seen["cap"] = cap
+        return events_module.PublicEventPoolResponse(
+            query_date=iso,
+            fetched_at="2026-09-03 00:00:00",
+            revision_safe=False,
+            sources_requested=list(sources),
+            source_statuses=[],
+            events=[],
+            warnings=[],
+        )
+
+    monkeypatch.setattr(events_module, "fetch_public_market_events_sync", fake_sync)
+
+    await events_module.get_public_market_events(
+        date="2026-07-15", sources="earnings_forecast", max_rows_per_source=4000
+    )
+
+    assert seen["cap"] == 4000
+
+
+@pytest.mark.asyncio
+async def test_row_cap_still_bounded():
+    """保留上限：单次响应已出现 1.8 MB，无界会威胁 500 MiB 峰值内存约束。"""
+    with pytest.raises(ValueError, match="1-10000"):
+        await events_module.get_public_market_events(
+            date="2026-07-15", sources="lhb", max_rows_per_source=10001
+        )
+    with pytest.raises(ValueError, match="1-10000"):
+        await events_module.get_public_market_events(
+            date="2026-07-15", sources="lhb", max_rows_per_source=0
+        )

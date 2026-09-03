@@ -38,6 +38,10 @@ ALLOWED_PUBLIC_EVENT_SOURCES = {
 _PUBLIC_EVENT_EXECUTOR = ThreadPoolExecutor(max_workers=3, thread_name_prefix="public-events")
 _PUBLIC_EVENT_CONCURRENCY_ATTR = "_cn_stock_public_event_concurrency"
 _DIRECT_REQUESTS_LOCAL = threading.local()
+# 全市场业绩预告一个报告期就有五千条量级，上一版 1000 的上限会让调用方直接失败
+# （2026-09-03 就有一次 max_rows_per_source=4000 被拒）。仍然保留上限：单次响应
+# 已经出现过 1.8 MB，无界会直接威胁 500 MiB 的峰值内存约束。
+MAX_ROWS_PER_SOURCE_LIMIT = 10000
 
 
 class PublicEventRecord(BaseModel):
@@ -127,14 +131,16 @@ async def get_public_market_events(
     sources: str = "lhb,limit_up,announcements",
     announcement_lookback_days: int = 1,
     keywords: str = "",
-    max_rows_per_source: int = 200,
+    max_rows_per_source: int = 1000,
     symbols: str = "",
 ) -> PublicEventPoolResponse:
     parsed_sources = parse_public_event_sources(sources)
     if not 1 <= announcement_lookback_days <= 5:
         raise ValueError("announcement_lookback_days 必须在 1-5 之间")
-    if not 1 <= max_rows_per_source <= 1000:
-        raise ValueError("max_rows_per_source 必须在 1-1000 之间")
+    if not 1 <= max_rows_per_source <= MAX_ROWS_PER_SOURCE_LIMIT:
+        raise ValueError(
+            f"max_rows_per_source 必须在 1-{MAX_ROWS_PER_SOURCE_LIMIT} 之间"
+        )
     iso_date, compact_date = normalize_query_date(date)
     keyword_list = [item.strip().lower() for item in keywords.split(",") if item.strip()]
     symbol_filter = {

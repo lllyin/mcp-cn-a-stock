@@ -1031,7 +1031,7 @@ async def market_events(
   sources: str = "lhb,limit_up,announcements",
   announcement_lookback_days: int = 1,
   keywords: str = "",
-  max_rows_per_source: int = 200,
+  max_rows_per_source: int = 1000,
   symbols: str = "",
   ctx: Context = None,  # type: ignore
 ) -> PublicEventPoolResponse:
@@ -1046,7 +1046,7 @@ async def market_events(
              previous_limit_up, broken_board, announcements, earnings_forecast.
     announcement_lookback_days: Include announcements from date back N calendar days, 1-5.
     keywords: Optional comma-separated keyword filter applied to names, industries, titles and reasons.
-    max_rows_per_source: Deterministic per-source response cap, 1-1000.
+    max_rows_per_source: Deterministic per-source response cap, 1-10000 (default 1000).
     symbols: Optional comma-separated normalized SH/SZ/BJ symbols. Filtering happens before the response cap.
 
   Returns:
