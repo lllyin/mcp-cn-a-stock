@@ -93,11 +93,19 @@ cp .env.example .env
 主要配置如下：
 
 ```env
+# 出站 HTTP 通道：auto | proxy | impersonate | direct，默认 auto
+CN_STOCK_HTTP_MODE=auto
+
 # AkShare Proxy Patch，可选但推荐
 AKSHARE_PROXY_ENABLED=1
 AKSHARE_PROXY_GATEWAY=你的代理网关
 AKSHARE_PROXY_TOKEN=你的访问令牌
 AKSHARE_PROXY_RETRY=30
+
+# impersonate 通道参数，以下是默认值
+CN_STOCK_HTTP_IMPERSONATE_RETRY=3
+CN_STOCK_HTTP_IMPERSONATE_TIMEOUT=8
+CN_STOCK_HTTP_IMPERSONATE_PROFILE=chrome
 
 # 同步行情 I/O 并发，以下是默认值
 CN_STOCK_DATA_FETCH_MAX_WORKERS=8
@@ -115,11 +123,48 @@ CN_STOCK_REPORT_CACHE_DISK_ENABLED=1
 CN_STOCK_REPORT_CACHE_DIR=.runtime/report-cache
 ```
 
+### 出站 HTTP 通道
+
+部分东方财富接口会直接断开普通 HTTP 客户端的连接，表现为空响应体和
+`Expecting value: line 1 column 1 (char 0)`。`CN_STOCK_HTTP_MODE` 决定用哪种方式访问
+这些主机，四种模式互斥，同一进程只安装一个：
+
+| 模式 | 行为 |
+|---|---|
+| `proxy` | 经 AkShare Proxy Patch 的授权网关和代理出口，附带 Cookie 与积分计费 |
+| `impersonate` | 本机直连，用 curl_cffi 伪装浏览器 TLS 指纹，无需网关 |
+| `direct` | 本机直连 + 原生 `requests`，即引入该开关之前的行为（可写作 `off`） |
+| `auto` | 网关可用时选 `proxy`，否则降级 `impersonate`（默认） |
+
+`impersonate` 只更换 TLS 指纹，不涉及浏览器；抓实时资金流的 Playwright 是另一条独立链路。
+
+`auto` 永不因配置缺失而启动失败，只会降级并打印 WARNING；只有显式写
+`CN_STOCK_HTTP_MODE=proxy` 却没有配 `AKSHARE_PROXY_GATEWAY` 时才会启动即报错。
+
+启动日志会在版本信息之后打印实际生效的通道：
+
+```text
+cn-stock-mcp version=1.2.0
+Market data library versions: akshare=... efinance=...
+HTTP channel mode=impersonate reason=auto:proxy_disabled profile=chrome retry=3 timeout=8.0s hooked_hosts=4
+HTTP channel mode=proxy reason=auto:proxy_configured gateway=... token=configured retry=30 patch_version=0.5.0 hooked_hosts=4
+HTTP channel mode=direct reason=requested hooked_hosts=4
+```
+
+`reason` 会写明是显式指定（`requested`）、`auto` 的判定结果，还是降级
+（`curl_cffi_unavailable`、`requests_already_patched`），降级同时记 WARNING。
+
+注意入口会执行 `load_dotenv(override=True)`，**`.env` 的取值优先于 shell 环境变量**。
+临时切换通道要改 `.env` 或注释掉其中的 `CN_STOCK_HTTP_MODE`，
+`CN_STOCK_HTTP_MODE=direct ./start.sh` 这种写法会被 `.env` 覆盖掉。
+
+只有 `push2`、`push2his`、`fund`、`emweb.securities` 这四个东方财富主机会被接管；
+同花顺以及 `public_events` 用到的 `datacenter-web`、`push2ex` 均原样直连。
+
+`AKSHARE_PROXY_ENABLED` 仍然有效，但只作为 `auto` 的判定输入，不再单独触发安装。
 兼容旧变量名 `AKSHARE_PROXY_IP`、`AKSHARE_PROXY_PASSWORD` 和
 `AKSHARE_PROXY_PORT`。其中 `PORT` 历史上表示重试次数，不是网络端口；新部署建议使用
-含义明确的 `GATEWAY`、`TOKEN`、`RETRY`。
-设置 `AKSHARE_PROXY_ENABLED=0` 后不会导入或安装代理插件，所有 AkShare 请求直接访问上游；
-修改后需要重启 MCP 服务。
+含义明确的 `GATEWAY`、`TOKEN`、`RETRY`。修改后需要重启 MCP 服务。
 
 Ubuntu 2 核 4G 建议先保持默认的 `8/16`。提高数值会增加上游压力，并不保证降低延迟。
 交易时段的 `brief/medium/full` 都以 Playwright 为实时资金流来源；仅同时进行中的
@@ -271,6 +316,31 @@ mcporter call cn-stock market_breadth
 
 `market_breadth` 返回 `source`、抓取时间、涨跌和平盘家数、涨跌停家数、十档涨跌幅分布
 及回退警告。调用方应读取 `source` 和 `warnings`，不要假设每次都来自同一提供方。
+
+`market_events` 按指定日期返回严格 as-of 的结构化公开事件池，可组合 `lhb`、`limit_up`、
+`strong`、`previous_limit_up`、`broken_board`、`announcements` 和 `earnings_forecast`。响应会主动删除龙虎榜
+“上榜后N日”等未来字段；历史池为空时通过 `warnings` 提示供应商保留窗口，不能把空表解释为当日无事件。
+
+```bash
+mcporter call cn-stock market_events \
+  date=2026-08-20 \
+  sources=lhb,limit_up,announcements \
+  announcement_lookback_days=3 \
+  keywords=中标,订单,涨价,投产,收购,重组 \
+  symbols=SH600000,SZ000001 \
+  max_rows_per_source=200
+```
+
+`symbols` 可选，使用标准 `SH/SZ/BJ + 6位代码`，并在 `max_rows_per_source` 截断前过滤；
+适合先读取 LHB/涨停池，再只抓这些证券的公告。省略时保持原来的全市场行为。
+
+`kline_daily` / `kline_range` 保留原 efinance 和 AkShare 主路径；配置
+`akshare-proxy-patch` 后若主路径失败，会自动回退腾讯历史行情，返回格式不变。
+
+`earnings_forecast` 按查询日自动选择最近已结束报告期（1-3月取上年年报、4-6月取一季报、
+7-9月取中报、10-12月取三季报），再按 `announcement_lookback_days` 过滤公告日期；返回预测
+指标、预告类型、预测值、同比变动中值、上年同期值、原因和报告期。生产回测仍应优先读取每日归档，
+因为供应商报告期快照可能覆盖历史修订版本；该来源会返回 `revision_safe=false` 和明确 warning。
 
 ## MCP 客户端接入
 
