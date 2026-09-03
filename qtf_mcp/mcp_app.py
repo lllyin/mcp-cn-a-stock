@@ -17,6 +17,7 @@ from .cache import build_key, get_report_cache, is_cacheable_report
 from .datasource import get_datasource
 from .datasource.base import FETCH_FAILURES_KEY, FetchRequirements
 from .datasource.market_breadth import get_market_breadth
+from .datasource.public_events import PublicEventPoolResponse, get_public_market_events
 from .config import BATCH_QUERY_CONCURRENCY
 from .observability import bind_log_context, http_trace_id_var
 
@@ -1007,4 +1008,42 @@ async def market_breadth(ctx: Context = None) -> MarketBreadthResponse:  # type:
       for bucket in data.distribution
     ],
     warnings=list(data.warnings),
+  )
+
+
+@mcp_app.tool()
+async def market_events(
+  date: str,
+  sources: str = "lhb,limit_up,announcements",
+  announcement_lookback_days: int = 1,
+  keywords: str = "",
+  max_rows_per_source: int = 200,
+  symbols: str = "",
+  ctx: Context = None,  # type: ignore
+) -> PublicEventPoolResponse:
+  """获取严格 as-of 的 A 股公开事件池，返回结构化 JSON。
+
+  Get leakage-safe public A-share event pools for one historical/as-of date.
+  Supplier fields such as 龙虎榜“上榜后N日” are never returned.
+
+  Args:
+    date: Query date in YYYY-MM-DD or YYYYMMDD format.
+    sources: Comma-separated values from lhb, limit_up, strong,
+             previous_limit_up, broken_board, announcements, earnings_forecast.
+    announcement_lookback_days: Include announcements from date back N calendar days, 1-5.
+    keywords: Optional comma-separated keyword filter applied to names, industries, titles and reasons.
+    max_rows_per_source: Deterministic per-source response cap, 1-1000.
+    symbols: Optional comma-separated normalized SH/SZ/BJ symbols. Filtering happens before the response cap.
+
+  Returns:
+    Structured source statuses, normalized SH/SZ/BJ events and warnings.
+    Empty historical pools are reported as warnings because public providers may expire history.
+  """
+  return await get_public_market_events(
+    date=date,
+    sources=sources,
+    announcement_lookback_days=announcement_lookback_days,
+    keywords=keywords,
+    max_rows_per_source=max_rows_per_source,
+    symbols=symbols,
   )

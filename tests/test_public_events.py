@@ -1,0 +1,279 @@
+import pandas as pd
+import pytest
+
+from qtf_mcp.datasource.public_events import (
+    PublicEventPoolResponse,
+    fetch_public_market_events_sync,
+    get_public_market_events,
+    normalize_query_date,
+    parse_public_event_sources,
+)
+
+
+class FakeAk:
+    def stock_zt_pool_em(self, date):
+        return pd.DataFrame([
+            {
+                "代码": "300001",
+                "名称": "测试涨停",
+                "涨跌幅": 20.0,
+                "流通市值": 1_000,
+                "总市值": 2_000,
+                "换手率": 8.0,
+                "封板资金": 100,
+                "首次封板时间": "093000",
+                "最后封板时间": "145500",
+                "炸板次数": 1,
+                "连板数": 2,
+                "所属行业": "测试行业",
+            }
+        ])
+
+    def stock_zt_pool_strong_em(self, date):
+        return pd.DataFrame()
+
+    def stock_zt_pool_previous_em(self, date):
+        return pd.DataFrame()
+
+    def stock_zt_pool_zbgc_em(self, date):
+        return pd.DataFrame()
+
+    def stock_lhb_detail_em(self, start_date, end_date):
+        return pd.DataFrame([
+            {
+                "代码": "600001",
+                "名称": "测试龙虎榜",
+                "上榜日": pd.Timestamp("2026-08-20"),
+                "解读": "机构买入",
+                "涨跌幅": 9.9,
+                "龙虎榜净买额": 20,
+                "龙虎榜买入额": 80,
+                "龙虎榜卖出额": 60,
+                "龙虎榜成交额": 140,
+                "市场总成交额": 1_000,
+                "换手率": 10,
+                "上榜原因": "涨幅偏离",
+                "上榜后5日": 99,
+            },
+            {
+                "代码": "600001",
+                "名称": "测试龙虎榜",
+                "上榜日": pd.Timestamp("2026-08-20"),
+                "龙虎榜成交额": 100,
+                "上榜后5日": -99,
+            },
+            {"代码": "123001", "名称": "测试转债", "龙虎榜成交额": 500},
+        ])
+
+    def stock_notice_report(self, symbol, date):
+        return pd.DataFrame([
+            {
+                "代码": "002001",
+                "名称": "测试公告",
+                "公告标题": "关于重大合同的公告",
+                "公告类型": "重大事项",
+                "公告日期": pd.Timestamp("2026-08-20"),
+                "网址": "https://example.test/notice",
+            }
+        ])
+
+    def stock_yjyg_em(self, date):
+        return pd.DataFrame([
+            {
+                "股票代码": "002001",
+                "股票简称": "测试公告",
+                "公告日期": pd.Timestamp("2026-08-20"),
+                "预测指标": "归属于上市公司股东的净利润",
+                "业绩变动": "预计盈利，同比增长10%至20%",
+                "预测数值": 100_000_000,
+                "业绩变动幅度": 15,
+                "业绩变动原因": "订单增长",
+                "预告类型": "略增",
+                "上年同期值": 87_000_000,
+            },
+            {
+                "股票代码": "600002",
+                "股票简称": "窗口外",
+                "公告日期": pd.Timestamp("2026-08-10"),
+                "预测指标": "归属于上市公司股东的净利润",
+                "预告类型": "预增",
+            },
+        ])
+
+
+def test_parses_sources_and_date():
+    assert parse_public_event_sources("lhb,limit_up,lhb") == ["lhb", "limit_up"]
+    assert normalize_query_date("20260820") == ("2026-08-20", "20260820")
+    with pytest.raises(ValueError, match="不支持"):
+        parse_public_event_sources("future_returns")
+
+
+def test_normalizes_structured_events_and_excludes_future_fields():
+    result = fetch_public_market_events_sync(
+        "2026-08-20",
+        "20260820",
+        ["lhb", "limit_up", "announcements"],
+        1,
+        [],
+        200,
+        FakeAk(),
+    )
+
+    assert result.as_of_safe is True
+    assert [status.status for status in result.source_statuses] == ["SUCCESS"] * 3
+    assert {event.symbol for event in result.events} == {"SH600001", "SZ300001", "SZ002001"}
+    lhb = next(event for event in result.events if event.source == "lhb")
+    assert lhb.lhb_turnover_amount == 140
+    assert lhb.net_buy_to_market_pct == 2
+    assert "上榜后" not in result.model_dump_json()
+
+
+def test_filters_keywords_and_caps_rows_with_warning():
+    result = fetch_public_market_events_sync(
+        "2026-08-20",
+        "20260820",
+        ["announcements", "strong"],
+        2,
+        ["重大合同"],
+        1,
+        FakeAk(),
+    )
+
+    assert [event.symbol for event in result.events] == ["SZ002001"]
+    assert result.source_statuses[0].raw_row_count == 2
+    assert result.source_statuses[0].matched_row_count == 2
+    assert result.source_statuses[0].returned_row_count == 1
+    assert any("仅返回前 1 条" in warning for warning in result.warnings)
+    assert any("strong" in warning and "空结果" in warning for warning in result.warnings)
+
+
+def test_filters_normalized_symbols_before_response_cap():
+    result = fetch_public_market_events_sync(
+        "2026-08-20",
+        "20260820",
+        ["lhb", "limit_up", "announcements"],
+        1,
+        [],
+        1,
+        FakeAk(),
+        {"SZ002001"},
+    )
+
+    assert [event.symbol for event in result.events] == ["SZ002001"]
+    assert [status.returned_row_count for status in result.source_statuses] == [0, 0, 1]
+
+
+def test_normalizes_point_in_time_earnings_forecast():
+    result = fetch_public_market_events_sync(
+        "2026-08-20",
+        "20260820",
+        ["earnings_forecast"],
+        3,
+        [],
+        200,
+        FakeAk(),
+    )
+
+    assert len(result.events) == 1
+    event = result.events[0]
+    assert event.symbol == "SZ002001"
+    assert event.event_date == "2026-08-20"
+    assert event.report_period == "2026-06-30"
+    assert event.forecast_type == "略增"
+    assert event.forecast_change_pct == 15
+    assert event.title == "业绩预告：略增；归属于上市公司股东的净利润，变动幅度中值15.00%"
+    assert result.revision_safe is False
+    assert any("自有归档" in warning for warning in result.warnings)
+
+
+def test_nan_text_is_normalized_to_null():
+    frame = FakeAk.stock_yjyg_em(FakeAk(), "20260630")
+    frame.loc[0, "业绩变动原因"] = float("nan")
+
+    class NanAk(FakeAk):
+        def stock_yjyg_em(self, date):
+            return frame
+
+    result = fetch_public_market_events_sync(
+        "2026-08-20", "20260820", ["earnings_forecast"], 3, [], 200, NanAk()
+    )
+
+    assert result.events[0].change_reason is None
+
+
+@pytest.mark.asyncio
+async def test_market_events_tool_delegates(monkeypatch):
+    import importlib
+
+    app_module = importlib.import_module("qtf_mcp.mcp_app")
+
+    expected = PublicEventPoolResponse(
+        query_date="2026-08-20",
+        fetched_at="2026-08-20 15:10:00",
+        sources_requested=["lhb"],
+        source_statuses=[],
+        events=[],
+        warnings=[],
+    )
+    calls = []
+
+    async def fake_get_public_market_events(**kwargs):
+        calls.append(kwargs)
+        return expected
+
+    monkeypatch.setattr(app_module, "get_public_market_events", fake_get_public_market_events)
+    result = await app_module.market_events(
+        date="2026-08-20",
+        sources="lhb",
+        announcement_lookback_days=2,
+        keywords="订单",
+        max_rows_per_source=50,
+        symbols="SH600001",
+    )
+
+    assert result is expected
+    assert calls == [{
+        "date": "2026-08-20",
+        "sources": "lhb",
+        "announcement_lookback_days": 2,
+        "keywords": "订单",
+        "max_rows_per_source": 50,
+        "symbols": "SH600001",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_public_event_requests_have_bounded_concurrency(monkeypatch):
+    import asyncio
+    import importlib
+    import threading
+    import time
+
+    module = importlib.import_module("qtf_mcp.datasource.public_events")
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def fake_fetch(*args):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+        return PublicEventPoolResponse(
+            query_date="2026-08-20",
+            fetched_at="2026-08-20 15:10:00",
+            sources_requested=["lhb"],
+            source_statuses=[],
+            events=[],
+            warnings=[],
+        )
+
+    monkeypatch.setattr(module, "fetch_public_market_events_sync", fake_fetch)
+    await asyncio.gather(*[
+        get_public_market_events("2026-08-20", sources="lhb")
+        for _ in range(10)
+    ])
+    assert max_active == 3
