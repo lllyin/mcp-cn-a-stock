@@ -7,6 +7,11 @@ from playwright.async_api import async_playwright, Browser, BrowserContext
 
 from ..config import ALL_INDICES
 from ..observability import log_context
+from .fund_flow_page import (
+    HISTORY_TABLE_ID,
+    FundFlowPage,
+    parse_fund_flow_page,
+)
 
 logger = logging.getLogger("qtf_mcp")
 
@@ -171,8 +176,23 @@ async def close_browser():
         _playwright = None
 
 
-# ── 单个 Symbol 抓取 ──────────────────────────────────────
-async def fetch_single(symbol: str, context: BrowserContext) -> dict:
+class FundFlowPageUnavailable(RuntimeError):
+    """该标的没有资金流向页面（三大指数之外的指数）。"""
+
+
+# ── 页面生命周期 ──────────────────────────────────────────
+async def _on_fund_flow_page(
+    symbol: str,
+    context: BrowserContext,
+    extract,
+    *,
+    purpose: str,
+) -> object:
+    """在资金流向页面上执行 extract。
+
+    信号量、资源拦截、页面开关和耗时日志都在这里，两个用途（今日字段、整页
+    HTML）共用一份，避免浏览器资源管理出现第二套写法。
+    """
     wait_started_at = time.perf_counter()
     await SEMAPHORE.acquire()
     semaphore_wait = time.perf_counter() - wait_started_at
@@ -180,7 +200,7 @@ async def fetch_single(symbol: str, context: BrowserContext) -> dict:
     try:
         url = get_fund_flow_url(symbol)
         if url is None:
-            return {"error": "暂无实时资金流向", "url": ""}
+            raise FundFlowPageUnavailable(symbol)
 
         page = await context.new_page()
 
@@ -193,42 +213,7 @@ async def fetch_single(symbol: str, context: BrowserContext) -> dict:
                 await page.route(pattern, block_route)
 
             await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-
-            # 先等页面框架出现
-            await page.wait_for_selector("text=今日主力净流入", timeout=10000)
-
-            # 再等 Ajax 数据真正填入（超时则认为停牌/非交易时段，直接读当前值）
-            try:
-                await page.wait_for_function(WAIT_FOR_DATA_JS, timeout=12000)
-            except Exception:
-                # 超时：停牌股 / 非交易时段，数据本身就是空，继续解析拿到的值即可
-                pass
-
-            raw = await page.evaluate(PARSE_JS)
-
-            def to_ratio(v: str) -> float:
-                try:
-                    return float(str(v).replace("%", ""))
-                except Exception:
-                    return 0.0
-
-            return {
-                "标的名称":      get_fund_flow_display_name(symbol, raw["name"]),
-                "主力净流入":    raw["f62"],
-                "主力净比(%)":   to_ratio(raw["f184"]),
-                "超大单净流入":  raw["f66"],
-                "超大单净比(%)": to_ratio(raw["f69"]),
-                "大单净流入":    raw["f72"],
-                "大单净比(%)":   to_ratio(raw["f75"]),
-                "中单净流入":    raw["f78"],
-                "中单净比(%)":   to_ratio(raw["f81"]),
-                "小单净流入":    raw["f84"],
-                "小单净比(%)":   to_ratio(raw["f87"]),
-            }
-
-        except Exception as e:
-            return {"error": str(e), "url": url}
-
+            return await extract(page)
         finally:
             await page.close()  # page 用完立即释放，context/browser 保留复用
     finally:
@@ -236,13 +221,80 @@ async def fetch_single(symbol: str, context: BrowserContext) -> dict:
         request_id, tool, _ = log_context()
         logger.info(
             "Realtime fund flow page request_id=%s tool=%s symbol=%s "
-            "semaphore_wait=%.3fs service=%.3fs",
+            "purpose=%s semaphore_wait=%.3fs service=%.3fs",
             request_id,
             tool,
             symbol,
+            purpose,
             semaphore_wait,
             time.perf_counter() - service_started_at,
         )
+
+
+# ── 单个 Symbol 抓取 ──────────────────────────────────────
+async def fetch_single(symbol: str, context: BrowserContext) -> dict:
+    async def extract(page) -> dict:
+        # 先等页面框架出现
+        await page.wait_for_selector("text=今日主力净流入", timeout=10000)
+
+        # 再等 Ajax 数据真正填入（超时则认为停牌/非交易时段，直接读当前值）
+        try:
+            await page.wait_for_function(WAIT_FOR_DATA_JS, timeout=12000)
+        except Exception:
+            # 超时：停牌股 / 非交易时段，数据本身就是空，继续解析拿到的值即可
+            pass
+
+        raw = await page.evaluate(PARSE_JS)
+
+        def to_ratio(v: str) -> float:
+            try:
+                return float(str(v).replace("%", ""))
+            except Exception:
+                return 0.0
+
+        return {
+            "标的名称":      get_fund_flow_display_name(symbol, raw["name"]),
+            "主力净流入":    raw["f62"],
+            "主力净比(%)":   to_ratio(raw["f184"]),
+            "超大单净流入":  raw["f66"],
+            "超大单净比(%)": to_ratio(raw["f69"]),
+            "大单净流入":    raw["f72"],
+            "大单净比(%)":   to_ratio(raw["f75"]),
+            "中单净流入":    raw["f78"],
+            "中单净比(%)":   to_ratio(raw["f81"]),
+            "小单净流入":    raw["f84"],
+            "小单净比(%)":   to_ratio(raw["f87"]),
+        }
+
+    try:
+        return await _on_fund_flow_page(symbol, context, extract, purpose="realtime")
+    except FundFlowPageUnavailable:
+        return {"error": "暂无实时资金流向", "url": ""}
+    except Exception as e:
+        return {"error": str(e), "url": get_fund_flow_url(symbol) or ""}
+
+
+async def fetch_history_page(symbol: str) -> FundFlowPage:
+    """加载资金流向页面并解析出历史资金流向。
+
+    与 fetch_single 走同一个页面、同一个信号量，但等的是历史表而不是今日字段：
+    这条路是在东财接口不可用时兜底用的，那时今日的数值也在历史表的最后一行里。
+    失败一律抛异常，由调用方决定是否降级，不静默返回空表。
+    """
+
+    async def extract(page) -> FundFlowPage:
+        try:
+            # 历史表是 Ajax 填充的，容器在首屏就存在但没有行。
+            await page.wait_for_selector(
+                f"#{HISTORY_TABLE_ID} tbody tr", timeout=12000
+            )
+        except Exception:
+            # 等不到就交给解析器判断：可能是新股没有历史，也可能是页面改版。
+            pass
+        return parse_fund_flow_page(await page.content())
+
+    context = await get_context()
+    return await _on_fund_flow_page(symbol, context, extract, purpose="history")
 
 
 async def _fetch_single_with_context(symbol: str) -> dict:
