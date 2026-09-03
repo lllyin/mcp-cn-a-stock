@@ -41,6 +41,45 @@ def _fetch_failure(source: str) -> Dict[str, str]:
     return {_FETCH_FAILURE_MARKER: source}
 
 
+def _normalize_tencent_volume(frame, code: str):
+    """Return the Tencent frame with 成交量 expressed in 手.
+
+    AkShare's Tencent endpoint reports 成交量 in 股 for some code prefixes and
+    leaves it in 手 for the rest, so neither unit can be assumed. Decide from the
+    data instead: 成交额 / 收盘价 is the traded share count, which sits two
+    orders of magnitude away from the lot count. Using 收盘价 as a stand-in for
+    VWAP is off by a few percent at worst, far inside that gap.
+    """
+    volume = frame["成交量"]
+    usable = (volume > 0) & (frame["成交额"] > 0) & (frame["收盘"] > 0)
+    if not usable.any():
+        # Only rows with no traded volume, where the unit cannot matter.
+        return frame
+
+    implied_shares = frame.loc[usable, "成交额"] / frame.loc[usable, "收盘"]
+    ratio = float((volume[usable] / implied_shares).median())
+    # ~1 means the column counts 股, ~0.01 means 手; 0.1 is the log midpoint.
+    in_shares = ratio > 0.1
+    if not 0.5 <= (ratio if in_shares else ratio * 100) <= 2.0:
+        logger.warning(
+            "腾讯历史行情成交量量级异常 %s: ratio=%.4g，按%s处理",
+            code,
+            ratio,
+            "股" if in_shares else "手",
+        )
+    else:
+        logger.debug(
+            "腾讯历史行情成交量单位 %s: ratio=%.4g unit=%s",
+            code,
+            ratio,
+            "股" if in_shares else "手",
+        )
+    if in_shares:
+        frame = frame.copy()
+        frame["成交量"] = volume / 100
+    return frame
+
+
 def check_is_index(symbol: str, name: str) -> bool:
     """判定是否为指数的辅助函数"""
     if not symbol:
@@ -391,8 +430,12 @@ class CNStockDataSource(DataSource):
                     df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""), adjust=ak_adj)
                 
                 if df is None or df.empty:
-                    logger.warning(f"获取K线数据依然为空 {code}")
-                    return None
+                    logger.warning(f"获取K线数据依然为空 {code}，尝试腾讯历史行情 fallback...")
+                    df = self._fetch_tencent_kline_sync(
+                        code, start_date, end_date, adjust, symbol
+                    )
+                    if df is None or df.empty:
+                        return None
             
             # 同时获取不复权数据用于计算
             if fqt != 0 and include_unadjusted:
@@ -432,7 +475,87 @@ class CNStockDataSource(DataSource):
                 "adjust_type": adjust,
             }
         except Exception as e:
-            logger.warning(f"获取K线数据失败 {code}: {e}")
+            logger.warning(f"获取K线数据失败 {code}: {e}；尝试腾讯历史行情 fallback...")
+            df = self._fetch_tencent_kline_sync(
+                code, start_date, end_date, adjust, symbol
+            )
+            if df is None or df.empty:
+                return None
+            if adjust != "none" and include_unadjusted:
+                df_unadj = self._fetch_tencent_kline_sync(
+                    code, start_date, end_date, "none", symbol
+                )
+            else:
+                df_unadj = df
+            return {
+                "adjusted": df,
+                "unadj": df_unadj if df_unadj is not None and not df_unadj.empty else df,
+                "adjust_type": adjust,
+            }
+
+    def _fetch_tencent_kline_sync(
+        self,
+        code: str,
+        start_date: str,
+        end_date: str,
+        adjust: str,
+        symbol: str = None,
+    ):
+        """Use AkShare's Tencent history only after existing providers fail."""
+        try:
+            import akshare as ak
+            import pandas as pd
+
+            normalized_symbol = (symbol or "").lower()
+            if not normalized_symbol:
+                if code.startswith(("4", "8", "92")):
+                    normalized_symbol = f"bj{code}"
+                elif code.startswith(("6", "9")):
+                    normalized_symbol = f"sh{code}"
+                else:
+                    normalized_symbol = f"sz{code}"
+            tx_adjust = "" if adjust == "none" else adjust
+            frame = ak.stock_zh_a_hist_tx(
+                symbol=normalized_symbol,
+                start_date=start_date.replace("-", ""),
+                end_date=end_date.replace("-", ""),
+                adjust=tx_adjust,
+            )
+            if frame is None or frame.empty:
+                return None
+            frame = frame.rename(columns={
+                "date": "日期",
+                "open": "开盘",
+                "close": "收盘",
+                "high": "最高",
+                "low": "最低",
+                "volume": "成交量",
+                "amount": "成交额",
+                "turnover": "换手率",
+            }).copy()
+            required = ["日期", "开盘", "收盘", "最高", "最低", "成交量", "成交额"]
+            if any(column not in frame.columns for column in required):
+                logger.warning("腾讯历史行情字段不完整 %s: %s", code, list(frame.columns))
+                return None
+            frame["日期"] = pd.to_datetime(frame["日期"], errors="coerce").dt.date
+            for column in required[1:]:
+                frame[column] = pd.to_numeric(frame[column], errors="coerce")
+            previous_close = frame["收盘"].shift(1)
+            frame["涨跌额"] = (frame["收盘"] - previous_close).fillna(0.0)
+            frame["涨跌幅"] = ((frame["收盘"] / previous_close - 1) * 100).fillna(0.0)
+            frame["振幅"] = (((frame["最高"] - frame["最低"]) / previous_close) * 100).fillna(0.0)
+            if "换手率" in frame.columns:
+                frame["换手率"] = pd.to_numeric(frame["换手率"], errors="coerce").fillna(0.0) * 100
+            else:
+                frame["换手率"] = 0.0
+            frame = frame.dropna(subset=required)
+            frame = _normalize_tencent_volume(frame, code)
+            return frame[[
+                "日期", "开盘", "收盘", "最高", "最低", "成交量", "成交额",
+                "振幅", "涨跌幅", "涨跌额", "换手率",
+            ]]
+        except Exception as error:
+            logger.warning("腾讯历史行情 fallback 失败 %s: %s", code, error)
             return None
     
     def fetch_kline_simple_sync(

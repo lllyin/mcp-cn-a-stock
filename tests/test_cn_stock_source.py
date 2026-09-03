@@ -276,6 +276,59 @@ def test_simple_kline_skips_unadjusted_copy(monkeypatch):
     assert result["data"][0]["收盘"] == 10.2
 
 
+def test_simple_kline_uses_tencent_fallback_after_provider_failure(monkeypatch):
+    datasource = CNStockDataSource()
+
+    def provider_failure(*args, **kwargs):
+        raise TypeError("unexpected impersonate")
+
+    monkeypatch.setattr(source_module.ef.stock, "get_quote_history", provider_failure)
+    monkeypatch.setattr(
+        datasource,
+        "_fetch_tencent_kline_sync",
+        lambda code, start_date, end_date, adjust, symbol: _sample_kline_frame(),
+    )
+
+    result = datasource.fetch_kline_simple_sync(
+        "SH600000", "2026-06-16", "2026-06-16", "qfq"
+    )
+
+    assert result["data"][0]["收盘"] == 10.2
+
+
+def test_tencent_kline_fallback_normalizes_columns(monkeypatch):
+    datasource = CNStockDataSource()
+    import akshare as ak
+
+    monkeypatch.setattr(
+        ak,
+        "stock_zh_a_hist_tx",
+        lambda **kwargs: pd.DataFrame([
+            {
+                "date": "2026-06-15", "open": 10.0, "close": 10.0,
+                "high": 10.2, "low": 9.8, "volume": 1000,
+                "amount": 10000.0, "turnover": 0.01,
+            },
+            {
+                "date": "2026-06-16", "open": 10.1, "close": 11.0,
+                "high": 11.2, "low": 10.0, "volume": 2000,
+                "amount": 21000.0, "turnover": 0.02,
+            },
+        ]),
+    )
+
+    frame = datasource._fetch_tencent_kline_sync(
+        "600000", "2026-06-15", "2026-06-16", "qfq", "SH600000"
+    )
+
+    assert list(frame.columns) == [
+        "日期", "开盘", "收盘", "最高", "最低", "成交量", "成交额",
+        "振幅", "涨跌幅", "涨跌额", "换手率",
+    ]
+    assert frame.iloc[1]["涨跌幅"] == pytest.approx(10.0)
+    assert frame.iloc[1]["换手率"] == pytest.approx(2.0)
+
+
 def test_etf_fund_flow_uses_stock_individual_fund_flow(monkeypatch):
     datasource = CNStockDataSource()
     seen = {}
@@ -564,3 +617,82 @@ async def test_finance_cache_prunes_expired_and_oldest_entries(monkeypatch):
     await datasource._fetch_finance_cached("fresh", "SH600003")
 
     assert set(source_module._finance_cache) == {"newer", "SH600003"}
+
+
+# --- 腾讯 fallback 的成交量单位 ---------------------------------------------
+
+
+def _tencent_frame(volume, amount=841972900.0, close=9.27, rows=3):
+    """构造归一化前的腾讯行情帧；默认取 sh600000 2026-09-03 的实测数值。"""
+    import pandas as pd
+
+    return pd.DataFrame(
+        {
+            "日期": pd.date_range("2026-09-01", periods=rows).date,
+            "开盘": [close] * rows,
+            "收盘": [close] * rows,
+            "最高": [close] * rows,
+            "最低": [close] * rows,
+            "成交量": [volume] * rows,
+            "成交额": [amount] * rows,
+        }
+    )
+
+
+def test_tencent_volume_in_shares_is_converted_to_lots():
+    """sh600000 实测：volume 89,817,200 与 成交额/收盘价 同量级，即单位是股。"""
+    frame = source_module._normalize_tencent_volume(
+        _tencent_frame(89817200.0), "600000"
+    )
+
+    assert frame["成交量"].iloc[0] == pytest.approx(898172.0)
+
+
+def test_tencent_volume_already_in_lots_is_left_alone():
+    """sz000333 实测：volume 148,596 约为 成交额/收盘价 的百分之一，已是手。"""
+    frame = source_module._normalize_tencent_volume(
+        _tencent_frame(148596.0, amount=1302253100.0, close=87.25), "000333"
+    )
+
+    assert frame["成交量"].iloc[0] == pytest.approx(148596.0)
+
+
+def test_tencent_volume_decision_survives_close_vwap_gap():
+    """用收盘价代替 VWAP 的误差远小于 100 倍的判定间隔。"""
+    for close_bias in (0.9, 1.1):
+        frame = source_module._normalize_tencent_volume(
+            _tencent_frame(89817200.0, close=9.27 * close_bias), "600000"
+        )
+        assert frame["成交量"].iloc[0] == pytest.approx(898172.0)
+
+
+def test_tencent_volume_ignores_rows_without_turnover():
+    """停牌行的成交额为 0，不能参与判定。"""
+    import pandas as pd
+
+    frame = _tencent_frame(89817200.0, rows=4)
+    frame.loc[0, ["成交量", "成交额"]] = 0.0
+    frame.loc[1, "成交额"] = 0.0
+
+    result = source_module._normalize_tencent_volume(frame, "600000")
+
+    assert result["成交量"].iloc[2] == pytest.approx(898172.0)
+    assert result["成交量"].iloc[0] == pytest.approx(0.0)
+
+
+def test_tencent_volume_untouched_when_nothing_traded():
+    frame = _tencent_frame(0.0, amount=0.0)
+
+    result = source_module._normalize_tencent_volume(frame, "600000")
+
+    assert result["成交量"].tolist() == [0.0, 0.0, 0.0]
+
+
+def test_tencent_volume_logs_an_unexpected_magnitude(caplog):
+    """量级既不像股也不像手时要留下痕迹，而不是静默猜一个。"""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="qtf_mcp")
+    source_module._normalize_tencent_volume(_tencent_frame(89817200.0 / 8), "600000")
+
+    assert "成交量量级异常" in caplog.text
