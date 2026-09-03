@@ -24,6 +24,9 @@ from ..config import (
     DATA_FETCH_MAX_WORKERS,
     FINANCE_CACHE_MAX_ENTRIES,
     FINANCE_CACHE_TTL_SECONDS,
+    FUND_FLOW_PAGE_FALLBACK_CONCURRENCY,
+    FUND_FLOW_PAGE_FALLBACK_ENABLED,
+    FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS,
     SOURCE_BREAKER_COOLDOWN_SECONDS,
     SOURCE_BREAKER_ENABLED,
     SOURCE_BREAKER_THRESHOLD,
@@ -42,6 +45,11 @@ _FETCH_FAILURE_MARKER = "_fetch_failure"
 def _fetch_failure(source: str) -> Dict[str, str]:
     """Return an internal sentinel for a source that failed or was unavailable."""
     return {_FETCH_FAILURE_MARKER: source}
+
+
+def _is_fetch_failure(result) -> bool:
+    """Whether a fetch result carries the failure sentinel."""
+    return isinstance(result, dict) and _FETCH_FAILURE_MARKER in result
 
 
 class SourceBreaker:
@@ -274,6 +282,7 @@ _executor = ThreadPoolExecutor(
 )
 _DATA_FETCH_SLOTS_ATTR = "_cn_stock_data_fetch_slots"
 _FINANCE_INFLIGHT_ATTR = "_cn_stock_finance_inflight"
+_FUND_FLOW_PAGE_SLOTS_ATTR = "_cn_stock_fund_flow_page_slots"
 _finance_cache: dict[str, tuple[float, Dict]] = {}
 _finance_cache_lock = threading.Lock()
 
@@ -285,6 +294,16 @@ def _get_data_fetch_slots() -> asyncio.Semaphore:
     if slots is None:
         slots = asyncio.Semaphore(DATA_FETCH_MAX_IN_FLIGHT)
         setattr(loop, _DATA_FETCH_SLOTS_ATTR, slots)
+    return slots
+
+
+def _get_fund_flow_page_slots() -> asyncio.Semaphore:
+    """Return the page-fallback limiter owned by the current event loop."""
+    loop = asyncio.get_running_loop()
+    slots = getattr(loop, _FUND_FLOW_PAGE_SLOTS_ATTR, None)
+    if slots is None:
+        slots = asyncio.Semaphore(FUND_FLOW_PAGE_FALLBACK_CONCURRENCY)
+        setattr(loop, _FUND_FLOW_PAGE_SLOTS_ATTR, slots)
     return slots
 
 
@@ -1034,6 +1053,55 @@ class CNStockDataSource(DataSource):
             "S_R": to_float_array("小单净流入-净占比", 0.01),
         }
     
+    async def _fetch_fund_flow_from_page(self, symbol: str) -> Optional[Dict]:
+        """接口不可用时，从东财资金流向页面兜底取资金流向。
+
+        页面走浏览器，不经过 requests，所以不消耗网关积分；代价是一次 Chromium
+        页面加载。返回结构与 _fetch_fund_flow_sync 完全相同，下游的转换和渲染
+        一行不用改——今日数值取的是历史表最后一行，与主源同一条路径。
+        """
+        if not FUND_FLOW_PAGE_FALLBACK_ENABLED:
+            return None
+
+        slots = _get_fund_flow_page_slots()
+        try:
+            await asyncio.wait_for(
+                slots.acquire(), timeout=FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            # 浏览器层没有空位。这里排队等于把"缺一段"换成"整体变慢"，而盘中
+            # 实时资金流没有任何别的源，不能被兜底挤掉。
+            logger.info("资金流向页面兜底跳过 %s: 浏览器层无空位", symbol)
+            return None
+
+        started_at = time.perf_counter()
+        try:
+            from . import realtime_ff
+
+            page = await realtime_ff.fetch_history_page(symbol)
+        except Exception as e:
+            logger.warning("资金流向页面兜底失败 %s: %s", symbol, e)
+            return None
+        finally:
+            slots.release()
+
+        records = page.history_records()
+        if not records:
+            logger.warning("资金流向页面兜底无历史数据 %s", symbol)
+            return None
+
+        import pandas as pd
+
+        logger.info(
+            "资金流向页面兜底成功 %s rows=%d cost=%.3fs",
+            symbol,
+            len(records),
+            time.perf_counter() - started_at,
+        )
+        # is_market 与主源保持一致：_fetch_fund_flow_sync 从不置 True，页面上的
+        # 列名也是"收盘价/涨跌幅"这一套，不是指数那套带交易所前缀的列。
+        return {"fund_flow": pd.DataFrame(records), "is_market": False}
+
     def _fetch_dividend_sync(self, code: str) -> Optional[Dict]:
         """同步获取分红数据"""
         # Note: dividend sync isn't passed symbol, but wait, does fetch_stock_data pass symbol?
@@ -1175,6 +1243,15 @@ class CNStockDataSource(DataSource):
 
         task_results = await asyncio.gather(*(future for _, future in task_specs))
         fetched = dict(zip((name for name, _ in task_specs), task_results))
+
+        if requirements.fund_flow and _is_fetch_failure(fetched.get("fund_flow")):
+            # 页面兜底挂在 gather 之后：只有主源真的失败才付这一次页面加载，正常
+            # 情况下这条路一次都不会走。必须在下面统计 fetch_failures 之前替换，
+            # 否则兜底成功了报告依然被判定为不完整而整体不进缓存。
+            page_result = await self._fetch_fund_flow_from_page(canonical_symbol)
+            if page_result is not None:
+                fetched["fund_flow"] = page_result
+
         kline_data = fetched.get("kline")
         finance_data = fetched.get("finance")
         fund_flow_data = fetched.get("fund_flow")
@@ -1184,7 +1261,7 @@ class CNStockDataSource(DataSource):
         stock_data.fetch_failures = [
             str(result[_FETCH_FAILURE_MARKER])
             for result in fetched.values()
-            if isinstance(result, dict) and _FETCH_FAILURE_MARKER in result
+            if _is_fetch_failure(result)
         ]
         
         if realtime_data and "info" in realtime_data:

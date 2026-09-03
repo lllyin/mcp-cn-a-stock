@@ -84,6 +84,32 @@ SOURCE_BREAKER_COOLDOWN_SECONDS = max(
 )
 
 
+# --- Fund-flow page fallback (qtf_mcp/datasource/fund_flow_page.py) ---
+# When the Eastmoney fund-flow endpoint refuses us, the same data is on
+# data.eastmoney.com/zjlx/<code>.html, which the browser tier can already load.
+# That path costs no gateway credits, but it costs a Chromium page load, so it
+# must never become the steady state under load: with the endpoint failing for
+# every symbol, an unbounded fallback would put four page loads per request
+# behind a semaphore of two.
+FUND_FLOW_PAGE_FALLBACK_ENABLED = _parse_bool(
+    os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_ENABLED"), True
+)
+# Page loads allowed to run at once, on top of whatever the realtime tier is
+# doing. Kept below the browser semaphore so the fallback cannot starve the
+# intraday realtime path, which has no alternative source at all.
+FUND_FLOW_PAGE_FALLBACK_CONCURRENCY = max(
+    1,
+    int(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_CONCURRENCY", "1")),
+)
+# How long a request waits for a fallback slot before giving up and rendering
+# the "no fund-flow data" line. Skipping is the right answer under load: queueing
+# here would trade a missing section for a much slower response.
+FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS = max(
+    0.0,
+    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", "0.5")),
+)
+
+
 class HttpModeError(ValueError):
     """Raised when an explicitly requested channel mode cannot be honoured."""
 

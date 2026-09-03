@@ -1132,3 +1132,187 @@ def test_simple_kline_returns_none_for_a_quiet_window(monkeypatch):
     assert CNStockDataSource().fetch_kline_simple_sync(
         "SH600000", "2026-09-01", "2026-09-03", "qfq"
     ) is None
+
+
+# --- 资金流向页面兜底 --------------------------------------------------------
+
+
+def _page_fallback_datasource(monkeypatch, fund_flow_result):
+    """装好一个除资金流向外都成功的数据源。"""
+    datasource = CNStockDataSource()
+
+    def fake_kline(code, start_date, end_date, adjust, symbol, include_unadjusted, *args):
+        frame = _sample_kline_frame()
+        return {"adjusted": frame, "unadj": frame, "adjust_type": adjust}
+
+    monkeypatch.setattr(datasource, "_fetch_kline_sync", fake_kline)
+    monkeypatch.setattr(datasource, "_fetch_finance_sync", lambda code, symbol: None)
+    monkeypatch.setattr(
+        datasource,
+        "_fetch_realtime_sync",
+        lambda code, symbol: {"info": {"股票简称": "三环集团", "最新价": 110.91}},
+    )
+    monkeypatch.setattr(
+        datasource, "_fetch_fund_flow_sync", lambda code, symbol: fund_flow_result
+    )
+    return datasource
+
+
+def _captured_page():
+    from pathlib import Path
+
+    from qtf_mcp.datasource.fund_flow_page import parse_fund_flow_page
+
+    fixture = Path(__file__).parent / "fixtures" / "eastmoney_zjlx_300408.html"
+    return parse_fund_flow_page(fixture.read_text(encoding="utf-8"))
+
+
+@pytest.mark.asyncio
+async def test_page_fallback_is_not_used_while_the_api_works(monkeypatch):
+    """主源正常时一次页面都不该加载——兜底不能变成常态开销。"""
+    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+
+    datasource = _page_fallback_datasource(
+        monkeypatch, {"fund_flow": pd.DataFrame(_captured_page().history_records())}
+    )
+
+    async def unexpected(symbol):
+        raise AssertionError(f"主源可用时不应加载页面: {symbol}")
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", unexpected)
+
+    result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
+
+    assert result.fetch_failures == []
+    assert result.fund_flow_history is not None
+
+
+@pytest.mark.asyncio
+async def test_page_fallback_supplies_history_and_clears_the_failure(monkeypatch):
+    """兜底成功后不能再留失败标记，否则报告整体不进缓存。"""
+    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+
+    datasource = _page_fallback_datasource(
+        monkeypatch, source_module._fetch_failure("fund_flow")
+    )
+    page = _captured_page()
+    loaded = []
+
+    async def fake_page(symbol):
+        loaded.append(symbol)
+        return page
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+
+    result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
+
+    assert loaded == ["SZ300408"]
+    assert result.fetch_failures == []
+    assert len(result.fund_flow_history["DATE"]) == 121
+    # 今日数值取历史表最后一行，与主源同一条路径。
+    assert result.fund_main_amount[-1] == pytest.approx(1.59e8)
+    assert result.fund_main_ratio[-1] == pytest.approx(0.0337)
+    assert result.is_market is False
+
+
+@pytest.mark.asyncio
+async def test_page_fallback_is_skipped_when_the_browser_tier_is_full(monkeypatch):
+    """没有空位就直接放弃：排队会把"缺一段"换成"整体变慢"。"""
+    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+
+    datasource = _page_fallback_datasource(
+        monkeypatch, source_module._fetch_failure("fund_flow")
+    )
+
+    exhausted = asyncio.Semaphore(1)
+    await exhausted.acquire()
+    monkeypatch.setattr(source_module, "_get_fund_flow_page_slots", lambda: exhausted)
+    monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", 0.01)
+
+    async def unexpected(symbol):
+        raise AssertionError("没有空位时不应加载页面")
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", unexpected)
+
+    result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
+
+    assert result.fetch_failures == ["fund_flow"]
+
+
+@pytest.mark.asyncio
+async def test_page_fallback_can_be_disabled(monkeypatch):
+    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+
+    datasource = _page_fallback_datasource(
+        monkeypatch, source_module._fetch_failure("fund_flow")
+    )
+    monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_FALLBACK_ENABLED", False)
+
+    async def unexpected(symbol):
+        raise AssertionError("开关关闭时不应加载页面")
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", unexpected)
+
+    result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
+
+    assert result.fetch_failures == ["fund_flow"]
+
+
+@pytest.mark.asyncio
+async def test_page_fallback_survives_a_page_error(monkeypatch):
+    """页面加载失败要退回今天的行为，不能把异常抛给调用方。"""
+    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+
+    datasource = _page_fallback_datasource(
+        monkeypatch, source_module._fetch_failure("fund_flow")
+    )
+
+    async def failing(symbol):
+        raise TimeoutError("Timeout 25000ms exceeded")
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", failing)
+
+    result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
+
+    assert result.fetch_failures == ["fund_flow"]
+    assert result.fund_flow_history is None
+
+
+@pytest.mark.asyncio
+async def test_page_fallback_releases_its_slot_after_a_failure(monkeypatch):
+    """失败也要归还名额，否则一次超时就永久关掉了兜底。"""
+    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+
+    datasource = _page_fallback_datasource(
+        monkeypatch, source_module._fetch_failure("fund_flow")
+    )
+    slots = asyncio.Semaphore(1)
+    monkeypatch.setattr(source_module, "_get_fund_flow_page_slots", lambda: slots)
+
+    async def failing(symbol):
+        raise TimeoutError("boom")
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", failing)
+
+    await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
+
+    assert not slots.locked()
+
+
+@pytest.mark.asyncio
+async def test_page_fallback_ignores_an_empty_history(monkeypatch):
+    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+    from qtf_mcp.datasource.fund_flow_page import FundFlowPage
+
+    datasource = _page_fallback_datasource(
+        monkeypatch, source_module._fetch_failure("fund_flow")
+    )
+
+    async def empty_page(symbol):
+        return FundFlowPage(name="三环集团", code="300408")
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", empty_page)
+
+    result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
+
+    assert result.fetch_failures == ["fund_flow"]
