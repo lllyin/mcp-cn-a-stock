@@ -30,11 +30,17 @@ logger.setLevel(logging.DEBUG)
 import click
 
 from qtf_mcp import __version__, mcp_app
+from qtf_mcp.datasource.http_channel import describe_installed_channel
 from qtf_mcp.symbols import load_symbols
 
 
 def log_application_version() -> None:
     logger.info("cn-stock-mcp version=%s", __version__)
+
+
+def log_http_channel() -> None:
+    """Report which outbound HTTP channel the process actually installed."""
+    logger.info("HTTP channel %s", describe_installed_channel())
 
 
 def log_market_data_versions() -> None:
@@ -63,6 +69,7 @@ def main(port: int, transport: str) -> int:
     """启动 A股数据 MCP 服务"""
     log_application_version()
     log_market_data_versions()
+    log_http_channel()
     load_symbols()
     if transport == "http":
         transport = "streamable-http"
