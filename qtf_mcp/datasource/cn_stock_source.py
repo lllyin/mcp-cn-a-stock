@@ -28,6 +28,7 @@ from ..config import (
     SZ_INDICES,
 )
 from .base import DataSource, FetchRequirements, StockData
+from .http_channel import install_http_channel
 from ..observability import log_context
 
 logger = logging.getLogger("qtf_mcp")
@@ -63,31 +64,14 @@ def check_is_index(symbol: str, name: str) -> bool:
         return True
     return False
 
-if AKSHARE_PROXY_ENABLED:
-    import akshare_proxy_patch
-
-    # Improve reliability for the configured Eastmoney interfaces only.
-    akshare_proxy_patch.install_patch(
-        AKSHARE_PROXY_IP,
-        auth_token=AKSHARE_PROXY_PASSWORD,
-        retry=AKSHARE_PROXY_RETRY,
-        hook_domains=[
-            "fund.eastmoney.com",
-            "push2.eastmoney.com",
-            "push2his.eastmoney.com",
-            "emweb.securities.eastmoney.com",
-        ],
-    )
-    logger.info(
-        "AkShare proxy patch installed: gateway=%s token_configured=%s "
-        "retry=%s version=%s",
-        AKSHARE_PROXY_IP,
-        bool(AKSHARE_PROXY_PASSWORD),
-        AKSHARE_PROXY_RETRY,
-        akshare_proxy_patch.__version__,
-    )
-else:
-    logger.info("AkShare proxy patch disabled; using direct AkShare requests")
+# Exactly one outbound HTTP channel, and it must be installed before efinance is
+# imported; see http_channel for why the import order is load bearing.
+install_http_channel(
+    proxy_enabled=AKSHARE_PROXY_ENABLED,
+    proxy_gateway=AKSHARE_PROXY_IP,
+    proxy_token=AKSHARE_PROXY_PASSWORD,
+    proxy_retry=AKSHARE_PROXY_RETRY,
+)
 
 import efinance as ef
 

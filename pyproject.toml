@@ -12,6 +12,8 @@ dependencies = [
     "click>=8.3.1",
     "python-dotenv>=1.2.1",
     "akshare-proxy-patch==0.5.0",
+    # Used directly by the direct HTTP channel, not only via akshare-proxy-patch.
+    "curl_cffi>=0.7",
     "efinance==0.5.9",
     "playwright>=1.58.0",
     "requests>=2.32.0",

@@ -28,6 +28,81 @@ AKSHARE_PROXY_RETRY = int(os.getenv("AKSHARE_PROXY_RETRY", os.getenv("AKSHARE_PR
 # akshare-proxy-patch treats the third argument as retry count.
 AKSHARE_PROXY_PORT = AKSHARE_PROXY_RETRY
 
+# --- Outbound HTTP channel (qtf_mcp/datasource/http_channel.py) ---
+# Some upstream quote hosts drop connections from plain HTTP clients, so requests
+# to them are issued through one of three channels. The modes are mutually
+# exclusive: the two non-plain implementations rewrite the same requests module
+# attributes, so installing both would silently leave only the last one active.
+#   proxy       - akshare-proxy-patch: authorised gateway, rotating egress, cookies
+#   impersonate - local connection with a browser TLS fingerprint, no gateway
+#   direct      - local connection with plain requests, i.e. the behaviour
+#                 before this switch existed
+#   auto        - proxy when the gateway is usable, otherwise impersonate
+HTTP_MODES = ("auto", "proxy", "impersonate", "direct")
+HTTP_MODE_DEFAULT = "auto"
+# Accepted spelling for operators who think of the channel as a feature switch.
+HTTP_MODE_ALIASES = {"off": "direct"}
+# Requests per target host before giving up and replaying through plain requests.
+HTTP_IMPERSONATE_RETRY = max(1, int(os.getenv("CN_STOCK_HTTP_IMPERSONATE_RETRY", "3")))
+HTTP_IMPERSONATE_TIMEOUT = max(
+    1.0,
+    float(os.getenv("CN_STOCK_HTTP_IMPERSONATE_TIMEOUT", "8")),
+)
+# curl_cffi browser profile to impersonate. Fixed rather than random so a
+# per-thread session can keep reusing its TLS connection.
+HTTP_IMPERSONATE_PROFILE = os.getenv("CN_STOCK_HTTP_IMPERSONATE_PROFILE") or "chrome"
+# Consecutive fully-failed hosts before the impersonated path goes on cooldown.
+# Without it, an environment where impersonation can never succeed pays the
+# retry budget plus the plain-requests replay on every single call.
+HTTP_IMPERSONATE_FAILURE_THRESHOLD = max(
+    1,
+    int(os.getenv("CN_STOCK_HTTP_IMPERSONATE_FAILURE_THRESHOLD", "4")),
+)
+HTTP_IMPERSONATE_COOLDOWN = max(
+    0.0,
+    float(os.getenv("CN_STOCK_HTTP_IMPERSONATE_COOLDOWN_SECONDS", "300")),
+)
+
+
+class HttpModeError(ValueError):
+    """Raised when an explicitly requested channel mode cannot be honoured."""
+
+
+def resolve_http_mode(
+    requested=None,
+    proxy_enabled: bool = AKSHARE_PROXY_ENABLED,
+    proxy_gateway=AKSHARE_PROXY_IP,
+) -> tuple[str, str]:
+    """Return the effective channel mode plus the reason, for startup logging.
+
+    ``auto`` never raises: an unusable gateway degrades to ``impersonate`` so
+    that a partial configuration cannot stop the service from starting. Only an
+    explicit ``proxy`` request is strict, because there the intent is stated.
+    """
+    raw = requested if requested is not None else os.getenv("CN_STOCK_HTTP_MODE")
+    mode = str(raw or "").strip().lower()
+    mode = HTTP_MODE_ALIASES.get(mode, mode)
+    if not mode:
+        mode = HTTP_MODE_DEFAULT
+    if mode not in HTTP_MODES:
+        return HTTP_MODE_DEFAULT, f"invalid_value:{mode}"
+
+    if mode == "proxy":
+        if not proxy_gateway:
+            raise HttpModeError(
+                "CN_STOCK_HTTP_MODE=proxy requires AKSHARE_PROXY_GATEWAY; "
+                "use auto to fall back to impersonate instead."
+            )
+        return "proxy", "requested"
+    if mode in ("impersonate", "direct"):
+        return mode, "requested"
+
+    if not proxy_enabled:
+        return "impersonate", "auto:proxy_disabled"
+    if not proxy_gateway:
+        return "impersonate", "auto:proxy_gateway_missing"
+    return "proxy", "auto:proxy_configured"
+
 # Synchronous AkShare/efinance calls are I/O bound. Keep the executor bounded,
 # while allowing deployments to tune it for their upstream capacity.
 DATA_FETCH_MAX_WORKERS = max(1, int(os.getenv("CN_STOCK_DATA_FETCH_MAX_WORKERS", "8")))

@@ -1,0 +1,486 @@
+"""Outbound HTTP channel mode resolution and installation tests."""
+
+import builtins
+import importlib
+import types
+
+import pytest
+import requests as std_requests
+
+from qtf_mcp.config import HttpModeError, resolve_http_mode
+
+channel = importlib.import_module("qtf_mcp.datasource.http_channel")
+
+
+@pytest.fixture(autouse=True)
+def restore_requests():
+    """Every test must leave the requests module exactly as it found it."""
+    before = (
+        std_requests.Session,
+        std_requests.get,
+        std_requests.post,
+        std_requests.request,
+    )
+    yield
+    channel.uninstall_http_channel()
+    assert (
+        std_requests.Session,
+        std_requests.get,
+        std_requests.post,
+        std_requests.request,
+    ) == before
+
+
+# --- mode resolution -------------------------------------------------------
+
+
+@pytest.fixture
+def unset_mode_env(monkeypatch):
+    """Drop the pinned test mode so the shipped default is what gets exercised."""
+    monkeypatch.delenv("CN_STOCK_HTTP_MODE", raising=False)
+
+
+@pytest.mark.parametrize(
+    "requested,proxy_enabled,gateway,expected",
+    [
+        # requested=None means "read the environment", which the fixture unsets,
+        # so these rows assert the default that a fresh deployment would get.
+        (None, True, "10.0.0.1", "proxy"),
+        (None, False, "10.0.0.1", "impersonate"),
+        (None, True, None, "impersonate"),
+        (None, False, None, "impersonate"),
+        ("auto", True, "10.0.0.1", "proxy"),
+        ("impersonate", True, "10.0.0.1", "impersonate"),
+        ("direct", True, "10.0.0.1", "direct"),
+        ("proxy", False, "10.0.0.1", "proxy"),
+        ("PROXY", False, "10.0.0.1", "proxy"),
+        # off is kept as an alias because operators reach for it to mean "plain".
+        ("off", True, "10.0.0.1", "direct"),
+        ("  OFF  ", True, "10.0.0.1", "direct"),
+    ],
+)
+def test_mode_resolution_matrix(
+    unset_mode_env, requested, proxy_enabled, gateway, expected
+):
+    mode, _ = resolve_http_mode(requested, proxy_enabled, gateway)
+    assert mode == expected
+
+
+def test_environment_overrides_the_default(monkeypatch):
+    monkeypatch.setenv("CN_STOCK_HTTP_MODE", "direct")
+    assert resolve_http_mode(None, True, "10.0.0.1") == ("direct", "requested")
+
+
+def test_auto_reason_explains_the_choice(unset_mode_env):
+    assert resolve_http_mode(None, True, "10.0.0.1")[1] == "auto:proxy_configured"
+    assert resolve_http_mode(None, False, "10.0.0.1")[1] == "auto:proxy_disabled"
+    assert resolve_http_mode(None, True, None)[1] == "auto:proxy_gateway_missing"
+
+
+def test_unknown_mode_degrades_to_auto_without_raising():
+    mode, reason = resolve_http_mode("turbo", False, None)
+    assert mode == "auto"
+    assert reason == "invalid_value:turbo"
+
+
+def test_explicit_proxy_without_gateway_fails_fast():
+    with pytest.raises(HttpModeError):
+        resolve_http_mode("proxy", True, None)
+
+
+def test_auto_never_raises_on_partial_proxy_config():
+    """A half-configured gateway must not stop the service from starting."""
+    assert resolve_http_mode("auto", True, "")[0] == "impersonate"
+
+
+# --- installation ----------------------------------------------------------
+
+
+def test_direct_mode_leaves_requests_untouched():
+    before = std_requests.Session
+    assert channel.install_http_channel("direct") == "direct"
+    assert std_requests.Session is before
+    assert channel.installed_mode() == "direct"
+
+
+def test_impersonate_mode_replaces_requests_entry_points():
+    assert channel.install_http_channel("impersonate") == "impersonate"
+    assert std_requests.Session is not getattr(std_requests, "_qtf_original_session")
+    assert issubclass(std_requests.Session, getattr(std_requests, "_qtf_original_session"))
+    assert channel.installed_mode() == "impersonate"
+
+
+def test_impersonate_mode_is_installed_once():
+    assert channel.install_http_channel("impersonate") == "impersonate"
+    installed = std_requests.Session
+    assert channel.install_http_channel("impersonate") == "impersonate"
+    assert std_requests.Session is installed
+
+
+def test_impersonate_degrades_to_direct_without_curl_cffi(monkeypatch):
+    """A missing optional wheel must not stop the service from starting."""
+    real_import = builtins.__import__
+
+    def blocked(name, *args, **kwargs):
+        if name.startswith("curl_cffi"):
+            raise ImportError("curl_cffi missing")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    before = std_requests.Session
+
+    assert channel._install_impersonate() is False
+    assert channel.install_http_channel("impersonate") == "direct"
+    assert std_requests.Session is before
+
+
+def test_impersonate_refuses_to_stack_on_the_proxy_patch(monkeypatch):
+    """Two channels rewriting requests would silently disable one of them."""
+    monkeypatch.setattr(std_requests, "_OriginalSession", std_requests.Session, raising=False)
+    before = std_requests.Session
+
+    assert channel.install_http_channel("impersonate") == "direct"
+    assert std_requests.Session is before
+
+
+# --- request routing -------------------------------------------------------
+
+
+def _install_impersonate_with_fake_cffi(monkeypatch, responses):
+    """Install the impersonate channel with a scripted curl_cffi session."""
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+    class FakeSession:
+        def request(self, method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            outcome = responses.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return FakeResponse(outcome)
+
+    monkeypatch.setattr(channel, "_cffi_session", lambda impersonate: FakeSession())
+    monkeypatch.setattr(channel.time, "sleep", lambda _seconds: None)
+    assert channel.install_http_channel("impersonate") == "impersonate"
+    return calls
+
+
+def test_passthrough_hosts_never_reach_curl_cffi(monkeypatch):
+    calls = _install_impersonate_with_fake_cffi(monkeypatch, [])
+    seen = []
+
+    original = getattr(std_requests, "_qtf_original_session")
+    monkeypatch.setattr(
+        original,
+        "request",
+        lambda self, method, url, **kwargs: seen.append(url) or "passthrough",
+    )
+
+    session = std_requests.Session()
+    # Tonghuashun plus the two Eastmoney hosts public_events uses: all untouched.
+    for url in (
+        "https://d.10jqka.com.cn/v6/line/x/x.js",
+        "https://datacenter-web.eastmoney.com/api/data/v1/get",
+        "https://push2ex.eastmoney.com/getTopicZTPool",
+    ):
+        assert session.request("GET", url) == "passthrough"
+
+    assert calls == []
+    assert len(seen) == 3
+
+
+def test_impersonated_host_uses_curl_cffi(monkeypatch):
+    calls = _install_impersonate_with_fake_cffi(monkeypatch, [200])
+
+    response = std_requests.Session().request(
+        "GET", "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0][2]["timeout"] == channel.HTTP_IMPERSONATE_TIMEOUT
+
+
+def test_page_assets_on_impersonated_hosts_pass_through(monkeypatch):
+    calls = _install_impersonate_with_fake_cffi(monkeypatch, [])
+    original = getattr(std_requests, "_qtf_original_session")
+    monkeypatch.setattr(
+        original, "request", lambda self, method, url, **kwargs: "passthrough"
+    )
+
+    assert (
+        std_requests.Session().request("GET", "https://push2.eastmoney.com/app.js")
+        == "passthrough"
+    )
+    assert calls == []
+
+
+def test_retries_then_replays_through_plain_requests(monkeypatch):
+    """Exhausted retries must surface requests' own behaviour, not curl_cffi's."""
+    boom = RuntimeError("connection reset")
+    calls = _install_impersonate_with_fake_cffi(monkeypatch, [boom, 500, boom])
+    original = getattr(std_requests, "_qtf_original_session")
+    replayed = []
+    monkeypatch.setattr(
+        original,
+        "request",
+        lambda self, method, url, **kwargs: replayed.append(kwargs) or "plain",
+    )
+
+    result = std_requests.Session().request(
+        "GET", "https://push2.eastmoney.com/api/qt/stock/get", params={"secid": "1.600000"}
+    )
+
+    assert result == "plain"
+    assert len(calls) == channel.HTTP_IMPERSONATE_RETRY
+    # The replay keeps the caller's kwargs, without curl_cffi-only additions.
+    assert replayed == [{"params": {"secid": "1.600000"}}]
+
+
+def test_broken_cffi_session_is_not_reused(monkeypatch):
+    channel._thread_local.cffi_session = object()
+    _install_impersonate_with_fake_cffi(monkeypatch, [RuntimeError("reset"), 200])
+
+    response = std_requests.Session().request(
+        "GET", "https://fund.eastmoney.com/api/x"
+    )
+
+    assert response.status_code == 200
+
+
+def test_module_level_helpers_are_rewired(monkeypatch):
+    calls = _install_impersonate_with_fake_cffi(monkeypatch, [200, 200, 200])
+
+    assert std_requests.get("https://push2.eastmoney.com/a").status_code == 200
+    assert std_requests.post("https://push2.eastmoney.com/b").status_code == 200
+    assert std_requests.request("GET", "https://push2.eastmoney.com/c").status_code == 200
+    assert [call[0] for call in calls] == ["GET", "POST", "GET"]
+
+
+def test_session_stays_constructible_for_public_events(monkeypatch):
+    """public_events clones AkShare functions around requests.Session().get."""
+    _install_impersonate_with_fake_cffi(monkeypatch, [200])
+    namespace = types.SimpleNamespace(get=std_requests.Session().get)
+
+    assert namespace.get("https://push2.eastmoney.com/api").status_code == 200
+
+
+# --- startup reporting -----------------------------------------------------
+
+
+def test_startup_line_reports_the_effective_channel():
+    channel.install_http_channel("direct")
+
+    summary = channel.describe_installed_channel()
+
+    assert "mode=direct" in summary
+    assert "reason=requested" in summary
+    assert f"hooked_hosts={len(channel.IMPERSONATED_HOSTS)}" in summary
+
+
+def test_startup_line_includes_impersonate_parameters(monkeypatch):
+    _install_impersonate_with_fake_cffi(monkeypatch, [])
+
+    summary = channel.describe_installed_channel()
+
+    assert "mode=impersonate" in summary
+    assert f"profile={channel.HTTP_IMPERSONATE_PROFILE}" in summary
+    assert f"retry={channel.HTTP_IMPERSONATE_RETRY}" in summary
+    assert f"timeout={channel.HTTP_IMPERSONATE_TIMEOUT}s" in summary
+
+
+def test_startup_line_reports_the_degraded_channel(monkeypatch):
+    """An operator must not read mode=impersonate when it silently degraded."""
+    monkeypatch.setattr(channel, "_install_impersonate", lambda *a, **k: False)
+
+    assert channel.install_http_channel("impersonate") == "direct"
+
+    summary = channel.describe_installed_channel()
+    assert "mode=direct" in summary
+    assert "reason=curl_cffi_unavailable" in summary
+    assert "profile=" not in summary
+
+
+def test_startup_line_reports_auto_resolution(monkeypatch):
+    monkeypatch.delenv("CN_STOCK_HTTP_MODE", raising=False)
+    _install_impersonate_with_fake_cffi(monkeypatch, [])
+    channel.uninstall_http_channel()
+    monkeypatch.setattr(channel, "_install_impersonate", lambda *a, **k: True)
+
+    channel.install_http_channel(None, proxy_enabled=False, proxy_gateway=None)
+
+    assert "reason=auto:proxy_disabled" in channel.describe_installed_channel()
+
+
+def test_startup_line_before_any_install():
+    channel.uninstall_http_channel()
+    assert channel.describe_installed_channel() == "mode=none reason=not_installed"
+
+
+# --- proxy inheritance and cooldown ----------------------------------------
+
+
+def test_impersonated_request_inherits_the_environment_proxy(monkeypatch):
+    """curl_cffi has no trust_env, so the channel must pass proxies explicitly."""
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+    calls = _install_impersonate_with_fake_cffi(monkeypatch, [200])
+
+    std_requests.Session().request("GET", "https://push2.eastmoney.com/api/qt/stock/get")
+
+    assert calls[0][2]["proxies"]["https"] == "http://127.0.0.1:7897"
+
+
+def test_session_proxies_win_over_the_environment(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+    calls = _install_impersonate_with_fake_cffi(monkeypatch, [200])
+
+    session = std_requests.Session()
+    session.proxies = {"https": "http://10.0.0.9:3128"}
+    session.request("GET", "https://push2.eastmoney.com/api/qt/stock/get")
+
+    assert calls[0][2]["proxies"]["https"] == "http://10.0.0.9:3128"
+
+
+def test_no_proxies_key_when_none_configured(monkeypatch):
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.setattr(channel.std_requests.utils, "get_environ_proxies", lambda *a, **k: {})
+    calls = _install_impersonate_with_fake_cffi(monkeypatch, [200])
+
+    std_requests.Session().request("GET", "https://push2.eastmoney.com/api/qt/stock/get")
+
+    assert "proxies" not in calls[0][2]
+
+
+def test_repeated_failures_suspend_impersonation(monkeypatch):
+    """A doomed environment must stop paying the retry budget on every call."""
+    threshold = channel.HTTP_IMPERSONATE_FAILURE_THRESHOLD
+    boom = RuntimeError("no route")
+    responses = [boom] * (channel.HTTP_IMPERSONATE_RETRY * (threshold + 1))
+    calls = _install_impersonate_with_fake_cffi(monkeypatch, responses)
+    original = getattr(std_requests, "_qtf_original_session")
+    monkeypatch.setattr(
+        original, "request", lambda self, method, url, **kwargs: "plain"
+    )
+
+    session = std_requests.Session()
+    for _ in range(threshold):
+        assert session.request("GET", "https://push2.eastmoney.com/a") == "plain"
+
+    attempts_before = len(calls)
+    # Cooldown is now active: no further curl_cffi attempts, straight to plain.
+    assert session.request("GET", "https://push2.eastmoney.com/a") == "plain"
+    assert len(calls) == attempts_before
+    assert channel._impersonation_suspended() is True
+
+
+def test_cooldown_expires(monkeypatch):
+    threshold = channel.HTTP_IMPERSONATE_FAILURE_THRESHOLD
+    boom = RuntimeError("no route")
+    _install_impersonate_with_fake_cffi(
+        monkeypatch, [boom] * (channel.HTTP_IMPERSONATE_RETRY * threshold)
+    )
+    original = getattr(std_requests, "_qtf_original_session")
+    monkeypatch.setattr(
+        original, "request", lambda self, method, url, **kwargs: "plain"
+    )
+
+    session = std_requests.Session()
+    for _ in range(threshold):
+        session.request("GET", "https://push2.eastmoney.com/a")
+    assert channel._impersonation_suspended() is True
+
+    monkeypatch.setattr(
+        channel.time, "monotonic", lambda: channel._breaker["suspended_until"] + 1
+    )
+    assert channel._impersonation_suspended() is False
+
+
+def test_a_success_resets_the_failure_streak(monkeypatch):
+    threshold = channel.HTTP_IMPERSONATE_FAILURE_THRESHOLD
+    boom = RuntimeError("flaky")
+    responses = []
+    for _ in range(threshold - 1):
+        responses += [boom] * channel.HTTP_IMPERSONATE_RETRY
+    responses.append(200)
+    responses += [boom] * channel.HTTP_IMPERSONATE_RETRY
+    _install_impersonate_with_fake_cffi(monkeypatch, responses)
+    original = getattr(std_requests, "_qtf_original_session")
+    monkeypatch.setattr(
+        original, "request", lambda self, method, url, **kwargs: "plain"
+    )
+
+    session = std_requests.Session()
+    for _ in range(threshold - 1):
+        session.request("GET", "https://push2.eastmoney.com/a")
+    assert session.request("GET", "https://push2.eastmoney.com/a").status_code == 200
+
+    session.request("GET", "https://push2.eastmoney.com/a")
+    assert channel._impersonation_suspended() is False
+
+
+# --- host matching ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("https://push2his.eastmoney.com/api/qt/stock/kline/get", True),
+        ("https://push2.eastmoney.com/api/qt/stock/get?secid=1.600000", True),
+        ("https://fund.eastmoney.com/api/x", True),
+        ("https://emweb.securities.eastmoney.com/api/x", True),
+        # Documented pass-through hosts must stay pass-through even when a query
+        # parameter mentions a hooked host.
+        ("https://datacenter-web.eastmoney.com/api/data/get?cb=push2.eastmoney.com", False),
+        ("https://push2ex.eastmoney.com/getTopicZTPool", False),
+        ("https://d.10jqka.com.cn/x?ref=https://push2.eastmoney.com/a", False),
+        # Page assets gain nothing from impersonation.
+        ("https://push2.eastmoney.com/app.js", False),
+        ("https://push2.eastmoney.com/index.html?x=1", False),
+        # Hostname comparison is case insensitive and port tolerant.
+        ("https://PUSH2.EastMoney.com/api/x", True),
+        ("", False),
+    ],
+)
+def test_only_hooked_hostnames_are_impersonated(url, expected):
+    assert channel._is_impersonated(url) is expected
+
+
+def test_verify_follows_requests_ca_bundle(monkeypatch):
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/etc/ssl/corp.pem")
+    calls = _install_impersonate_with_fake_cffi(monkeypatch, [200])
+
+    std_requests.Session().request("GET", "https://push2.eastmoney.com/api/x")
+
+    assert calls[0][2]["verify"] == "/etc/ssl/corp.pem"
+
+
+def test_session_verify_false_is_honoured(monkeypatch):
+    monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising=False)
+    calls = _install_impersonate_with_fake_cffi(monkeypatch, [200])
+
+    session = std_requests.Session()
+    session.verify = False
+    session.request("GET", "https://push2.eastmoney.com/api/x")
+
+    assert calls[0][2]["verify"] is False
+
+
+def test_impersonation_failure_reason_is_logged(monkeypatch, caplog):
+    """The plain replay's error alone hid a proxy misconfiguration in production."""
+    import logging
+
+    _install_impersonate_with_fake_cffi(
+        monkeypatch, [RuntimeError("no route")] * channel.HTTP_IMPERSONATE_RETRY
+    )
+    original = getattr(std_requests, "_qtf_original_session")
+    monkeypatch.setattr(original, "request", lambda self, m, u, **k: "plain")
+    caplog.set_level(logging.DEBUG, logger="qtf_mcp")
+
+    std_requests.Session().request("GET", "https://push2his.eastmoney.com/api/x")
+
+    assert "Impersonation failed" in caplog.text
+    assert "host=push2his.eastmoney.com" in caplog.text
+    assert "RuntimeError: no route" in caplog.text
