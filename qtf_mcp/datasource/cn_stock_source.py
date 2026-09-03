@@ -10,7 +10,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -515,9 +515,15 @@ class CNStockDataSource(DataSource):
                 else:
                     normalized_symbol = f"sz{code}"
             tx_adjust = "" if adjust == "none" else adjust
+            # 派生列需要请求区间之前的那个交易日的收盘价，否则首行只能填 0，
+            # 而 kline_daily 只请求一天，首行就是唯一一行。A 股最长假期约 8 个
+            # 交易日，往前多取 20 个自然日足够跨过去；腾讯接口按整年抓取，
+            # 除跨年外不增加请求。
+            requested_start = datetime.strptime(start_date, "%Y-%m-%d").date()
+            fetch_start = (requested_start - timedelta(days=20)).strftime("%Y%m%d")
             frame = ak.stock_zh_a_hist_tx(
                 symbol=normalized_symbol,
-                start_date=start_date.replace("-", ""),
+                start_date=fetch_start,
                 end_date=end_date.replace("-", ""),
                 adjust=tx_adjust,
             )
@@ -550,6 +556,10 @@ class CNStockDataSource(DataSource):
                 frame["换手率"] = 0.0
             frame = frame.dropna(subset=required)
             frame = _normalize_tencent_volume(frame, code)
+            # 派生列算完再裁回请求区间，前置行只用于提供首行的前收盘价。
+            frame = frame[frame["日期"] >= requested_start]
+            if frame.empty:
+                return None
             return frame[[
                 "日期", "开盘", "收盘", "最高", "最低", "成交量", "成交额",
                 "振幅", "涨跌幅", "涨跌额", "换手率",

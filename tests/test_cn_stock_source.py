@@ -3,6 +3,7 @@ CN stock data source tests.
 """
 
 import asyncio
+import datetime
 import threading
 import time
 
@@ -696,3 +697,95 @@ def test_tencent_volume_logs_an_unexpected_magnitude(caplog):
     source_module._normalize_tencent_volume(_tencent_frame(89817200.0 / 8), "600000")
 
     assert "成交量量级异常" in caplog.text
+
+
+# --- 腾讯 fallback 的派生列 -------------------------------------------------
+
+
+def _fake_tx_frame():
+    """腾讯接口的原始列名，含请求区间之前的一行。"""
+    import pandas as pd
+
+    return pd.DataFrame(
+        {
+            "date": [
+                datetime.date(2026, 8, 31),
+                datetime.date(2026, 9, 1),
+                datetime.date(2026, 9, 2),
+            ],
+            "open": [10.0, 10.2, 10.6],
+            "close": [10.0, 10.5, 11.0],
+            "high": [10.1, 10.6, 11.2],
+            "low": [9.9, 10.1, 10.5],
+            "volume": [1000.0, 1000.0, 1000.0],
+            "amount": [1000000.0, 1050000.0, 1100000.0],
+            "turnover": [0.01, 0.01, 0.01],
+        }
+    )
+
+
+def _patch_tx(monkeypatch, frame=None, seen=None):
+    import akshare
+
+    def fake_tx(symbol, start_date, end_date, adjust="", **kwargs):
+        if seen is not None:
+            seen["start_date"] = start_date
+            seen["end_date"] = end_date
+        source = (_fake_tx_frame() if frame is None else frame).copy()
+        # 与真实接口一致地按区间裁剪，否则测不出"加宽取数"这一步
+        lower = datetime.datetime.strptime(start_date, "%Y%m%d").date()
+        upper = datetime.datetime.strptime(end_date, "%Y%m%d").date()
+        return source[(source["date"] >= lower) & (source["date"] <= upper)]
+
+    monkeypatch.setattr(akshare, "stock_zh_a_hist_tx", fake_tx)
+
+
+def test_tencent_fallback_widens_the_fetch_window(monkeypatch):
+    """首行的前收盘价必须来自请求区间之前的交易日。"""
+    seen = {}
+    _patch_tx(monkeypatch, seen=seen)
+
+    CNStockDataSource()._fetch_tencent_kline_sync(
+        "600000", "2026-09-01", "2026-09-02", "qfq", "SH600000"
+    )
+
+    assert seen["start_date"] == "20260812"
+    assert seen["end_date"] == "20260902"
+
+
+def test_tencent_fallback_derives_first_row_from_the_prior_close(monkeypatch):
+    _patch_tx(monkeypatch)
+
+    frame = CNStockDataSource()._fetch_tencent_kline_sync(
+        "600000", "2026-09-01", "2026-09-02", "qfq", "SH600000"
+    )
+
+    # 前置行被裁掉，但它的收盘价参与了首行的派生计算。
+    assert frame["日期"].tolist() == [datetime.date(2026, 9, 1), datetime.date(2026, 9, 2)]
+    assert frame["涨跌额"].iloc[0] == pytest.approx(0.5)
+    assert frame["涨跌幅"].iloc[0] == pytest.approx(5.0)
+    assert frame["振幅"].iloc[0] == pytest.approx(5.0)
+
+
+def test_tencent_fallback_single_day_is_not_zeroed(monkeypatch):
+    """kline_daily 只请求一天，修复前这三列恒为 0。"""
+    _patch_tx(monkeypatch)
+
+    frame = CNStockDataSource()._fetch_tencent_kline_sync(
+        "600000", "2026-09-02", "2026-09-02", "qfq", "SH600000"
+    )
+
+    assert len(frame) == 1
+    assert frame["涨跌额"].iloc[0] == pytest.approx(0.5)
+    assert frame["涨跌幅"].iloc[0] == pytest.approx(4.7619, abs=1e-4)
+
+
+def test_tencent_fallback_returns_none_when_window_has_no_rows(monkeypatch):
+    _patch_tx(monkeypatch)
+
+    assert (
+        CNStockDataSource()._fetch_tencent_kline_sync(
+            "600000", "2026-09-10", "2026-09-11", "qfq", "SH600000"
+        )
+        is None
+    )
