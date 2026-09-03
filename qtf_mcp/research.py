@@ -885,6 +885,10 @@ def build_technical_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> N
 
 def build_financial_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> None:
     """构建财务数据部分"""
+    # 与 build_basic_data 一致地先纠偏：is_stock 只认 SH6/SZ00/SZ30，调用方传进来
+    # 的可能是交易所前缀写错的输入。查 SH300408（实为深市）时数据源已把代码纠正
+    # 成 SZ300408，基本数据段用的是纠正后的值，这里不纠偏就会静默丢掉整段财务数据。
+    symbol = data.get("SYMBOL", symbol)
     if not is_stock(symbol):
         return
     

@@ -498,3 +498,30 @@ class TestPriceToBook:
     def test_omitted_when_neither_is_available(self):
         data = self._data(PB=np.array([0.0]), NAVPS=np.array([0.0]))
         assert self._pb_line(data) == ""
+
+
+class TestFinancialSectionSymbolCorrection:
+    """交易所前缀写错时不能静默丢掉财务数据段。
+
+    2026-09-03 查 SH300408（三环集团实为深市）时，数据源把代码纠正成 SZ300408，
+    基本数据段用的是纠正后的值，但 build_financial_data 用的还是入参，
+    is_stock("SH300408") 为假，整段财务数据无声消失。
+    """
+
+    def _has_section(self, passed_symbol: str, resolved_symbol: str) -> bool:
+        fp = StringIO()
+        build_financial_data(
+            fp,
+            passed_symbol,
+            {"SYMBOL": resolved_symbol, "_DS_FINANCE": _finance_dataset()},
+        )
+        return "# 财务数据" in fp.getvalue()
+
+    def test_wrong_prefix_still_renders(self):
+        assert self._has_section("SH300408", "SZ300408") is True
+
+    def test_correct_prefix_unchanged(self):
+        assert self._has_section("SZ300408", "SZ300408") is True
+
+    def test_index_still_has_no_financial_section(self):
+        assert self._has_section("SH000001", "SH000001") is False
