@@ -10,7 +10,9 @@ from ..observability import log_context
 from .fund_flow_page import (
     HISTORY_TABLE_ID,
     FundFlowPage,
+    FundFlowPageError,
     parse_fund_flow_page,
+    parse_percent,
 )
 
 logger = logging.getLogger("qtf_mcp")
@@ -180,29 +182,73 @@ class FundFlowPageUnavailable(RuntimeError):
     """该标的没有资金流向页面（三大指数之外的指数）。"""
 
 
-# ── 页面生命周期 ──────────────────────────────────────────
-async def _on_fund_flow_page(
-    symbol: str,
-    context: BrowserContext,
-    extract,
-    *,
-    purpose: str,
-) -> object:
-    """在资金流向页面上执行 extract。
+class FundFlowPageBlocked(RuntimeError):
+    """页面加载成功，但资金流接口被风控拦截。
 
-    信号量、资源拦截、页面开关和耗时日志都在这里，两个用途（今日字段、整页
-    HTML）共用一份，避免浏览器资源管理出现第二套写法。
+    风控表现为对 ``/fflow/`` 请求直接断连（``net::ERR_EMPTY_RESPONSE``）并要求
+    人过一次滑块，页面框架照常渲染、数据区留空。放行是按浏览器会话给的：
+    2026-09-03 手工过完滑块后，那个实例持续正常出数，而同一时刻新起的实例仍然
+    全部为空。所以这不是重试能解决的失败，调用方应当长时间退避。
     """
+
+
+# 本进程是否已有被风控放行的会话。盘中实时路径从 09:15 起持续加载这个页面，会话
+# 一直是热的；而窗口外冷启动的第一次加载才是最容易撞上滑块的那次。
+_session_warm = False
+
+
+def session_is_warm() -> bool:
+    """本进程是否已经成功从这个页面取到过数据。"""
+    return _session_warm
+
+
+async def _wait_for_today(page) -> None:
+    """等今日一栏的 Ajax 填充完成。超时不算错：停牌或非交易时段本就是空的。"""
+    try:
+        await page.wait_for_selector("text=今日主力净流入", timeout=10000)
+        await page.wait_for_function(WAIT_FOR_DATA_JS, timeout=12000)
+    except Exception:
+        pass
+
+
+async def _wait_for_history(page) -> None:
+    """等历史表的 Ajax 填充完成。"""
+    try:
+        await page.wait_for_selector(
+            f"#{HISTORY_TABLE_ID} tbody tr",
+            timeout=int(FUND_FLOW_PAGE_TABLE_WAIT_SECONDS * 1000),
+        )
+    except Exception:
+        pass
+
+
+async def load_fund_flow_page(symbol: str, context: BrowserContext) -> FundFlowPage:
+    """加载一次页面，解析出今日与历史两块。
+
+    两块都在同一个页面上，且都由 ``/fflow/`` 接口填充，所以分两次加载既浪费一次
+    Chromium，又多一次撞风控的机会——风控是按会话放行的，页面加载次数本身就是
+    风险。两个等待并发进行，实时路径的耗时上限因此与合并前一致。
+    """
+    global _session_warm
+
     wait_started_at = time.perf_counter()
     await SEMAPHORE.acquire()
     semaphore_wait = time.perf_counter() - wait_started_at
     service_started_at = time.perf_counter()
+    outcome = "error"
     try:
         url = get_fund_flow_url(symbol)
         if url is None:
+            outcome = "unsupported"
             raise FundFlowPageUnavailable(symbol)
 
         page = await context.new_page()
+        refused: list[str] = []
+
+        def on_request_failed(request) -> None:
+            # 风控的特征是资金流接口被直接断连，而页面框架本身加载成功。
+            if "/fflow/" in request.url or "/qt/stock/get" in request.url:
+                refused.append(request.url)
 
         try:
             # 拦截无用资源，降低带宽和 CPU 消耗
@@ -212,62 +258,114 @@ async def _on_fund_flow_page(
             for pattern in BLOCKED_PATTERNS:
                 await page.route(pattern, block_route)
 
+            page.on("requestfailed", on_request_failed)
             await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-            return await extract(page)
+            await asyncio.gather(_wait_for_today(page), _wait_for_history(page))
+            content = await page.content()
         finally:
             await page.close()  # page 用完立即释放，context/browser 保留复用
+
+        try:
+            parsed = parse_fund_flow_page(content)
+        except FundFlowPageError:
+            if refused:
+                outcome = "blocked"
+                raise FundFlowPageBlocked(
+                    f"{symbol} 资金流接口被拒 {len(refused)} 次，页面数据区为空；"
+                    "本进程会话未获风控放行"
+                ) from None
+            raise
+
+        _session_warm = True
+        outcome = f"today={parsed.today is not None} history={len(parsed.history)}"
+        return parsed
     finally:
         SEMAPHORE.release()
         request_id, tool, _ = log_context()
         logger.info(
             "Realtime fund flow page request_id=%s tool=%s symbol=%s "
-            "purpose=%s semaphore_wait=%.3fs service=%.3fs",
+            "outcome=%s semaphore_wait=%.3fs service=%.3fs",
             request_id,
             tool,
             symbol,
-            purpose,
+            outcome,
             semaphore_wait,
             time.perf_counter() - service_started_at,
         )
 
 
+def _page_to_realtime_dict(symbol: str, page: FundFlowPage) -> dict:
+    """把解析结果转成实时资金流的既有返回结构。
+
+    净额取原样文本、占比取解析后的百分数，与之前 PARSE_JS 的行为逐字一致，包括
+    占位符回落成 ``"0"``。名称取页面上第一个 ``.title`` 的原文，也和
+    ``document.querySelector('.title')`` 一致。
+    """
+    text = page.today_text
+    # 与 PARSE_JS 的 get() 一致：空串和 - / -- 都回落成 "0"，而不是把占位符原样
+    # 输出。这一层是给报告直接打印的，不是给计算用的。
+    placeholders = {"", "-", "--"}
+
+    def amount(field_id: str) -> str:
+        raw = (text.get(field_id) or "").strip()
+        return "0" if raw in placeholders else raw
+
+    def ratio(field_id: str) -> float:
+        value = parse_percent(text.get(field_id, ""))
+        return 0.0 if value is None else value
+
+    return {
+        "标的名称":      get_fund_flow_display_name(symbol, page.title_text),
+        "主力净流入":    amount("f62"),
+        "主力净比(%)":   ratio("f184"),
+        "超大单净流入":  amount("f66"),
+        "超大单净比(%)": ratio("f69"),
+        "大单净流入":    amount("f72"),
+        "大单净比(%)":   ratio("f75"),
+        "中单净流入":    amount("f78"),
+        "中单净比(%)":   ratio("f81"),
+        "小单净流入":    amount("f84"),
+        "小单净比(%)":   ratio("f87"),
+    }
+
+
+# ── 页面级单飞 ────────────────────────────────────────────
+# 外层 _inflight 管的是消费者取消语义（预取可以被丢弃）；这一层管的是"同一个页面
+# 不要为今日和历史各加载一次"。两者时间上会重叠：实时预取在 process_item 开头就
+# 启动，而资金流兜底在数据 gather 之后才决定要不要走。
+_page_inflight: dict[str, asyncio.Task] = {}
+
+
+def _complete_page_inflight(symbol: str, task: asyncio.Task) -> None:
+    if _page_inflight.get(symbol) is task:
+        _page_inflight.pop(symbol, None)
+    if not task.cancelled():
+        task.exception()  # 取一次异常，避免"never retrieved"告警
+
+
+async def _load_page_shared(symbol: str) -> FundFlowPage:
+    context = await get_context()
+    return await load_fund_flow_page(symbol, context)
+
+
+async def fetch_page_shared(symbol: str) -> FundFlowPage:
+    """同一标的的并发页面加载只做一次，今日与历史两个用途共享结果。"""
+    task = _page_inflight.get(symbol)
+    if task is None or task.done():
+        task = asyncio.create_task(_load_page_shared(symbol))
+        _page_inflight[symbol] = task
+        task.add_done_callback(
+            lambda completed, key=symbol: _complete_page_inflight(key, completed)
+        )
+    # shield：一个等待者被取消不能中断另一个等待者需要的加载。
+    return await asyncio.shield(task)
+
+
 # ── 单个 Symbol 抓取 ──────────────────────────────────────
 async def fetch_single(symbol: str, context: BrowserContext) -> dict:
-    async def extract(page) -> dict:
-        # 先等页面框架出现
-        await page.wait_for_selector("text=今日主力净流入", timeout=10000)
-
-        # 再等 Ajax 数据真正填入（超时则认为停牌/非交易时段，直接读当前值）
-        try:
-            await page.wait_for_function(WAIT_FOR_DATA_JS, timeout=12000)
-        except Exception:
-            # 超时：停牌股 / 非交易时段，数据本身就是空，继续解析拿到的值即可
-            pass
-
-        raw = await page.evaluate(PARSE_JS)
-
-        def to_ratio(v: str) -> float:
-            try:
-                return float(str(v).replace("%", ""))
-            except Exception:
-                return 0.0
-
-        return {
-            "标的名称":      get_fund_flow_display_name(symbol, raw["name"]),
-            "主力净流入":    raw["f62"],
-            "主力净比(%)":   to_ratio(raw["f184"]),
-            "超大单净流入":  raw["f66"],
-            "超大单净比(%)": to_ratio(raw["f69"]),
-            "大单净流入":    raw["f72"],
-            "大单净比(%)":   to_ratio(raw["f75"]),
-            "中单净流入":    raw["f78"],
-            "中单净比(%)":   to_ratio(raw["f81"]),
-            "小单净流入":    raw["f84"],
-            "小单净比(%)":   to_ratio(raw["f87"]),
-        }
-
+    """取今日资金流。返回结构与合并前完全一致，包括失败时的 error 形态。"""
     try:
-        return await _on_fund_flow_page(symbol, context, extract, purpose="realtime")
+        return _page_to_realtime_dict(symbol, await load_fund_flow_page(symbol, context))
     except FundFlowPageUnavailable:
         return {"error": "暂无实时资金流向", "url": ""}
     except Exception as e:
@@ -275,34 +373,17 @@ async def fetch_single(symbol: str, context: BrowserContext) -> dict:
 
 
 async def fetch_history_page(symbol: str) -> FundFlowPage:
-    """加载资金流向页面并解析出历史资金流向。
-
-    与 fetch_single 走同一个页面、同一个信号量，但等的是历史表而不是今日字段：
-    这条路是在东财接口不可用时兜底用的，那时今日的数值也在历史表的最后一行里。
-    失败一律抛异常，由调用方决定是否降级，不静默返回空表。
-    """
-
-    async def extract(page) -> FundFlowPage:
-        try:
-            # 历史表是 Ajax 填充的，容器在首屏就存在但没有行。等待预算很小：这张
-            # 表由主源同一个端点填充，端点拒绝时怎么等都不会来，而每多等一秒都是
-            # 白付的。2026-09-03 用 12 秒预算时，一次徒劳把请求从 6.7s 拖到 20.1s。
-            await page.wait_for_selector(
-                f"#{HISTORY_TABLE_ID} tbody tr",
-                timeout=int(FUND_FLOW_PAGE_TABLE_WAIT_SECONDS * 1000),
-            )
-        except Exception:
-            # 等不到就交给解析器判断：可能是新股没有历史，也可能是页面改版。
-            pass
-        return parse_fund_flow_page(await page.content())
-
-    context = await get_context()
-    return await _on_fund_flow_page(symbol, context, extract, purpose="history")
+    """取历史资金流。失败一律抛异常，由调用方决定是否降级。"""
+    return await fetch_page_shared(symbol)
 
 
 async def _fetch_single_with_context(symbol: str) -> dict:
-    context = await get_context()
-    return await fetch_single(symbol, context)
+    try:
+        return _page_to_realtime_dict(symbol, await fetch_page_shared(symbol))
+    except FundFlowPageUnavailable:
+        return {"error": "暂无实时资金流向", "url": ""}
+    except Exception as e:
+        return {"error": str(e), "url": get_fund_flow_url(symbol) or ""}
 
 
 def _complete_inflight(symbol: str, task: asyncio.Task[dict]) -> None:

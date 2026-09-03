@@ -260,3 +260,89 @@ def test_page_renders_the_same_table_as_the_api_source(page):
     ]
 
     assert rendered == PUBLISHED_ROWS.splitlines()
+
+
+# --- 与合并前 PARSE_JS 的输出等价性 ------------------------------------------
+
+FULL_PAGE = Path(__file__).parent / "fixtures" / "eastmoney_zjlx_full_300408.html"
+
+
+def _legacy_realtime_dict(html: str, symbol: str) -> dict:
+    """按合并前 PARSE_JS + to_ratio 的规则算一遍，作为等价性基准。
+
+    合并前是在浏览器里 evaluate 取 10 个 ``td[data-field]`` 的 innerText，占位符
+    回落成 "0"，占比用 float(去掉%) 且失败算 0.0，名称取第一个 .title 的原文。
+    """
+    import re
+
+    from qtf_mcp.datasource.realtime_ff import get_fund_flow_display_name
+
+    def get(field_id: str) -> str:
+        m = re.search(
+            rf'<td[^>]*data-field="{field_id}"[^>]*>(.*?)</td>', html, re.S
+        )
+        txt = re.sub(r"<[^>]+>", "", m.group(1)).strip() if m else ""
+        return txt if txt and txt not in ("-", "--") else "0"
+
+    def to_ratio(value: str) -> float:
+        try:
+            return float(str(value).replace("%", ""))
+        except Exception:
+            return 0.0
+
+    title = re.search(r'<div[^>]*class=.title.[^>]*>(.*?)</div>', html, re.S)
+    name = re.sub(r"<[^>]+>", "", title.group(1)).strip() if title else ""
+
+    return {
+        "标的名称": get_fund_flow_display_name(symbol, name),
+        "主力净流入": get("f62"),
+        "主力净比(%)": to_ratio(get("f184")),
+        "超大单净流入": get("f66"),
+        "超大单净比(%)": to_ratio(get("f69")),
+        "大单净流入": get("f72"),
+        "大单净比(%)": to_ratio(get("f75")),
+        "中单净流入": get("f78"),
+        "中单净比(%)": to_ratio(get("f81")),
+        "小单净流入": get("f84"),
+        "小单净比(%)": to_ratio(get("f87")),
+    }
+
+
+def test_merged_load_reproduces_the_legacy_realtime_dict():
+    """合并成一次加载后，今日资金流的返回结构必须逐字不变。
+
+    fixture 是 2026-09-03 抓下的完整页面（今日块 + 121 行历史）。
+    """
+    from qtf_mcp.datasource.realtime_ff import _page_to_realtime_dict
+
+    html = FULL_PAGE.read_text(encoding="utf-8")
+    parsed = parse_fund_flow_page(html)
+
+    assert _page_to_realtime_dict("SZ300408", parsed) == _legacy_realtime_dict(
+        html, "SZ300408"
+    )
+
+
+def test_merged_load_yields_both_blocks_from_one_page():
+    """同一份 HTML 同时产出今日和历史，这是合并的全部意义。"""
+    parsed = parse_fund_flow_page(FULL_PAGE.read_text(encoding="utf-8"))
+
+    assert parsed.today is not None
+    assert len(parsed.history) == 121
+    assert parsed.title_text == "三环集团(300408)"
+
+
+def test_placeholders_fall_back_to_zero_like_the_legacy_script():
+    """停牌时页面是 -- ，合并前会输出 "0"，合并后必须一样。"""
+    from qtf_mcp.datasource.realtime_ff import _page_to_realtime_dict
+
+    cells = "".join(
+        f'<td data-field="{fid}">--</td>' for fid in TODAY_FIELDS
+    )
+    html = f'<div class="title">测试股(000001)</div><table><tr>{cells}</tr></table>'
+    parsed = parse_fund_flow_page(html)
+
+    result = _page_to_realtime_dict("SZ000001", parsed)
+
+    assert result["主力净流入"] == "0"
+    assert result["主力净比(%)"] == 0.0

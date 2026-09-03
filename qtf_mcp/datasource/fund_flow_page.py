@@ -96,6 +96,9 @@ class FundFlowPage:
 
     name: str = ""
     code: str = ""
+    # 页面上第一个 .title 的原样文本（如 "三环集团(300408)"）。realtime_ff 把它
+    # 直接当"标的名称"输出，保留原文才能让输出逐字不变。
+    title_text: str = ""
     # 今日一栏；页面未渲染该块时为 None，调用方不应把它当成"今日为零"。
     today: Optional[dict] = None
     # 历史行，按日期升序。代码里凡是取"最新"的地方都用 [-1]，与内部数据集一致。
@@ -275,7 +278,7 @@ def parse_fund_flow_page(html: str) -> FundFlowPage:
     parser.feed(html)
     parser.close()
 
-    page = FundFlowPage()
+    page = FundFlowPage(title_text=parser.title_text)
     match = _TITLE_RE.match(parser.title_text)
     if match:
         page.name = match.group("name").strip()
