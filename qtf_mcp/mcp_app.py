@@ -841,14 +841,21 @@ async def kline_daily(
   result = await datasource.fetch_kline_simple(symbol, date, date, adjust)
 
   if result is None or not result.get("data"):
+    unsupported = bool(result and result.get("unsupported"))
     logger.info(
       "Finished kline_daily symbol=%s date=%s adjust=%s cache=miss "
-      "elapsed=%.3fs outcome=empty",
+      "elapsed=%.3fs outcome=%s",
       symbol,
       date,
       adjust,
       time.perf_counter() - started_at,
+      "unsupported" if unsupported else "empty",
     )
+    if unsupported:
+      return (
+        f"{symbol} 当前无可用数据源。主数据源不可用，备用数据源不支持该标的"
+        "（北交所与可转债覆盖不全），这不代表该标的当日没有交易。"
+      )
     return f"未找到 {symbol} 在 {date} 的数据。可能是非交易日或股票代码有误。"
   
   data = result["data"][0]
@@ -932,15 +939,22 @@ async def kline_range(
   result = await datasource.fetch_kline_simple(symbol, start_date, end_date, adjust)
 
   if result is None or not result.get("data"):
+    unsupported = bool(result and result.get("unsupported"))
     logger.info(
       "Finished kline_range symbol=%s range=%s~%s adjust=%s cache=miss "
-      "elapsed=%.3fs outcome=empty",
+      "elapsed=%.3fs outcome=%s",
       symbol,
       start_date,
       end_date,
       adjust,
       time.perf_counter() - started_at,
+      "unsupported" if unsupported else "empty",
     )
+    if unsupported:
+      return (
+        f"{symbol} 当前无可用数据源。主数据源不可用，备用数据源不支持该标的"
+        "（北交所与可转债覆盖不全），这不代表该标的在此期间没有交易。"
+      )
     return f"未找到 {symbol} 在 {start_date} 至 {end_date} 期间的数据。"
   
   data_list = result["data"]
