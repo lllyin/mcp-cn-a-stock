@@ -108,6 +108,27 @@ FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS = max(
     0.0,
     float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", "0.5")),
 )
+# How long to wait for the historical table to fill after the page loads. The
+# table is Ajax-filled from the same endpoint the API path uses, so when that
+# endpoint is refusing, this wait is paid in full and buys nothing: on
+# 2026-09-03 a futile attempt turned a 6.7s request into 20.1s. It either fills
+# in a second or two or not at all, so the budget is small.
+FUND_FLOW_PAGE_TABLE_WAIT_SECONDS = max(
+    0.5,
+    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_TABLE_WAIT_SECONDS", "4")),
+)
+# Consecutive futile page loads before the fallback is skipped entirely. Lower
+# than the HTTP source breaker because each attempt costs a Chromium page load
+# rather than a sub-second request, so two wasted attempts already outweigh
+# what a third could recover.
+FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD = max(
+    1,
+    int(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD", "2")),
+)
+FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS = max(
+    1.0,
+    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS", "300")),
+)
 
 
 class HttpModeError(ValueError):

@@ -1138,7 +1138,12 @@ def test_simple_kline_returns_none_for_a_quiet_window(monkeypatch):
 
 
 def _page_fallback_datasource(monkeypatch, fund_flow_result):
-    """装好一个除资金流向外都成功的数据源。"""
+    """装好一个除资金流向外都成功的数据源。
+
+    顺带复位页面兜底熔断器：它是模块级状态，不复位的话用例之间会互相污染，
+    测试顺序一变结果就变。
+    """
+    source_module._FUND_FLOW_PAGE_BREAKER.reset()
     datasource = CNStockDataSource()
 
     def fake_kline(code, start_date, end_date, adjust, symbol, include_unadjusted, *args):
@@ -1316,3 +1321,57 @@ async def test_page_fallback_ignores_an_empty_history(monkeypatch):
     result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
 
     assert result.fetch_failures == ["fund_flow"]
+
+
+@pytest.mark.asyncio
+async def test_page_fallback_stops_after_repeated_futile_attempts(monkeypatch):
+    """连续徒劳后必须停手。
+
+    页面的历史表由主源同一个端点填充，端点拒绝时这条路必然徒劳，而每次徒劳都
+    要付一次 Chromium 页面加载：2026-09-03 实测一次把请求从 6.7s 拖到 20.1s。
+    """
+    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+    from qtf_mcp.datasource.fund_flow_page import FundFlowPageError
+
+    datasource = _page_fallback_datasource(
+        monkeypatch, source_module._fetch_failure("fund_flow")
+    )
+    attempts = []
+
+    async def futile(symbol):
+        attempts.append(symbol)
+        raise FundFlowPageError("页面既无今日数据也无历史表")
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", futile)
+
+    threshold = source_module.FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD
+    for _ in range(threshold + 3):
+        result = await datasource.fetch_stock_data(
+            "SZ300408", "2024-01-01", "2026-09-03"
+        )
+        assert result.fetch_failures == ["fund_flow"]
+
+    # 熔断打开后不再加载页面，冷却期内最多只放一次探测。
+    assert len(attempts) == threshold
+    assert source_module._FUND_FLOW_PAGE_BREAKER.is_open
+
+
+@pytest.mark.asyncio
+async def test_page_fallback_breaker_closes_after_a_success(monkeypatch):
+    """端点恢复后要能自动回到兜底可用状态。"""
+    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+
+    datasource = _page_fallback_datasource(
+        monkeypatch, source_module._fetch_failure("fund_flow")
+    )
+    page = _captured_page()
+
+    async def working(symbol):
+        return page
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", working)
+
+    result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
+
+    assert result.fetch_failures == []
+    assert not source_module._FUND_FLOW_PAGE_BREAKER.is_open

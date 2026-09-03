@@ -25,7 +25,9 @@ from ..config import (
     FINANCE_CACHE_MAX_ENTRIES,
     FINANCE_CACHE_TTL_SECONDS,
     FUND_FLOW_PAGE_FALLBACK_CONCURRENCY,
+    FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS,
     FUND_FLOW_PAGE_FALLBACK_ENABLED,
+    FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD,
     FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS,
     SOURCE_BREAKER_COOLDOWN_SECONDS,
     SOURCE_BREAKER_ENABLED,
@@ -135,13 +137,24 @@ class SourceBreaker:
             self._probing = False
 
 
-# Only the K-line tier gets a breaker: it is the one with an equivalent
-# fallback. Historical fund flow has no per-symbol alternative, so skipping it
-# would return the same empty result without buying anything.
+# The K-line tier gets a breaker because it has an equivalent fallback; the
+# HTTP fund-flow tier does not, since skipping it would return the same empty
+# result without buying anything.
 _KLINE_BREAKER = SourceBreaker(
     "eastmoney_kline",
     SOURCE_BREAKER_THRESHOLD,
     SOURCE_BREAKER_COOLDOWN_SECONDS,
+)
+
+# The page fallback does get one, for the opposite reason: it is expensive
+# rather than cheap. The page fills its table from the same endpoint the HTTP
+# tier uses, so once that endpoint refuses, every attempt is futile and costs a
+# Chromium page load. Measured on 2026-09-03: one futile attempt turned a 6.7s
+# request into 20.1s.
+_FUND_FLOW_PAGE_BREAKER = SourceBreaker(
+    "fund_flow_page",
+    FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD,
+    FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS,
 )
 
 
@@ -1062,6 +1075,11 @@ class CNStockDataSource(DataSource):
         """
         if not FUND_FLOW_PAGE_FALLBACK_ENABLED:
             return None
+        if _FUND_FLOW_PAGE_BREAKER.should_skip():
+            # 页面和主源取的是同一个端点，主源被拒时页面的表也填不上。不熔断的
+            # 话每次请求都要白付一次页面加载，把"缺一段"变成"慢三倍还是缺一段"。
+            logger.debug("资金流向页面兜底跳过 %s: 熔断器打开", symbol)
+            return None
 
         slots = _get_fund_flow_page_slots()
         try:
@@ -1081,6 +1099,7 @@ class CNStockDataSource(DataSource):
             page = await realtime_ff.fetch_history_page(symbol)
         except Exception as e:
             logger.warning("资金流向页面兜底失败 %s: %s", symbol, e)
+            _FUND_FLOW_PAGE_BREAKER.record(success=False)
             return None
         finally:
             slots.release()
@@ -1088,7 +1107,9 @@ class CNStockDataSource(DataSource):
         records = page.history_records()
         if not records:
             logger.warning("资金流向页面兜底无历史数据 %s", symbol)
+            _FUND_FLOW_PAGE_BREAKER.record(success=False)
             return None
+        _FUND_FLOW_PAGE_BREAKER.record(success=True)
 
         import pandas as pd
 

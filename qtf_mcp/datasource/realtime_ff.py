@@ -5,7 +5,7 @@ import os
 import time
 from playwright.async_api import async_playwright, Browser, BrowserContext
 
-from ..config import ALL_INDICES
+from ..config import ALL_INDICES, FUND_FLOW_PAGE_TABLE_WAIT_SECONDS
 from ..observability import log_context
 from .fund_flow_page import (
     HISTORY_TABLE_ID,
@@ -284,9 +284,12 @@ async def fetch_history_page(symbol: str) -> FundFlowPage:
 
     async def extract(page) -> FundFlowPage:
         try:
-            # 历史表是 Ajax 填充的，容器在首屏就存在但没有行。
+            # 历史表是 Ajax 填充的，容器在首屏就存在但没有行。等待预算很小：这张
+            # 表由主源同一个端点填充，端点拒绝时怎么等都不会来，而每多等一秒都是
+            # 白付的。2026-09-03 用 12 秒预算时，一次徒劳把请求从 6.7s 拖到 20.1s。
             await page.wait_for_selector(
-                f"#{HISTORY_TABLE_ID} tbody tr", timeout=12000
+                f"#{HISTORY_TABLE_ID} tbody tr",
+                timeout=int(FUND_FLOW_PAGE_TABLE_WAIT_SECONDS * 1000),
             )
         except Exception:
             # 等不到就交给解析器判断：可能是新股没有历史，也可能是页面改版。
