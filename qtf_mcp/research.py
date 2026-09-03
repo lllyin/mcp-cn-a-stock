@@ -330,14 +330,20 @@ def build_basic_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> None:
             if len(pe_ttm_arr) > 0 and pe_ttm_arr[-1] > 0:
                 print(f"- 市盈率(动): {pe_ttm_arr[-1]:.2f}", file=fp)
         
-        # 市净率
-        navps = data.get("NAVPS", np.array([]))
-        if len(navps) > 0 and navps[-1] != 0 and current_price > 0:
-            pb = current_price / navps[-1]
-            # 优先检查数据源是否直接提供了 PB (如果有的话)
-            pb_arr = data.get("PB", np.array([]))
-            if len(pb_arr) > 0 and pb_arr[-1] > 0:
-                 pb = pb_arr[-1]
+        # 市净率。优先用数据源直接给的口径：总市值 / 最新报告期归母净资产，
+        # 分子用最新总股本，与券商终端一致。回退式只能用每股净资产反推，隐含的
+        # 是报告期末股本，股本在报告期之后变动过就会偏低——2026-09-03 的
+        # SZ300408 两者是 9.78 与 9.38，比值正好是总股本 19.97 亿股与期末
+        # 19.16 亿股之比。回退式在实时行情不可用时仍能出数，所以保留。
+        pb = None
+        pb_arr = data.get("PB", np.array([]))
+        if len(pb_arr) > 0 and pb_arr[-1] > 0:
+            pb = float(pb_arr[-1])
+        else:
+            navps = data.get("NAVPS", np.array([]))
+            if len(navps) > 0 and navps[-1] != 0 and current_price > 0:
+                pb = current_price / navps[-1]
+        if pb is not None:
             print(f"- 市净率: {pb:.2f}", file=fp)
         
         # 净资产收益率

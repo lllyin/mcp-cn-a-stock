@@ -1093,6 +1093,10 @@ class CNStockDataSource(DataSource):
             info = {
                 "股票简称": info_series.get("股票名称", ""),
                 "动态市盈率": self._safe_float(info_series.get("市盈率(动)", 0)),
+                # base_info 本来就在请求 f167，之前取回后丢弃了。它是"总市值 /
+                # 最新报告期归母净资产"，与券商终端一致；本地按每股净资产反推的
+                # 口径只能用报告期末股本，股本变动后会偏低。
+                "市净率": self._safe_float(info_series.get("市净率", 0)),
             }
             
             snapshot = ef.stock.get_quote_snapshot(query_code)
@@ -1205,6 +1209,9 @@ class CNStockDataSource(DataSource):
             
             pe_ttm = info.get("动态市盈率", 0)
             stock_data.pe_ttm = np.array([self._safe_float(pe_ttm)])
+
+            pb = info.get("市净率", 0)
+            stock_data.pb = np.array([self._safe_float(pb)])
         
         if kline_data:
             df_qfq = kline_data.get("adjusted")

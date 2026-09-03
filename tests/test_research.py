@@ -9,6 +9,8 @@ import numpy as np
 import pytest
 
 from qtf_mcp.research import (
+    build_basic_data,
+    build_financial_data,
     build_trading_data,
     build_historical_fund_flow_data,
     compute_kdj,
@@ -435,3 +437,64 @@ class TestComputeMACD:
         # 在下降趋势的后半段，DIF 应该为负
         valid_dif = dif[~np.isnan(dif)]
         assert valid_dif[-1] < 0
+
+
+def _ns(year: int, month: int, day: int) -> int:
+    return int(datetime.datetime(year, month, day).timestamp() * 1e9)
+
+
+def _finance_dataset() -> tuple:
+    """两个年度报告期，够 build_financial_data 输出一行。"""
+    return (
+        {
+            "DATE": np.array([_ns(2024, 12, 31), _ns(2025, 12, 31)]),
+            "MR": np.array([73.75e8, 90.07e8]),
+            "NP": np.array([21.90e8, 26.18e8]),
+            "EPS": np.array([1.14, 1.37]),
+            "NAVPS": np.array([10.37, 11.30]),
+            "ROE": np.array([0.1150, 0.1262]),
+        },
+        "1q",
+    )
+
+
+class TestPriceToBook:
+    """市净率取值优先级。
+
+    数值取自 2026-09-03 的 SZ300408：数据源口径 9.78 = 总市值 2214.56 亿 /
+    归母净资产 226.44 亿；回退口径 9.38 = 110.910 / 每股净资产 11.82。两者相差
+    的正好是最新总股本 19.97 亿股与报告期末股本 19.16 亿股之比。
+    """
+
+    def _data(self, **overrides) -> dict:
+        data = {
+            "SYMBOL": "SZ300408",
+            "NAME": "三环集团",
+            "DATE": np.array([_ns(2026, 9, 3)]),
+            "CLOSE2": np.array([110.910]),
+            "TCAP": np.array([19.9672e8]),
+            "NAVPS": np.array([11.82]),
+            "_DS_FINANCE": _finance_dataset(),
+        }
+        data.update(overrides)
+        return data
+
+    def _pb_line(self, data: dict) -> str:
+        fp = StringIO()
+        build_basic_data(fp, "SZ300408", data)
+        lines = [line for line in fp.getvalue().splitlines() if "市净率" in line]
+        return lines[0] if lines else ""
+
+    def test_source_value_wins(self):
+        assert self._pb_line(self._data(PB=np.array([9.78]))) == "- 市净率: 9.78"
+
+    def test_falls_back_when_the_realtime_source_failed(self):
+        """实时行情失败时 PB 为 0，仍要出数而不是丢字段。"""
+        assert self._pb_line(self._data(PB=np.array([0.0]))) == "- 市净率: 9.38"
+
+    def test_falls_back_when_the_source_omits_the_field(self):
+        assert self._pb_line(self._data()) == "- 市净率: 9.38"
+
+    def test_omitted_when_neither_is_available(self):
+        data = self._data(PB=np.array([0.0]), NAVPS=np.array([0.0]))
+        assert self._pb_line(data) == ""
