@@ -5,6 +5,7 @@ CN Stock 数据源实现
 """
 
 import asyncio
+import collections
 import json
 import logging
 import threading
@@ -28,6 +29,7 @@ from ..config import (
     FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS,
     FUND_FLOW_PAGE_FALLBACK_ENABLED,
     FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD,
+    FUND_FLOW_PAGE_FALLBACK_FAILURE_WINDOW_SECONDS,
     FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS,
     FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS,
     SOURCE_BREAKER_COOLDOWN_SECONDS,
@@ -66,14 +68,27 @@ class SourceBreaker:
 
     Once open, every request skips the source except one probe per cooldown, so
     the cooldown bounds recovery latency instead of the cost of staying open.
+
+    失败可以按两种口径计数，由 ``window`` 选择：
+
+    ``window == 0``（默认）
+        **连续**失败，一次成功清零。适合"要么全通要么全封"的来源。
+
+    ``window > 0``
+        **滑动窗口内**累计失败，成功不清零，只靠时间过期。适合"逐次随机被拒"的
+        来源——连续计数在持续 50% 拒绝率下几乎永远开不了，因为总有一次成功把它
+        清零，于是每次请求都白付一次代价。资金流向页面就是这一类，见配置项里的
+        实测数据。
     """
 
-    def __init__(self, name: str, threshold: int, cooldown: float):
+    def __init__(self, name: str, threshold: int, cooldown: float, window: float = 0.0):
         self.name = name
         self.threshold = threshold
         self.cooldown = cooldown
+        self.window = window
         self._lock = threading.Lock()
         self._failures = 0
+        self._failed_at: collections.deque = collections.deque()
         self._open_until = 0.0
         self._probing = False
 
@@ -108,13 +123,25 @@ class SourceBreaker:
             recovered = False
             if success:
                 recovered = self._open_until > 0.0
-                self._failures = 0
+                # 窗口口径下成功不清零：清零就退化成连续计数，而窗口存在的理由
+                # 正是"逐次随机被拒时，成功和失败是交替出现的"。让时间去过期它。
+                if not self.window:
+                    self._failures = 0
                 self._open_until = 0.0
                 self._probing = False
             elif self._open_until > 0.0:
                 # A failed probe buys another cooldown rather than a new streak.
                 self._open_until = time.monotonic() + effective_cooldown
                 self._probing = False
+            elif self.window:
+                now = time.monotonic()
+                self._failed_at.append(now)
+                while self._failed_at and now - self._failed_at[0] > self.window:
+                    self._failed_at.popleft()
+                if len(self._failed_at) >= self.threshold:
+                    self._failed_at.clear()
+                    self._open_until = now + effective_cooldown
+                    reopened = True
             else:
                 self._failures += 1
                 if self._failures >= self.threshold:
@@ -140,6 +167,7 @@ class SourceBreaker:
     def reset(self) -> None:
         with self._lock:
             self._failures = 0
+            self._failed_at.clear()
             self._open_until = 0.0
             self._probing = False
 
@@ -158,10 +186,15 @@ _KLINE_BREAKER = SourceBreaker(
 # tier uses, so once that endpoint refuses, every attempt is futile and costs a
 # Chromium page load. Measured on 2026-09-03: one futile attempt turned a 6.7s
 # request into 20.1s.
+#
+# 用窗口口径而不是连续口径：实测被拒是逐次随机的（单次被拒率 12.5%，而同一批
+# 标的可获取 94%），连续计数在这种上游下两头都不准——两次噪声就能凑满阈值把整层
+# 停掉，而真的持续半通时又总有一次成功把它清零。
 _FUND_FLOW_PAGE_BREAKER = SourceBreaker(
     "fund_flow_page",
     FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD,
     FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS,
+    window=FUND_FLOW_PAGE_FALLBACK_FAILURE_WINDOW_SECONDS,
 )
 
 
@@ -1347,8 +1380,8 @@ class CNStockDataSource(DataSource):
             page = await realtime_ff.fetch_history_page(symbol)
         except realtime_ff.FundFlowPageUnavailable:
             # 这个标的根本没有资金流向页面（科创 50 这类指数就没有），跟数据源
-            # 的健康状况无关。计进熔断器的话，连查两次这种标的就会把兜底整层
-            # 关掉 5 分钟，代价落在所有别的标的头上。
+            # 的健康状况无关。计进熔断器的话，查几次这种标的就会把兜底整层关掉
+            # 一整个冷却期，代价落在所有别的标的头上。
             logger.debug("资金流向页面兜底跳过 %s: 该标的没有资金流向页面", symbol)
             return None
         except realtime_ff.FundFlowPageRefused as e:

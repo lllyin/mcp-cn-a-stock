@@ -1491,8 +1491,8 @@ async def test_page_fallback_ignores_symbols_without_a_page(monkeypatch):
     """没有资金流向页面的标的不能拖垮整层兜底。
 
     科创 50 这类指数就没有 zjlx 页面，fetch_history_page 抛
-    FundFlowPageUnavailable。把它算成一次源失败的话，连查两次就到了阈值 2，
-    兜底对所有别的标的一起关闭 5 分钟。
+    FundFlowPageUnavailable。把它算成一次源失败的话，查几次就到了阈值，兜底对
+    所有别的标的一起关闭一整个冷却期。
     """
     from qtf_mcp.datasource import realtime_ff as realtime_ff_module
 
@@ -1586,6 +1586,71 @@ class TestBeijingExchangeMapping:
         assert source._akshare_to_symbol("430047", "bj") == "BJ430047"
         assert source._akshare_to_symbol("600547", "sh") == "SH600547"
         assert source._akshare_to_symbol("300408", "sz") == "SZ300408"
+
+
+# --- P3：熔断器的滑动窗口口径 ---------------------------------------------
+# 连续计数在"逐次随机被拒"的上游下两头都不准：两次噪声就能凑满阈值把整层停掉，
+# 而真的持续半通时又总有一次成功把它清零。
+
+
+class TestSourceBreakerWindow:
+    def test_consecutive_is_still_the_default(self):
+        """window=0 保持原语义，K 线那个熔断器依赖它。"""
+        breaker = source_module.SourceBreaker("t", threshold=2, cooldown=60)
+        breaker.record(success=False)
+        breaker.record(success=True)          # 成功清零
+        breaker.record(success=False)
+        assert not breaker.is_open
+
+    def test_a_window_does_not_let_a_success_erase_the_evidence(self):
+        """成功不清零，只靠时间过期——否则窗口就退化成连续计数。"""
+        breaker = source_module.SourceBreaker(
+            "t", threshold=2, cooldown=60, window=60
+        )
+        breaker.record(success=False)
+        breaker.record(success=True)
+        breaker.record(success=False)
+        assert breaker.is_open
+
+    def test_failures_older_than_the_window_do_not_count(self, monkeypatch):
+        breaker = source_module.SourceBreaker(
+            "t", threshold=2, cooldown=60, window=10
+        )
+        clock = [1000.0]
+        monkeypatch.setattr(source_module.time, "monotonic", lambda: clock[0])
+
+        breaker.record(success=False)
+        clock[0] += 11                        # 第一次失败已经出窗
+        breaker.record(success=False)
+        assert not breaker.is_open
+
+        breaker.record(success=False)         # 窗口内累计两次
+        assert breaker.is_open
+
+    def test_a_sustained_block_opens_it_quickly(self, monkeypatch):
+        """持续被拒时窗口口径不会比连续口径慢——全失败时两者一样。"""
+        breaker = source_module.SourceBreaker(
+            "t", threshold=4, cooldown=60, window=60
+        )
+        for _ in range(3):
+            breaker.record(success=False)
+            assert not breaker.is_open
+        breaker.record(success=False)
+        assert breaker.is_open
+
+    def test_reset_clears_the_window(self):
+        breaker = source_module.SourceBreaker(
+            "t", threshold=2, cooldown=60, window=60
+        )
+        breaker.record(success=False)
+        breaker.reset()
+        breaker.record(success=False)
+        assert not breaker.is_open
+
+    def test_the_fund_flow_page_breaker_uses_the_window(self):
+        assert source_module._FUND_FLOW_PAGE_BREAKER.window > 0
+        # K 线那个仍是连续口径：它的上游是"要么全通要么全封"。
+        assert source_module._KLINE_BREAKER.window == 0
 
 
 # --- P1：兜底名额的等待改成按请求计预算 -----------------------------------

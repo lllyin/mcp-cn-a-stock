@@ -154,17 +154,36 @@ FUND_FLOW_PAGE_TABLE_WAIT_SECONDS = max(
     0.5,
     float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_TABLE_WAIT_SECONDS", "15")),
 )
-# Consecutive futile page loads before the fallback is skipped entirely. Lower
-# than the HTTP source breaker because each attempt costs a Chromium page load
-# rather than a sub-second request, so two wasted attempts already outweigh
-# what a third could recover.
+# 关掉整层兜底之前允许多少次白付的页面加载。
+#
+# 原值是"连续 2 次 + 冷却 300s"。它在名额只有 1 个的时候被实测证伪：一批里只有
+# 1 个标的真的碰到上游,"连续 2 次失败"就不再是信号而是噪声。2026-09-04 把逐次
+# 实测结果重放过熔断器:
+#
+#   预算 3   SH600519 ❌  SH601318 ✅第2次  其余 14 个 ✅第1次  ->  15/16 = 94%
+#   预算 1   SH600519 ❌  SH601318 ❌  ⚡熔断打开 -> 后面 14 个全跳过  ->  0/16 = 0%
+#
+# 同一份上游行为,2 次噪声换来整层停 5 分钟。而同一批标的绕开闸门实测可获取
+# 15/16 = 94%,单次被拒率只有 12.5% —— 这个量级的失败是噪声,不该触发停摆。
+#
+# 所以改成滑动窗口计数:60 秒内累计 4 次失败才开,冷却 60s。窗口计数比连续计数
+# 更贴合"逐次随机被拒"这个已实测的上游行为:连续计数会被一次成功清零,也会被
+# 两次噪声凑满,两头都不准。
 FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD = max(
     1,
-    int(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD", "2")),
+    int(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD", "4")),
 )
+# 失败计数的滑动窗口秒数。置 0 退回原来的"连续失败"语义。
+FUND_FLOW_PAGE_FALLBACK_FAILURE_WINDOW_SECONDS = max(
+    0.0,
+    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_FAILURE_WINDOW_SECONDS", "60")),
+)
+# 冷却从 300s 降到 60s。300s 的原意是"被拒是分钟级的,等久点省页面加载",但那是
+# 在阈值 2 容易误触的前提下;阈值改成窗口计数后误触少了,冷却长反而是纯损失——
+# 实测持续封锁态确实是分钟级,60s 足够避开一轮,又不会在风控解除后继续空转 4 分钟。
 FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS = max(
     1.0,
-    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS", "300")),
+    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS", "60")),
 )
 
 # 一次请求内允许的页面加载次数。
