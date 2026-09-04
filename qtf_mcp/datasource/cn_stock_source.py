@@ -1252,9 +1252,15 @@ class CNStockDataSource(DataSource):
                 slots.acquire(), timeout=FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS
             )
         except (asyncio.TimeoutError, TimeoutError):
-            # 浏览器层没有空位。这里排队等于把"缺一段"换成"整体变慢"，而盘中
-            # 实时资金流没有任何别的源，不能被兜底挤掉。
-            logger.info("资金流向页面兜底跳过 %s: 浏览器层无空位", symbol)
+            # 满的是兜底层自己那 CONCURRENCY 个名额，不是 realtime_ff 的浏览器
+            # 信号量——兜底刻意开得比它小，免得把没有替代来源的盘中实时路径挤掉。
+            # 这里排队等于把"缺一段"换成"整体变慢"，所以直接放弃。
+            logger.info(
+                "资金流向页面兜底跳过 %s: 兜底名额已满(上限 %d)，等 %.1fs 未排到",
+                symbol,
+                FUND_FLOW_PAGE_FALLBACK_CONCURRENCY,
+                FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS,
+            )
             return None
 
         started_at = time.perf_counter()

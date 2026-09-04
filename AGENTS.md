@@ -17,3 +17,10 @@
 
 - 设计、依赖、脚本和验证优先保证 Ubuntu 兼容,不依赖 macOS 专属能力。
 - 发布前在目标 Ubuntu 环境验证启动、停止、并发、浏览器回退和内存峰值。
+
+## 四、提交信息不带署名
+
+- 禁止在 commit message 里添加任何署名或协作者标记,例如
+  `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`、
+  `Generated with ...`、`Signed-off-by` 等 trailer。
+- 提交信息只写改了什么、为什么改,以及支撑判断的实测数据。
