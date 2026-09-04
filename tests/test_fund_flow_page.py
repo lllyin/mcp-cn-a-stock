@@ -346,3 +346,67 @@ def test_placeholders_fall_back_to_zero_like_the_legacy_script():
 
     assert result["主力净流入"] == "0"
     assert result["主力净比(%)"] == 0.0
+
+
+# --- 两个调用方必须落到同一个页面和同一次加载 --------------------------------
+
+
+class TestPageIdentityAcrossCallers:
+    """实时路径给纯代码、资金流兜底给带前缀的规范代码。
+
+    2026-09-04 09:22 的日志里，同一次请求把同一个页面加载了两次：
+    ``symbol=300408`` 拿到 ``history=120``，而 ``symbol=SZ300408`` 是
+    ``outcome=error`` —— 后者拼出的是 /zjlx/SZ300408.html，一个不存在的页面。
+    """
+
+    def test_prefixed_symbol_resolves_to_the_same_url(self):
+        from qtf_mcp.datasource.realtime_ff import get_fund_flow_url
+
+        expected = "https://data.eastmoney.com/zjlx/300408.html"
+        assert get_fund_flow_url("300408") == expected
+        assert get_fund_flow_url("SZ300408") == expected
+        assert get_fund_flow_url("SH600547") == (
+            "https://data.eastmoney.com/zjlx/600547.html"
+        )
+
+    def test_both_callers_share_one_singleflight_key(self):
+        from qtf_mcp.datasource.realtime_ff import page_key
+
+        assert page_key("300408") == page_key("SZ300408") == "300408"
+        assert page_key("600547") == page_key("SH600547") == "600547"
+
+    def test_index_pages_are_unchanged(self):
+        from qtf_mcp.datasource.realtime_ff import get_fund_flow_url, page_key
+
+        assert get_fund_flow_url("000001") == (
+            "https://data.eastmoney.com/zjlx/zs000001.html"
+        )
+        assert get_fund_flow_url("dpzjlx") == (
+            "https://data.eastmoney.com/zjlx/dpzjlx.html"
+        )
+        assert page_key("dpzjlx") == "dpzjlx"
+
+    @pytest.mark.asyncio
+    async def test_one_load_serves_both_key_spellings(self, monkeypatch):
+        import asyncio
+
+        from qtf_mcp.datasource import realtime_ff
+
+        loads = []
+
+        async def fake_load(symbol):
+            loads.append(symbol)
+            await asyncio.sleep(0.02)
+            return parse_fund_flow_page(FULL_PAGE.read_text(encoding="utf-8"))
+
+        monkeypatch.setattr(realtime_ff, "_load_page_shared", fake_load)
+        realtime_ff._page_inflight.clear()
+
+        first, second = await asyncio.gather(
+            realtime_ff.fetch_page_shared("300408"),
+            realtime_ff.fetch_page_shared("SZ300408"),
+        )
+
+        assert len(loads) == 1
+        assert first is second
+        assert len(first.history) == 121

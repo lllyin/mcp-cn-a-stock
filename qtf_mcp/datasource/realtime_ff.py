@@ -99,7 +99,20 @@ def get_fund_flow_url(symbol: str) -> str | None:
         return "https://data.eastmoney.com/zjlx/dpzjlx.html"
     if pure_code in ALL_INDICES:
         return None
-    return f"https://data.eastmoney.com/zjlx/{symbol}.html"
+    # 用纯代码而不是入参：页面路径是 /zjlx/300408.html，带交易所前缀的
+    # /zjlx/SZ300408.html 是一个不存在的页面，会静默返回一个没有数据区的框架。
+    return f"https://data.eastmoney.com/zjlx/{pure_code}.html"
+
+
+def page_key(symbol: str) -> str:
+    """页面级单飞的键。
+
+    同一个页面会被两个调用方以不同写法请求——实时路径给纯代码，资金流兜底给
+    带前缀的规范代码——归一之后它们才会共享同一次加载，而不是各加载一次。
+    """
+    if symbol == "dpzjlx":
+        return symbol
+    return "".join(filter(str.isdigit, symbol)) or symbol
 
 
 def get_fund_flow_display_name(symbol: str, parsed_name: str) -> str:
@@ -202,24 +215,61 @@ def session_is_warm() -> bool:
     return _session_warm
 
 
-async def _wait_for_today(page) -> None:
-    """等今日一栏的 Ajax 填充完成。超时不算错：停牌或非交易时段本就是空的。"""
-    try:
-        await page.wait_for_selector("text=今日主力净流入", timeout=10000)
-        await page.wait_for_function(WAIT_FOR_DATA_JS, timeout=12000)
-    except Exception:
-        pass
+async def _race_with_refusal(coro, refused: asyncio.Event):
+    """等 coro 完成，但一旦资金流接口被拒就立刻放弃。
 
-
-async def _wait_for_history(page) -> None:
-    """等历史表的 Ajax 填充完成。"""
+    固定超时在这里是个两难：给短了，冷启动的页面来不及填表（实测 4 秒不够、
+    需要十几秒）；给长了，端点被拒时每次都白等满。用"被拒"这个事件抢答就不用
+    折中——正常时按页面自己的速度返回（热加载约 0.5 秒），被拒时立即返回。
+    """
+    task = asyncio.ensure_future(coro)
+    refusal = asyncio.ensure_future(refused.wait())
     try:
-        await page.wait_for_selector(
-            f"#{HISTORY_TABLE_ID} tbody tr",
-            timeout=int(FUND_FLOW_PAGE_TABLE_WAIT_SECONDS * 1000),
+        await asyncio.wait(
+            {task, refusal}, return_when=asyncio.FIRST_COMPLETED
         )
-    except Exception:
-        pass
+    finally:
+        for pending in (task, refusal):
+            if not pending.done():
+                pending.cancel()
+        # 取一次异常，避免 "never retrieved" 告警。
+        if task.done() and not task.cancelled():
+            task.exception()
+
+
+# 页面上两块数据由不同端点填充，而且会独立失败：2026-09-03 抓包里
+# push2/…/fflow/kline/get（盘中曲线）被拒的同时，push2his/…/fflow/daykline/get
+# （历史表）返回 200。所以抢答必须各盯各的，否则一个失败会连累另一个。
+TODAY_ENDPOINTS = ("/fflow/kline/get", "/qt/stock/get")
+HISTORY_ENDPOINTS = ("/fflow/daykline/get",)
+
+
+async def _wait_for_today(page, refused: asyncio.Event) -> None:
+    """等今日一栏的 Ajax 填充完成。超时不算错：停牌或非交易时段本就是空的。"""
+
+    async def wait():
+        try:
+            await page.wait_for_selector("text=今日主力净流入", timeout=10000)
+            await page.wait_for_function(WAIT_FOR_DATA_JS, timeout=12000)
+        except Exception:
+            pass
+
+    await _race_with_refusal(wait(), refused)
+
+
+async def _wait_for_history(page, refused: asyncio.Event) -> None:
+    """等历史表的 Ajax 填充完成。"""
+
+    async def wait():
+        try:
+            await page.wait_for_selector(
+                f"#{HISTORY_TABLE_ID} tbody tr",
+                timeout=int(FUND_FLOW_PAGE_TABLE_WAIT_SECONDS * 1000),
+            )
+        except Exception:
+            pass
+
+    await _race_with_refusal(wait(), refused)
 
 
 async def load_fund_flow_page(symbol: str, context: BrowserContext) -> FundFlowPage:
@@ -244,11 +294,18 @@ async def load_fund_flow_page(symbol: str, context: BrowserContext) -> FundFlowP
 
         page = await context.new_page()
         refused: list[str] = []
+        today_refused = asyncio.Event()
+        history_refused = asyncio.Event()
 
         def on_request_failed(request) -> None:
             # 风控的特征是资金流接口被直接断连，而页面框架本身加载成功。
-            if "/fflow/" in request.url or "/qt/stock/get" in request.url:
-                refused.append(request.url)
+            url = request.url
+            if any(part in url for part in TODAY_ENDPOINTS):
+                refused.append(url)
+                today_refused.set()
+            elif any(part in url for part in HISTORY_ENDPOINTS):
+                refused.append(url)
+                history_refused.set()
 
         try:
             # 拦截无用资源，降低带宽和 CPU 消耗
@@ -260,7 +317,10 @@ async def load_fund_flow_page(symbol: str, context: BrowserContext) -> FundFlowP
 
             page.on("requestfailed", on_request_failed)
             await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-            await asyncio.gather(_wait_for_today(page), _wait_for_history(page))
+            await asyncio.gather(
+                _wait_for_today(page, today_refused),
+                _wait_for_history(page, history_refused),
+            )
             content = await page.content()
         finally:
             await page.close()  # page 用完立即释放，context/browser 保留复用
@@ -350,12 +410,13 @@ async def _load_page_shared(symbol: str) -> FundFlowPage:
 
 async def fetch_page_shared(symbol: str) -> FundFlowPage:
     """同一标的的并发页面加载只做一次，今日与历史两个用途共享结果。"""
-    task = _page_inflight.get(symbol)
+    key = page_key(symbol)
+    task = _page_inflight.get(key)
     if task is None or task.done():
         task = asyncio.create_task(_load_page_shared(symbol))
-        _page_inflight[symbol] = task
+        _page_inflight[key] = task
         task.add_done_callback(
-            lambda completed, key=symbol: _complete_page_inflight(key, completed)
+            lambda completed, k=key: _complete_page_inflight(k, completed)
         )
     # shield：一个等待者被取消不能中断另一个等待者需要的加载。
     return await asyncio.shield(task)

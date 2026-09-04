@@ -108,14 +108,14 @@ FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS = max(
     0.0,
     float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", "0.5")),
 )
-# How long to wait for the historical table to fill after the page loads. The
-# table is Ajax-filled from the same endpoint the API path uses, so when that
-# endpoint is refusing, this wait is paid in full and buys nothing: on
-# 2026-09-03 a futile attempt turned a 6.7s request into 20.1s. It either fills
-# in a second or two or not at all, so the budget is small.
+# Upper bound on waiting for the historical table to fill. It is only a
+# backstop: the wait aborts as soon as a fund-flow request is refused, so a
+# blocked page costs nothing regardless of this value. Measured 2026-09-04: a
+# warm browser fills the table in 0.51s, a cold start needs over 4s, so a small
+# fixed budget silently returned an empty table on the first load of a process.
 FUND_FLOW_PAGE_TABLE_WAIT_SECONDS = max(
     0.5,
-    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_TABLE_WAIT_SECONDS", "4")),
+    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_TABLE_WAIT_SECONDS", "15")),
 )
 # Consecutive futile page loads before the fallback is skipped entirely. Lower
 # than the HTTP source breaker because each attempt costs a Chromium page load
