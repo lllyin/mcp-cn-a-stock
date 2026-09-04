@@ -281,6 +281,35 @@ class TestAppendIntradayBar:
 
         assert len(append_intraday_bar(self._frame(), self._quote(as_of=None))) == 1
 
+    def test_does_not_append_past_the_requested_end_date(self):
+        """历史查询不能被实时行情污染。
+
+        date=2026-08-27 会拿到截到 08-27 的序列，若再接一根今天的，报告的
+        "数据日期"就变成今天，5/20/60 日窗口也跟着漂——生产归档比对时就是这样
+        暴露出来的。
+        """
+        from qtf_mcp.datasource.cn_stock_source import append_intraday_bar
+
+        frame = self._frame(last_date="2026-08-27")
+        assert len(append_intraday_bar(frame, self._quote(), not_after="2026-08-27")) == 1
+        # 不指定日期时 load_raw_data 传的是"明天"，当天这根要能通过。
+        assert len(append_intraday_bar(frame, self._quote(), not_after="2026-09-05")) == 2
+
+    def test_end_date_accepts_dates_and_datetimes(self):
+        import datetime
+
+        from qtf_mcp.datasource.cn_stock_source import append_intraday_bar
+
+        frame = self._frame()
+        for limit in (
+            datetime.date(2026, 9, 3),
+            datetime.datetime(2026, 9, 3, 15, 0),
+            "2026-09-03",
+        ):
+            assert len(append_intraday_bar(frame, self._quote(), not_after=limit)) == 1
+        # 解析不了的值不该悄悄挡掉当天这根
+        assert len(append_intraday_bar(frame, self._quote(), not_after="不是日期")) == 2
+
     def test_skips_backward_adjusted_series(self):
         """后复权的最新价被缩放过，接一根原始价上去是错的。"""
         from qtf_mcp.datasource.cn_stock_source import append_intraday_bar

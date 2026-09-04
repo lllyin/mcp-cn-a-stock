@@ -285,7 +285,23 @@ def _finalize_fallback_frame(
     return frame[FALLBACK_FRAME_COLUMNS]
 
 
-def append_intraday_bar(frame, quote, *, adjust: str = "qfq"):
+def _as_date(value):
+    """把 ``YYYY-MM-DD`` 字符串、datetime 或 date 统一成 date；解析不了返回 None。"""
+    import datetime as _dt
+
+    if value is None:
+        return None
+    if isinstance(value, _dt.datetime):
+        return value.date()
+    if isinstance(value, _dt.date):
+        return value
+    try:
+        return _dt.datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def append_intraday_bar(frame, quote, *, adjust: str = "qfq", not_after=None):
     """把当天这根未完成的 bar 追加到兜底源的日 K 上。
 
     东财的 K 线接口盘中带当天，腾讯和新浪的日 K 不带（实测 2026-09-04 盘中最后
@@ -294,6 +310,11 @@ def append_intraday_bar(frame, quote, *, adjust: str = "qfq"):
 
     只在行情自报的日期确实晚于表里最后一行时才追加：不看本地时钟，也就不需要
     交易日历。休市时行情的日期就是上一个交易日，与最后一行相同，自然不追加。
+
+    ``not_after`` 是调用方请求的截止日（``research.load_raw_data`` 的 end_date）。
+    没有它的话，一次 ``date=2026-08-27`` 的查询会拿到截到 08-27 的序列，再被今天
+    的实时行情续上一根，于是"数据日期"变成今天、5/20/60 日窗口也跟着漂——历史
+    查询被实时数据污染。不指定日期时 end_date 是"明天"，当天这根自然通得过。
 
     后复权序列不能这么补：那种序列的最新价是被缩放过的，而行情是原始价。前复权
     的最近若干根本来就等于原始价，所以可以直接接上。
@@ -309,6 +330,10 @@ def append_intraday_bar(frame, quote, *, adjust: str = "qfq"):
     try:
         quote_date = _dt.datetime.strptime(quote.as_of[:8], "%Y%m%d").date()
     except ValueError:
+        return frame
+
+    limit = _as_date(not_after)
+    if limit is not None and quote_date > limit:
         return frame
 
     last_date = frame["日期"].iloc[-1]
@@ -822,9 +847,11 @@ class CNStockDataSource(DataSource):
         from . import intraday_quote
 
         quote = intraday_quote.resolve(symbol or code, require_ohlc=True)
-        df = append_intraday_bar(df, quote, adjust=adjust)
+        df = append_intraday_bar(df, quote, adjust=adjust, not_after=end_date)
         if df_unadj is not None and not df_unadj.empty:
-            df_unadj = append_intraday_bar(df_unadj, quote, adjust="none")
+            df_unadj = append_intraday_bar(
+                df_unadj, quote, adjust="none", not_after=end_date
+            )
         return {
             "adjusted": df,
             "unadj": df_unadj if df_unadj is not None and not df_unadj.empty else df,
