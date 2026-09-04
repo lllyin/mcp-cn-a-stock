@@ -5,12 +5,15 @@ Realtime fund-flow page routing tests.
 import asyncio
 import datetime
 import importlib
+import logging
 from io import StringIO
 
 import numpy as np
 import pytest
+from pathlib import Path
 
 from qtf_mcp import research
+from qtf_mcp.config import _parse_range_ms
 from qtf_mcp.datasource import realtime_ff
 from qtf_mcp.datasource.realtime_ff import get_fund_flow_display_name, get_fund_flow_url
 
@@ -667,3 +670,289 @@ async def test_disguise_failure_never_breaks_the_fetch(monkeypatch):
     boom.context = _FakeContext(_FakePage("x", "y", "z"))
 
     await realtime_ff.disguise_page(boom)   # 不抛
+
+
+async def _noop_context():
+    return None
+
+
+# --- 没数据先 reload 一次 ---------------------------------------------------
+# 唯一新增的逻辑就这一条：页面打开没拿到数据，先在同一个 tab 上刷一次，刷了还没有
+# 才关掉开下一个 tab。reload 留在同一段信号量持有区间内 —— tab 一旦活过这段区间，
+# "整个浏览器同时最多 2 个 tab"这个隐式上限就失效了。
+
+
+class _FakeTabPage:
+    """够用的假页面：记录 goto / reload / close 的顺序。"""
+
+    def __init__(self, contents):
+        self.contents = list(contents)
+        self.calls = []
+        self.closed = False
+        self._listeners = {}
+
+    async def goto(self, url, **_kwargs):
+        self.calls.append("goto")
+
+    async def reload(self, **_kwargs):
+        self.calls.append("reload")
+
+    async def content(self):
+        return self.contents.pop(0) if self.contents else ""
+
+    async def route(self, *_a, **_k):
+        pass
+
+    def on(self, event, handler):
+        self._listeners.setdefault(event, []).append(handler)
+
+    def remove_listener(self, event, handler):
+        self._listeners.get(event, []).remove(handler)
+
+    async def close(self):
+        self.closed = True
+
+
+class _TabPageContext:
+    def __init__(self, page):
+        self.page = page
+
+    async def new_page(self):
+        return self.page
+
+
+EMPTY_HTML = '<div class="title">三环集团(300408)</div><td data-field="f62"></td>'
+
+
+def _full_html():
+    return (Path(__file__).parent / "fixtures" / "eastmoney_zjlx_full_300408.html").read_text(
+        encoding="utf-8"
+    )
+
+
+async def _no_wait(*_a, **_k):
+    return None
+
+
+@pytest.mark.asyncio
+async def test_reloads_the_same_tab_before_opening_another(monkeypatch):
+    """第一次没数据 -> 同一个 tab reload，不是新开一个。"""
+    page = _FakeTabPage([EMPTY_HTML, _full_html()])
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+    monkeypatch.setattr(realtime_ff, "_wait_for_today", _no_wait)
+    monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
+    monkeypatch.setattr(realtime_ff, "_sleep_before_retry", lambda: _resolved(0.3))
+
+    parsed = await realtime_ff.load_fund_flow_page(
+        "300408", _TabPageContext(page), loads=2,
+        satisfies=lambda p: bool(p.history),
+    )
+
+    assert page.calls == ["goto", "reload"]
+    assert len(parsed.history) == 121
+    assert page.closed                      # 用完即关，tab 不越出这段区间
+
+
+@pytest.mark.asyncio
+async def test_an_unsupported_symbol_still_logs_one_line(monkeypatch, caplog):
+    """日志改成一次加载一行之后，走不到那一行的两条路要靠 finally 补记。
+
+    科创50 没有资金流向页面，每次查询都走这条路；它在日志里消失了就等于看不见
+    这层被调用过多少次。
+    """
+    monkeypatch.setattr(realtime_ff, "get_fund_flow_url", lambda _s: None)
+
+    with caplog.at_level(logging.INFO, logger="qtf_mcp.datasource.realtime_ff"):
+        with pytest.raises(realtime_ff.FundFlowPageUnavailable):
+            await realtime_ff.load_fund_flow_page("SH000688", _TabPageContext(None))
+
+    lines = [r.getMessage() for r in caplog.records if "Realtime fund flow page" in r.getMessage()]
+    assert len(lines) == 1
+    assert "outcome=unsupported" in lines[0] and "how=-" in lines[0]
+
+
+@pytest.mark.asyncio
+async def test_a_load_that_blows_up_still_logs_one_line(monkeypatch, caplog):
+    """goto 超时之类的异常也要留下 outcome=error，否则只剩上游一句笼统的失败。"""
+    page = _FakeTabPage([])
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+
+    async def boom(*_a, **_k):
+        raise TimeoutError("goto 超时")
+
+    monkeypatch.setattr(realtime_ff, "_load_once", boom)
+
+    with caplog.at_level(logging.INFO, logger="qtf_mcp.datasource.realtime_ff"):
+        with pytest.raises(TimeoutError):
+            await realtime_ff.load_fund_flow_page("300408", _TabPageContext(page))
+
+    lines = [r.getMessage() for r in caplog.records if "Realtime fund flow page" in r.getMessage()]
+    assert len(lines) == 1
+    assert "outcome=error" in lines[0] and "how=new_tab" in lines[0]
+    assert page.closed
+
+
+@pytest.mark.asyncio
+async def test_each_load_logs_exactly_one_line(monkeypatch, caplog):
+    """goto + reload = 两行，靠 how 区分；不能少记也不能被 finally 重复补记。"""
+    page = _FakeTabPage([EMPTY_HTML, _full_html()])
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+    monkeypatch.setattr(realtime_ff, "_wait_for_today", _no_wait)
+    monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
+    monkeypatch.setattr(realtime_ff, "_sleep_before_retry", lambda: _resolved(0.0))
+
+    with caplog.at_level(logging.INFO, logger="qtf_mcp.datasource.realtime_ff"):
+        await realtime_ff.load_fund_flow_page(
+            "300408", _TabPageContext(page), loads=2,
+            satisfies=lambda p: bool(p.history),
+        )
+
+    lines = [r.getMessage() for r in caplog.records if "Realtime fund flow page" in r.getMessage()]
+    assert len(lines) == 2
+    assert "how=new_tab" in lines[0] and "how=reload" in lines[1]
+    # 名额是这个 tab 一开始就拿到的，reload 时不该再报一次等待
+    assert "semaphore_wait=0.000s" in lines[1]
+
+
+@pytest.mark.asyncio
+async def test_one_load_never_reloads(monkeypatch):
+    """预算只有一次时不 reload——会话已经热了就不该多付一次加载。"""
+    page = _FakeTabPage([_full_html()])
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+    monkeypatch.setattr(realtime_ff, "_wait_for_today", _no_wait)
+    monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
+
+    await realtime_ff.load_fund_flow_page("300408", _TabPageContext(page), loads=1)
+
+    assert page.calls == ["goto"]
+
+
+@pytest.mark.asyncio
+async def test_a_satisfied_first_load_does_not_reload(monkeypatch):
+    """第一次就拿到了想要的，不该白刷一次。"""
+    page = _FakeTabPage([_full_html()])
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+    monkeypatch.setattr(realtime_ff, "_wait_for_today", _no_wait)
+    monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
+
+    await realtime_ff.load_fund_flow_page(
+        "300408", _TabPageContext(page), loads=2,
+        satisfies=lambda p: bool(p.history),
+    )
+
+    assert page.calls == ["goto"]
+
+
+@pytest.mark.asyncio
+async def test_the_tab_is_closed_even_when_every_load_fails(monkeypatch):
+    """两次都没数据也要关掉，否则 tab 会活过信号量区间、上限失效。"""
+    page = _FakeTabPage([EMPTY_HTML, EMPTY_HTML])
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+    monkeypatch.setattr(realtime_ff, "_wait_for_today", _no_wait)
+    monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
+    monkeypatch.setattr(realtime_ff, "_sleep_before_retry", lambda: _resolved(0.0))
+
+    # 两次都没数据：解析本身是成功的（页面框架在，数据区空），所以按契约把这份
+    # 不满足要求的结果交回上层，由它决定换不换 tab——不在这里抛。
+    parsed = await realtime_ff.load_fund_flow_page(
+        "300408", _TabPageContext(page), loads=2,
+        satisfies=lambda p: bool(p.history),
+    )
+
+    assert parsed.history == [] and parsed.has_today is False
+    assert page.calls == ["goto", "reload"]
+    assert page.closed
+
+
+@pytest.mark.asyncio
+async def test_the_semaphore_is_released_after_both_loads(monkeypatch):
+    """reload 在同一段持有区间内，结束后必须把名额还回去。"""
+    page = _FakeTabPage([EMPTY_HTML, _full_html()])
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+    monkeypatch.setattr(realtime_ff, "_wait_for_today", _no_wait)
+    monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
+    monkeypatch.setattr(realtime_ff, "_sleep_before_retry", lambda: _resolved(0.0))
+
+    before = realtime_ff.SEMAPHORE._value
+    await realtime_ff.load_fund_flow_page(
+        "300408", _TabPageContext(page), loads=2,
+        satisfies=lambda p: bool(p.history),
+    )
+    assert realtime_ff.SEMAPHORE._value == before
+
+
+# --- reload 之前的随机等待 -------------------------------------------------
+# 只作用在重试路径上：那一次已经被拒、本来就要再付一次页面加载。
+
+
+@pytest.mark.asyncio
+async def test_retry_delay_lands_in_the_configured_range(monkeypatch):
+    slept = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(realtime_ff.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_RETRY_DELAY_MS", (250.0, 350.0))
+
+    for _ in range(40):
+        delay = await realtime_ff._sleep_before_retry()
+        assert 0.250 <= delay <= 0.350
+    assert len(slept) == 40
+    # 随机而不是固定：40 次里不该只有一个值
+    assert len(set(slept)) > 1
+
+
+@pytest.mark.asyncio
+async def test_retry_delay_can_be_switched_off(monkeypatch):
+    async def boom(_seconds):
+        raise AssertionError("置 0 时不该 sleep")
+
+    monkeypatch.setattr(realtime_ff.asyncio, "sleep", boom)
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_RETRY_DELAY_MS", (0.0, 0.0))
+
+    assert await realtime_ff._sleep_before_retry() == 0.0
+
+
+class TestRetryDelayParsing:
+    """区间写成一个 "下界,上界" 字符串，解析要宽进严出。"""
+
+    def test_two_values(self):
+        assert _parse_range_ms("250,350", "1,2") == (250.0, 350.0)
+
+    def test_spaces_are_tolerated(self):
+        assert _parse_range_ms(" 250 , 350 ", "1,2") == (250.0, 350.0)
+
+    def test_single_value_means_a_fixed_delay(self):
+        assert _parse_range_ms("300", "1,2") == (300.0, 300.0)
+
+    def test_reversed_order_still_works(self):
+        assert _parse_range_ms("350,250", "1,2") == (250.0, 350.0)
+
+    def test_zero_switches_it_off(self):
+        assert _parse_range_ms("0", "1,2") == (0.0, 0.0)
+
+    def test_negative_is_clamped_not_rejected(self):
+        assert _parse_range_ms("-50,350", "1,2") == (0.0, 350.0)
+
+    def test_unset_falls_back_to_the_default(self):
+        assert _parse_range_ms(None, "250,350") == (250.0, 350.0)
+        assert _parse_range_ms("", "250,350") == (250.0, 350.0)
+
+    def test_garbage_raises_instead_of_silently_defaulting(self):
+        # 配错了要在启动时就炸，别让运维以为自己配上了。
+        with pytest.raises(ValueError):
+            _parse_range_ms("250ms,350ms", "1,2")
+        with pytest.raises(ValueError):
+            _parse_range_ms(",", "1,2")
+
+
+async def _resolved(value):
+    return value

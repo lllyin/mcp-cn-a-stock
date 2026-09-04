@@ -171,6 +171,7 @@ cn-stock-mcp --transport sse --port 8686
 | `CN_STOCK_FUND_FLOW_PAGE_TABLE_WAIT_SECONDS` | 秒（默认 `15`） | 等历史表渲染完成的上限。请求被拒时会提前结束，不会白等满 |
 | `CN_STOCK_FUND_FLOW_PAGE_REUSE_SECONDS` | 秒，`0` 关闭复用（默认 `30`） | 同一标的页面解析结果的复用窗口，避免一次请求内重复加载同一页面 |
 | `CN_STOCK_FUND_FLOW_PAGE_COLD_ATTEMPTS` | 正整数（默认 `2`） | 本进程还没成功取到过数据时，单次请求允许的页面加载次数 |
+| `CN_STOCK_FUND_FLOW_PAGE_RETRY_DELAY_MS` | `下界,上界` 毫秒<br>单个数字为固定值<br>`0` 关闭<br>（默认 `250,350`） | reload 之前的随机等待区间。只作用在重试路径上，顺利路径不受影响；没拿到数据后 0 毫秒就刷新同一个页面是个机器节奏 |
 | `CN_STOCK_FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD` | 正整数（默认 `2`） | 连续多少次徒劳加载后暂停整层兜底 |
 | `CN_STOCK_FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS` | 秒（默认 `300`） | 暂停时长 |
 | `CN_STOCK_FUND_FLOW_PAGE_DISGUISE` | `0`<br>`1`<br>（默认 `1`） | 把无头浏览器的自报特征改成普通浏览器的样子。不改的话 `sec-ch-ua` 请求头里写着 `HeadlessChrome`，容易被上游风控挑出来 |

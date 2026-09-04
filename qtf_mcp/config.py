@@ -166,6 +166,36 @@ FUND_FLOW_PAGE_CLAIM_PLATFORM = (
     os.getenv("CN_STOCK_FUND_FLOW_PAGE_CLAIM_PLATFORM") or "auto"
 ).strip().lower()
 
+def _parse_range_ms(raw, default: str) -> tuple[float, float]:
+    """把 "250,350" 解析成 (下界, 上界) 毫秒。
+
+    只写一个数就是固定值，写 "0" 就是关闭，顺序写反也认。数字写坏了直接在启动时
+    抛 ValueError：与本文件其它数值项一致，宁可起不来，也别让运维以为自己配上了。
+    """
+    text = str(raw).strip() if raw not in (None, "") else default
+    values = sorted(max(0.0, float(part)) for part in text.split(",") if part.strip())
+    if not values:
+        raise ValueError(f"区间为空: {raw!r}")
+    return values[0], values[-1]
+
+
+# 同一个 tab 上 reload 之前的随机等待区间，毫秒，写作 "下界,上界"。只作用在重试
+# 路径上：那一次已经没拿到数据、本来就要再付一次页面加载，所以顺利路径一秒都不
+# 多花。睡的次数是每个 tab 的那次 reload 各一次，即 ⌊COLD_ATTEMPTS/2⌋ 次，
+# 默认就是每个标的每次请求最多多等一次 350ms。
+#
+# 为什么随机而不是固定：没拿到数据后 0 毫秒就刷新同一个页面，本身是个机器节奏。
+# 收益没有实测数据支撑——本机出口 IP 处于持续封锁态，量不出命中率变化；写下这一点
+# 是为了以后别把它当成已验证的结论。代价可量化，见下面副作用一条。
+#
+# 副作用要连带看隔壁阈值：资金流兜底走这条路时，名额是在整个 fetch_history_page
+# 外面持有的，多睡 300ms 就多占 300ms，而 FALLBACK_WAIT_SECONDS 只有 0.5s，
+# 可能让"名额已满跳过"更容易触发。重试路径本身少见，所以判断是可以接受；
+# 真在日志里看到跳过变多，把这两个值一起调。置 0 关闭。
+FUND_FLOW_PAGE_RETRY_DELAY_MS = _parse_range_ms(
+    os.getenv("CN_STOCK_FUND_FLOW_PAGE_RETRY_DELAY_MS"), "250,350"
+)
+
 # 调试开关，默认关。开启后浏览器有头运行、抓完不关页面，用于人工观察页面到底
 # 渲染成了什么样。两者都会显著抬高内存（每个页面是一个独立渲染进程），只在排查
 # 时开；Linux 上有头模式需要 DISPLAY，start.sh 会拉起 Xvfb。

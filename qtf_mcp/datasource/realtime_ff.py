@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import platform
+import random
 import re
 import time
 from playwright.async_api import async_playwright, Browser, BrowserContext
@@ -14,6 +15,7 @@ from ..config import (
     FUND_FLOW_PAGE_DISGUISE,
     FUND_FLOW_PAGE_HEADFUL,
     FUND_FLOW_PAGE_KEEP_PAGES,
+    FUND_FLOW_PAGE_RETRY_DELAY_MS,
     FUND_FLOW_PAGE_REUSE_SECONDS,
     FUND_FLOW_PAGE_TABLE_WAIT_SECONDS,
 )
@@ -500,109 +502,212 @@ async def _wait_for_history(page, refused: asyncio.Event) -> None:
     await _race_with_refusal(wait(), refused)
 
 
-async def load_fund_flow_page(symbol: str, context: BrowserContext) -> FundFlowPage:
-    """加载一次页面，解析出今日与历史两块。
+async def load_fund_flow_page(
+    symbol: str,
+    context: BrowserContext,
+    *,
+    loads: int = 1,
+    satisfies=None,
+) -> FundFlowPage:
+    """加载页面，解析出今日与历史两块。
 
-    两块都在同一个页面上，且都由 ``/fflow/`` 接口填充，所以分两次加载既浪费一次
-    Chromium，又多一次被拒的机会。两个等待并发进行，实时路径的耗时上限因此与
-    合并前一致。
+    今日和历史都在同一个页面上、都由 ``/fflow/`` 接口填充，所以分两次加载既浪费
+    一次 Chromium，又多一次被拒的机会。两个等待并发进行，耗时上限与合并前一致。
+
+    ``loads`` 是这一个 tab 允许的加载次数：第一次 goto，没拿到（想要的）数据就在
+    同一个 tab 上 reload。实测 reload 便宜一半——同一标的第二次加载 p50 0.240s，
+    而关掉再开新 tab 是 0.452s，且 CDP 的 UA 覆盖能活过 reload、不用重装。
+
+    reload 刻意留在同一段信号量持有区间内：整个浏览器同时开着的 tab 数是靠
+    ``SEMAPHORE`` 隐式限住的（页面在这段区间里创建也在这段区间里关闭），tab 一旦
+    活过这段区间，那个上限就失效了——4 个标的并发时会变成 4 个 tab、每个约 120 MiB。
     """
     global _session_warm
 
     wait_started_at = time.perf_counter()
     await SEMAPHORE.acquire()
     semaphore_wait = time.perf_counter() - wait_started_at
-    service_started_at = time.perf_counter()
     outcome = "error"
-    # 在 try 之外绑定，好让 finally 里的日志无论成败都能带上实际访问的地址。
     url = None
+    how = "-"
+    started_at = time.perf_counter()
+    # 这一次加载有没有自己记过日志。日志是一次加载一行，而 unsupported 和加载途中
+    # 抛出的异常根本走不到那一行，靠这个标记在 finally 里补记，别让它们在日志里消失。
+    logged = True
     try:
         url = get_fund_flow_url(symbol)
         if url is None:
             outcome = "unsupported"
+            logged = False
             raise FundFlowPageUnavailable(symbol)
 
         page = await context.new_page()
-        # 必须在 goto 之前：覆盖是 per-target 的，导航之后再装，这一次请求的
-        # sec-ch-ua 已经带着 HeadlessChrome 发出去了。
-        await disguise_page(page)
-        refused: list[str] = []
-        today_refused = asyncio.Event()
-        history_refused = asyncio.Event()
-
-        def on_request_failed(request) -> None:
-            # 被拒的特征是资金流接口被直接断连，而页面框架本身加载成功。
-            failed_url = request.url
-            if any(part in failed_url for part in TODAY_ENDPOINTS):
-                refused.append(failed_url)
-                today_refused.set()
-            elif any(part in failed_url for part in HISTORY_ENDPOINTS):
-                refused.append(failed_url)
-                history_refused.set()
-
         try:
-            # 拦截无用资源，降低带宽和 CPU 消耗
+            # 必须在 goto 之前：覆盖是 per-target 的，导航之后再装，这一次请求的
+            # sec-ch-ua 已经带着 HeadlessChrome 发出去了。reload 不用重装。
+            await disguise_page(page)
+
+            # 拦截无用资源，降低带宽和 CPU。路由是页面级的，reload 之后依旧生效。
             async def block_route(route):
                 await route.abort()
 
             for pattern in BLOCKED_PATTERNS:
                 await page.route(pattern, block_route)
 
-            page.on("requestfailed", on_request_failed)
-            await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-            await asyncio.gather(
-                _wait_for_today(page, today_refused),
-                _wait_for_history(page, history_refused),
+            last_refusal = None
+            parsed = None
+            for index in range(max(1, loads)):
+                if index:
+                    delay = await _sleep_before_retry()
+                    logger.info(
+                        "资金流向页面没数据，同一 tab reload symbol=%s 第%d/%d次 "
+                        "等待=%.0fms",
+                        symbol,
+                        index + 1,
+                        loads,
+                        delay * 1000,
+                    )
+                started_at = time.perf_counter()
+                how = "reload" if index else "new_tab"
+                outcome = "error"
+                logged = False
+                parsed, last_refusal = await _load_once(
+                    page, symbol, url, reload=bool(index)
+                )
+                outcome = (
+                    "blocked_captcha"
+                    if last_refusal is not None and last_refusal.captcha
+                    else "blocked" if last_refusal is not None
+                    else f"today={parsed.has_today} history={len(parsed.history)}"
+                )
+                _log_page_load(
+                    symbol,
+                    url,
+                    how,
+                    outcome,
+                    semaphore_wait if not index else 0.0,
+                    time.perf_counter() - started_at,
+                )
+                logged = True
+                if parsed is None:
+                    continue
+                _session_warm = True
+                if satisfies is None or satisfies(parsed):
+                    return parsed
+            if parsed is not None:
+                # 拿到了数据但不满足调用方要的那一块，交给上层决定要不要换 tab 再试。
+                return parsed
+            raise last_refusal or FundFlowPageError(
+                f"{symbol} 页面既无今日数据也无历史表"
             )
-            content = await page.content()
         finally:
             if FUND_FLOW_PAGE_KEEP_PAGES:
-                # 调试模式：留着页面供人工观察。每个页面是一个渲染进程，会持续
-                # 占内存，所以只在排查时开。
+                # 调试模式：留着页面供人工观察。每个页面是一个独立渲染进程，实测
+                # 约 120 MiB，会持续占着，只在排查时开。
                 logger.info("调试模式保留页面 symbol=%s url=%s", symbol, url)
             else:
-                await page.close()  # page 用完立即释放，context/browser 保留复用
-
-        try:
-            parsed = parse_fund_flow_page(content)
-        except FundFlowPageError:
-            parsed = None
-
-        # 页面渲染成功但两块都没值，同时相关请求被拒。停牌和开盘前也会得到空值，
-        # 但那时不会有请求失败，所以两个条件必须同时成立才算"被拒"。
-        got_nothing = parsed is None or (not parsed.history and not parsed.has_today)
-        if got_nothing and refused:
-            captcha = parsed is not None and parsed.captcha_present
-            outcome = "blocked_captcha" if captcha else "blocked"
-            reason = (
-                "东财风控要求滑块验证（页面已弹出验证框），过验证前接口不会返回数据"
-                if captcha
-                else "页面数据区为空"
-            )
-            raise FundFlowPageRefused(
-                f"{symbol} 资金流接口拒绝了 {len(refused)} 个请求（空响应），{reason}"
-            ) from None
-        if parsed is None:
-            raise FundFlowPageError(f"{symbol} 页面既无今日数据也无历史表")
-
-        if not got_nothing:
-            _session_warm = True
-        outcome = f"today={parsed.has_today} history={len(parsed.history)}"
-        return parsed
+                await page.close()
     finally:
+        if not logged:
+            _log_page_load(
+                symbol,
+                url or "-",
+                how,
+                outcome,
+                semaphore_wait,
+                time.perf_counter() - started_at,
+            )
         SEMAPHORE.release()
-        request_id, tool, _ = log_context()
-        logger.info(
-            "Realtime fund flow page request_id=%s tool=%s symbol=%s url=%s "
-            "outcome=%s semaphore_wait=%.3fs service=%.3fs",
-            request_id,
-            tool,
-            symbol,
-            url or "-",
-            outcome,
-            semaphore_wait,
-            time.perf_counter() - service_started_at,
+
+
+def _log_page_load(
+    symbol: str,
+    url: str,
+    how: str,
+    outcome: str,
+    semaphore_wait: float,
+    service: float,
+) -> None:
+    """一次页面加载记一行。同一个 tab 上的 reload 也是一行，用 how 区分。
+
+    semaphore_wait 只在这个 tab 的第一次加载上有意义：reload 时名额早已在手。
+    """
+    request_id, tool, _ = log_context()
+    logger.info(
+        "Realtime fund flow page request_id=%s tool=%s symbol=%s url=%s "
+        "how=%s outcome=%s semaphore_wait=%.3fs service=%.3fs",
+        request_id,
+        tool,
+        symbol,
+        url,
+        how,
+        outcome,
+        semaphore_wait,
+        service,
+    )
+
+
+class _PageRefusal(FundFlowPageRefused):
+    """带上"是不是滑块"的被拒，好让日志分开 blocked 和 blocked_captcha。"""
+
+    def __init__(self, message: str, *, captcha: bool) -> None:
+        super().__init__(message)
+        self.captcha = captcha
+
+
+async def _load_once(page, symbol: str, url: str, *, reload: bool):
+    """在给定页面上跑一次加载，返回 (解析结果 或 None, 被拒异常 或 None)。"""
+    refused: list = []
+    today_refused = asyncio.Event()
+    history_refused = asyncio.Event()
+
+    def on_request_failed(request) -> None:
+        # 被拒的特征是资金流接口被直接断连，而页面框架本身加载成功。
+        failed_url = request.url
+        if any(part in failed_url for part in TODAY_ENDPOINTS):
+            refused.append(failed_url)
+            today_refused.set()
+        elif any(part in failed_url for part in HISTORY_ENDPOINTS):
+            refused.append(failed_url)
+            history_refused.set()
+
+    # 监听器现挂现摘：refused 是这一次的账，不能跨 reload 累计。
+    page.on("requestfailed", on_request_failed)
+    try:
+        if reload:
+            await page.reload(wait_until="domcontentloaded", timeout=25000)
+        else:
+            await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        await asyncio.gather(
+            _wait_for_today(page, today_refused),
+            _wait_for_history(page, history_refused),
         )
+        content = await page.content()
+    finally:
+        page.remove_listener("requestfailed", on_request_failed)
+
+    try:
+        parsed = parse_fund_flow_page(content)
+    except FundFlowPageError:
+        parsed = None
+
+    # 页面渲染成功但两块都没值，同时相关请求被拒。停牌和开盘前也会得到空值，
+    # 但那时不会有请求失败，所以两个条件必须同时成立才算"被拒"。
+    got_nothing = parsed is None or (not parsed.history and not parsed.has_today)
+    if got_nothing and refused:
+        captcha = parsed is not None and parsed.captcha_present
+        reason = (
+            "东财风控要求滑块验证（页面已弹出验证框），过验证前接口不会返回数据"
+            if captcha
+            else "页面数据区为空"
+        )
+        return None, _PageRefusal(
+            f"{symbol} 资金流接口拒绝了 {len(refused)} 个请求（空响应），{reason}",
+            captcha=captcha,
+        )
+    if parsed is None:
+        return None, None
+    return parsed, None
 
 
 def _page_to_realtime_dict(symbol: str, page: FundFlowPage) -> dict:
@@ -701,6 +806,21 @@ def _satisfies(page: FundFlowPage, require_history: bool, require_today: bool) -
     return True
 
 
+async def _sleep_before_retry() -> float:
+    """reload 之前随机等一小会儿，返回实际等待的秒数（供日志核对）。
+
+    没拿到数据后 0 毫秒就刷新同一个页面是个机器节奏。这一觉睡在信号量持有区间
+    内——tab 必须留着才能 reload，换不来名额，只能认这点占用；区间上界因此要和
+    FALLBACK_WAIT_SECONDS 一起看。
+    """
+    low, high = FUND_FLOW_PAGE_RETRY_DELAY_MS
+    if high <= 0:
+        return 0.0
+    delay = random.uniform(low, high) / 1000
+    await asyncio.sleep(delay)
+    return delay
+
+
 async def _load_page_shared(
     symbol: str, *, require_history: bool = False, require_today: bool = False
 ) -> FundFlowPage:
@@ -709,34 +829,47 @@ async def _load_page_shared(
     重试条件是"这次拿到的还不满足调用方"，不只是"被拒"：一次加载可能只拿到两块
     中的一块，而调用方要的恰好是另一块。
 
-    次数上限见 FUND_FLOW_PAGE_COLD_ATTEMPTS 的注释——实测第三次不再带来成功，
-    所以默认只有两次。本进程一旦成功取过数，就只试一次。
+    次数上限见 FUND_FLOW_PAGE_COLD_ATTEMPTS 的注释——它数的是页面加载次数，
+    不是 tab 数。一个 tab 消耗两次（goto + reload），所以默认 2 就是"一个 tab 试
+    两次"，与改动前的总加载次数一致；调到 3 才会开第二个 tab。
+
+        1 次  新 tab + goto
+        2 次  同一个 tab reload
+        3 次  关掉，开下一个 tab + goto
+        4 次  reload
     """
     context = await get_context()
-    attempts = FUND_FLOW_PAGE_COLD_ATTEMPTS if not _session_warm else 1
+    budget = FUND_FLOW_PAGE_COLD_ATTEMPTS if not _session_warm else 1
+    predicate = lambda page: _satisfies(page, require_history, require_today)
     last_error = None
+    used = 0
 
-    for attempt in range(1, attempts + 1):
+    while used < budget:
+        # 每个 tab 最多两次加载：goto，没数据就 reload。剩余预算不足就少给。
+        loads = min(2, budget - used)
+        used += loads
         try:
-            page = await load_fund_flow_page(symbol, context)
+            page = await load_fund_flow_page(
+                symbol, context, loads=loads, satisfies=predicate
+            )
         except FundFlowPageRefused as e:
             last_error = e
-            if attempt < attempts:
+            if used < budget:
                 logger.info(
-                    "资金流向页面被拒，重试 symbol=%s 第%d/%d次",
+                    "资金流向页面被拒，换一个 tab symbol=%s 已用%d/%d次加载",
                     symbol,
-                    attempt + 1,
-                    attempts,
+                    used,
+                    budget,
                 )
                 continue
             raise
-        if _satisfies(page, require_history, require_today) or attempt == attempts:
+        if predicate(page) or used >= budget:
             return page
         logger.info(
-            "资金流向页面数据不全，重试 symbol=%s 第%d/%d次 今日=%s 历史=%d",
+            "资金流向页面数据不全，换一个 tab symbol=%s 已用%d/%d次加载 今日=%s 历史=%d",
             symbol,
-            attempt + 1,
-            attempts,
+            used,
+            budget,
             page.has_today,
             len(page.history),
         )

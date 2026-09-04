@@ -463,8 +463,8 @@ class TestColdSessionRetry:
         attempts = []
         good = parse_fund_flow_page(FULL_PAGE.read_text(encoding="utf-8"))
 
-        async def flaky(symbol, context):
-            attempts.append(symbol)
+        async def flaky(symbol, context, *, loads=1, satisfies=None):
+            attempts.append(loads)
             if len(attempts) == 1:
                 raise realtime_ff.FundFlowPageBlocked("cold")
             return good
@@ -472,10 +472,12 @@ class TestColdSessionRetry:
         monkeypatch.setattr(realtime_ff, "load_fund_flow_page", flaky)
         monkeypatch.setattr(realtime_ff, "get_context", _fake_context)
         monkeypatch.setattr(realtime_ff, "_session_warm", False)
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_COLD_ATTEMPTS", 4)
 
         page = await realtime_ff._load_page_shared("300408")
 
-        assert len(attempts) == 2
+        # 预算 4 次加载 = 两个 tab，每个 tab 拿到 2 次（goto + reload）
+        assert attempts == [2, 2]
         assert len(page.history) == 121
 
     @pytest.mark.asyncio
@@ -485,7 +487,7 @@ class TestColdSessionRetry:
 
         attempts = []
 
-        async def always_blocked(symbol, context):
+        async def always_blocked(symbol, context, *, loads=1, satisfies=None):
             attempts.append(symbol)
             raise realtime_ff.FundFlowPageBlocked("blocked")
 
@@ -638,10 +640,10 @@ class TestColdSessionAttempts:
         from qtf_mcp.datasource import realtime_ff
 
         partial, full = self._pages()
-        results = [realtime_ff.FundFlowPageBlocked("cold"), partial, full]
+        results = [partial, full]
         seen = []
 
-        async def flaky(symbol, context):
+        async def flaky(symbol, context, *, loads=1, satisfies=None):
             item = results[len(seen)]
             seen.append(item)
             if isinstance(item, Exception):
@@ -655,7 +657,8 @@ class TestColdSessionAttempts:
 
         page = await realtime_ff._load_page_shared("300408", require_history=True)
 
-        assert len(seen) == 3
+        # 预算 3 = 第一个 tab 2 次 + 第二个 tab 1 次
+        assert len(seen) == 2
         assert len(page.history) == 121
 
     @pytest.mark.asyncio
@@ -666,7 +669,7 @@ class TestColdSessionAttempts:
         partial, _ = self._pages()
         seen = []
 
-        async def always_partial(symbol, context):
+        async def always_partial(symbol, context, *, loads=1, satisfies=None):
             seen.append(symbol)
             return partial
 
@@ -677,7 +680,7 @@ class TestColdSessionAttempts:
 
         page = await realtime_ff._load_page_shared("300408", require_history=True)
 
-        assert len(seen) == 3
+        assert len(seen) == 2       # 3 次加载预算 -> 2 个 tab
         assert page.history == []
 
     @pytest.mark.asyncio
@@ -688,7 +691,7 @@ class TestColdSessionAttempts:
         partial, _ = self._pages()
         seen = []
 
-        async def always_partial(symbol, context):
+        async def always_partial(symbol, context, *, loads=1, satisfies=None):
             seen.append(symbol)
             return partial
 
@@ -708,7 +711,7 @@ class TestColdSessionAttempts:
         _, full = self._pages()
         seen = []
 
-        async def good(symbol, context):
+        async def good(symbol, context, *, loads=1, satisfies=None):
             seen.append(symbol)
             return full
 
