@@ -16,6 +16,8 @@ wheels/
 log.txt
 /logs/
 /.runtime/
+# 基线（verification/baseline/）要跟着代码走，每次跑出来的报告不用
+/verification/reports/
 /benchmarks/
 /private/
 
