@@ -276,19 +276,29 @@ class TestScore:
         """平均会把"一个源整层挂了"稀释成看着还行的分数。"""
         score = verify.Score(
             tools_ok=9, tools_total=9, dims_ok=77, dims_total=100,
-            baselines_ok=1, baselines_total=7,
+            docs_ok=1, docs_total=7,
         )
         assert score.tool_rate == 100.0
         assert round(score.overall) == 14
         assert score.verdict.startswith("❌")
 
     def test_a_clean_run_is_publishable(self):
-        score = verify.Score(9, 9, 100, 100, 7, 7)
+        score = verify.Score(9, 9, 100, 100, docs_ok=7, docs_total=7)
         assert score.overall == 100.0
         assert score.verdict.startswith("✅")
 
+    def test_a_data_gap_downgrades_a_full_score(self):
+        """三个分数都满但有文档整段没取到数据，不能给干净的通过。
+
+        缺数据不算漂移（那是可用性），但也不该被一个 100% 盖过去——先判断是偶发
+        还是系统性。
+        """
+        score = verify.Score(9, 9, 100, 100, docs_ok=7, docs_total=7, gaps=4)
+        assert score.overall == 100.0
+        assert score.verdict.startswith("⚠️") and "数据缺口" in score.verdict
+
     def test_a_small_degradation_asks_for_confirmation(self):
-        score = verify.Score(9, 9, 95, 100, 7, 7)
+        score = verify.Score(9, 9, 95, 100, docs_ok=7, docs_total=7)
         assert score.verdict.startswith("⚠️")
 
     def test_nothing_measured_does_not_divide_by_zero(self):
@@ -330,13 +340,50 @@ class TestNumericCanonicalisation:
         assert verify.compare_structures({"a": None}, {"a": 0}, "x").diffs
 
 
+class TestKnownDifferences:
+    """已核实的上游差异降级不计分，但每条都有偏差上界，超出就重新算成真差异。"""
+
+    def test_the_tencent_amount_rounding_is_known(self):
+        old = "# SH600362 2026-08-28 日K线数据 (前复权)\n- 成交额: 3452443817.00\n"
+        new = "# SH600362 2026-08-28 日K线数据 (前复权)\n- 成交额: 3452443800.00\n"
+        diff = verify.compare_documents(old, new, "（正文）")
+        assert diff.hard == []
+        assert [d.kind for d in diff.known] == ["已知差异"]
+        assert "100 元" in diff.known[0].note
+
+    def test_a_deviation_past_the_recorded_bound_is_a_real_difference(self):
+        """成交额差 1% 就不是"精度到 100 元"那件事了，不能继续放行。"""
+        old = "# SH600362 2026-08-28 日K线数据 (前复权)\n- 成交额: 3452443817.00\n"
+        new = "# SH600362 2026-08-28 日K线数据 (前复权)\n- 成交额: 3400000000.00\n"
+        assert [d.kind for d in verify.compare_documents(old, new, "（正文）").hard] == [
+            "值变化"
+        ]
+
+    def test_the_chinext_volume_gap_is_known_only_for_that_index(self):
+        old = "## 成交量(万手)\n- 当日: 19364.88\n"
+        new = "## 成交量(万手)\n- 当日: 18615.42\n"          # 低 3.9%
+        assert verify.compare_documents(old, new, "SZ399006").hard == []
+        # 同样的偏差出现在深证成指上就不放行——核实过的只有创业板指一个标的
+        assert [d.kind for d in verify.compare_documents(old, new, "SZ399001").hard] == [
+            "值变化"
+        ]
+
+    def test_every_entry_carries_a_reason_and_a_bound(self):
+        """条目是拿来记已核实结论的，不是拿来消红字的开关。"""
+        assert verify.KNOWN_DIFFERENCES
+        for entry in verify.KNOWN_DIFFERENCES:
+            assert len(entry.reason) > 20, entry.key
+            assert 0 <= entry.bound < 0.1, entry.key
+
+
 class TestLostSectionCollapse:
     def test_a_whole_section_vanishing_is_one_row(self):
         """full 的历史资金流向是 60 行的表，拿不到时逐行列出会把别的差异挤没。"""
         old = "## 历史资金流向\n" + "\n".join(f"| 2026-08-{d:02d} | x |" for d in range(1, 21))
         diff = verify.compare_documents(old, "# 别的\n- a: 1\n", "x")
-        lost = [d for d in diff.hard if "整段不见了" in d.key]
-        assert len(lost) == 1 and "21 行" in lost[0].key
+        # 整段消失算"缺数据"——可用性问题，不进回归漂移
+        assert len(diff.gaps) == 1 and "21 行" in diff.gaps[0].key
+        assert not [d for d in diff.hard if "整段不见了" in d.key]
 
     def test_a_section_that_only_changed_is_not_collapsed(self):
         """段落还在、只是内容变了，就得逐行报——那才是要查的。"""

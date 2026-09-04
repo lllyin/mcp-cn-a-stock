@@ -457,10 +457,11 @@ def _pin_date(spec: CallSpec, payload: Payload) -> tuple[CallSpec | None, str]:
 
 @dataclass
 class LineDiff:
-    kind: str          # 缺失 / 新增 / 值变化
+    kind: str          # 缺失 / 新增 / 值变化 / 实时口径 / 复权漂移 / 已知差异 / 缺数据
     key: str
     old: str = ""
     new: str = ""
+    note: str = ""     # 已知差异的原因
 
 
 @dataclass
@@ -473,14 +474,23 @@ class DocumentDiff:
     def clean(self) -> bool:
         return not self.diffs
 
+    #: 不算"回归漂移"的类别，各有各的理由，都在 _classify 和 _LIVE_VALUE_KEY 那里
+    #: 写清楚了。它们仍然出现在报告里，只是不进回归一致率。
+    NOT_DRIFT = ("实时口径", "复权漂移", "已知差异", "缺数据")
+
     @property
     def hard(self) -> list[LineDiff]:
-        """真正该看的差异。
+        """真正算回归漂移的差异——钉死日期之后本该一样却变了的数字。"""
+        return [diff for diff in self.diffs if diff.kind not in self.NOT_DRIFT]
 
-        实时口径是钉日期造成的，复权漂移是公司行为造成的——两类都不是这次改动的
-        问题，进了结论只会把真差异挤出视野。它们在 drift_note 和计数里仍然可见。
-        """
-        return [diff for diff in self.diffs if diff.kind not in ("实时口径", "复权漂移")]
+    @property
+    def gaps(self) -> list[LineDiff]:
+        """整段没取到。算可用性，不算漂移。"""
+        return [diff for diff in self.diffs if diff.kind == "缺数据"]
+
+    @property
+    def known(self) -> list[LineDiff]:
+        return [diff for diff in self.diffs if diff.kind == "已知差异"]
 
 
 def _line_key(line: str) -> str:
@@ -583,7 +593,68 @@ def compare_structures(old, new, name: str) -> DocumentDiff:
             diffs.append(LineDiff("新增", path, new=value))
     # drift_note 要在合并之前算，合并会丢掉大部分样本点。
     note = _drift_note(diffs)
-    return DocumentDiff(name, _collapse(diffs), drift_note=note)
+    collapsed = _collapse(diffs)
+    _classify(name, collapsed)
+    return DocumentDiff(name, collapsed, drift_note=note)
+
+
+# ── 已知的上游差异 ─────────────────────────────────────────────
+# 两个上游源对同一个字段给出不同的值，而这不是本项目能修的。逐条记下来：
+# 匹配到的差异降级成"已知差异"，不计入回归一致率，但仍然在报告里列出来。
+#
+# 每条都必须带 ``bound``——已核实的最大相对偏差。超出这个界就重新算成真差异，
+# 因为那说明性质变了，不再是当初核实过的那件事。默默无条件忽略一个字段，等于
+# 在这一层上开了个永久的盲区。
+#
+# 加条目之前先把成因查清楚并写进 reason，别拿它当"消掉红字"的开关。
+
+
+@dataclass(frozen=True)
+class KnownDifference:
+    key: str          # 匹配 LineDiff.key 的正则
+    reason: str
+    bound: float      # 允许的最大相对偏差；0 表示只允许一模一样的文本差异
+    document: str = ".*"
+
+
+KNOWN_DIFFERENCES = (
+    KnownDifference(
+        # kline 的文档名是"（正文）"，K线数据那个标题在 key 的段落部分里，所以
+        # 只约束 key 不约束 document。
+        key=r"日?K线数据.*› - 成交额",
+        reason="腾讯的成交额精度到 100 元，新浪和东财给的是精确值"
+        "（SH600362 2026-08-28：3,452,443,817 对 3,452,443,800）",
+        bound=1e-6,
+    ),
+    KnownDifference(
+        key=r"成交[量额]",
+        document=r"^SZ399006$",
+        reason="创业板指的成交量/成交额东财与腾讯口径不同，腾讯低 3.2%~4.4%（量）"
+        "和 0.5%~0.8%（额）。2026-06 的 8 个交易日逐日核过，上证/深证/科创50 两个源"
+        "完全相同，只有创业板指这一个标的有分歧；隐含成分股均价两边都在合理区间，"
+        "判不出谁对",
+        bound=0.05,
+    ),
+    KnownDifference(
+        key=r"(120|240)日均[量额]",
+        reason="长窗口均值：窗口里某一天被上游修正过，摊到 120/240 个交易日上",
+        bound=0.001,
+    ),
+)
+
+
+def _known_reason(document: str, diff: LineDiff) -> str:
+    """这处差异是不是已核实的上游差异。是就返回原因，不是返回空串。"""
+    for entry in KNOWN_DIFFERENCES:
+        if not re.search(entry.document, document) or not re.search(entry.key, diff.key):
+            continue
+        ratios = _ratios(diff)
+        if not ratios:
+            # 取不到数值对（文本变了或数字个数都不一样），只在 bound 为 0 时放行。
+            return entry.reason if entry.bound == 0 else ""
+        if max(abs(r - 1) for r in ratios) <= entry.bound:
+            return entry.reason
+    return ""
 
 
 # 归档是当时的实时查询，重放是脚本钉了日期的——资金流那一段必然对不上，而且是
@@ -655,6 +726,7 @@ def compare_documents(
             diffs.append(LineDiff("新增", key, new=values[0]))
 
     diffs = _collapse_lost_sections(diffs)
+    _classify(name, diffs)
     note = _drift_note(diffs)
     factor = _adjustment_drift(diffs)
     if factor is not None:
@@ -675,6 +747,25 @@ def compare_documents(
         if rounding:
             note += f"；涨跌幅/振幅另有 {rounding} 行只差在末位，是价格缩放后的精度损失"
     return DocumentDiff(name, diffs, drift_note=note)
+
+
+def _classify(document: str, diffs: list[LineDiff]) -> None:
+    """给差异贴上不计入回归漂移的两个类别。就地改 kind。
+
+    ``已知差异``  两个上游源对同一字段口径或精度不同，本项目改不了
+    ``缺数据``    整段没取到。这是可用性问题，回归指标量的是"数字变没变"，
+                  两件事混在一个分数里会互相矛盾——完整率说 100% 而回归说不一致。
+    """
+    for diff in diffs:
+        if diff.kind in ("实时口径", "复权漂移"):
+            continue
+        if "整段不见了" in diff.key:
+            diff.kind = "缺数据"
+            continue
+        reason = _known_reason(document, diff)
+        if reason:
+            diff.kind = "已知差异"
+            diff.note = reason
 
 
 def _collapse_lost_sections(diffs: list[LineDiff]) -> list[LineDiff]:
@@ -947,6 +1038,22 @@ def last_settled_trading_day(today: dt.date | None = None) -> str:
 # ── 九、报告 ────────────────────────────────────────────────────
 
 
+def _kind_summary(diffs: list[DocumentDiff]) -> str:
+    """把不算漂移的那几类按类别数出来。
+
+    原先一律标成"实时口径"，可 NOT_DRIFT 现在有四类，标签跟着就不准了——报告里
+    写着"实时口径"而实际是"整段缺数据"，比不写更糟。
+    """
+    counts: dict[str, int] = {}
+    for document in diffs:
+        for diff in document.diffs:
+            if diff.kind in DocumentDiff.NOT_DRIFT:
+                counts[diff.kind] = counts.get(diff.kind, 0) + 1
+    if not counts:
+        return ""
+    return "、".join(f"{n} 处{kind}" for kind, n in sorted(counts.items()))
+
+
 def _focus(old: str, new: str, width: int = 78) -> tuple[str, str]:
     """两个长值只在中间某处不同时，截开头会截出两个一模一样的片段。
 
@@ -973,8 +1080,13 @@ class Score:
     tools_total: int = 0
     dims_ok: int = 0
     dims_total: int = 0
-    baselines_ok: int = 0
-    baselines_total: int = 0
+    # 分母是"参与比对的文档"而不是"基线文件"：kline_daily 我挑了 4 份单标的基线，
+    # 它们的唯一差异是同一件上游精度差，按文件计分就占掉 4/13 = 31 个百分点，
+    # 一个问题被算了四次。
+    docs_ok: int = 0
+    docs_total: int = 0
+    gaps: int = 0          # 整段没取到的文档数，单独报，不进回归一致率
+    known: int = 0         # 命中已核实上游差异的文档数
 
     @staticmethod
     def _pct(ok: int, total: int) -> float:
@@ -990,7 +1102,7 @@ class Score:
 
     @property
     def baseline_rate(self) -> float:
-        return self._pct(self.baselines_ok, self.baselines_total)
+        return self._pct(self.docs_ok, self.docs_total)
 
     @property
     def overall(self) -> float:
@@ -1003,11 +1115,15 @@ class Score:
 
     @property
     def verdict(self) -> str:
-        if self.overall >= 99.0:
-            return "✅ 可发布"
-        if self.overall >= 90.0:
+        if self.overall < 90.0:
+            return "❌ 不可发布"
+        if self.overall < 99.0:
             return "⚠️ 有降级，确认原因后再发"
-        return "❌ 不可发布"
+        if self.gaps:
+            # 三个分数都满，但有文档整段没取到数据。不当成漂移（那是可用性），
+            # 也不能给个干净的通过——先判断是偶发还是系统性。
+            return "⚠️ 数字没漂，但有数据缺口，确认是偶发还是系统性再发"
+        return "✅ 可发布"
 
 
 # 四大指数走的是和个股不同的代码路径：成交量单位推断整条绕过（指数的"收盘"是
@@ -1122,15 +1238,22 @@ def render_report(
         baseline for baseline, result, _ in regressions if result is not None and not result.ok
     ]
     comparable = [b for b, result, _ in regressions if result is not None]
-    failed = bool(probe_failures or bad_missing or dirty or replay_failures)
+    all_docs = [d for _, result, diffs in regressions if result is not None for d in diffs]
+    docs_dirty = [d for d in all_docs if d.hard]
+    docs_gap = [d for d in all_docs if d.gaps]
+    docs_known = [d for d in all_docs if d.known]
+    failed = bool(probe_failures or bad_missing or docs_dirty or replay_failures)
 
     score = Score(
         tools_ok=len(probes) - len(probe_failures),
         tools_total=len(probes),
         dims_ok=sum(c.available for _, _, c in probes),
         dims_total=sum(c.graded for _, _, c in probes),
-        baselines_ok=len(comparable) - len(dirty) - len(replay_failures),
-        baselines_total=len(comparable),
+        # 重放整份失败的，它那些文档一份都没进 all_docs，所以要额外扣掉
+        docs_ok=len(all_docs) - len(docs_dirty),
+        docs_total=len(all_docs) + len(replay_failures),
+        gaps=len(docs_gap),
+        known=len(docs_known),
     )
 
     lines.append("# 上线数据验证报告")
@@ -1151,13 +1274,26 @@ def render_report(
     )
     lines.append(
         f"| 回归一致率 | {score.baseline_rate:.0f}% | "
-        f"{score.baselines_ok}/{score.baselines_total} 份基线重放后一致 |"
+        f"{score.docs_ok}/{score.docs_total} 份基线文档重放后没有未解释的漂移"
+        + (f"；{score.known} 份命中已核实的上游差异，不计分" if score.known else "")
+        + " |"
     )
+    if score.gaps:
+        lines.append(
+            f"| 数据缺口 | —— | {score.gaps} 份文档整段数据没取到，"
+            "单列不计入回归分（那是可用性问题，不是数字漂了） |"
+        )
     lines.append("")
     lines.append(
         "> 综合分取三项里最低的那个：平均会把「某个源整层挂了」稀释成看着还行的分数，"
         "而这层是发布前的闸门，闸门按最短的那块板算。"
         "≥99% 可发布，≥90% 要确认原因，低于 90% 不发。"
+    )
+    lines.append("")
+    lines.append(
+        "> 回归一致率的分母是**文档**而不是基线文件。kline_daily 那 4 份单标的基线"
+        "只差在同一件上游精度上，按文件计分会让一个问题占掉 4/13；按文档算它仍然是"
+        "四份，但和别的工具的四十多份文档放在一起，权重才对得上它的实际影响。"
     )
     lines.append("")
     if failed:
@@ -1172,8 +1308,14 @@ def render_report(
             lines.append(f"- ❌ `{source}` 源没取到 {count} 项：{'、'.join(names)}")
         for result in probe_failures:
             lines.append(f"- ❌ `{result.spec.describe()[:60]}` 调用失败")
-        if dirty:
-            lines.append(f"- ❌ {len(dirty)} 份基线重放后与旧数据不一致，见第四节")
+        if docs_dirty:
+            lines.append(
+                f"- ❌ {len(docs_dirty)} 份基线文档有未解释的漂移，见第四节"
+            )
+        if docs_gap:
+            lines.append(
+                f"- ⚠️ {len(docs_gap)} 份基线文档整段数据没取到（可用性，不是漂移）"
+            )
         if replay_failures:
             lines.append(f"- ❌ {len(replay_failures)} 份基线重放失败")
         lines.append("")
@@ -1270,8 +1412,8 @@ def render_report(
                 verdict = f"**重放失败** exit={result.exit_code}"
             else:
                 hard = sum(len(diff.hard) for diff in diffs)
-                live = sum(len(diff.diffs) - len(diff.hard) for diff in diffs)
-                tail = f"，另有 {live} 处实时口径差异（不可比）" if live else ""
+                summary = _kind_summary(diffs)
+                tail = f"，另有 {summary}（均不计分）" if summary else ""
                 if not hard:
                     verdict = f"一致{tail}"
                 elif baseline.intraday_capture:
@@ -1293,10 +1435,10 @@ def render_report(
             lines.append(f"### {baseline.path.name}")
             lines.append("")
             for document in bad:
-                live = len(document.diffs) - len(document.hard)
+                summary = _kind_summary([document])
                 lines.append(
                     f"**{document.document}**：{len(document.hard)} 处"
-                    + (f"（另有 {live} 处实时口径差异，已折叠）" if live else "")
+                    + (f"（另有 {summary}，已折叠）" if summary else "")
                 )
                 if document.drift_note:
                     lines.append(f"- {document.drift_note}")
@@ -1345,12 +1487,19 @@ def render_report(
                  "报告里的「数据日期」反推补上——不钉住就等于拿今天的行情去对昨天的账。")
     lines.append("- **正当缺席**：钉了日期就没有实时资金流可展示，这不是故障，"
                  "不进可用率的分母。")
+    lines.append("- **已知差异**：两个上游源对同一字段口径或精度不同，本项目改不了，"
+                 "逐条记在脚本的 `KNOWN_DIFFERENCES` 里。每条都带一个已核实的最大"
+                 "相对偏差，超出就重新算成真差异——无条件忽略一个字段等于在这一层"
+                 "开个永久盲区。")
+    lines.append("- **数据缺口**：整段没取到。算可用性，不算漂移，所以单列一行而不是"
+                 "进回归分——回归量的是「数字变没变」，两件事混在一个分数里会互相矛盾："
+                 "完整率说 100% 而回归说不一致。")
     lines.append("")
     lines.append("- 基线过期了就从 `logs/mcporter/` 拷收盘后的新归档进 "
                  "`verification/baseline/`，文件名不限，脚本按文件里的「命令：」那一行"
                  "反解调用；选基线的规则见该目录下的 README。")
     lines.append("")
-    return "\n".join(lines), failed
+    return "\n".join(lines), failed, score.verdict
 
 
 # ── 十、入口 ────────────────────────────────────────────────────
@@ -1475,21 +1624,22 @@ def main() -> int:
                         )
                     )
             bad = sum(len(diff.hard) for diff in diffs)
-            live = sum(len(diff.diffs) - len(diff.hard) for diff in diffs)
+            summary = _kind_summary(diffs)
             note = "" if not bad else f"  {bad} 处不同"
-            note += "" if not live else f"（另 {live} 处实时口径）"
+            note += "" if not summary else f"（另 {summary}）"
             print(f"  [{'OK ' if not bad else 'DIFF'}] {baseline.path.name}{note}")
             regressions.append((baseline, result, diffs))
 
     scan = scan_log(args.log, started)
-    report, failed = render_report(started, config, probes, regressions, scan)
+    report, failed, verdict = render_report(started, config, probes, regressions, scan)
 
     destination = args.report or (DEFAULT_REPORT_DIR / f"{started:%Y%m%d_%H%M%S}.md")
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(report, encoding="utf-8")
     print()
     print(f"[验证] 报告已写入 {destination}")
-    print(f"[验证] 结论：{'有问题' if failed else '全部通过'}")
+    # 与报告里那一行同一个判定，别一边说"全部通过"一边在报告里标着数据缺口。
+    print(f"[验证] 结论：{verdict}")
     return 1 if failed else 0
 
 
