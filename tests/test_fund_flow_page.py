@@ -410,3 +410,94 @@ class TestPageIdentityAcrossCallers:
         assert len(loads) == 1
         assert first is second
         assert len(first.history) == 121
+
+
+class TestRefusalSignals:
+    """哪些请求失败才算"这块数据取不到"。
+
+    2026-09-04 09:49 实测：push2/api/qt/stock/get 失败的同时，今日一栏照样填出
+    9443.9402万，因为今日只依赖 fflow/kline/get。把 qt/stock/get 当成失败信号，
+    会在它失败时提前放弃等待，让今日一栏变成一串 0 —— 而历史表不受影响，于是
+    出现"历史有值、实时没值"这种不可能的组合。
+    """
+
+    def test_quote_endpoint_is_not_a_today_signal(self):
+        from qtf_mcp.datasource.realtime_ff import (
+            HISTORY_ENDPOINTS,
+            TODAY_ENDPOINTS,
+        )
+
+        quote = "https://push2.eastmoney.com/api/qt/stock/get?cb=quotedelaytip0"
+        assert not any(part in quote for part in TODAY_ENDPOINTS)
+        assert not any(part in quote for part in HISTORY_ENDPOINTS)
+
+    def test_each_block_watches_only_its_own_endpoint(self):
+        from qtf_mcp.datasource.realtime_ff import (
+            HISTORY_ENDPOINTS,
+            TODAY_ENDPOINTS,
+        )
+
+        today = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get?cb=x"
+        history = (
+            "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get?cb=x"
+        )
+
+        assert any(part in today for part in TODAY_ENDPOINTS)
+        assert not any(part in today for part in HISTORY_ENDPOINTS)
+        assert any(part in history for part in HISTORY_ENDPOINTS)
+        assert not any(part in history for part in TODAY_ENDPOINTS)
+
+
+class TestColdSessionRetry:
+    """冷会话的第一次加载被拒时重试一次。
+
+    实测形状：新 context 的第 1 次加载两个端点全被拒，第 2、3 次全部成功
+    （2026-09-03 是 [0, 121, 121] 行，2026-09-04 复测一致）。不重试的话，
+    进程起来后的第一次请求必然拿不到资金流向。
+    """
+
+    @pytest.mark.asyncio
+    async def test_retries_once_when_the_session_is_cold(self, monkeypatch):
+        from qtf_mcp.datasource import realtime_ff
+
+        attempts = []
+        good = parse_fund_flow_page(FULL_PAGE.read_text(encoding="utf-8"))
+
+        async def flaky(symbol, context):
+            attempts.append(symbol)
+            if len(attempts) == 1:
+                raise realtime_ff.FundFlowPageBlocked("cold")
+            return good
+
+        monkeypatch.setattr(realtime_ff, "load_fund_flow_page", flaky)
+        monkeypatch.setattr(realtime_ff, "get_context", _fake_context)
+        monkeypatch.setattr(realtime_ff, "_session_warm", False)
+
+        page = await realtime_ff._load_page_shared("300408")
+
+        assert len(attempts) == 2
+        assert len(page.history) == 121
+
+    @pytest.mark.asyncio
+    async def test_does_not_retry_once_the_session_is_warm(self, monkeypatch):
+        """会话热了之后的被拒是真的被拒，重试只是白费一次页面加载。"""
+        from qtf_mcp.datasource import realtime_ff
+
+        attempts = []
+
+        async def always_blocked(symbol, context):
+            attempts.append(symbol)
+            raise realtime_ff.FundFlowPageBlocked("blocked")
+
+        monkeypatch.setattr(realtime_ff, "load_fund_flow_page", always_blocked)
+        monkeypatch.setattr(realtime_ff, "get_context", _fake_context)
+        monkeypatch.setattr(realtime_ff, "_session_warm", True)
+
+        with pytest.raises(realtime_ff.FundFlowPageBlocked):
+            await realtime_ff._load_page_shared("300408")
+
+        assert len(attempts) == 1
+
+
+async def _fake_context():
+    return object()

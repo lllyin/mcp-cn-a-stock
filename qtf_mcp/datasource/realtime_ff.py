@@ -237,10 +237,14 @@ async def _race_with_refusal(coro, refused: asyncio.Event):
             task.exception()
 
 
-# 页面上两块数据由不同端点填充，而且会独立失败：2026-09-03 抓包里
-# push2/…/fflow/kline/get（盘中曲线）被拒的同时，push2his/…/fflow/daykline/get
-# （历史表）返回 200。所以抢答必须各盯各的，否则一个失败会连累另一个。
-TODAY_ENDPOINTS = ("/fflow/kline/get", "/qt/stock/get")
+# 页面上两块数据由不同端点填充，而且会独立失败：2026-09-04 09:49 的抓包里
+# fflow/kline/get 返回 200 而 fflow/daykline/get 被拒，页面就是今日有值、历史
+# 为空。所以抢答必须各盯各的，否则一个失败会连累另一个。
+#
+# 只认 /fflow/：同一次抓包里 qt/stock/get 也失败了，而今日一栏照样填出了
+# 9443.9402万——它是页头行情和延时提示（cb=quotedelaytip0）用的，不供给这两块
+# 数据。把它算成失败信号会凭空掐掉今日的等待，让今日一栏变成一串 0。
+TODAY_ENDPOINTS = ("/fflow/kline/get",)
 HISTORY_ENDPOINTS = ("/fflow/daykline/get",)
 
 
@@ -408,7 +412,17 @@ def _complete_page_inflight(symbol: str, task: asyncio.Task) -> None:
 
 async def _load_page_shared(symbol: str) -> FundFlowPage:
     context = await get_context()
-    return await load_fund_flow_page(symbol, context)
+    try:
+        return await load_fund_flow_page(symbol, context)
+    except FundFlowPageBlocked:
+        if _session_warm:
+            raise
+        # 冷会话的第一次加载几乎总是被拒，同一个 context 的第二次就过了。
+        # 2026-09-03 是 [0, 121, 121] 行，2026-09-04 复测是第 1 次两个端点全拒、
+        # 第 2/3 次全成功。所以这里重试一次，且只在会话还没热起来时重试——
+        # 会话热了之后的被拒是真的被拒，再加载一次只是白费一次页面。
+        logger.info("资金流向页面首次加载被拒，用同一会话重试一次 symbol=%s", symbol)
+        return await load_fund_flow_page(symbol, context)
 
 
 async def fetch_page_shared(symbol: str) -> FundFlowPage:
