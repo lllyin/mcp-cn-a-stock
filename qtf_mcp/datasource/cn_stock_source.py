@@ -35,6 +35,7 @@ from ..config import (
     SH_INDICES,
     SZ_INDICES,
 )
+from . import basic_info
 from .base import DataSource, FetchRequirements, StockData
 from .http_channel import install_http_channel, installed_mode
 from ..observability import bind_log_context, log_context
@@ -1346,67 +1347,68 @@ class CNStockDataSource(DataSource):
             return None
     
     def _fetch_realtime_sync(self, code: str, symbol: str = None) -> Optional[Dict]:
-        """同步获取实时数据"""
-        try:
-            # 对于 ETF，避免调用 ak.fund_etf_category_sina，因为它会拉取全量 1000+ 条数据导致超时
-            if code.startswith(("1", "5")):
-                snapshot = ef.stock.get_quote_snapshot(code)
-                if snapshot is not None and not snapshot.empty:
-                    info = {
-                        "股票简称": str(snapshot.get("名称", "")),
-                        "最新价": float(snapshot.get("最新价", 0)),
-                        "总股本": 0.0,
-                        "总市值": 0.0,
-                        "流通市值": 0.0,
-                        "动态市盈率": 0.0,
-                    }
-                    return {"info": info}
-                return _fetch_failure("realtime")
-            from ..symbols import get_symbol_name
-            symbol_name = get_symbol_name(symbol) if symbol else ""
-            is_index = check_is_index(symbol, symbol_name)
-            # 对指数优先使用名称查询
-            query_code = symbol_name if (is_index and symbol_name) else (symbol if is_index else code)
-                
-            info_series = ef.stock.get_base_info(query_code)
-            if info_series is None or info_series.empty:
-                # 即使 base_info 失败，尝试用 snapshot 保底
-                snapshot = ef.stock.get_quote_snapshot(query_code)
-                if snapshot is not None and not snapshot.empty:
-                    info = {
-                        "股票简称": str(snapshot.get("名称", "")),
-                        "最新价": float(snapshot.get("最新价", 0)),
-                        "总股本": 0.0,
-                        "总市值": 0.0,
-                        "流通市值": 0.0,
-                        "动态市盈率": 0.0,
-                    }
-                    return {"info": info}
-                return _fetch_failure("realtime")
-            
-            info = {
-                "股票简称": info_series.get("股票名称", ""),
-                "动态市盈率": self._safe_float(info_series.get("市盈率(动)", 0)),
-                # base_info 本来就在请求 f167，之前取回后丢弃了。它是"总市值 /
-                # 最新报告期归母净资产"，与券商终端一致；本地按每股净资产反推的
-                # 口径只能用报告期末股本，股本变动后会偏低。
-                "市净率": self._safe_float(info_series.get("市净率", 0)),
-            }
-            
-            snapshot = ef.stock.get_quote_snapshot(query_code)
-            if snapshot is not None and not snapshot.empty:
-                latest_price = self._safe_float(snapshot.get("最新价", 0))
-                total_market_val = self._safe_float(info_series.get("总市值", 0))
-                if latest_price > 0:
-                    info["总股本"] = total_market_val / latest_price
-                info["最新价"] = latest_price
-                info["总市值"] = total_market_val
-                info["流通市值"] = self._safe_float(info_series.get("流通市值", 0))
-            
-            return {"info": info}
-        except Exception as e:
-            logger.warning(f"获取实时数据失败 {code}: {e}")
+        """取基本数据。逐级回退见 datasource/basic_info.py。
+
+        这里只做三件事：决定用什么代码去查、按标的类别决定哪些字段该留、把结果映射
+        成下游那七个键。取数本身交给 basic_info 那一层，加源去源都不用动这里。
+
+        为什么按类别裁字段，而不是有什么就给什么：
+          - ETF 的市值一直是 0（保留改动前的行为）。腾讯其实给得出 193.07 亿，
+            但那会让 ETF 报告凭空多出几维，属于新功能不是补缺，得单独决定。
+          - 指数同理。腾讯给上证 694637 亿、市盈率 17.06，而现在的报告里指数只有
+            代码/名称/日期。
+        改这两条之前先想清楚要不要改，别让"修回退"顺手改了输出。
+        """
+        from ..symbols import get_symbol_name
+
+        symbol_name = get_symbol_name(symbol) if symbol else ""
+        is_index = check_is_index(symbol, symbol_name)
+        is_etf = code.startswith(("1", "5"))
+        # efinance 认的是不带前缀的六位码：实测 get_quote_snapshot("SH600519") 返回
+        # 一个全 NaN 的 series，而 "600519" 才拿得到贵州茅台。指数是唯一的例外，
+        # 按代码查不到，得按中文名。这三支的取法与改动前逐字一致，别顺手"统一"成
+        # 带前缀的写法——那会让东财整条路静默失效，而腾讯兜底会把症状盖住。
+        query = symbol_name if (is_index and symbol_name) else (symbol if is_index else code)
+
+        # ETF 和指数本来就不取市值，就别为了它去问第二个源。
+        # 第二个参数必须带市场前缀：腾讯拿 000001 会猜成深市的平安银行。
+        info = basic_info.resolve(
+            query,
+            symbol or code,
+            require_valuation=not (is_etf or is_index),
+        )
+        if info is None or (info.name is None and info.last is None):
             return _fetch_failure("realtime")
+
+        mapped = {
+            "股票简称": info.name or "",
+            "最新价": info.last or 0.0,
+            "总股本": 0.0,
+            "总市值": 0.0,
+            "流通市值": 0.0,
+            "动态市盈率": 0.0,
+        }
+        if not is_etf and not is_index:
+            mapped["总股本"] = info.total_shares or 0.0
+            mapped["总市值"] = info.total_market_cap or 0.0
+            mapped["流通市值"] = info.float_market_cap or 0.0
+            mapped["动态市盈率"] = info.pe_ttm or 0.0
+            if info.pb:
+                # 有就给，没有就不放这个键——渲染层会退回本地的
+                # 现价/每股净资产，那条路差得更开（见 research.py 的注释），
+                # 但总比没有好。
+                mapped["市净率"] = info.pb
+
+        if info.source != "eastmoney":
+            logger.info(
+                "基本数据来源 %s symbol=%s 市值=%s 市盈率=%s 市净率=%s",
+                info.source,
+                symbol or code,
+                "有" if info.total_market_cap else "无",
+                "有" if info.pe_ttm else "无",
+                "有" if info.pb else "无",
+            )
+        return {"info": mapped}
     
     def _fetch_sector_sync(self, code: str) -> List[str]:
         """同步获取所属板块"""

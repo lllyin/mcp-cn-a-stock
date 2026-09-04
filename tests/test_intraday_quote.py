@@ -135,12 +135,12 @@ class TestTencentProvider:
         assert provider.fetch("SZ300408", iq.QuoteContext()) is None
 
     def test_code_normalisation(self):
-        assert iq._tencent_code("SZ300408") == "sz300408"
-        assert iq._tencent_code("SH600547") == "sh600547"
-        assert iq._tencent_code("300408") == "sz300408"
-        assert iq._tencent_code("600547") == "sh600547"
-        assert iq._tencent_code("430047") == "bj430047"
-        assert iq._tencent_code("abc") is None
+        assert iq.tencent_code("SZ300408") == "sz300408"
+        assert iq.tencent_code("SH600547") == "sh600547"
+        assert iq.tencent_code("300408") == "sz300408"
+        assert iq.tencent_code("600547") == "sh600547"
+        assert iq.tencent_code("430047") == "bj430047"
+        assert iq.tencent_code("abc") is None
 
 
 class TestResolveAndCrossCheck:

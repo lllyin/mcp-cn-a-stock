@@ -276,7 +276,7 @@ class TencentQuoteProvider(QuoteProvider):
         self.timeout = timeout
 
     def fetch(self, symbol: str, context: QuoteContext) -> Optional[IntradayQuote]:
-        code = _tencent_code(symbol)
+        code = tencent_code(symbol)
         if code is None:
             return None
 
@@ -313,8 +313,11 @@ class TencentQuoteProvider(QuoteProvider):
         )
 
 
-def _tencent_code(symbol: str) -> Optional[str]:
-    """把 SZ300408 / 300408 归一成腾讯的 sz300408。"""
+def tencent_code(symbol: str) -> Optional[str]:
+    """把 SZ300408 / 300408 归一成腾讯的 sz300408。
+
+    basic_info 那层也用它——同一个 qt.gtimg.cn 端点，代码归一的规则只该有一份。
+    """
     digits = "".join(filter(str.isdigit, symbol))
     if len(digits) != 6:
         return None

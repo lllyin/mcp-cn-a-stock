@@ -164,6 +164,7 @@ cn-stock-mcp --transport sse --port 8686
 
 | 配置名 | 可选参数 | 作用 |
 | --- | --- | --- |
+| `CN_STOCK_BASIC_INFO_PROVIDERS` | `eastmoney`<br>`tencent`<br>`off`<br>（默认 `eastmoney,tencent`） | 基本数据（总市值、流通市值、市盈率、市净率）的尝试顺序，后面的源补前面缺的字段：<br>`eastmoney` 字段最全，需要网关或未被封的出口<br>`tencent` 走 `qt.gtimg.cn`，无需鉴权，与东财逐项比对过市值与市盈率 0.000% 一致<br>没有网关的部署靠它兜住这一组，否则会连带丢掉市盈率(静) 和换手率 |
 | `CN_STOCK_INTRADAY_QUOTE_PROVIDERS` | `fund_flow_page`<br>`tencent`<br>`off`<br>（默认 `fund_flow_page,tencent`） | 盘中实时行情的尝试顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`fund_flow_page` 复用已解析的资金流页面，不发请求但没有开高低<br>`tencent` 走 `qt.gtimg.cn`，六项俱全 |
 | `CN_STOCK_FUND_FLOW_PAGE_FALLBACK_ENABLED` | `0`<br>`1`<br>（默认 `1`） | 东财资金流接口不可用时，是否回退到资金流向页面 |
 | `CN_STOCK_FUND_FLOW_PAGE_FALLBACK_CONCURRENCY` | 正整数（默认 `1`） | 同时进行的兜底页面加载数。调高会挤占实时资金流的浏览器额度 |
