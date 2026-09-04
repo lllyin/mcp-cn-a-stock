@@ -286,6 +286,8 @@ async def load_fund_flow_page(symbol: str, context: BrowserContext) -> FundFlowP
     semaphore_wait = time.perf_counter() - wait_started_at
     service_started_at = time.perf_counter()
     outcome = "error"
+    # 在 try 之外绑定，好让 finally 里的日志无论成败都能带上实际访问的地址。
+    url = None
     try:
         url = get_fund_flow_url(symbol)
         if url is None:
@@ -299,12 +301,12 @@ async def load_fund_flow_page(symbol: str, context: BrowserContext) -> FundFlowP
 
         def on_request_failed(request) -> None:
             # 风控的特征是资金流接口被直接断连，而页面框架本身加载成功。
-            url = request.url
-            if any(part in url for part in TODAY_ENDPOINTS):
-                refused.append(url)
+            failed_url = request.url
+            if any(part in failed_url for part in TODAY_ENDPOINTS):
+                refused.append(failed_url)
                 today_refused.set()
-            elif any(part in url for part in HISTORY_ENDPOINTS):
-                refused.append(url)
+            elif any(part in failed_url for part in HISTORY_ENDPOINTS):
+                refused.append(failed_url)
                 history_refused.set()
 
         try:
@@ -343,11 +345,12 @@ async def load_fund_flow_page(symbol: str, context: BrowserContext) -> FundFlowP
         SEMAPHORE.release()
         request_id, tool, _ = log_context()
         logger.info(
-            "Realtime fund flow page request_id=%s tool=%s symbol=%s "
+            "Realtime fund flow page request_id=%s tool=%s symbol=%s url=%s "
             "outcome=%s semaphore_wait=%.3fs service=%.3fs",
             request_id,
             tool,
             symbol,
+            url or "-",
             outcome,
             semaphore_wait,
             time.perf_counter() - service_started_at,
