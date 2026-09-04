@@ -8,6 +8,8 @@ from playwright.async_api import async_playwright, Browser, BrowserContext
 from ..config import (
     ALL_INDICES,
     FUND_FLOW_PAGE_COLD_ATTEMPTS,
+    FUND_FLOW_PAGE_HEADFUL,
+    FUND_FLOW_PAGE_KEEP_PAGES,
     FUND_FLOW_PAGE_REUSE_SECONDS,
     FUND_FLOW_PAGE_TABLE_WAIT_SECONDS,
 )
@@ -152,8 +154,13 @@ async def get_context() -> BrowserContext:
             try:
                 new_playwright = await async_playwright().start()
                 new_browser = await new_playwright.chromium.launch(
-                    headless=True,
+                    headless=not FUND_FLOW_PAGE_HEADFUL,
                     args=[
+                        # 不带这一条时 navigator.webdriver 为 true，东财的资金流
+                        # 接口对页面发出的 /fflow/ 请求直接空响应。实测同一时间、
+                        # 8 只沪深标的各加载一次：不带 0/8，带上 7/8，与有头模式
+                        # 的 7/8 持平。所以服务器上不需要有头，也不需要 Xvfb。
+                        "--disable-blink-features=AutomationControlled",
                         "--disable-gpu",
                         "--no-sandbox",
                         "--disable-dev-shm-usage",
@@ -343,7 +350,12 @@ async def load_fund_flow_page(symbol: str, context: BrowserContext) -> FundFlowP
             )
             content = await page.content()
         finally:
-            await page.close()  # page 用完立即释放，context/browser 保留复用
+            if FUND_FLOW_PAGE_KEEP_PAGES:
+                # 调试模式：留着页面供人工观察。每个页面是一个渲染进程，会持续
+                # 占内存，所以只在排查时开。
+                logger.info("调试模式保留页面 symbol=%s url=%s", symbol, url)
+            else:
+                await page.close()  # page 用完立即释放，context/browser 保留复用
 
         try:
             parsed = parse_fund_flow_page(content)

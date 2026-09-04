@@ -138,6 +138,16 @@ FUND_FLOW_PAGE_COLD_ATTEMPTS = max(
     int(os.getenv("CN_STOCK_FUND_FLOW_PAGE_COLD_ATTEMPTS", "2")),
 )
 
+# 调试开关，默认关。开启后浏览器有头运行、抓完不关页面，用于人工观察页面到底
+# 渲染成了什么样。两者都会显著抬高内存（每个页面是一个独立渲染进程），只在排查
+# 时开；Linux 上有头模式需要 DISPLAY，start.sh 会拉起 Xvfb。
+FUND_FLOW_PAGE_HEADFUL = _parse_bool(
+    os.getenv("CN_STOCK_FUND_FLOW_PAGE_HEADFUL"), False
+)
+FUND_FLOW_PAGE_KEEP_PAGES = _parse_bool(
+    os.getenv("CN_STOCK_FUND_FLOW_PAGE_KEEP_PAGES"), False
+)
+
 # 解析结果的复用窗口。页面级单飞只能合并并发的加载，而实时预取和资金流兜底在
 # 一次请求里是先后发生的（实测相隔约 4 秒），于是同一个页面被加载两次。每次加载
 # 都可能再被拒一次，不只是一次 Chromium 开销。默认与报告缓存的盘中 TTL 对齐，
