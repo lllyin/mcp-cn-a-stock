@@ -572,3 +572,30 @@ def test_an_etf_is_not_faulted_for_having_no_financials():
     )
     result = verify.check_completeness("medium", verify.Payload({"SH512480": document}))
     assert [m.dimension.name for m in result.bad] == []
+
+
+# --- 负零不是漂移 -----------------------------------------------------------
+# 两个资金流来源在"四舍五入后是零"的值上符号不一致：主源是浮点数，-0.000038
+# 格式化成两位小数是 -0.00%；页面兜底取页面已渲染好的文本，同一个值是 0.00%。
+
+
+class TestNegativeZero:
+    def test_negative_zero_is_the_same_number(self):
+        assert verify._canonical_text("| -1.10万 | -0.00% |") == "| -1.10万 | 0.00% |"
+        assert verify._canonical_text("-0.000") == "0.000"
+        assert verify._canonical_text("-0") == "0"
+
+    def test_a_real_negative_is_untouched(self):
+        """只等同数值相同的写法，不能把真的负数抹成正数。"""
+        for text in ("-0.01", "-0.10%", "-1.10万", "-10.0", "-0.001"):
+            assert verify._canonical_text(text) == text
+
+    def test_a_document_differing_only_in_zero_sign_is_clean(self):
+        old = "# 历史资金流向\n| 2026-06-30 | -1.10万 | -0.00% | 2.08亿 |"
+        new = "# 历史资金流向\n| 2026-06-30 | -1.10万 | 0.00% | 2.08亿 |"
+        assert verify.compare_documents(old, new, "t").clean
+
+    def test_a_real_change_still_reports(self):
+        old = "# 历史资金流向\n| 2026-06-30 | -1.10万 | -0.01% | 2.08亿 |"
+        new = "# 历史资金流向\n| 2026-06-30 | -1.10万 | 0.01% | 2.08亿 |"
+        assert not verify.compare_documents(old, new, "t").clean

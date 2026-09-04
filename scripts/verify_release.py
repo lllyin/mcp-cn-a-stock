@@ -560,6 +560,24 @@ def _canonical_number(value: float) -> str:
     return repr(value)
 
 
+#: 一个完整的数字 token 恰好是负零。前后都要求不是数字或小数点，免得从
+#: ``-0.01`` 里切出一个 ``-0``。
+_NEGATIVE_ZERO = re.compile(r"(?<![0-9.])-(0(?:\.0+)?)(?![0-9.])")
+
+
+def _canonical_text(text: str) -> str:
+    """把负零写成正零。
+
+    两个资金流来源在"四舍五入之后是零"的值上符号不一致：主源给的是浮点数，
+    -0.000038 格式化成两位小数就是 ``-0.00%``；页面兜底取的是页面已经渲染好的
+    文本，同一个值是 ``0.00%``。数值上两者相等，报成"值变化"是假阳性。
+
+    只等同数值完全相同的写法，所以不会开盲区——真的 ``-0.01`` 对 ``0.01``
+    照旧会报出来。
+    """
+    return _NEGATIVE_ZERO.sub(r"\1", text)
+
+
 def _volatile_path(path: str) -> bool:
     tail = path.rsplit(".", 1)[-1]
     return tail in ("timestamp", "fetched_at", "generated_at", "as_of")
@@ -716,7 +734,10 @@ def compare_documents(
 
     old_lines = [line for line in old.splitlines() if keep(line)]
     new_lines = [line for line in new.splitlines() if keep(line)]
-    if old_lines == new_lines:
+    # 比对用归一化后的文本，展示仍用原样：报告里要看到上游到底写了什么。
+    if [_canonical_text(line) for line in old_lines] == [
+        _canonical_text(line) for line in new_lines
+    ]:
         return DocumentDiff(name, [])
 
     old_map = _index_by_section(old_lines)
@@ -726,7 +747,9 @@ def compare_documents(
     for key, values in old_map.items():
         if key not in new_map:
             diffs.append(LineDiff("缺失", key, old=values[0]))
-        elif new_map[key] != values:
+        elif [_canonical_text(v) for v in new_map[key]] != [
+            _canonical_text(v) for v in values
+        ]:
             kind = "值变化"
             if demote_live_values and _LIVE_VALUE_KEY.search(key):
                 kind = "实时口径"
