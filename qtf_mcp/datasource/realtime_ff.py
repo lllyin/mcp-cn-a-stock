@@ -5,7 +5,11 @@ import os
 import time
 from playwright.async_api import async_playwright, Browser, BrowserContext
 
-from ..config import ALL_INDICES, FUND_FLOW_PAGE_TABLE_WAIT_SECONDS
+from ..config import (
+    ALL_INDICES,
+    FUND_FLOW_PAGE_REUSE_SECONDS,
+    FUND_FLOW_PAGE_TABLE_WAIT_SECONDS,
+)
 from ..observability import log_context
 from .fund_flow_page import (
     HISTORY_TABLE_ID,
@@ -408,6 +412,32 @@ def _page_to_realtime_dict(symbol: str, page: FundFlowPage) -> dict:
 # 不要为今日和历史各加载一次"。两者时间上会重叠：实时预取在 process_item 开头就
 # 启动，而资金流兜底在数据 gather 之后才决定要不要走。
 _page_inflight: dict[str, asyncio.Task] = {}
+# 已解析结果的短期复用：key -> (完成时刻, 结果)。单飞只覆盖并发，这一层覆盖
+# "一次请求里两个用途先后要同一个页面"。
+_page_cache: dict[str, tuple[float, FundFlowPage]] = {}
+
+
+def _cached_page(key: str) -> FundFlowPage | None:
+    if FUND_FLOW_PAGE_REUSE_SECONDS <= 0:
+        return None
+    entry = _page_cache.get(key)
+    if entry is None:
+        return None
+    cached_at, page = entry
+    if time.monotonic() - cached_at > FUND_FLOW_PAGE_REUSE_SECONDS:
+        _page_cache.pop(key, None)
+        return None
+    return page
+
+
+def _remember_page(key: str, page: FundFlowPage) -> None:
+    if FUND_FLOW_PAGE_REUSE_SECONDS <= 0:
+        return
+    _page_cache[key] = (time.monotonic(), page)
+    # 只保留还在窗口内的条目：标的数不设上限，靠过期回收即可。
+    deadline = time.monotonic() - FUND_FLOW_PAGE_REUSE_SECONDS
+    for stale in [k for k, (at, _) in _page_cache.items() if at < deadline]:
+        _page_cache.pop(stale, None)
 
 
 def _complete_page_inflight(symbol: str, task: asyncio.Task) -> None:
@@ -433,8 +463,12 @@ async def _load_page_shared(symbol: str) -> FundFlowPage:
 
 
 async def fetch_page_shared(symbol: str) -> FundFlowPage:
-    """同一标的的并发页面加载只做一次，今日与历史两个用途共享结果。"""
+    """同一标的的页面加载只做一次，今日与历史两个用途共享结果。"""
     key = page_key(symbol)
+    cached = _cached_page(key)
+    if cached is not None:
+        logger.debug("资金流向页面复用解析结果 symbol=%s key=%s", symbol, key)
+        return cached
     task = _page_inflight.get(key)
     if task is None or task.done():
         task = asyncio.create_task(_load_page_shared(symbol))
@@ -443,7 +477,9 @@ async def fetch_page_shared(symbol: str) -> FundFlowPage:
             lambda completed, k=key: _complete_page_inflight(k, completed)
         )
     # shield：一个等待者被取消不能中断另一个等待者需要的加载。
-    return await asyncio.shield(task)
+    page = await asyncio.shield(task)
+    _remember_page(key, page)
+    return page
 
 
 # ── 单个 Symbol 抓取 ──────────────────────────────────────

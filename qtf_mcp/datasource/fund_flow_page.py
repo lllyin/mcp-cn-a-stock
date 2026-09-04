@@ -59,6 +59,17 @@ TODAY_FIELDS = {
 # 历史表所在容器。页面上还有别的 dataview，所以按 id 而不是 class 定位。
 HISTORY_TABLE_ID = "table_ls"
 
+# 页头那块实时行情（ul.hqlist）的元素 id。它比今日资金流那一栏多一份行情，
+# 缺开盘/最高/最低，所以拼不出完整 K 线 bar，但可以做次级兜底和交叉验证。
+QUOTE_FIELD_IDS = {
+    "newPrice": "最新价",
+    "zd": "涨跌",
+    "zdf": "涨跌幅",
+    "hs": "换手率",
+    "sum": "总手",
+    "totalPrice": "成交额",
+}
+
 _PLACEHOLDERS = {"", "-", "--", "—", "常规"}
 _TITLE_RE = re.compile(r"^(?P<name>.*?)[（(](?P<code>\d{6})[)）]")
 _NUMBER_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
@@ -105,6 +116,13 @@ class FundFlowPage:
     history: list = field(default_factory=list)
     # 今日各字段的原样文本，供需要逐字一致输出的调用方使用。
     today_text: dict = field(default_factory=dict)
+    # 页头实时行情的原样文本，键是中文字段名。
+    quote_text: dict = field(default_factory=dict)
+
+    @property
+    def has_quote(self) -> bool:
+        """页头行情是否有最新价。没有价格的行情对调用方没有意义。"""
+        return parse_price(self.quote_text.get("最新价", "")) is not None
 
     @property
     def has_today(self) -> bool:
@@ -197,6 +215,13 @@ class _FundFlowHTMLParser(HTMLParser):
         self._cell_parts: Optional[list] = None
         self._today_field: Optional[str] = None
         self._today_parts: list = []
+        self.quote_text: dict = {}
+        # 行情字段的值可能嵌套在带颜色的 span 里，所以按同名标签深度配对，
+        # 不能见到第一个结束标签就收工。
+        self._quote_field: Optional[str] = None
+        self._quote_tag: Optional[str] = None
+        self._quote_depth = 0
+        self._quote_parts: list = []
 
     # -- 标签 -------------------------------------------------------------
     def handle_starttag(self, tag: str, attrs) -> None:
@@ -222,6 +247,14 @@ class _FundFlowHTMLParser(HTMLParser):
             self._row_cells = []
             return
 
+        if self._quote_field is not None and tag == self._quote_tag:
+            self._quote_depth += 1
+        elif attributes.get("id") in QUOTE_FIELD_IDS and self._quote_field is None:
+            self._quote_field = QUOTE_FIELD_IDS[attributes["id"]]
+            self._quote_tag = tag
+            self._quote_depth = 1
+            self._quote_parts = []
+
         if tag == "td":
             field_id = attributes.get("data-field")
             if field_id in TODAY_FIELDS:
@@ -232,6 +265,15 @@ class _FundFlowHTMLParser(HTMLParser):
             return
 
     def handle_endtag(self, tag: str) -> None:
+        if self._quote_field is not None and tag == self._quote_tag:
+            self._quote_depth -= 1
+            if self._quote_depth == 0:
+                self.quote_text.setdefault(
+                    self._quote_field, "".join(self._quote_parts).strip()
+                )
+                self._quote_field = None
+                self._quote_tag = None
+
         if tag == "div":
             if self._history_depth:
                 self._history_depth -= 1
@@ -270,6 +312,8 @@ class _FundFlowHTMLParser(HTMLParser):
             self._today_parts.append(data)
         if self._cell_parts is not None:
             self._cell_parts.append(data)
+        if self._quote_field is not None:
+            self._quote_parts.append(data)
 
 
 def _has_class(attributes: dict, wanted: str) -> bool:
@@ -295,6 +339,7 @@ def parse_fund_flow_page(html: str) -> FundFlowPage:
         page.name = match.group("name").strip()
         page.code = match.group("code")
 
+    page.quote_text = dict(parser.quote_text)
     page.today_text = dict(parser.today_text)
     if parser.today_text:
         today = {}
@@ -323,7 +368,7 @@ def parse_fund_flow_page(html: str) -> FundFlowPage:
             )
         )
 
-    if not page.history and page.today is None:
+    if not page.history and page.today is None and not page.quote_text:
         raise FundFlowPageError("页面既无今日数据也无历史表")
 
     # 页面是倒序（最新在前），转成升序对齐内部数据集：取最新一律用 [-1]。

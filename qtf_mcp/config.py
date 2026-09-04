@@ -141,6 +141,16 @@ FUND_FLOW_PAGE_RISK_COOLDOWN_SECONDS = max(
 )
 
 
+# 解析结果的复用窗口。页面级单飞只能合并并发的加载，而实时预取和资金流兜底在
+# 一次请求里是先后发生的（实测相隔约 4 秒），于是同一个页面被加载两次。每次加载
+# 都是一次撞风控的机会，不只是一次 Chromium 开销。默认与报告缓存的盘中 TTL 对齐，
+# 不引入超出既有约定的陈旧度。置 0 关闭复用。
+FUND_FLOW_PAGE_REUSE_SECONDS = max(
+    0.0,
+    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_REUSE_SECONDS", "30")),
+)
+
+
 class HttpModeError(ValueError):
     """Raised when an explicitly requested channel mode cannot be honoured."""
 

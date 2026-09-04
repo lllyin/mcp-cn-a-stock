@@ -248,6 +248,66 @@ def _finalize_fallback_frame(frame, code: str, requested_start, source: str):
     return frame[FALLBACK_FRAME_COLUMNS]
 
 
+def append_intraday_bar(frame, quote, *, adjust: str = "qfq"):
+    """把当天这根未完成的 bar 追加到兜底源的日 K 上。
+
+    东财的 K 线接口盘中带当天，腾讯和新浪的日 K 不带（实测 2026-09-04 盘中最后
+    一行仍是 09-03）。于是东财一失败，报告的"当日"就退回昨天，而同一份报告里的
+    市值又是今天的——两块数据来自不同日期，报告本身却没有任何提示。
+
+    只在行情自报的日期确实晚于表里最后一行时才追加：不看本地时钟，也就不需要
+    交易日历。休市时行情的日期就是上一个交易日，与最后一行相同，自然不追加。
+
+    后复权序列不能这么补：那种序列的最新价是被缩放过的，而行情是原始价。前复权
+    的最近若干根本来就等于原始价，所以可以直接接上。
+    """
+    import datetime as _dt
+
+    import pandas as pd
+
+    if frame is None or frame.empty or quote is None:
+        return frame
+    if adjust == "hfq" or not quote.has_ohlc or not quote.as_of:
+        return frame
+    try:
+        quote_date = _dt.datetime.strptime(quote.as_of[:8], "%Y%m%d").date()
+    except ValueError:
+        return frame
+
+    last_date = frame["日期"].iloc[-1]
+    if quote_date <= last_date:
+        return frame
+
+    previous_close = float(frame["收盘"].iloc[-1])
+    if previous_close <= 0:
+        return frame
+
+    row = {
+        "日期": quote_date,
+        "开盘": quote.open,
+        "收盘": quote.last,
+        "最高": quote.high,
+        "最低": quote.low,
+        "成交量": quote.volume_lots or 0.0,
+        "成交额": quote.amount_yuan or 0.0,
+        "振幅": (quote.high - quote.low) / previous_close * 100,
+        "涨跌幅": (quote.last / previous_close - 1) * 100,
+        "涨跌额": quote.last - previous_close,
+        "换手率": quote.turnover_pct or 0.0,
+    }
+    logger.debug(
+        "补当日盘中 bar 来源=%s 日期=%s 收盘=%s 前收=%s",
+        quote.source,
+        quote_date,
+        quote.last,
+        previous_close,
+    )
+    return pd.concat(
+        [frame, pd.DataFrame([row], columns=FALLBACK_FRAME_COLUMNS)],
+        ignore_index=True,
+    )
+
+
 def _market_prefixed_symbol(code: str, symbol: str = None) -> str:
     """Return the lower-case market-prefixed code the fallback providers expect."""
     normalized = (symbol or "").lower()
@@ -705,6 +765,14 @@ class CNStockDataSource(DataSource):
             )
         else:
             df_unadj = df
+
+        # 行情只取一次，两个序列共用：复权与否不影响当天这根 bar 的原始价格。
+        from . import intraday_quote
+
+        quote = intraday_quote.resolve(symbol or code, require_ohlc=True)
+        df = append_intraday_bar(df, quote, adjust=adjust)
+        if df_unadj is not None and not df_unadj.empty:
+            df_unadj = append_intraday_bar(df_unadj, quote, adjust="none")
         return {
             "adjusted": df,
             "unadj": df_unadj if df_unadj is not None and not df_unadj.empty else df,
