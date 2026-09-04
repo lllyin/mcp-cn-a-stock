@@ -176,7 +176,7 @@ HTTP 层记录响应字节数、是否完成发送及 `client_disconnected`，
 启动日志会在版本信息之后打印实际生效的通道：
 
 ```text
-cn-stock-mcp version=1.2.0
+cn-stock-mcp version=2.0.0
 Market data library versions: akshare=... efinance=...
 HTTP channel mode=impersonate reason=auto:proxy_disabled profile=chrome retry=3 timeout=8.0s hooked_hosts=4
 HTTP channel mode=proxy reason=auto:proxy_configured gateway=... token=configured retry=30 patch_version=0.5.0 hooked_hosts=4
