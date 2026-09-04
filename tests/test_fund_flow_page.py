@@ -543,3 +543,74 @@ class TestEmptyTodayBlockIsNotSuccess:
         assert page.has_today is True
         assert page.today["主力净流入-净额"] == pytest.approx(1.59e8)
         assert page.today["超大单净流入-净额"] is None
+
+
+class TestPageReuseRespectsWhatTheCallerNeeds:
+    """复用不能把一次残缺的加载固化下来。
+
+    2026-09-04 10:48：实时路径拿到 today=True history=0，兜底复用了这份结果，
+    报告于是有实时资金流、没有历史资金流。两块由不同端点填充、会独立失败，而
+    那些端点是间歇性可用的，隔几秒重新加载相当有机会拿到。
+    """
+
+    def _page(self, *, history: int, today: bool):
+        from qtf_mcp.datasource.fund_flow_page import FundFlowRow
+
+        full = parse_fund_flow_page(FULL_PAGE.read_text(encoding="utf-8"))
+        rows = full.history[:history] if history else []
+        return type(full)(
+            name=full.name,
+            code=full.code,
+            title_text=full.title_text,
+            today=full.today if today else None,
+            today_text=full.today_text if today else {},
+            history=list(rows) if rows else [],
+        )
+
+    def _seed(self, page):
+        from qtf_mcp.datasource import realtime_ff
+
+        realtime_ff._page_cache.clear()
+        realtime_ff._remember_page("300408", page)
+        return realtime_ff
+
+    def test_a_history_less_page_is_not_reused_for_history(self):
+        module = self._seed(self._page(history=0, today=True))
+
+        assert module._cached_page(
+            "300408", require_history=True, require_today=False
+        ) is None
+
+    def test_the_same_page_is_still_reused_for_today(self):
+        module = self._seed(self._page(history=0, today=True))
+
+        assert module._cached_page(
+            "300408", require_history=False, require_today=True
+        ) is not None
+
+    def test_a_today_less_page_is_not_reused_for_today(self):
+        module = self._seed(self._page(history=5, today=False))
+
+        assert module._cached_page(
+            "300408", require_history=False, require_today=True
+        ) is None
+
+    def test_a_complete_page_serves_both(self):
+        module = self._seed(self._page(history=5, today=True))
+
+        assert module._cached_page(
+            "300408", require_history=True, require_today=False
+        ) is not None
+        assert module._cached_page(
+            "300408", require_history=False, require_today=True
+        ) is not None
+
+    def test_reuse_expires(self, monkeypatch):
+        from qtf_mcp.datasource import realtime_ff
+
+        module = self._seed(self._page(history=5, today=True))
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_REUSE_SECONDS", 0.0)
+
+        assert module._cached_page(
+            "300408", require_history=False, require_today=False
+        ) is None

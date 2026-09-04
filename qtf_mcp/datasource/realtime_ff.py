@@ -417,7 +417,16 @@ _page_inflight: dict[str, asyncio.Task] = {}
 _page_cache: dict[str, tuple[float, FundFlowPage]] = {}
 
 
-def _cached_page(key: str) -> FundFlowPage | None:
+def _cached_page(
+    key: str, *, require_history: bool, require_today: bool
+) -> FundFlowPage | None:
+    """取可复用的解析结果，但只在它满足调用方的需求时。
+
+    页面的两块由不同端点填充、会独立失败，所以一次加载可能只拿到其中一块。把这
+    种残缺结果交给需要另一块的调用方，等于用缓存把一次失败固化下来：而那两个端点
+    是间歇性可用的，隔几秒重新加载相当有机会拿到。2026-09-04 10:48 就是如此——
+    实时路径拿到 today=True history=0，兜底复用了它，于是报告有实时、没历史。
+    """
     if FUND_FLOW_PAGE_REUSE_SECONDS <= 0:
         return None
     entry = _page_cache.get(key)
@@ -426,6 +435,10 @@ def _cached_page(key: str) -> FundFlowPage | None:
     cached_at, page = entry
     if time.monotonic() - cached_at > FUND_FLOW_PAGE_REUSE_SECONDS:
         _page_cache.pop(key, None)
+        return None
+    if require_history and not page.history:
+        return None
+    if require_today and not page.has_today:
         return None
     return page
 
@@ -462,10 +475,18 @@ async def _load_page_shared(symbol: str) -> FundFlowPage:
         return await load_fund_flow_page(symbol, context)
 
 
-async def fetch_page_shared(symbol: str) -> FundFlowPage:
-    """同一标的的页面加载只做一次，今日与历史两个用途共享结果。"""
+async def fetch_page_shared(
+    symbol: str, *, require_history: bool = False, require_today: bool = False
+) -> FundFlowPage:
+    """同一标的的页面加载只做一次，今日与历史两个用途共享结果。
+
+    require_* 声明调用方要哪一块：只影响能否复用既有结果，不影响并发合并——同一
+    时刻的两个等待者拿到的本来就是同一次加载，再加载一遍不会有不同结果。
+    """
     key = page_key(symbol)
-    cached = _cached_page(key)
+    cached = _cached_page(
+        key, require_history=require_history, require_today=require_today
+    )
     if cached is not None:
         logger.debug("资金流向页面复用解析结果 symbol=%s key=%s", symbol, key)
         return cached
@@ -495,12 +516,13 @@ async def fetch_single(symbol: str, context: BrowserContext) -> dict:
 
 async def fetch_history_page(symbol: str) -> FundFlowPage:
     """取历史资金流。失败一律抛异常，由调用方决定是否降级。"""
-    return await fetch_page_shared(symbol)
+    return await fetch_page_shared(symbol, require_history=True)
 
 
 async def _fetch_single_with_context(symbol: str) -> dict:
     try:
-        return _page_to_realtime_dict(symbol, await fetch_page_shared(symbol))
+        page = await fetch_page_shared(symbol, require_today=True)
+        return _page_to_realtime_dict(symbol, page)
     except FundFlowPageUnavailable:
         return {"error": "暂无实时资金流向", "url": ""}
     except Exception as e:
