@@ -489,3 +489,118 @@ async def test_discard_consumes_failed_prefetch_exception(monkeypatch):
     prefetch.discard()
 
     assert isinstance(prefetch.task.exception(), RuntimeError)
+
+
+# --- 无头特征伪装 -----------------------------------------------------------
+# 起因：sec-ch-ua 在每个请求头里写着 "HeadlessChrome";v="145"，是自报身份。
+# 这里钉住"身份是从真实构建现算的"，不是硬编码——硬编码在 Linux 服务器上会变成
+# UA 说 Macintosh、sec-ch-ua-platform 说 Linux 的新矛盾。
+
+
+class _FakePage:
+    def __init__(self, ua, platform_value, ch_platform):
+        self._values = {"ua": ua, "platform": platform_value, "chPlatform": ch_platform}
+        self.context = None
+        self.closed = False
+
+    async def evaluate(self, _script):
+        return dict(self._values)
+
+    async def close(self):
+        self.closed = True
+
+
+class _FakeContext:
+    def __init__(self, page):
+        self._page = page
+        page.context = self
+        self.sent = []
+
+    async def new_page(self):
+        return self._page
+
+    async def new_cdp_session(self, _page):
+        context = self
+
+        class _Session:
+            async def send(self, method, params):
+                context.sent.append((method, params))
+
+        return _Session()
+
+
+@pytest.mark.asyncio
+async def test_identity_is_derived_from_the_real_build(monkeypatch):
+    monkeypatch.setattr(realtime_ff, "_identity", None)
+    page = _FakePage(
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "HeadlessChrome/145.0.0.0 Safari/537.36",
+        "Linux x86_64",
+        "Linux",
+    )
+    context = _FakeContext(page)
+
+    identity = await realtime_ff._browser_identity(context)
+
+    assert "HeadlessChrome" not in identity["userAgent"]
+    assert "Chrome/145.0.0.0" in identity["userAgent"]
+    # 平台取真实值，不能写死 macOS
+    assert identity["platform"] == "Linux x86_64"
+    assert identity["userAgentMetadata"]["platform"] == "Linux"
+    brands = [b["brand"] for b in identity["userAgentMetadata"]["brands"]]
+    assert "HeadlessChrome" not in brands
+    assert "Google Chrome" in brands
+    assert identity["acceptLanguage"].startswith("zh-CN")
+
+
+@pytest.mark.asyncio
+async def test_identity_is_probed_once(monkeypatch):
+    monkeypatch.setattr(realtime_ff, "_identity", None)
+    page = _FakePage("Chrome/140.0.0.0", "MacIntel", "macOS")
+    context = _FakeContext(page)
+
+    first = await realtime_ff._browser_identity(context)
+    second = await realtime_ff._browser_identity(context)
+
+    assert first is second
+
+
+@pytest.mark.asyncio
+async def test_disguise_page_sends_the_override(monkeypatch):
+    monkeypatch.setattr(realtime_ff, "_identity", None)
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", True)
+    page = _FakePage("HeadlessChrome/145.0.0.0", "MacIntel", "macOS")
+    context = _FakeContext(page)
+
+    await realtime_ff.disguise_page(page)
+
+    assert [m for m, _ in context.sent] == ["Network.setUserAgentOverride"]
+
+
+@pytest.mark.asyncio
+async def test_disguise_is_skipped_when_switched_off(monkeypatch):
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+    page = _FakePage("HeadlessChrome/145.0.0.0", "MacIntel", "macOS")
+    context = _FakeContext(page)
+
+    await realtime_ff.disguise_page(page)
+
+    assert context.sent == []
+
+
+@pytest.mark.asyncio
+async def test_disguise_failure_never_breaks_the_fetch(monkeypatch):
+    """拿不到数据的代价远大于指纹暴露，伪装失败必须放行。"""
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", True)
+    monkeypatch.setattr(realtime_ff, "_identity", None)
+
+    class _Boom:
+        context = None
+
+        async def evaluate(self, _script):
+            raise RuntimeError("CDP 挂了")
+
+    boom = _Boom()
+    boom.context = _FakeContext(_FakePage("x", "y", "z"))
+
+    await realtime_ff.disguise_page(boom)   # 不抛

@@ -237,8 +237,40 @@ benchmark 应以代理尝试数设置预算，不能用 MCP 调用次数估算�
 分别是 15/16 和 14/16。这个启动参数是必需项，不是可选优化。另有 8 轮全新浏览器、每轮最多三次
 的实测显示成功全部发生在前两次，所以 `COLD_ATTEMPTS` 定为 2。
 
-被拒绝是**逐次随机**的，不是会话级粘性：同一进程里前一次被拒、后一次成功的情况反复出现，
-因此没有"这个会话已被标记"的长冷却，只有上面的失败计数熔断。
+### 被拒的机制与无头特征
+
+2026-09-04 抓到了被拒时的完整时序：`/fflow/` 在页面加载后约 1 秒以
+`net::ERR_EMPTY_RESPONSE` 失败，**600 毫秒之后**页面才去问
+`websitecaptcha/api/checkuser`，拿到 `{"block":true}`，随后挂上
+`<iframe class="popwscps_d_iframe">` 的滑块模态框。所以空响应就是风控本身，滑块是它给的
+解法，而判定发生在请求那一刻——那时页面刚加载完，没有任何行为可供观察。这也说明"打开页面后
+滚动一下"之类的行为伪装对当次取数不可能有作用。
+
+判定依据只能是请求时就存在的东西，而我们原先在每个请求头里写着：
+
+```text
+sec-ch-ua: "Not:A-Brand";v="99", "HeadlessChrome";v="145", "Chromium";v="145"
+user-agent: Mozilla/5.0 (Macintosh; ...) Chrome/120.0.0.0 Safari/537.36
+```
+
+`HeadlessChrome` 是自报身份，不是细微指纹；而且硬编码的 UA 说 Chrome/120、client hints 说 145，
+自相矛盾——在 Linux 服务器上还会变成 UA 说 Macintosh、`sec-ch-ua-platform` 说 Linux 的第二重矛盾。
+`FUND_FLOW_PAGE_DISGUISE` 用 CDP `Network.setUserAgentOverride` 把 UA 与 client hints 一起改成
+自洽的非 Headless（版本号和平台都从真实构建现算），配合 `locale=zh-CN`、1920x1080 视口，以及一段
+只补 `window.chrome` / `plugins` / `pdfViewerEnabled` 的 init script。
+
+注意 `setUserAgentOverride` 是 **per-target** 的：在 context 上装一次不会被后建页面继承，
+实测第一个页面装完之后，新建页面的 `sec-ch-ua` 依旧是 `HeadlessChrome`。所以
+`load_fund_flow_page` 在每次 `new_page()` 之后、`goto()` 之前都调一次。
+
+换完整 Chromium 的新无头模式能得到同样的指纹，但实测浏览器进程树 footprint 从 63.7/95 MiB
+涨到 323/401 MiB（+260），会把服务总量推到 710-810 MiB，按第二条内存约束不可采纳；上面这套
+CDP 方案只 +2/+16 MiB。
+
+被拒的**时长有两种**，不要混为一谈：瞬时的立刻重试就过（2026-09-04 15:51 的 SH512480 第一次
+`blocked_captcha`、593 毫秒后第二次拿到 `today=True history=121`），这是 `COLD_ATTEMPTS=2`
+存在的理由；持续的可达分钟级（15:35-15:50 实测背靠背 10 次全拒、静默 75 秒仍拒、16 分钟后仍拒），
+重试无用只能等。单次日志区分不了两者，所以策略是最多试两次然后放弃。
 
 ### 盘中行情多级回退
 

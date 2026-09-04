@@ -140,6 +140,21 @@ FUND_FLOW_PAGE_COLD_ATTEMPTS = max(
     int(os.getenv("CN_STOCK_FUND_FLOW_PAGE_COLD_ATTEMPTS", "2")),
 )
 
+# 把无头浏览器的自报特征改成普通浏览器的样子。默认开。
+#
+# 起因是实测发现 sec-ch-ua 在每个请求头里写着 "HeadlessChrome";v="145" —— 这不是
+# 细微指纹而是自报身份，而且和我们原先硬编码的 UA（Chrome/120）自相矛盾；在 Linux
+# 服务器上还会变成 UA 说 Macintosh、sec-ch-ua-platform 说 Linux 的第二重矛盾。
+#
+# 实测 2026-09-04 三个方案的指纹与内存（浏览器进程树 footprint，四个标的）：
+#   现状 headless_shell + 硬编码 UA : sec-ch-ua 说 HeadlessChrome，63.7/95 MiB
+#   换完整 Chromium 新无头          : 指纹全对，但 323/401 MiB（+260，超预算）
+#   本方案（CDP 覆盖 + locale）     : 指纹全对，65.7/111 MiB（+2/+16）
+# 所以走本方案。置 0 可一键退回原样，用于对照或伪装反而招致拦截时回滚。
+FUND_FLOW_PAGE_DISGUISE = _parse_bool(
+    os.getenv("CN_STOCK_FUND_FLOW_PAGE_DISGUISE"), True
+)
+
 # 调试开关，默认关。开启后浏览器有头运行、抓完不关页面，用于人工观察页面到底
 # 渲染成了什么样。两者都会显著抬高内存（每个页面是一个独立渲染进程），只在排查
 # 时开；Linux 上有头模式需要 DISPLAY，start.sh 会拉起 Xvfb。

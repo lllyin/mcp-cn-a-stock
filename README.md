@@ -173,6 +173,7 @@ cn-stock-mcp --transport sse --port 8686
 | `CN_STOCK_FUND_FLOW_PAGE_COLD_ATTEMPTS` | 正整数（默认 `2`） | 本进程还没成功取到过数据时，单次请求允许的页面加载次数 |
 | `CN_STOCK_FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD` | 正整数（默认 `2`） | 连续多少次徒劳加载后暂停整层兜底 |
 | `CN_STOCK_FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS` | 秒（默认 `300`） | 暂停时长 |
+| `CN_STOCK_FUND_FLOW_PAGE_DISGUISE` | `0`<br>`1`<br>（默认 `1`） | 把无头浏览器的自报特征改成普通浏览器的样子。不改的话 `sec-ch-ua` 请求头里写着 `HeadlessChrome`，容易被上游风控挑出来 |
 
 ### 上游源熔断
 

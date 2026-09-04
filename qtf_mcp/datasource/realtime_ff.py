@@ -2,12 +2,15 @@ import asyncio
 import json
 import logging
 import os
+import platform
+import re
 import time
 from playwright.async_api import async_playwright, Browser, BrowserContext
 
 from ..config import (
     ALL_INDICES,
     FUND_FLOW_PAGE_COLD_ATTEMPTS,
+    FUND_FLOW_PAGE_DISGUISE,
     FUND_FLOW_PAGE_HEADFUL,
     FUND_FLOW_PAGE_KEEP_PAGES,
     FUND_FLOW_PAGE_REUSE_SECONDS,
@@ -145,6 +148,120 @@ async def _close_started_browser(playwright, browser: Browser | None) -> None:
             logger.warning("清理未完成初始化的 Playwright 失败", exc_info=True)
 
 
+# 无头构建缺失、而真实 Chrome 上一定存在的几项。只补检测脚本必查的这几个，
+# 不做通用 stealth：补得越多，越可能被"属性描述符/toString 特征"反查出来，
+# 半成品的伪装比不伪装更显眼。plugins 那段带条件，所以换成完整构建后自动让路。
+_HEADLESS_GAPS_SCRIPT = """
+(() => {
+  if (!window.chrome) {
+    window.chrome = {
+      runtime: {},
+      loadTimes: function () { return {}; },
+      csi: function () { return {}; },
+      app: { isInstalled: false },
+    };
+  }
+  if (navigator.plugins.length === 0) {
+    const mk = (name) => ({
+      name, filename: 'internal-pdf-viewer',
+      description: 'Portable Document Format', length: 1,
+    });
+    const plugins = [
+      mk('PDF Viewer'), mk('Chrome PDF Viewer'), mk('Chromium PDF Viewer'),
+      mk('Microsoft Edge PDF Viewer'), mk('WebKit built-in PDF'),
+    ];
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => plugins, configurable: true,
+    });
+    Object.defineProperty(navigator, 'mimeTypes', {
+      get: () => [
+        { type: 'application/pdf', suffixes: 'pdf', description: '' },
+        { type: 'text/pdf', suffixes: 'pdf', description: '' },
+      ],
+      configurable: true,
+    });
+    Object.defineProperty(navigator, 'pdfViewerEnabled', {
+      get: () => true, configurable: true,
+    });
+  }
+})();
+"""
+
+# 真实构建自报的身份，只探一次。键是 UA 里的大版本号和平台，用来拼出与本机
+# 一致的 client hints —— 平台必须取真实值，否则又会变成 Linux 上说 macOS。
+_identity: dict | None = None
+
+
+async def _browser_identity(context: BrowserContext) -> dict:
+    """读一次真实 UA 与平台，拼出自洽的 UA / UA-CH 覆盖参数。"""
+    global _identity
+    if _identity is not None:
+        return _identity
+    page = await context.new_page()
+    try:
+        probe = await page.evaluate(
+            "() => ({ua: navigator.userAgent, platform: navigator.platform,"
+            " chPlatform: navigator.userAgentData"
+            " ? navigator.userAgentData.platform : ''})"
+        )
+    finally:
+        await page.close()
+
+    ua = str(probe.get("ua") or "")
+    match = re.search(r"(?:Headless)?Chrome/(\d+)", ua)
+    major = match.group(1) if match else ""
+    ch_platform = probe.get("chPlatform") or ""
+    if not ch_platform:
+        ch_platform = "Windows" if "Windows" in ua else "Linux" if "Linux" in ua else "macOS"
+    _identity = {
+        # HeadlessChrome 就是那句自报身份，只把它换掉，其余原样保留。
+        "userAgent": ua.replace("HeadlessChrome", "Chrome"),
+        "acceptLanguage": "zh-CN,zh;q=0.9,en;q=0.8",
+        "platform": probe.get("platform") or "",
+        "userAgentMetadata": {
+            "brands": [
+                {"brand": "Not_A Brand", "version": "8"},
+                {"brand": "Chromium", "version": major},
+                {"brand": "Google Chrome", "version": major},
+            ],
+            "fullVersion": f"{major}.0.0.0",
+            "platform": ch_platform,
+            "platformVersion": "",
+            "architecture": "arm" if "arm" in platform.machine().lower() else "x86",
+            "model": "",
+            "mobile": False,
+        },
+    }
+    logger.info(
+        "资金流向页面伪装身份 ua=%s ch_platform=%s",
+        _identity["userAgent"][:70],
+        ch_platform,
+    )
+    return _identity
+
+
+async def disguise_page(page) -> None:
+    """把 UA 与 client hints 一起改成自洽的非 Headless。
+
+    ``Network.setUserAgentOverride`` 是 per-target 的，context 上装一次不会被后建
+    的页面继承——实测在第一个页面上装完，后面新建页面的 sec-ch-ua 依旧是
+    ``HeadlessChrome``。所以每个页面导航之前都要装一次。
+
+    这条是这批伪装里唯一有明确机制的：``sec-ch-ua`` 在每个请求头里写着
+    ``"HeadlessChrome";v="145"``，是自报身份，不是什么细微指纹。
+    """
+    if not FUND_FLOW_PAGE_DISGUISE:
+        return
+    try:
+        context = page.context
+        identity = await _browser_identity(context)
+        session = await context.new_cdp_session(page)
+        await session.send("Network.setUserAgentOverride", identity)
+    except Exception:
+        # 伪装失败不该让取数失败：拿不到数据的代价远大于指纹暴露。
+        logger.debug("资金流向页面伪装失败，按原样继续", exc_info=True)
+
+
 async def get_context() -> BrowserContext:
     global _playwright, _browser, _context
     async with _lock:
@@ -171,15 +288,29 @@ async def get_context() -> BrowserContext:
                         "--mute-audio",
                     ],
                 )
-                new_context = await new_browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    ),
-                    java_script_enabled=True,
-                    bypass_csp=True,
-                )
+                # 不再硬编码 UA 字符串。硬编码解决不了问题还制造新问题：它只改
+                # navigator.userAgent，sec-ch-ua 仍由真实构建给出，于是一个请求里
+                # UA 说 Chrome/120、client hints 说 HeadlessChrome/145，自相矛盾；
+                # 在 Linux 服务器上更糟，UA 说 Macintosh 而 sec-ch-ua-platform 说
+                # Linux。一致的伪装在 _disguise_page 里按真实版本号现算。
+                context_options = {
+                    "java_script_enabled": True,
+                    "bypass_csp": True,
+                }
+                if FUND_FLOW_PAGE_DISGUISE:
+                    context_options.update(
+                        # 中文财经站的访客不会只带 en-US。locale 同时决定
+                        # navigator.language(s) 和 Accept-Language 请求头。
+                        locale="zh-CN",
+                        timezone_id="Asia/Shanghai",
+                        # 默认 1280x720 是 Playwright 的值，桌面浏览器少见；同时
+                        # 让 outerWidth 不再等于 innerWidth。
+                        viewport={"width": 1920, "height": 1080},
+                        screen={"width": 1920, "height": 1080},
+                    )
+                new_context = await new_browser.new_context(**context_options)
+                if FUND_FLOW_PAGE_DISGUISE:
+                    await new_context.add_init_script(_HEADLESS_GAPS_SCRIPT)
             except BaseException:
                 await _close_started_browser(new_playwright, new_browser)
                 raise
@@ -193,7 +324,9 @@ async def get_context() -> BrowserContext:
 
 async def close_browser():
     """服务退出时调用，清理资源"""
-    global _playwright, _browser, _context
+    global _playwright, _browser, _context, _identity
+    # 身份是从具体这个构建探出来的，换浏览器要重探。
+    _identity = None
     if _browser:
         await _browser.close()
         _browser = None
@@ -339,6 +472,9 @@ async def load_fund_flow_page(symbol: str, context: BrowserContext) -> FundFlowP
             raise FundFlowPageUnavailable(symbol)
 
         page = await context.new_page()
+        # 必须在 goto 之前：覆盖是 per-target 的，导航之后再装，这一次请求的
+        # sec-ch-ua 已经带着 HeadlessChrome 发出去了。
+        await disguise_page(page)
         refused: list[str] = []
         today_refused = asyncio.Event()
         history_refused = asyncio.Event()
