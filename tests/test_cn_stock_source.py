@@ -720,6 +720,31 @@ def test_tencent_volume_logs_an_unexpected_magnitude(caplog):
     assert "成交量量级异常" in caplog.text
 
 
+def test_forward_adjusted_close_biases_the_ratio_but_not_the_verdict():
+    """前复权把收盘缩放了、成交额没有，ratio 会被整体压低。
+
+    SH512480 实测：ratio(qfq)=0.5007 而 ratio(none)=0.9999，正好是它那次 1:2
+    拆分的 2 倍。两簇相距 71 倍，压低 2 倍仍不改判。
+    """
+    for scale in (1.0, 0.5, 0.2):
+        frame = _tencent_frame(89817200.0, close=9.27 * scale)
+        result = source_module._normalize_volume_to_lots(frame, "600000")
+        assert result["成交量"].iloc[0] == pytest.approx(898172.0)
+
+
+def test_a_ratio_pushed_across_the_boundary_cannot_be_silent(caplog):
+    """压低到 10 倍以上会改判成"手"，但一定会打 WARNING，不会静默错到 100 倍。"""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="qtf_mcp")
+    # 收盘被压到 1/20，ratio 从 ~1 掉到 ~0.05，越过 0.1 判成"手"
+    frame = _tencent_frame(89817200.0, close=9.27 / 20)
+    result = source_module._normalize_volume_to_lots(frame, "600000")
+
+    assert result["成交量"].iloc[0] == pytest.approx(89817200.0)  # 改判成手，不再除 100
+    assert "成交量量级异常" in caplog.text                        # 但留下了痕迹
+
+
 # --- 指数的成交量单位 -------------------------------------------------------
 # 指数的"收盘"是点位不是股价，成交额/点位 算不出股数，所以个股那条推断在这里
 # 完全失效。下面几个标的的数值都是 2026-09-03 腾讯接口的实测值。
