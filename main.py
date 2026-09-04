@@ -9,8 +9,15 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 import logging
+import os
 import warnings
 from importlib.metadata import PackageNotFoundError, version as package_version
+
+# AkShare 的若干接口用 tqdm 画进度条，写的是 stderr，而 start.sh 把 stderr 并进
+# 日志文件。于是日志里混着 "0%|          | 0/3 [00:00<?, ?it/s]" 和光标控制字符，
+# grep 出来的行经常被进度条截断。tqdm 4.66 起认这个环境变量；用 setdefault，
+# 需要看进度条的人仍可以显式置 0。必须在 akshare 被导入之前设。
+os.environ.setdefault("TQDM_DISABLE", "1")
 
 # stateless_http 每个请求新建一次会话，MCP SDK 不显式关闭 anyio 的内存流，靠 GC 回收，
 # 于是每个请求在 __del__ 里丢一条 ResourceWarning。实测一次 109 次调用的运行里，这些
@@ -23,6 +30,12 @@ warnings.filterwarnings(
 )
 
 logging.basicConfig(level=logging.WARN, format="%(asctime)s %(levelname)s %(message)s")
+
+# urllib3 在每次重试上打一条 WARNING，带完整 URL。上游拒绝一个端点时，一次四标的
+# 的请求就能刷出 20 多条，而每条重试链最后都有我们自己那条 "获取K线数据失败 ..."
+# 的汇总，同样带 URL 和错误——重试过程本身没有多余信息，只是把汇总淹掉。留 ERROR
+# 级，连接池真正出事时仍然可见。
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 logger = logging.getLogger("qtf_mcp")
 logger.setLevel(logging.DEBUG)

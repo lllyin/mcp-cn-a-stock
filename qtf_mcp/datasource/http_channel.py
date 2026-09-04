@@ -136,6 +136,10 @@ def _record_impersonation(*, success: bool) -> None:
         if success:
             _breaker["failures"] = 0
             return
+        if _breaker["suspended_until"] > time.monotonic():
+            # 冷却已经开始，这些是熔断前就发出去、现在才失败返回的请求。再计一次
+            # 只会把冷却往后推，并重复打一条读起来像"又失败了一整轮"的 WARNING。
+            return
         _breaker["failures"] += 1
         if _breaker["failures"] < HTTP_IMPERSONATE_FAILURE_THRESHOLD:
             return

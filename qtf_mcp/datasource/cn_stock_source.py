@@ -37,7 +37,7 @@ from ..config import (
 )
 from .base import DataSource, FetchRequirements, StockData
 from .http_channel import install_http_channel, installed_mode
-from ..observability import log_context
+from ..observability import bind_log_context, log_context
 
 logger = logging.getLogger("qtf_mcp")
 
@@ -163,7 +163,22 @@ _FUND_FLOW_PAGE_BREAKER = SourceBreaker(
 )
 
 
-def _normalize_volume_to_lots(frame, code: str, source: str = "腾讯"):
+# 指数的六位码：沪市个股是 60/68 开头，000 开头的六位码只可能是指数；深市指数
+# 一律 399 开头，北交所是 899。用结构规则而不是 confs/indices.json 的名单，是因为
+# 那份名单只列了主要指数，而在成交量单位这件事上漏判一个就是 100 倍的量级错误。
+_INDEX_CODE_PREFIXES = {"sh": ("000",), "sz": ("399",), "bj": ("899",)}
+
+
+def _is_index_code(prefixed_code: str) -> bool:
+    """带市场前缀的六位码是不是指数。只用于成交量单位推断。"""
+    normalized = (prefixed_code or "").lower()
+    market, code = normalized[:2], normalized[2:]
+    return code.startswith(_INDEX_CODE_PREFIXES.get(market, ()))
+
+
+def _normalize_volume_to_lots(
+    frame, code: str, source: str = "腾讯", *, is_index: bool = False
+):
     """Return the frame with 成交量 expressed in 手.
 
     The fallback providers disagree on the unit -- AkShare's Tencent endpoint
@@ -172,11 +187,32 @@ def _normalize_volume_to_lots(frame, code: str, source: str = "腾讯"):
     the traded share count, which sits two orders of magnitude away from the lot
     count. Using 收盘价 as a stand-in for VWAP is off by a few percent at worst,
     far inside that gap. Validated against 1497 eastmoney-sourced trading days.
+
+    指数走不了这条推断：那里的"收盘"是点位不是股价，成交额/点位 算不出任何股数。
+    实测 2026-09-04 的 11 个主要指数，ratio 在 0.15 到 7.7 之间连续分布，没有一个
+    靠近 1 或 0.01，却全部被判成"股"又除以 100——指数成交量因此小了两个数量级。
     """
     volume = frame["成交量"]
     usable = (volume > 0) & (frame["成交额"] > 0) & (frame["收盘"] > 0)
     if not usable.any():
         # Only rows with no traded volume, where the unit cannot matter.
+        return frame
+
+    if is_index:
+        # 腾讯的指数成交量实测是手，与东财主源一致，所以原样返回。还能做的唯一
+        # 校验是把它按手换算回股：成交额/股数应当是一个说得通的成分股均价，实测
+        # 11 个指数落在 16-94 元，按股算则是 1600-9400 元，A 股没有这样的均价。
+        # 腾讯哪天改了单位，这条会叫出来。
+        avg_price = float(
+            (frame.loc[usable, "成交额"] / (volume[usable] * 100)).median()
+        )
+        log = logger.debug if 1.0 <= avg_price <= 1000.0 else logger.warning
+        log(
+            "%s历史行情指数成交量按手处理 %s: 成分股均价=%.4g 元",
+            source,
+            code,
+            avg_price,
+        )
         return frame
 
     implied_shares = frame.loc[usable, "成交额"] / frame.loc[usable, "收盘"]
@@ -218,7 +254,9 @@ _FALLBACK_REQUIRED = ["日期", "开盘", "收盘", "最高", "最低", "成交�
 _UNSUPPORTED_ERRORS = (KeyError, IndexError, ValueError)
 
 
-def _finalize_fallback_frame(frame, code: str, requested_start, source: str):
+def _finalize_fallback_frame(
+    frame, code: str, requested_start, source: str, *, is_index: bool = False
+):
     """Bring a fallback provider's frame to the shape the primary path produces."""
     import pandas as pd
 
@@ -239,7 +277,7 @@ def _finalize_fallback_frame(frame, code: str, requested_start, source: str):
     else:
         frame["换手率"] = 0.0
     frame = frame.dropna(subset=_FALLBACK_REQUIRED)
-    frame = _normalize_volume_to_lots(frame, code, source)
+    frame = _normalize_volume_to_lots(frame, code, source, is_index=is_index)
     # 派生列算完再裁回请求区间，前置行只用于提供首行的前收盘价。
     frame = frame[frame["日期"] >= requested_start]
     if frame.empty:
@@ -434,7 +472,11 @@ def _prune_finance_cache(now: float, *, reserve_entry: bool = False) -> tuple[in
 def _execute_timed(func, args, requested_at, submitted_at, request_id, tool, symbol):
     started_at = time.perf_counter()
     try:
-        return func(*args)
+        # 线程池的 worker 线程有自己的一份 contextvars，默认全是 "-"。不在这里补绑
+        # 一次的话，同步函数内部打出来的日志——K 线失败、兜底、熔断打开——全都没有
+        # request_id，而它们恰恰是排查时最需要和入口那条串起来的几行。
+        with bind_log_context(request_id=request_id, tool=tool, symbol=symbol):
+            return func(*args)
     finally:
         logger.debug(
             "Data task %s request_id=%s tool=%s symbol=%s "
@@ -832,7 +874,13 @@ class CNStockDataSource(DataSource):
             if any(column not in frame.columns for column in required):
                 logger.warning("腾讯历史行情字段不完整 %s: %s", code, list(frame.columns))
                 return None
-            return _finalize_fallback_frame(frame, code, requested_start, "腾讯")
+            return _finalize_fallback_frame(
+                frame,
+                code,
+                requested_start,
+                "腾讯",
+                is_index=_is_index_code(normalized_symbol),
+            )
         except Exception as error:
             if status is not None and isinstance(error, _UNSUPPORTED_ERRORS):
                 status["tencent_unsupported"] = True
@@ -878,7 +926,13 @@ class CNStockDataSource(DataSource):
                 "amount": "成交额",
                 "turnover": "换手率",
             })
-            return _finalize_fallback_frame(frame, code, requested_start, "新浪")
+            return _finalize_fallback_frame(
+                frame,
+                code,
+                requested_start,
+                "新浪",
+                is_index=_is_index_code(normalized_symbol),
+            )
         except Exception as error:
             if status is not None and isinstance(error, _UNSUPPORTED_ERRORS):
                 status["sina_unsupported"] = True
@@ -1181,6 +1235,12 @@ class CNStockDataSource(DataSource):
 
         try:
             page = await realtime_ff.fetch_history_page(symbol)
+        except realtime_ff.FundFlowPageUnavailable:
+            # 这个标的根本没有资金流向页面（科创 50 这类指数就没有），跟数据源
+            # 的健康状况无关。计进熔断器的话，连查两次这种标的就会把兜底整层
+            # 关掉 5 分钟，代价落在所有别的标的头上。
+            logger.debug("资金流向页面兜底跳过 %s: 该标的没有资金流向页面", symbol)
+            return None
         except realtime_ff.FundFlowPageRefused as e:
             # 与普通失败用同一个冷却：实测被拒是逐次随机的，8 轮里有 3 轮当场重试
             # 就能成功，长时间退避只会把本可以拿到的数据挡在外面。
@@ -1188,7 +1248,11 @@ class CNStockDataSource(DataSource):
             _FUND_FLOW_PAGE_BREAKER.record(success=False)
             return None
         except Exception as e:
-            logger.warning("资金流向页面兜底失败 %s: %s", symbol, e)
+            # 带上异常类型：FundFlowPageUnavailable 这类异常的 str() 就是标的本身，
+            # 只打 %s 的话日志是"兜底失败 SH000688: SH000688"，读不出任何原因。
+            logger.warning(
+                "资金流向页面兜底失败 %s: %s: %s", symbol, type(e).__name__, e
+            )
             _FUND_FLOW_PAGE_BREAKER.record(success=False)
             return None
         finally:

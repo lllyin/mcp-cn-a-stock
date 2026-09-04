@@ -376,6 +376,31 @@ def test_repeated_failures_suspend_impersonation(monkeypatch):
     assert channel._impersonation_suspended() is True
 
 
+def test_failures_in_flight_at_suspension_do_not_re_arm_it(caplog):
+    """熔断已经打开时，晚到的失败不该再计一次。
+
+    这些请求是熔断前就发出去的，只是现在才失败返回。再计数会把冷却终点往后推，
+    并重复打一条读起来像"又失败了一整轮"的 WARNING——生产日志里就出现过两条
+    相隔 31 毫秒的 suspending。
+    """
+    import logging
+
+    channel._breaker["failures"] = 0
+    channel._breaker["suspended_until"] = 0.0
+    caplog.set_level(logging.WARNING, logger="qtf_mcp")
+
+    for _ in range(channel.HTTP_IMPERSONATE_FAILURE_THRESHOLD):
+        channel._record_impersonation(success=False)
+    suspended_until = channel._breaker["suspended_until"]
+    assert caplog.text.count("suspending impersonation") == 1
+
+    for _ in range(channel.HTTP_IMPERSONATE_FAILURE_THRESHOLD * 2):
+        channel._record_impersonation(success=False)
+
+    assert channel._breaker["suspended_until"] == suspended_until
+    assert caplog.text.count("suspending impersonation") == 1
+
+
 def test_cooldown_expires(monkeypatch):
     threshold = channel.HTTP_IMPERSONATE_FAILURE_THRESHOLD
     boom = RuntimeError("no route")

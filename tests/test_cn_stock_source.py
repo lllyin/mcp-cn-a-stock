@@ -108,6 +108,27 @@ def test_executor_limiter_can_be_reused_across_event_loops(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_executor_tasks_carry_the_request_context():
+    """同步函数内部打的日志也要带 request_id。
+
+    线程池 worker 有自己的一份 contextvars。不补绑的话，"获取K线数据失败" 和
+    "Source breaker opened" 这类最需要串起来的行，request_id/tool/symbol 全是
+    "-"，生产日志里就是这样。
+    """
+    from qtf_mcp.observability import bind_log_context, log_context
+
+    seen = []
+
+    def worker():
+        seen.append(log_context())
+
+    with bind_log_context(request_id="req-1", tool="brief", symbol="SZ300408"):
+        await source_module._run_in_executor(worker)
+
+    assert seen == [("req-1", "brief", "SZ300408")]
+
+
+@pytest.mark.asyncio
 async def test_technical_requirements_skip_unused_sources(monkeypatch):
     datasource = CNStockDataSource()
     calls = []
@@ -697,6 +718,90 @@ def test_tencent_volume_logs_an_unexpected_magnitude(caplog):
     source_module._normalize_volume_to_lots(_tencent_frame(89817200.0 / 8), "600000")
 
     assert "成交量量级异常" in caplog.text
+
+
+# --- 指数的成交量单位 -------------------------------------------------------
+# 指数的"收盘"是点位不是股价，成交额/点位 算不出股数，所以个股那条推断在这里
+# 完全失效。下面几个标的的数值都是 2026-09-03 腾讯接口的实测值。
+
+INDEX_SAMPLES = {
+    # 代码: (点位, 成交量列, 成交额, 按手换算出的成分股均价)
+    "sh000001": (3942.09, 496990189.0, 8.198824e11, 16.50),
+    "sz399001": (13625.12, 585378201.0, 9.390340e11, 16.04),
+    "sz399006": (3312.54, 161532447.0, 4.306778e11, 26.66),
+    "sh000688": (1611.17, 6044152.0, 5.663536e10, 93.70),
+}
+
+
+@pytest.mark.parametrize("prefixed", sorted(INDEX_SAMPLES))
+def test_index_volume_is_left_in_lots(prefixed):
+    """指数成交量原样保留。
+
+    走个股那条推断的话，这四个标的的 ratio 分别是 8.09、2.68、1.18、0.19——
+    全都大于 0.1，于是全被判成"股"再除以 100，指数成交量小两个数量级。
+    """
+    close, volume, amount, _ = INDEX_SAMPLES[prefixed]
+    frame = _tencent_frame(volume, amount=amount, close=close)
+
+    result = source_module._normalize_volume_to_lots(
+        frame, prefixed[2:], is_index=True
+    )
+
+    assert result["成交量"].iloc[0] == pytest.approx(volume)
+
+
+@pytest.mark.parametrize("prefixed", sorted(INDEX_SAMPLES))
+def test_index_volume_is_quiet_when_the_implied_price_is_plausible(prefixed, caplog):
+    """按手换算出的成分股均价说得通时不该告警。"""
+    import logging
+
+    close, volume, amount, avg_price = INDEX_SAMPLES[prefixed]
+    assert 1.0 <= avg_price <= 1000.0
+
+    caplog.set_level(logging.WARNING, logger="qtf_mcp")
+    source_module._normalize_volume_to_lots(
+        _tencent_frame(volume, amount=amount, close=close),
+        prefixed[2:],
+        is_index=True,
+    )
+
+    assert caplog.text == ""
+
+
+def test_index_volume_warns_when_the_implied_price_is_absurd(caplog):
+    """腾讯哪天把指数成交量改成股，均价会变成 1650 元，这条要叫出来。"""
+    import logging
+
+    close, volume, amount, _ = INDEX_SAMPLES["sh000001"]
+    caplog.set_level(logging.WARNING, logger="qtf_mcp")
+    source_module._normalize_volume_to_lots(
+        _tencent_frame(volume / 100, amount=amount, close=close),
+        "000001",
+        is_index=True,
+    )
+
+    assert "指数成交量" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "prefixed,expected",
+    [
+        ("sh000001", True),   # 上证指数
+        ("sh000688", True),   # 科创 50
+        ("sz399001", True),   # 深证成指
+        ("bj899050", True),   # 北证 50
+        ("sz000001", False),  # 平安银行，与上证指数同码不同市场
+        ("sz000333", False),  # 美的集团
+        ("sh600000", False),  # 浦发银行
+        ("sh603986", False),  # 兆易创新
+        ("sz300408", False),  # 三环集团
+        ("sh510300", False),  # 沪深 300 ETF
+        ("sz159915", False),  # 创业板 ETF
+        ("", False),
+    ],
+)
+def test_index_code_detection(prefixed, expected):
+    assert source_module._is_index_code(prefixed) is expected
 
 
 # --- 腾讯 fallback 的派生列 -------------------------------------------------
@@ -1354,6 +1459,31 @@ async def test_page_fallback_stops_after_repeated_futile_attempts(monkeypatch):
     # 熔断打开后不再加载页面，冷却期内最多只放一次探测。
     assert len(attempts) == threshold
     assert source_module._FUND_FLOW_PAGE_BREAKER.is_open
+
+
+@pytest.mark.asyncio
+async def test_page_fallback_ignores_symbols_without_a_page(monkeypatch):
+    """没有资金流向页面的标的不能拖垮整层兜底。
+
+    科创 50 这类指数就没有 zjlx 页面，fetch_history_page 抛
+    FundFlowPageUnavailable。把它算成一次源失败的话，连查两次就到了阈值 2，
+    兜底对所有别的标的一起关闭 5 分钟。
+    """
+    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+
+    datasource = _page_fallback_datasource(
+        monkeypatch, source_module._fetch_failure("fund_flow")
+    )
+
+    async def unavailable(symbol):
+        raise realtime_ff_module.FundFlowPageUnavailable(symbol)
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", unavailable)
+
+    for _ in range(source_module.FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD + 2):
+        await datasource.fetch_stock_data("SH000688", "2024-01-01", "2026-09-03")
+
+    assert not source_module._FUND_FLOW_PAGE_BREAKER.is_open
 
 
 @pytest.mark.asyncio
