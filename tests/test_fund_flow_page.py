@@ -617,10 +617,11 @@ class TestPageReuseRespectsWhatTheCallerNeeds:
 
 
 class TestColdSessionAttempts:
-    """冷会话要多试几次才过风控。
+    """本进程还没取到过数据时多试一次。
 
-    实测三轮冷启动：「五次全拒」「前两次拒、第三次起正常」「第一次拒、第二次只
-    拿到今日、第三次两块齐全」。所以重试条件是"还不满足调用方"，不只是"被拒"。
+    重试条件是"还不满足调用方"，不只是"被拒"：一次加载可能只拿回两块中的一块，
+    而调用方要的恰好是另一块。次数上限见 FUND_FLOW_PAGE_COLD_ATTEMPTS——8 轮实测
+    第三次不再带来成功，所以默认只有两次。
     """
 
     def _pages(self):
@@ -681,7 +682,7 @@ class TestColdSessionAttempts:
 
     @pytest.mark.asyncio
     async def test_a_warm_session_gets_one_attempt(self, monkeypatch):
-        """会话热了之后的失败是真的失败，多加载只是多一次撞风控。"""
+        """已经取到过数据之后，再失败就只试一次——多加载只是多一次被拒。"""
         from qtf_mcp.datasource import realtime_ff
 
         partial, _ = self._pages()
