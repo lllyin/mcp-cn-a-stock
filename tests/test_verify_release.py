@@ -465,6 +465,29 @@ class TestCompleteness:
         ]
         assert result.bad and result.findings[0].verdict.startswith("⚠️")
 
+    def test_every_no_data_phrase_in_the_renderer_is_covered(self):
+        """这张表漏一句，那一维就会被标成"有数据"——假保证比没有更糟。
+
+        2026-09-04 就漏过 ``暂无资金流向数据``：四个标的的资金流实际是空的，
+        而维度矩阵把它们全标成了 ✅。所以这里直接去 research.py 里数一遍。
+        """
+        import ast
+        import re as _re
+
+        source = (Path(__file__).resolve().parents[1] / "qtf_mcp" / "research.py").read_text(
+            encoding="utf-8"
+        )
+        phrases = set()
+        for node in ast.walk(ast.parse(source)):
+            if (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "print"
+                    and node.args):
+                first = node.args[0]
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    if _re.search(r"暂无|不可用|获取失败|暂不", first.value):
+                        phrases.add(first.value.strip().lstrip("- "))
+        missing = sorted(p for p in phrases if p not in verify.DEGRADED_MARKERS)
+        assert not missing, f"research.py 里这些提示语没进 DEGRADED_MARKERS: {missing}"
+
     def test_an_empty_section_is_also_degraded(self):
         document = _index_report(fund_flow="")
         result = verify.check_completeness("brief", verify.Payload({"SH000001": document}))
