@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
-"""上线后的数据验证层：探活、维度完整性、与旧数据回归比对。
+"""上线后的数据验证层。一次运行、一份报告，两个部分各回答一个问题。
 
-改了取数逻辑、换了数据源、挪了机器之后跑一遍，它回答三个问题：
+**实时探活**——维度在不在
+    不钉日期，按三批固定标的把每个工具都调一遍，然后按维度契约逐项检查：该有的
+    段落在不在、在了有没有值。回答的是"线上现在缺什么"。必须实时，因为资金流只有
+    "今天"这一个口径，钉了日期它本就没有，那样就永远查不出它到底取不取得到。
 
-  1. 还回不回数据    每个工具都调一遍，看退出码、errors 和 warnings
-  2. 数据齐不齐      按维度契约逐项检查报告，缺哪一维就指出该看哪个上游源
-  3. 和以前一不一样  用 verification/baseline/ 里的历史归档重放同样的调用，逐行比对
+**基线比对**——数字对不对
+    用 verification/baseline/ 里的历史归档重放同样的调用，逐项比对。这一边一律把
+    日期钉死（归档命令里没有 date= 的，就从归档报告自己的数据日期反推补上），
+    所以已收盘的字段应当逐字相同——对不上就是真漂了，不是行情动了。
 
-只读，不改任何服务状态。重放一律把日期钉死（归档命令里没有 date= 的，就从归档
-报告自己的数据日期反推补上），所以已收盘的字段应当逐字相同——对不上就是真漂了，
-不是行情动了。
+两部分不能互相替代：实时探活拿不到"以前是什么样"，基线比对拿不到"实时资金流现在
+取不取得到"。所以默认两边都跑，出一份报告。
+
+只读，不改任何服务状态。
 
 用法：
 
-    python scripts/verify_release.py                      # 全跑
-    python scripts/verify_release.py --skip-baseline      # 只探活和完整性
-    python scripts/verify_release.py --skip-probe         # 只跑回归比对
+    python scripts/verify_release.py                      # 两部分都跑（默认）
+    python scripts/verify_release.py --skip-baseline      # 只看维度在不在
+    python scripts/verify_release.py --skip-probe         # 只看数字对不对
     python scripts/verify_release.py --only brief,full    # 限定工具
-    python scripts/verify_release.py --probe-date 2026-08-21
 
 退出码：0 全过；1 有失败/缺维/不一致；2 脚本自己跑不起来（找不到 mcporter 等）。
 """
@@ -122,27 +126,24 @@ CONTRACT: dict[str, tuple[Dimension, ...]] = {
 # 报告里这些句子说明某一维是"渲染出来了但没有值"。有值和有段落标题是两回事，
 # 只查标题会把降级当成正常。
 #
-# benign=True 的是正当缺席：不是故障，也不该扣可用率的分。查询里写了 date= 就是
-# 在查那一天的收盘数据，实时资金流本来就没有当天之外的口径，不展示是对的。
 # 这张表必须和 research.py 里所有"没数据"的 print 一一对上，不能靠猜。查法：
 #
 #   ast 遍历 research.py 的 print，抓第一个字符串参数里带 暂无/不可用/失败 的
 #
 # 2026-09-04 漏过一次：``暂无资金流向数据`` 不在表里，于是四个标的的资金流其实是
 # 空的，而矩阵把它们全标成了 ✅——比没有这张表更糟，是给了假保证。渲染层加一句
-# 新的提示语就要往这里加一行。
+# 新的提示语就要往这里加一行，有测试盯着这件事。
 DEGRADED_MARKERS = {
-    "指定日期查询暂不展示实时资金流向": (
-        "查询指定了 date=，问的是那天的收盘数据，实时资金流没有当天之外的口径",
-        True,
-    ),
-    "暂无实时资金流向": ("实时资金流没取到（主源被拒且页面兜底也没成）", False),
-    "暂无资金流向数据": ("资金流整段为空", False),
-    "暂无财务数据": ("财务报表没取到", False),
-    "暂无年度财务数据": ("财务报表里没有年度期", False),
-    "盘中实时数据暂时不可用": ("盘中回退整层被跳过或熔断", False),
-    "暂无数据": ("该维度取到空值", False),
-    "获取失败": ("该维度取数失败", False),
+    # 探活一律不钉日期，所以这一句不该出现。出现了说明有人给探活加了 date=，
+    # 那会让"实时资金流取不取得到"这件事永远查不出来——是 bug 不是正当缺席。
+    "指定日期查询暂不展示实时资金流向": "探活钉了日期？实时资金流因此查不到，检查调用参数",
+    "暂无实时资金流向": "实时资金流没取到（主源被拒且页面兜底也没成）",
+    "暂无资金流向数据": "资金流整段为空",
+    "暂无财务数据": "财务报表没取到",
+    "暂无年度财务数据": "财务报表里没有年度期",
+    "盘中实时数据暂时不可用": "盘中回退整层被跳过或熔断",
+    "暂无数据": "该维度取到空值",
+    "获取失败": "该维度取数失败",
 }
 
 # 指数判定与服务端保持一致，见 cn_stock_source._INDEX_CODE_PREFIXES。
@@ -295,12 +296,9 @@ class MissingDimension:
     symbol: str
     dimension: Dimension
     degraded_note: str = ""    # 有段落但内容是降级说明
-    benign: bool = False       # 正当缺席，不算故障也不扣分
 
     @property
     def verdict(self) -> str:
-        if self.benign:
-            return f"✅ {self.degraded_note}"
         if self.degraded_note:
             return f"⚠️ {self.degraded_note}"
         return "❌ 该有却没有"
@@ -311,28 +309,26 @@ class Completeness:
     """一次调用的维度账：应检多少、正当缺席多少、真缺多少。"""
 
     expected: int = 0
-    benign: int = 0
     findings: list[MissingDimension] = field(default_factory=list)
 
     @property
     def bad(self) -> list[MissingDimension]:
-        return [item for item in self.findings if not item.benign]
+        return list(self.findings)
 
     @property
     def graded(self) -> int:
-        """算分的分母：应检的减去正当缺席的。"""
-        return max(0, self.expected - self.benign)
+        return self.expected
 
     @property
     def available(self) -> int:
         return self.graded - len(self.bad)
 
 
-def check_completeness(tool: str, payload: Payload, *, live: bool = False) -> Completeness:
-    """``live`` 是"这次调用没钉日期"。
+def check_completeness(tool: str, payload: Payload) -> Completeness:
+    """按维度契约检查一份返回。探活一律实时，所以这里没有"正当缺席"这回事。
 
-    它只改一件事：钉日期时"不展示实时资金流"是正当缺席，实时调用下同一句话就是
-    真缺失——资金流只有"今天"这一个口径，实时问它还答不出来，那是真没取到。
+    唯一的例外由 ``applies_to`` 处理：ETF 没有财务报表和市盈率，指数连市值都没有，
+    那不是缺失，是这类标的本来就没有这一维。
     """
     dimensions = CONTRACT.get(tool)
     result = Completeness()
@@ -347,28 +343,24 @@ def check_completeness(tool: str, payload: Payload, *, live: bool = False) -> Co
             if dimension.marker not in document:
                 result.findings.append(MissingDimension(symbol, dimension))
                 continue
-            note, benign = _degraded_note(document, dimension)
-            if live:
-                benign = False
+            note = _degraded_note(document, dimension)
             if note:
-                result.findings.append(MissingDimension(symbol, dimension, note, benign))
-                if benign:
-                    result.benign += 1
+                result.findings.append(MissingDimension(symbol, dimension, note))
     return result
 
 
-def _degraded_note(document: str, dimension: Dimension) -> tuple[str, bool]:
+def _degraded_note(document: str, dimension: Dimension) -> str:
     """段落在，但里面只有一句"没有数据"——这也算这一维没拿到。"""
     if not dimension.marker.startswith("##"):
-        return "", False
+        return ""
     _, _, tail = document.partition(dimension.marker)
     body = tail.split("\n#", 1)[0]
-    for marker, (explanation, benign) in DEGRADED_MARKERS.items():
+    for marker, explanation in DEGRADED_MARKERS.items():
         if marker in body:
-            return explanation, benign
+            return explanation
     if not body.strip():
-        return "段落为空", False
-    return "", False
+        return "段落为空"
+    return ""
 
 
 # ── 五、归档解析与重放 ──────────────────────────────────────────
@@ -982,31 +974,6 @@ def scan_log(path: Path, since: dt.datetime) -> LogScan:
 # ── 八、探活套件 ────────────────────────────────────────────────
 
 
-def probe_suite(date: str, tools: set[str]) -> list[CallSpec]:
-    """每个工具至少一发，标的覆盖主板/创业板/科创板/ETF/指数。
-
-    日期钉在一个已收盘的交易日上，这样两次跑出来应当一致，脚本自己也可复现。
-    """
-    stocks = "SH600519,SZ000333,SZ300750,SH688981"
-    indices = "SH000001,SZ399001,SZ399006,SH000688"
-    specs = [
-        CallSpec("brief", {"symbol": stocks, "date": date}, "个股 brief"),
-        CallSpec("brief", {"symbol": indices, "date": date}, "指数 brief"),
-        CallSpec("medium", {"symbol": "SH600519", "date": date}, "medium"),
-        CallSpec("full", {"symbol": "SH600519,SH512480", "date": date}, "full + ETF"),
-        CallSpec("kline_daily", {"symbol": "SH600519", "date": date}, "kline_daily"),
-        CallSpec(
-            "kline_range",
-            {"symbol": "SH600519", "start_date": _shift(date, -14), "end_date": date},
-            "kline_range",
-        ),
-        CallSpec("tech", {"symbol": "SH600519", "days": "30", "date": date}, "tech"),
-        CallSpec("market_breadth", {}, "market_breadth"),
-        CallSpec("market_events", {"date": date, "sources": "lhb,limit_up"}, "market_events"),
-    ]
-    return [spec for spec in specs if spec.tool in tools]
-
-
 # 实时探活的标的。三批固定不变，因为它们和开着网关的服务器上采过的那三份
 # （logs/s1_index.json、s2_cap.json、s3_edge.json）是同一批标的——标的对齐了，
 # 这一层的输出才能直接和"东财路径的正确答案"逐字比，而不是只能自说自话。
@@ -1029,7 +996,7 @@ LIVE_BATCHES = (
 )
 
 
-def live_probe_suite(tools: set[str]) -> list[CallSpec]:
+def probe_suite(tools: set[str]) -> list[CallSpec]:
     """不钉日期的实时探活：每个工具都跑，标的按上面三批走。
 
     和钉日期那套的区别不只是少一个参数：
@@ -1109,14 +1076,6 @@ def capture_baseline(result: CallResult, directory: Path, config: Path) -> Path:
         encoding="utf-8",
     )
     return path
-
-
-def last_settled_trading_day(today: dt.date | None = None) -> str:
-    """上一个已收盘的交易日（只避开周末，不查节假日；节假日会自然回退到空数据）。"""
-    day = (today or dt.date.today()) - dt.timedelta(days=1)
-    while day.weekday() >= 5:
-        day -= dt.timedelta(days=1)
-    return day.isoformat()
 
 
 # ── 九、报告 ────────────────────────────────────────────────────
@@ -1253,7 +1212,7 @@ def _render_matrix(
                     row.setdefault(dimension.name, "·")
                     continue
                 item = bad.get((symbol, dimension.name))
-                mark = "✅" if item is None else ("✅" if item.benign else "⚠️" if item.degraded_note else "❌")
+                mark = "✅" if item is None else ("⚠️" if item.degraded_note else "❌")
                 if RANK[mark] > RANK.get(row.get(dimension.name, "·"), -1):
                     row[dimension.name] = mark
     if not grid:
@@ -1370,7 +1329,6 @@ def render_report(
 
     probe_failures = [result for result, _, _ in probes if not result.ok]
     bad_missing = [item for _, _, c in probes for item in c.bad]
-    benign_missing = sum(c.benign for _, _, c in probes)
     dirty = [
         baseline
         for baseline, _, diffs in regressions
@@ -1411,8 +1369,7 @@ def render_report(
     lines.append(
         f"| 维度完整率 | {score.dimension_rate:.0f}% | "
         f"{score.dims_ok}/{score.dims_total} 项该有的数据真的有"
-        + (f"；另有 {benign_missing} 项正当缺席，不计分" if benign_missing else "")
-        + " |"
+        "（实时探活，见第三节矩阵）|"
     )
     if score.docs_total:
         lines.append(
@@ -1469,6 +1426,12 @@ def render_report(
         if replay_failures:
             lines.append(f"- ❌ {len(replay_failures)} 份基线重放失败")
         lines.append("")
+    lines.append(
+        "两部分各回答一个问题，不能互相替代：**实时探活**（第二、三、四节）看维度"
+        "在不在，**基线比对**（第五节）看数字对不对。前者拿不到「以前是什么样」，"
+        "后者拿不到「实时资金流现在取不取得到」。"
+    )
+    lines.append("")
     lines.append(f"- 运行时间：{started:%Y-%m-%d %H:%M:%S}")
     lines.append(f"- mcporter 配置：`{config}`")
     lines.append("")
@@ -1494,7 +1457,12 @@ def render_report(
             lines.append("- 窗口内没有任何回退、熔断或风控信号，全部走的主源。")
     lines.append("")
 
-    lines.append("## 二、工具探活与维度完整性")
+    lines.append("## 二、实时探活：维度在不在")
+    lines.append("")
+    lines.append(
+        "不钉日期，按三批固定标的把每个工具都调一遍。必须实时——资金流只有「今天」"
+        "这一个口径，钉了日期它本就没有，那样就永远查不出它到底取不取得到。"
+    )
     lines.append("")
     lines.append("| 工具 | 调用 | 结果 | 耗时 | 维度完整率 | 缺失维度 |")
     lines.append("| --- | --- | --- | ---: | ---: | --- |")
@@ -1544,7 +1512,12 @@ def render_report(
     lines.extend(_render_matrix(probes))
     lines.extend(_render_index_section(probes, regressions))
 
-    lines.append("## 五、与旧数据比对")
+    lines.append("## 五、基线比对：数字对不对")
+    lines.append("")
+    lines.append(
+        "用 `verification/baseline/` 里的历史归档重放同样的调用。这一边一律把日期"
+        "钉死，所以已收盘的字段应当逐字相同——对不上就是真漂了，不是行情动了。"
+    )
     lines.append("")
     if not regressions:
         lines.append("- 没有可用基线（`verification/baseline/` 为空或全部跳过）。")
@@ -1608,6 +1581,15 @@ def render_report(
 
     lines.append("## 六、怎么看这份报告")
     lines.append("")
+    lines.append("**一份报告，两个部分**")
+    lines.append("")
+    lines.append("| 部分 | 验什么 | 怎么验 | 看哪里 |")
+    lines.append("| --- | --- | --- | --- |")
+    lines.append("| 实时探活 | 维度在不在 | 不钉日期，三批十二个标的过一遍全部工具，"
+                 "按维度契约逐项检查 | 第二、三、四节；分数是「维度完整率」|")
+    lines.append("| 基线比对 | 数字对不对 | 钉死日期重放历史归档，逐项比对 | "
+                 "第五节；分数是「回归一致率」|")
+    lines.append("")
     lines.append("**判定符号**")
     lines.append("")
     lines.append("| 符号 | 含义 |")
@@ -1636,8 +1618,9 @@ def render_report(
     lines.append("- **钉日期**：重放时给调用加上 `date=`，问的是那一天的收盘数据，"
                  "而不是此刻的实时行情。归档命令自带 `date=` 就直接用，没有的话从归档"
                  "报告里的「数据日期」反推补上——不钉住就等于拿今天的行情去对昨天的账。")
-    lines.append("- **正当缺席**：钉了日期就没有实时资金流可展示，这不是故障，"
-                 "不进可用率的分母。")
+    lines.append("- **本来就没有这一维**：矩阵里的 `·`。ETF 没有财务报表和市盈率，"
+                 "指数连市值都没有——那不是缺失，不进可用率的分母。判据在维度契约的"
+                 "`applies_to` 上。")
     lines.append("- **已知差异**：两个上游源对同一字段口径或精度不同，本项目改不了，"
                  "逐条记在脚本的 `KNOWN_DIFFERENCES` 里。每条都带一个已核实的最大"
                  "相对偏差，超出就重新算成真差异——无条件忽略一个字段等于在这一层"
@@ -1678,14 +1661,7 @@ def main() -> int:
     parser.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE_DIR)
     parser.add_argument("--report", type=Path, help="报告输出路径")
     parser.add_argument("--log", type=Path, default=DEFAULT_LOG_PATH)
-    parser.add_argument("--probe-date", help="探活用的已收盘交易日，默认取上一个工作日")
     parser.add_argument("--only", help="只跑这些工具，逗号分隔")
-    parser.add_argument(
-        "--live",
-        action="store_true",
-        help="实时探活：不钉日期，跑三批十二个标的，逐维度看线上缺什么。"
-        "同时跳过回归比对——实时输出没有可比的旧数据",
-    )
     parser.add_argument("--skip-probe", action="store_true")
     parser.add_argument("--skip-baseline", action="store_true")
     parser.add_argument(
@@ -1703,25 +1679,19 @@ def main() -> int:
 
     config = resolve_config(args.config)
     tools = set(args.only.split(",")) if args.only else set(ALL_TOOLS)
-    probe_date = args.probe_date or last_settled_trading_day()
-    if args.live:
-        # 实时输出没有可比的旧数据：归档是某一天某一刻的快照，拿今天的实时值去比
-        # 只会得到满屏噪音。所以 --live 只做探活和完整性。
-        args.skip_baseline = True
     started = dt.datetime.now().replace(microsecond=0)
 
     print(f"[验证] 配置={config}")
-    print(f"[验证] 探活日期={probe_date} 工具={','.join(sorted(tools))}")
+    print(f"[验证] 工具={','.join(sorted(tools))}")
 
     probes: list[tuple[CallResult, Payload, Completeness]] = []
     if not args.skip_probe:
-        specs = live_probe_suite(tools) if args.live else probe_suite(probe_date, tools)
+        specs = probe_suite(tools)
         print(f"[验证] 探活 {len(specs)} 个调用…")
         for result in run_calls(specs, config, args.timeout_ms, args.concurrency):
             payload = parse_payload(result.payload)
             completeness = (
-                check_completeness(result.spec.tool, payload, live=args.live)
-                if result.ok
+                check_completeness(result.spec.tool, payload) if result.ok
                 else Completeness()
             )
             probes.append((result, payload, completeness))

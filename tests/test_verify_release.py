@@ -495,14 +495,18 @@ class TestCompleteness:
             ("资金流向", "段落为空")
         ]
 
-    def test_a_pinned_date_query_is_not_penalised_for_having_no_live_flow(self):
-        """钉了日期就没有实时资金流可展示，这不是故障，不能扣可用率的分。"""
+    def test_a_pinned_date_in_a_probe_is_a_bug_not_an_excuse(self):
+        """探活一律不钉日期，所以这句话出现就说明调用参数错了。
+
+        它曾经被当成"正当缺席"放行——那是钉日期探活时代的逻辑。实时探活下放行
+        它，等于让"实时资金流取不取得到"这件事永远查不出来。
+        """
         document = _index_report(fund_flow="- 指定日期查询暂不展示实时资金流向")
         result = verify.check_completeness("brief", verify.Payload({"SH000001": document}))
-        assert result.bad == []
-        assert result.benign == 1
-        assert result.available == result.graded == result.expected - 1
-        assert result.findings[0].verdict.startswith("✅")
+        assert len(result.bad) == 1
+        assert result.available == result.graded - 1
+        assert result.findings[0].verdict.startswith("⚠️")
+        assert "钉了日期" in result.findings[0].degraded_note
 
 
 class TestFocus:
@@ -516,18 +520,28 @@ class TestFocus:
 
 class TestProbeSuite:
     def test_every_tool_is_probed(self):
-        specs = verify.probe_suite("2026-09-03", set(verify.ALL_TOOLS))
+        specs = verify.probe_suite(set(verify.ALL_TOOLS))
         assert {spec.tool for spec in specs} == set(verify.ALL_TOOLS)
 
+    def test_the_probe_never_pins_a_date_on_the_report_tools(self):
+        """brief/medium/full/tech 钉了日期就查不出实时资金流取不取得到。
+
+        kline_daily 是例外——它的 date 是必填的，那个工具本身就是按日寻址的。
+        """
+        for spec in verify.probe_suite({"brief", "medium", "full", "tech"}):
+            assert "date" not in spec.args, spec.describe()
+
+    def test_the_symbols_are_pinned_to_the_three_captured_sets(self):
+        """标的要和服务器采过的那三份对齐，否则实时输出没有参照可比。"""
+        assert len(verify.LIVE_BATCHES) == 3
+        symbols = {s for _, group in verify.LIVE_BATCHES for s in group.split(",")}
+        assert symbols >= {"SH000001", "SZ399001", "SZ399006", "SH000688"}   # 四大指数
+        assert "SH512480" in symbols                                        # ETF
+        assert len(symbols) == 12
+
     def test_the_range_probe_asks_for_a_past_window(self):
-        spec = next(s for s in verify.probe_suite("2026-09-03", {"kline_range"}))
-        assert spec.args["start_date"] < spec.args["end_date"] == "2026-09-03"
-
-    def test_the_default_probe_date_avoids_weekends(self):
-        import datetime as dt
-
-        # 2026-09-07 是周一，前一天是周日，要退到上周五。
-        assert verify.last_settled_trading_day(dt.date(2026, 9, 7)) == "2026-09-04"
+        spec = next(s for s in verify.probe_suite({"kline_range"}))
+        assert spec.args["start_date"] < spec.args["end_date"]
 
 
 def test_index_detection_matches_the_service():
