@@ -174,6 +174,7 @@ cn-stock-mcp --transport sse --port 8686
 | `CN_STOCK_FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD` | 正整数（默认 `2`） | 连续多少次徒劳加载后暂停整层兜底 |
 | `CN_STOCK_FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS` | 秒（默认 `300`） | 暂停时长 |
 | `CN_STOCK_FUND_FLOW_PAGE_DISGUISE` | `0`<br>`1`<br>（默认 `1`） | 把无头浏览器的自报特征改成普通浏览器的样子。不改的话 `sec-ch-ua` 请求头里写着 `HeadlessChrome`，容易被上游风控挑出来 |
+| `CN_STOCK_FUND_FLOW_PAGE_CLAIM_PLATFORM` | `auto`<br>`real`<br>`macos`<br>`windows`<br>（默认 `auto`） | 对外声明哪个平台。`auto` 下 Windows/macOS 照实报，其余（服务器上的 Linux）统一报 macOS —— Linux 桌面在真实访客里占比极低。`real` 用于在部署机上做对照 |
 
 ### 上游源熔断
 

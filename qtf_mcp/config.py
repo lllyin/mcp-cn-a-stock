@@ -155,6 +155,17 @@ FUND_FLOW_PAGE_DISGUISE = _parse_bool(
     os.getenv("CN_STOCK_FUND_FLOW_PAGE_DISGUISE"), True
 )
 
+# 对外声明哪个平台：auto | real | macos | windows。
+#   auto  Windows 和 macOS 照实报，其余（服务器上就是 Linux）统一报 macOS。
+#         Linux 桌面在真实访客里占比极低，照实报等于自带一个少数派特征。
+#   real  照实报，用于在部署机上做对照
+# 注意代价：声明 macOS 之后 WebGL renderer 和字体列表仍是 Linux 的样子，若对端
+# 交叉核对到那一层，声明 macOS 反而更可疑。所以要在部署机上用 blocked_captcha
+# 的占比比一比 auto 与 real，别凭感觉定。
+FUND_FLOW_PAGE_CLAIM_PLATFORM = (
+    os.getenv("CN_STOCK_FUND_FLOW_PAGE_CLAIM_PLATFORM") or "auto"
+).strip().lower()
+
 # 调试开关，默认关。开启后浏览器有头运行、抓完不关页面，用于人工观察页面到底
 # 渲染成了什么样。两者都会显著抬高内存（每个页面是一个独立渲染进程），只在排查
 # 时开；Linux 上有头模式需要 DISPLAY，start.sh 会拉起 Xvfb。

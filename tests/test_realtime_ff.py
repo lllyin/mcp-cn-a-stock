@@ -529,28 +529,91 @@ class _FakeContext:
         return _Session()
 
 
+LINUX_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "HeadlessChrome/145.0.7632.6 Safari/537.36"
+)
+MAC_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) HeadlessChrome/145.0.7632.6 Safari/537.36"
+)
+WINDOWS_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) HeadlessChrome/145.0.7632.6 Safari/537.36"
+)
+
+
 @pytest.mark.asyncio
-async def test_identity_is_derived_from_the_real_build(monkeypatch):
+async def test_version_is_kept_whole_and_headless_is_dropped(monkeypatch):
+    """版本号要完整保留：报一个比引擎新的版本会被特性检测抓出来。"""
     monkeypatch.setattr(realtime_ff, "_identity", None)
-    page = _FakePage(
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-        "HeadlessChrome/145.0.0.0 Safari/537.36",
-        "Linux x86_64",
-        "Linux",
-    )
-    context = _FakeContext(page)
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_CLAIM_PLATFORM", "real")
+    context = _FakeContext(_FakePage(MAC_UA, "MacIntel", "macOS"))
 
     identity = await realtime_ff._browser_identity(context)
 
     assert "HeadlessChrome" not in identity["userAgent"]
-    assert "Chrome/145.0.0.0" in identity["userAgent"]
-    # 平台取真实值，不能写死 macOS
-    assert identity["platform"] == "Linux x86_64"
-    assert identity["userAgentMetadata"]["platform"] == "Linux"
+    assert "Chrome/145.0.7632.6" in identity["userAgent"]
+    assert identity["userAgentMetadata"]["fullVersion"] == "145.0.7632.6"
     brands = [b["brand"] for b in identity["userAgentMetadata"]["brands"]]
     assert "HeadlessChrome" not in brands
     assert "Google Chrome" in brands
     assert identity["acceptLanguage"].startswith("zh-CN")
+
+
+@pytest.mark.asyncio
+async def test_linux_claims_macos_by_default(monkeypatch):
+    """Linux 桌面份额极低，照实报等于自带一个少数派特征。
+
+    改平台就得三处一起改，否则只是把一个矛盾换成另一个：UA 里的平台 token、
+    navigator.platform、client hints 的 platform。
+    """
+    monkeypatch.setattr(realtime_ff, "_identity", None)
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_CLAIM_PLATFORM", "auto")
+    context = _FakeContext(_FakePage(LINUX_UA, "Linux x86_64", "Linux"))
+
+    identity = await realtime_ff._browser_identity(context)
+    meta = identity["userAgentMetadata"]
+
+    assert "Macintosh; Intel Mac OS X 10_15_7" in identity["userAgent"]
+    assert "Linux" not in identity["userAgent"]
+    assert identity["platform"] == "MacIntel"
+    assert meta["platform"] == "macOS"
+    assert meta["platformVersion"] == "15.6.0"
+    # 版本号不能被平台替换弄丢
+    assert "Chrome/145.0.7632.6" in identity["userAgent"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ua,nav_platform,ch_platform",
+    [(MAC_UA, "MacIntel", "macOS"), (WINDOWS_UA, "Win32", "Windows")],
+)
+async def test_common_desktop_platforms_are_reported_truthfully(
+    monkeypatch, ua, nav_platform, ch_platform
+):
+    monkeypatch.setattr(realtime_ff, "_identity", None)
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_CLAIM_PLATFORM", "auto")
+    context = _FakeContext(_FakePage(ua, nav_platform, ch_platform))
+
+    identity = await realtime_ff._browser_identity(context)
+
+    assert identity["userAgentMetadata"]["platform"] == ch_platform
+    assert identity["platform"] == nav_platform
+
+
+@pytest.mark.asyncio
+async def test_claim_platform_real_keeps_linux(monkeypatch):
+    """留 real 是为了在部署机上做对照，不能被 auto 的规则覆盖掉。"""
+    monkeypatch.setattr(realtime_ff, "_identity", None)
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_CLAIM_PLATFORM", "real")
+    context = _FakeContext(_FakePage(LINUX_UA, "Linux x86_64", "Linux"))
+
+    identity = await realtime_ff._browser_identity(context)
+
+    assert "X11; Linux x86_64" in identity["userAgent"]
+    assert identity["userAgentMetadata"]["platform"] == "Linux"
+    assert identity["userAgentMetadata"]["platformVersion"] == "6.8.0"
 
 
 @pytest.mark.asyncio

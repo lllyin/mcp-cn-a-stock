@@ -9,6 +9,7 @@ from playwright.async_api import async_playwright, Browser, BrowserContext
 
 from ..config import (
     ALL_INDICES,
+    FUND_FLOW_PAGE_CLAIM_PLATFORM,
     FUND_FLOW_PAGE_COLD_ATTEMPTS,
     FUND_FLOW_PAGE_DISGUISE,
     FUND_FLOW_PAGE_HEADFUL,
@@ -187,9 +188,43 @@ _HEADLESS_GAPS_SCRIPT = """
 })();
 """
 
-# 真实构建自报的身份，只探一次。键是 UA 里的大版本号和平台，用来拼出与本机
-# 一致的 client hints —— 平台必须取真实值，否则又会变成 Linux 上说 macOS。
+# 声明某个平台时，UA 里那段平台 token 和 navigator.platform 必须跟着一起改，
+# 否则就是新的自相矛盾。这两串是 Chrome 冻结后的固定写法，真实浏览器就长这样：
+# Apple Silicon 上的 Chrome 也照样报 "Intel Mac OS X 10_15_7"。
+_UA_PLATFORM_TOKEN = {
+    "macOS": "Macintosh; Intel Mac OS X 10_15_7",
+    "Windows": "Windows NT 10.0; Win64; x64",
+}
+_NAVIGATOR_PLATFORM = {"macOS": "MacIntel", "Windows": "Win32"}
+# 声明某个平台就得给个说得通的系统版本，空字符串本身也是特征。Linux 上真实
+# Chrome 报的是内核版本，这里给一个常见的 LTS 值。
+_PLATFORM_VERSION = {"macOS": "15.6.0", "Windows": "10.0.0", "Linux": "6.8.0"}
+# 桌面上常见、风控见惯了的平台。Linux 桌面份额极低，一个自称 Linux 的访客本身
+# 就是少数派特征，所以不在这个名单里的一律对外声明 macOS。
+_COMMON_DESKTOP_PLATFORMS = ("Windows", "macOS")
+
+# 真实构建自报的身份，只探一次。
 _identity: dict | None = None
+
+
+def _claimed_platform(real: str) -> str:
+    """决定对外声明哪个平台。
+
+    默认规则（``auto``）：Windows 和 macOS 照实报，其余——服务器上就是 Linux——
+    统一报 macOS。Linux 桌面在真实访客里占比极低，照实报等于自带一个少数派特征。
+
+    代价要写明：声明 macOS 之后，WebGL renderer（Linux 上是 SwiftShader/Mesa）和
+    字体列表仍然是 Linux 的样子。如果对端交叉核对到那一层，声明 macOS 反而比照实
+    报更可疑。所以留了 ``real`` 选项，好在部署机上用 blocked_captcha 的占比做对照。
+    """
+    configured = (FUND_FLOW_PAGE_CLAIM_PLATFORM or "auto").strip().lower()
+    if configured == "real":
+        return real
+    if configured in ("macos", "mac"):
+        return "macOS"
+    if configured == "windows":
+        return "Windows"
+    return real if real in _COMMON_DESKTOP_PLATFORMS else "macOS"
 
 
 async def _browser_identity(context: BrowserContext) -> dict:
@@ -208,34 +243,50 @@ async def _browser_identity(context: BrowserContext) -> dict:
         await page.close()
 
     ua = str(probe.get("ua") or "")
-    match = re.search(r"(?:Headless)?Chrome/(\d+)", ua)
-    major = match.group(1) if match else ""
-    ch_platform = probe.get("chPlatform") or ""
-    if not ch_platform:
-        ch_platform = "Windows" if "Windows" in ua else "Linux" if "Linux" in ua else "macOS"
+    match = re.search(r"(?:Headless)?Chrome/([\d.]+)", ua)
+    full_version = match.group(1) if match else ""
+    major = full_version.split(".")[0] if full_version else ""
+
+    real_platform = probe.get("chPlatform") or ""
+    if not real_platform:
+        real_platform = (
+            "Windows" if "Windows" in ua
+            else "Linux" if "Linux" in ua
+            else "macOS" if "Mac" in ua
+            else ""
+        )
+    claimed = _claimed_platform(real_platform)
+
+    # HeadlessChrome 是那句自报身份；平台 token 是第一个括号里的内容。两处一起改，
+    # 版本号原样保留——报一个比引擎新的版本会被特性检测抓出来。
+    ua = ua.replace("HeadlessChrome", "Chrome")
+    token = _UA_PLATFORM_TOKEN.get(claimed)
+    if token and claimed != real_platform:
+        ua = re.sub(r"\([^)]*\)", f"({token})", ua, count=1)
+
     _identity = {
-        # HeadlessChrome 就是那句自报身份，只把它换掉，其余原样保留。
-        "userAgent": ua.replace("HeadlessChrome", "Chrome"),
+        "userAgent": ua,
         "acceptLanguage": "zh-CN,zh;q=0.9,en;q=0.8",
-        "platform": probe.get("platform") or "",
+        "platform": _NAVIGATOR_PLATFORM.get(claimed) or probe.get("platform") or "",
         "userAgentMetadata": {
             "brands": [
                 {"brand": "Not_A Brand", "version": "8"},
                 {"brand": "Chromium", "version": major},
                 {"brand": "Google Chrome", "version": major},
             ],
-            "fullVersion": f"{major}.0.0.0",
-            "platform": ch_platform,
-            "platformVersion": "",
+            "fullVersion": full_version or f"{major}.0.0.0",
+            "platform": claimed,
+            "platformVersion": _PLATFORM_VERSION.get(claimed, ""),
             "architecture": "arm" if "arm" in platform.machine().lower() else "x86",
             "model": "",
             "mobile": False,
         },
     }
     logger.info(
-        "资金流向页面伪装身份 ua=%s ch_platform=%s",
-        _identity["userAgent"][:70],
-        ch_platform,
+        "资金流向页面伪装身份 platform=%s(真实 %s) ua=%s",
+        claimed,
+        real_platform or "?",
+        _identity["userAgent"],
     )
     return _identity
 
