@@ -543,6 +543,11 @@ class CNStockDataSource(DataSource):
         elif code.startswith(("1", "5")): # 基金/ETF
             if code.startswith("5"): market = "sh"
             else: market = "sz"
+        # 北交所：43/83/87/88 段与新号段 92。原来没有这一条，它们落进下面的兜底
+        # 被判成 sz，于是腾讯被问 sz430047、新浪同理，两家都 KeyError，三级 K 线
+        # 全挂，整只票返回"未找到相关行情数据"——而腾讯本身是支持 bj430047 的。
+        elif code.startswith(("43", "83", "87", "88", "92")):
+            market = "bj"
         else:
             # 兜底：保留用户指定的前缀
             market = "sh" if symbol.upper().startswith("SH") else "sz"
@@ -560,7 +565,13 @@ class CNStockDataSource(DataSource):
         ("600000", "sh") -> "SH600000"
         """
         if market:
-            prefix = "SH" if market.lower() in ["sh", "1"] else "SZ"
+            lowered = market.lower()
+            if lowered in ("sh", "1"):
+                prefix = "SH"
+            elif lowered == "bj":
+                prefix = "BJ"
+            else:
+                prefix = "SZ"
         else:
             prefix = "SH" if code.startswith("6") else "SZ"
         return f"{prefix}{code}"

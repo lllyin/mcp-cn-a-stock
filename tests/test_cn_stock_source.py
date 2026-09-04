@@ -1375,3 +1375,59 @@ async def test_page_fallback_breaker_closes_after_a_success(monkeypatch):
 
     assert result.fetch_failures == []
     assert not source_module._FUND_FLOW_PAGE_BREAKER.is_open
+
+
+# --- 北交所代码归属 ----------------------------------------------------------
+
+
+class TestBeijingExchangeMapping:
+    """北交所必须映射到 bj。
+
+    2026-09-04 实测：BJ430047 被判成 sz，于是腾讯被问 sz430047、新浪同理，两家
+    都抛 KeyError，三级 K 线全挂，整只票返回"未找到相关行情数据"。而腾讯本身是
+    支持的——直接请求 param=bj430047 能拿到真实日 K。
+    """
+
+    def _map(self, symbol):
+        source = CNStockDataSource()
+        code, market = source._symbol_to_akshare(symbol)
+        return code, market, source._get_canonical_symbol(code, market)
+
+    @pytest.mark.parametrize(
+        "symbol,code",
+        [
+            ("BJ430047", "430047"),
+            ("BJ831195", "831195"),
+            ("BJ871981", "871981"),
+            ("BJ889999", "889999"),
+            ("BJ920819", "920819"),
+        ],
+    )
+    def test_beijing_codes_map_to_bj(self, symbol, code):
+        assert self._map(symbol) == (code, "bj", f"BJ{code}")
+
+    @pytest.mark.parametrize(
+        "symbol,market",
+        [
+            ("SH600547", "sh"),
+            ("SH688981", "sh"),
+            ("SZ000001", "sz"),
+            ("SZ300408", "sz"),
+            ("SZ002594", "sz"),
+            ("SH510300", "sh"),
+            ("SZ159915", "sz"),
+        ],
+    )
+    def test_other_markets_are_unchanged(self, symbol, market):
+        assert self._map(symbol)[1] == market
+
+    def test_index_correction_still_works(self):
+        """SH000333 之类写错前缀的仍要纠正到 sz。"""
+        assert self._map("SH000333")[1] == "sz"
+        assert self._map("SH000001")[1] == "sh"   # 上证指数在名单里
+
+    def test_akshare_to_symbol_round_trips_bj(self):
+        source = CNStockDataSource()
+        assert source._akshare_to_symbol("430047", "bj") == "BJ430047"
+        assert source._akshare_to_symbol("600547", "sh") == "SH600547"
+        assert source._akshare_to_symbol("300408", "sz") == "SZ300408"
