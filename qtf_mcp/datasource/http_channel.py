@@ -296,7 +296,7 @@ def _install_proxy(gateway, token, retry: int) -> None:
 
 def install_http_channel(
     requested=None,
-    proxy_enabled: bool = True,
+    proxy_enabled: bool = False,
     proxy_gateway=None,
     proxy_token=None,
     proxy_retry: int = 30,

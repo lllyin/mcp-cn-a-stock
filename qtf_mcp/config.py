@@ -20,7 +20,9 @@ def _parse_bool(raw, default: bool) -> bool:
 
 
 # AkShare Proxy Patch Configuration
-AKSHARE_PROXY_ENABLED = _parse_bool(os.getenv("AKSHARE_PROXY_ENABLED"), True)
+# 默认关闭：网关是付费的，每次认证都计积分，而 impersonate 通道在同样的东财主机
+# 上已经能独立取到数据。没有显式开启的部署不应该在第一次调用时就开始扣费。
+AKSHARE_PROXY_ENABLED = _parse_bool(os.getenv("AKSHARE_PROXY_ENABLED"), False)
 AKSHARE_PROXY_IP = os.getenv("AKSHARE_PROXY_GATEWAY") or os.getenv("AKSHARE_PROXY_IP")
 AKSHARE_PROXY_PASSWORD = os.getenv("AKSHARE_PROXY_TOKEN") or os.getenv("AKSHARE_PROXY_PASSWORD")
 AKSHARE_PROXY_RETRY = int(os.getenv("AKSHARE_PROXY_RETRY", os.getenv("AKSHARE_PROXY_PORT", "30")))

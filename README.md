@@ -13,8 +13,8 @@ CnStock 是一个面向大模型和 MCP 客户端的 A 股数据服务。
 - 支持指定历史截止日期，非交易日自动使用最近可用行情。
 - 自动纠正错误市场前缀，例如将 `SH000333` 规范为 `SZ000333`。
 - 内置 KDJ、MACD、RSI、布林带等技术指标。
+- 开箱即用，不需要付费网关；上游接口不可用时逐级回退到备用数据源。
 - 使用有界并发控制同步数据请求，适合 Ubuntu 2 核 4G 等小型服务器。
-- 全市场涨跌分布支持数据源回退、短时缓存和同请求合并。
 
 ## MCP 工具
 
@@ -27,8 +27,10 @@ CnStock 是一个面向大模型和 MCP 客户端的 A 股数据服务。
 | `kline_daily` | Markdown | 指定交易日的 K 线 |
 | `kline_range` | Markdown 表格 | 指定日期区间的 K 线 |
 | `market_breadth` | 严格 JSON | 全市场涨跌家数、涨跌停和十档分布 |
+| `market_events` | 严格 JSON | 指定日期的龙虎榜、涨停池、公告和业绩预告 |
 
 完整报告示例：[兆易创新 SH603986](docs/SH603986-full.md)。
+各工具的返回字段见[技术实现说明](docs/technical-details.md#9-输出与错误契约)。
 
 ## 环境要求
 
@@ -36,8 +38,7 @@ CnStock 是一个面向大模型和 MCP 客户端的 A 股数据服务。
 - Linux、macOS；生产部署推荐 Ubuntu。
 - 推荐使用 [uv](https://docs.astral.sh/uv/) 管理依赖。
 - 可访问 AkShare、efinance 使用的公开行情接口。
-- AkShare Proxy Patch 账号可选，但推荐用于提高东财接口稳定性。
-- `market_breadth` 首选数据源需要 Chromium；不可用时会回退到 efinance。
+- Chromium：盘中实时资金流和 `market_breadth` 的首选数据源需要，缺失时会回退到备用源。
 
 ## 快速安装
 
@@ -65,173 +66,27 @@ source .venv/bin/activate
 pip install .
 ```
 
-### 3. 安装可选浏览器依赖
-
-需要同花顺全市场涨跌分布时安装 Chromium：
+### 3. 安装浏览器
 
 ```bash
 playwright install chromium
 ```
 
-Ubuntu 可使用 Playwright 安装浏览器所需的系统依赖：
+Ubuntu 用下面这条命令，会一并安装浏览器所需的系统依赖：
 
 ```bash
 playwright install --with-deps chromium
 ```
 
-无桌面的 Ubuntu 可额外安装 `xvfb`。`start.sh` 会在没有 `DISPLAY` 时自动启动并管理
-一个项目专用的 Xvfb；未安装也不影响其他工具，`market_breadth` 会尝试备用数据源。
-
-## 配置
-
-复制示例配置后按需修改：
-
-```bash
-cp .env.example .env
-```
-
-主要配置如下：
-
-```env
-# 出站 HTTP 通道：auto | proxy | impersonate | direct，默认 auto
-CN_STOCK_HTTP_MODE=auto
-
-# AkShare Proxy Patch，可选但推荐
-AKSHARE_PROXY_ENABLED=1
-AKSHARE_PROXY_GATEWAY=你的代理网关
-AKSHARE_PROXY_TOKEN=你的访问令牌
-AKSHARE_PROXY_RETRY=30
-
-# impersonate 通道参数，以下是默认值
-CN_STOCK_HTTP_IMPERSONATE_RETRY=3
-CN_STOCK_HTTP_IMPERSONATE_TIMEOUT=8
-CN_STOCK_HTTP_IMPERSONATE_PROFILE=chrome
-
-# 盘中行情的多级回退。按顺序尝试，逗号分隔；置 off 关闭整层。
-# fund_flow_page 复用资金流向页面里已解析的页头行情，不发请求，但没有开高低；
-# tencent 走 qt.gtimg.cn，六项俱全。兜底源的日K盘中不含当天，靠这一层补上。
-CN_STOCK_INTRADAY_QUOTE_PROVIDERS=fund_flow_page,tencent
-
-# 资金流向页面兜底，以下是默认值
-CN_STOCK_FUND_FLOW_PAGE_FALLBACK_ENABLED=1
-CN_STOCK_FUND_FLOW_PAGE_FALLBACK_CONCURRENCY=1
-CN_STOCK_FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS=0.5
-CN_STOCK_FUND_FLOW_PAGE_TABLE_WAIT_SECONDS=15
-CN_STOCK_FUND_FLOW_PAGE_REUSE_SECONDS=30
-CN_STOCK_FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD=2
-CN_STOCK_FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS=300
-CN_STOCK_FUND_FLOW_PAGE_COLD_ATTEMPTS=2
-
-# 上游源熔断，以下是默认值
-CN_STOCK_SOURCE_BREAKER_ENABLED=1
-CN_STOCK_SOURCE_BREAKER_THRESHOLD=3
-CN_STOCK_SOURCE_BREAKER_COOLDOWN_SECONDS=120
-
-# 同步行情 I/O 并发，以下是默认值
-CN_STOCK_DATA_FETCH_MAX_WORKERS=8
-CN_STOCK_DATA_FETCH_MAX_IN_FLIGHT=16
-CN_STOCK_BATCH_QUERY_CONCURRENCY=2
-CN_STOCK_FINANCE_CACHE_TTL_SECONDS=21600
-CN_STOCK_FINANCE_CACHE_MAX_ENTRIES=512
-
-# 报告缓存，以下是默认值
-CN_STOCK_REPORT_CACHE_ENABLED=1
-CN_STOCK_REPORT_CACHE_LIVE_TTL_SECONDS=30
-CN_STOCK_REPORT_CACHE_SETTLE_HHMM=1530
-CN_STOCK_REPORT_CACHE_MAX_ENTRIES=512
-CN_STOCK_REPORT_CACHE_DISK_ENABLED=1
-CN_STOCK_REPORT_CACHE_DIR=.runtime/report-cache
-```
-
-### 出站 HTTP 通道
-
-部分东方财富接口会直接断开普通 HTTP 客户端的连接，表现为空响应体和
-`Expecting value: line 1 column 1 (char 0)`。`CN_STOCK_HTTP_MODE` 决定用哪种方式访问
-这些主机，四种模式互斥，同一进程只安装一个：
-
-| 模式 | 行为 |
-|---|---|
-| `proxy` | 经 AkShare Proxy Patch 的授权网关和代理出口，附带 Cookie 与积分计费 |
-| `impersonate` | 本机直连，用 curl_cffi 伪装浏览器 TLS 指纹，无需网关 |
-| `direct` | 本机直连 + 原生 `requests`，即引入该开关之前的行为（可写作 `off`） |
-| `auto` | 网关可用时选 `proxy`，否则降级 `impersonate`（默认） |
-
-`impersonate` 只更换 TLS 指纹，不涉及浏览器；抓实时资金流的 Playwright 是另一条独立链路。
-
-`auto` 永不因配置缺失而启动失败，只会降级并打印 WARNING；只有显式写
-`CN_STOCK_HTTP_MODE=proxy` 却没有配 `AKSHARE_PROXY_GATEWAY` 时才会启动即报错。
-
-启动日志会在版本信息之后打印实际生效的通道：
-
-```text
-cn-stock-mcp version=1.2.0
-Market data library versions: akshare=... efinance=...
-HTTP channel mode=impersonate reason=auto:proxy_disabled profile=chrome retry=3 timeout=8.0s hooked_hosts=4
-HTTP channel mode=proxy reason=auto:proxy_configured gateway=... token=configured retry=30 patch_version=0.5.0 hooked_hosts=4
-HTTP channel mode=direct reason=requested hooked_hosts=4
-```
-
-`reason` 会写明是显式指定（`requested`）、`auto` 的判定结果，还是降级
-（`curl_cffi_unavailable`、`requests_already_patched`），降级同时记 WARNING。
-
-注意入口会执行 `load_dotenv(override=True)`，**`.env` 的取值优先于 shell 环境变量**。
-临时切换通道要改 `.env` 或注释掉其中的 `CN_STOCK_HTTP_MODE`，
-`CN_STOCK_HTTP_MODE=direct ./start.sh` 这种写法会被 `.env` 覆盖掉。
-
-只有 `push2`、`push2his`、`fund`、`emweb.securities` 这四个东方财富主机会被接管；
-同花顺以及 `public_events` 用到的 `datacenter-web`、`push2ex` 均原样直连。
-
-`AKSHARE_PROXY_ENABLED` 仍然有效，但只作为 `auto` 的判定输入，不再单独触发安装。
-兼容旧变量名 `AKSHARE_PROXY_IP`、`AKSHARE_PROXY_PASSWORD` 和
-`AKSHARE_PROXY_PORT`。其中 `PORT` 历史上表示重试次数，不是网络端口；新部署建议使用
-含义明确的 `GATEWAY`、`TOKEN`、`RETRY`。修改后需要重启 MCP 服务。
-
-Ubuntu 2 核 4G 建议先保持默认的 `8/16`。提高数值会增加上游压力，并不保证降低延迟。
-交易时段的 `brief/medium/full` 都以 Playwright 为实时资金流来源；仅同时进行中的
-同标的 Playwright 请求会合并，完成后的新请求仍会重新获取实时数据。
-成功且非空的财务摘要默认缓存 6 小时；缓存命中不会提交线程池任务。
-`brief/medium/full` 共用最多 2 个活跃批次的准入限制。财务缓存每次访问清理过期项，
-超过 512 个标的时淘汰最早缓存，避免进程长期运行时无限增长。
-参数含义和调优方法见[技术实现说明](docs/technical-details.md)。
-
-### 报告缓存
-
-按标的缓存已渲染的报告，用于降低代理积分消耗；命中与否不改变返回内容。
-缓存条目绑定"市场纪元"——只有在重新生成会得到同样字节的时间窗口内才会被复用：
-
-| 时段 | 复用行为 |
-|------|----------|
-| 09:15–11:30、13:00–SETTLE | 仅 `LIVE_TTL_SECONDS` 内复用，用于合并突发重复请求 |
-| 11:30–11:35、17:00–17:05 | 边界结算缓冲，同上（上游此时尚未定稿） |
-| 11:35–13:00 午间休市 | 纪元内完全复用 |
-| SETTLE–17:00 | 纪元内完全复用 |
-| 17:05–次日 09:15、周末 | 纪元内完全复用 |
-
-`CN_STOCK_REPORT_CACHE_ENABLED=0` 时缓存完全不参与调用链，可用于冷热对照压测。
-`CN_STOCK_REPORT_CACHE_LIVE_TTL_SECONDS=0` 则保留闭市复用、但盘中绝不复用。
-
-盘中数值持续变动，因此缓存命中返回的必然是一份稍旧的快照，TTL 决定这份快照能有多旧。
-基于下游真实捕获的比对，主力净流入的 P90 相对漂移在 60 秒窗口是 21%、30 秒窗口是 7.7%，
-方向翻转（净流入读成净流出）的比例低于 1%；当日价的漂移可忽略（P90 0.2%）。默认取 30 秒，
-代价是约 2.8 个百分点的积分降幅。对资金流精度要求更高时可设为 0。
-
-`CN_STOCK_REPORT_CACHE_SETTLE_HHMM` 是收盘后的结算缓冲终点，四位 HHMM。默认 `1530`：
-连续竞价 15:00 结束，但东财资金流页面要在收盘后几分钟才定稿，提前复用会把半结算的
-数字钉住整个盘后窗口。取值被夹在 `[1500, 1700]`，越界会记 WARNING 并夹到边界——早于
-15:00 会把仍在变动的盘中折进完全复用纪元，晚于 17:00 会让一个纪元横跨实时资金流的
-渲染分支翻转点（`research.is_realtime_fund_flow_window`）。
-
-磁盘层写在 `CN_STOCK_REPORT_CACHE_DIR`，用于跨重启保留闭市纪元的条目（傍晚纪元长达
-16 小时，周末达 64 小时）。旧纪元目录不会在纪元切换时立即删除——过期条目靠读取时的
-纪元校验失效，目录本身由每小时至多一次的清理在超过 5 天保留期后回收。
-
-`market_breadth` 不走缓存：它以同花顺为主源，不消耗代理积分。
+无桌面的 Ubuntu 可额外安装 `xvfb`。`start.sh` 会在没有 `DISPLAY` 时自动启动并管理一个项目专用的
+Xvfb；未安装也不影响其他工具。
 
 ## 启动和停止
 
-推荐通过脚本后台运行：
+复制一份配置，然后用脚本后台运行：
 
 ```bash
+cp .env.example .env
 ./start.sh
 ```
 
@@ -241,16 +96,10 @@ Ubuntu 2 核 4G 建议先保持默认的 `8/16`。提高数值会增加上游压
 http://localhost:8686/cnstock/mcp
 ```
 
-查看日志：
+查看日志（启动时会打印当前版本）：
 
 ```bash
 tail -f logs/cn-stock-mcp.log
-```
-
-日志启动时会输出当前版本，例如：
-
-```text
-cn-stock-mcp version=1.2.0
 ```
 
 停止服务：
@@ -266,6 +115,116 @@ cn-stock-mcp --transport http --port 8686
 cn-stock-mcp --transport stdio
 cn-stock-mcp --transport sse --port 8686
 ```
+
+## 配置
+
+所有配置都通过 `.env` 提供，全部可省略，省略即使用下表的默认值。改完需要重启服务。
+
+> 入口执行的是 `load_dotenv(override=True)`，**`.env` 的取值优先于 shell 环境变量**。
+> `CN_STOCK_HTTP_MODE=direct ./start.sh` 这种写法会被 `.env` 里的同名项覆盖掉，
+> 临时改配置请直接改 `.env` 或注释掉其中对应的行。
+
+### 出站 HTTP 通道
+
+部分东方财富接口会直接断开普通 HTTP 客户端的连接，`CN_STOCK_HTTP_MODE` 决定用哪种方式访问这些
+主机。默认的 `auto` 在没有配置网关时使用 `impersonate`，无需任何额外账号。
+
+| 配置名 | 可选参数 | 作用 |
+| --- | --- | --- |
+| `CN_STOCK_HTTP_MODE` | `auto`（默认）、`proxy`、`impersonate`、`direct`（可写作 `off`） | `auto` 在网关可用时走 `proxy`，否则降级 `impersonate`；`impersonate` 为本机直连 + 浏览器 TLS 指纹；`direct` 为原生 `requests` |
+| `CN_STOCK_HTTP_IMPERSONATE_RETRY` | 正整数，默认 `3` | 每个目标主机的伪装尝试次数，用尽后改用原生 `requests` 重放一次 |
+| `CN_STOCK_HTTP_IMPERSONATE_TIMEOUT` | 秒，默认 `8` | 单次伪装请求的超时 |
+| `CN_STOCK_HTTP_IMPERSONATE_PROFILE` | curl_cffi 浏览器名，默认 `chrome` | 伪装的浏览器指纹；固定取值才能复用 TLS 连接 |
+| `CN_STOCK_HTTP_IMPERSONATE_FAILURE_THRESHOLD` | 正整数，默认 `4` | 连续多少个主机完全失败后暂停伪装通道 |
+| `CN_STOCK_HTTP_IMPERSONATE_COOLDOWN_SECONDS` | 秒，默认 `300` | 暂停时长，期间直接走原生 `requests` |
+
+只有 `push2`、`push2his`、`fund`、`emweb.securities` 四个东方财富主机会被接管，其余主机原样直连。
+四种模式互斥，同一进程只安装一个；详见[出站 HTTP 通道](docs/technical-details.md#6-出站-http-通道)。
+
+### AkShare Proxy Patch（可选，付费）
+
+**默认关闭。** 这是一个按积分计费的授权网关，不配置也能正常使用全部工具；上游对本机出口 IP
+限流严重时可以启用它来提高东财接口的成功率。
+
+| 配置名 | 可选参数 | 作用 |
+| --- | --- | --- |
+| `AKSHARE_PROXY_ENABLED` | `0`（默认）、`1` | 是否启用网关。只作为 `CN_STOCK_HTTP_MODE=auto` 的判定输入 |
+| `AKSHARE_PROXY_GATEWAY` | 网关地址，不含协议和端口 | 授权网关地址（旧名 `AKSHARE_PROXY_IP`） |
+| `AKSHARE_PROXY_TOKEN` | 访问令牌 | 网关访问令牌（旧名 `AKSHARE_PROXY_PASSWORD`） |
+| `AKSHARE_PROXY_RETRY` | 正整数，默认 `30` | 失败重试次数（旧名 `AKSHARE_PROXY_PORT`，它表示重试次数而不是端口） |
+
+从旧版本升级时注意：这个开关以前默认开启。如果原来只配了 `GATEWAY` 和 `TOKEN`、没有写
+`AKSHARE_PROXY_ENABLED`，现在需要显式写 `AKSHARE_PROXY_ENABLED=1` 才会继续走网关，否则会
+自动降级到 `impersonate`，启动日志里的 `reason` 会是 `auto:proxy_disabled`。
+
+### 盘中行情与资金流
+
+盘中的当日 K 线 bar 由一层可插拔的实时行情 provider 补齐，资金流在东财接口不可用时回退到
+浏览器加载的资金流向页面。两者都可以整层关闭。
+
+| 配置名 | 可选参数 | 作用 |
+| --- | --- | --- |
+| `CN_STOCK_INTRADAY_QUOTE_PROVIDERS` | 逗号分隔，默认 `fund_flow_page,tencent`；`off` 关闭整层 | 盘中实时行情的尝试顺序。`fund_flow_page` 复用已解析的资金流页面，不发请求但没有开高低；`tencent` 走 `qt.gtimg.cn`，六项俱全 |
+| `CN_STOCK_FUND_FLOW_PAGE_FALLBACK_ENABLED` | `0`、`1`（默认） | 东财资金流接口不可用时，是否回退到资金流向页面 |
+| `CN_STOCK_FUND_FLOW_PAGE_FALLBACK_CONCURRENCY` | 正整数，默认 `1` | 同时进行的兜底页面加载数。调高会挤占实时资金流的浏览器额度 |
+| `CN_STOCK_FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS` | 秒，默认 `0.5` | 等不到槽位就跳过兜底，改渲染“盘中实时数据暂时不可用”，不排队 |
+| `CN_STOCK_FUND_FLOW_PAGE_TABLE_WAIT_SECONDS` | 秒，默认 `15` | 等历史表渲染完成的上限。请求被拒时会提前结束，不会白等满 |
+| `CN_STOCK_FUND_FLOW_PAGE_REUSE_SECONDS` | 秒，默认 `30`；`0` 关闭复用 | 同一标的页面解析结果的复用窗口，避免一次请求内重复加载同一页面 |
+| `CN_STOCK_FUND_FLOW_PAGE_COLD_ATTEMPTS` | 正整数，默认 `2` | 本进程还没成功取到过数据时，单次请求允许的页面加载次数 |
+| `CN_STOCK_FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD` | 正整数，默认 `2` | 连续多少次徒劳加载后暂停整层兜底 |
+| `CN_STOCK_FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS` | 秒，默认 `300` | 暂停时长 |
+
+### 上游源熔断
+
+某个上游源连续失败时直接跳过它，不必每次请求都把整条 provider 链走完。
+
+| 配置名 | 可选参数 | 作用 |
+| --- | --- | --- |
+| `CN_STOCK_SOURCE_BREAKER_ENABLED` | `0`、`1`（默认） | 是否启用熔断 |
+| `CN_STOCK_SOURCE_BREAKER_THRESHOLD` | 正整数，默认 `3` | 连续失败多少次后跳过该源 |
+| `CN_STOCK_SOURCE_BREAKER_COOLDOWN_SECONDS` | 秒，默认 `120` | 冷却时长，结束后放行一次探测请求 |
+
+### 并发与线程池
+
+AkShare 和 efinance 的接口是同步网络调用，由一个有界线程池执行。Ubuntu 2 核 4G 建议保持默认值，
+调高会增加上游压力，并不保证降低延迟。
+
+| 配置名 | 可选参数 | 作用 |
+| --- | --- | --- |
+| `CN_STOCK_DATA_FETCH_MAX_WORKERS` | 正整数，默认 `8` | 同时执行同步数据任务的线程数 |
+| `CN_STOCK_DATA_FETCH_MAX_IN_FLIGHT` | 正整数，默认 `16` | 已运行和已提交任务的总上限，超出后请求以协程等待 |
+| `CN_STOCK_BATCH_QUERY_CONCURRENCY` | 正整数，默认 `2` | `brief/medium/full` 共享的活跃批次数上限 |
+| `CN_STOCK_FINANCE_CACHE_TTL_SECONDS` | 秒，默认 `21600`；`0` 关闭 | 成功且非空的财务摘要缓存时间。财务数据只在定期报告发布后变动 |
+| `CN_STOCK_FINANCE_CACHE_MAX_ENTRIES` | 正整数，默认 `512` | 财务缓存的最大标的数，超出后淘汰最早项 |
+
+### 报告缓存
+
+按标的缓存已渲染的报告。缓存条目绑定“市场纪元”，只在重新生成会得到同样字节的窗口内复用，
+因此命中与否不改变返回内容。
+
+| 配置名 | 可选参数 | 作用 |
+| --- | --- | --- |
+| `CN_STOCK_REPORT_CACHE_ENABLED` | `0`、`1`（默认） | 关闭后缓存完全不参与调用链，可用于冷热对照压测 |
+| `CN_STOCK_REPORT_CACHE_LIVE_TTL_SECONDS` | 秒，默认 `30`；`0` 表示盘中绝不复用 | 盘中数值持续变动，这个 TTL 只用于合并突发重复请求 |
+| `CN_STOCK_REPORT_CACHE_SETTLE_HHMM` | 四位 HHMM，默认 `1530`，取值夹在 `1500`–`1700` | 收盘后进入完全复用纪元的时间。默认留 30 分钟缓冲等东财资金流页面定稿 |
+| `CN_STOCK_REPORT_CACHE_MAX_ENTRIES` | 正整数，默认 `512` | 内存缓存的最大条目数 |
+| `CN_STOCK_REPORT_CACHE_DISK_ENABLED` | `0`、`1`（默认） | 跨重启保留闭市纪元的条目。傍晚纪元长达 16 小时，周末达 64 小时 |
+| `CN_STOCK_REPORT_CACHE_DIR` | 路径，默认 `.runtime/report-cache` | 磁盘缓存目录，相对路径基于项目根目录 |
+
+盘中命中返回的必然是一份稍旧的快照，TTL 决定这份快照能有多旧。对资金流精度要求高时设为 `0`。
+纪元划分、TTL 取值依据和实测数据见[报告缓存](docs/technical-details.md#10-报告缓存)。
+
+### 浏览器与显示
+
+| 配置名 | 可选参数 | 作用 |
+| --- | --- | --- |
+| `CN_STOCK_TONGHUASHUN_AUTH_FILE` | 路径，默认 `.runtime/tonghuashun-auth.json` | 同花顺认证缓存文件 |
+| `CN_STOCK_TONGHUASHUN_COOLDOWN_SECONDS` | 秒，默认 `300` | 同花顺认证失败后的冷却时间，冷却期内 `market_breadth` 直接用 efinance |
+| `CN_STOCK_CHROME_NO_SANDBOX` | `0`（默认）、`1` | 为 Chromium 添加 `--no-sandbox`。会降低浏览器隔离，仅在受控容器且 sandbox 确实不可用时启用 |
+| `CN_STOCK_XVFB_DISPLAY_NUMBER` | 整数，默认 `99` | 无 `DISPLAY` 时 `start.sh` 使用的 Xvfb 起始显示号 |
+| `CN_STOCK_XVFB_SCREEN` | `宽x高x色深`，默认 `1920x1080x24` | Xvfb 屏幕配置 |
+| `CN_STOCK_FUND_FLOW_PAGE_HEADFUL` | `0`（默认）、`1` | 调试开关：资金流页面用有头浏览器加载，便于人工观察渲染结果 |
+| `CN_STOCK_FUND_FLOW_PAGE_KEEP_PAGES` | `0`（默认）、`1` | 调试开关：抓完不关页面。每个页面是一个独立渲染进程，会显著抬高内存 |
 
 ## 使用 mcporter 调用
 
@@ -306,14 +265,12 @@ mcporter call cn-stock brief symbol=SZ002463 date=2026-06-05
 mcporter call cn-stock tech symbol=SZ002463 days=30 date=2026-06-05
 ```
 
-查询单日或区间 K 线：
+查询单日或区间 K 线，`adjust` 可选 `qfq`（前复权）、`hfq`（后复权）和 `none`（不复权）：
 
 ```bash
 mcporter call cn-stock kline_daily symbol=SH603986 date=2026-05-29 adjust=qfq
 mcporter call cn-stock kline_range symbol=SH603986 start_date=2026-05-22 end_date=2026-05-29
 ```
-
-`adjust` 可选 `qfq`（前复权）、`hfq`（后复权）和 `none`（不复权）。
 
 查询全市场涨跌分布：
 
@@ -321,25 +278,7 @@ mcporter call cn-stock kline_range symbol=SH603986 start_date=2026-05-22 end_dat
 mcporter call cn-stock market_breadth
 ```
 
-## 返回结构
-
-`brief`、`medium`、`full` 的顶层响应包含：
-
-- `reports`：以规范化证券代码为键的 Markdown 报告。
-- `errors`：以证券代码为键的错误信息。
-- `warnings`：批量截断、数据回退等非致命提醒。
-- `symbols_count`：应用批量上限后的标的数量。
-- `timestamp`：报告生成时间。
-
-`tech` 使用相同的批量外壳，但 `reports` 的值是结构化对象，包含 `symbol`、`name`、
-`quote_date` 和按日期排列的 `indicators`。不可计算或缺失的指标使用 JSON `null`。
-
-`market_breadth` 返回 `source`、抓取时间、涨跌和平盘家数、涨跌停家数、十档涨跌幅分布
-及回退警告。调用方应读取 `source` 和 `warnings`，不要假设每次都来自同一提供方。
-
-`market_events` 按指定日期返回严格 as-of 的结构化公开事件池，可组合 `lhb`、`limit_up`、
-`strong`、`previous_limit_up`、`broken_board`、`announcements` 和 `earnings_forecast`。响应会主动删除龙虎榜
-“上榜后N日”等未来字段；历史池为空时通过 `warnings` 提示供应商保留窗口，不能把空表解释为当日无事件。
+查询指定日期的公开事件池：
 
 ```bash
 mcporter call cn-stock market_events \
@@ -351,16 +290,9 @@ mcporter call cn-stock market_events \
   max_rows_per_source=200
 ```
 
-`symbols` 可选，使用标准 `SH/SZ/BJ + 6位代码`，并在 `max_rows_per_source` 截断前过滤；
-适合先读取 LHB/涨停池，再只抓这些证券的公告。省略时保持原来的全市场行为。
-
-`kline_daily` / `kline_range` 保留原 efinance 和 AkShare 主路径；配置
-`akshare-proxy-patch` 后若主路径失败，会自动回退腾讯历史行情，返回格式不变。
-
-`earnings_forecast` 按查询日自动选择最近已结束报告期（1-3月取上年年报、4-6月取一季报、
-7-9月取中报、10-12月取三季报），再按 `announcement_lookback_days` 过滤公告日期；返回预测
-指标、预告类型、预测值、同比变动中值、上年同期值、原因和报告期。生产回测仍应优先读取每日归档，
-因为供应商报告期快照可能覆盖历史修订版本；该来源会返回 `revision_safe=false` 和明确 warning。
+`sources` 可组合 `lhb`、`limit_up`、`strong`、`previous_limit_up`、`broken_board`、
+`announcements` 和 `earnings_forecast`。`symbols` 可选，使用标准 `SH/SZ/BJ + 6 位代码`，
+在 `max_rows_per_source` 截断前过滤；省略时保持全市场行为。
 
 ## MCP 客户端接入
 
@@ -411,6 +343,11 @@ python -c "from qtf_mcp import __version__; print(__version__)"
 
 周末和节假日通常返回截止日期之前最近一个交易日的数据；代码错误或标的尚未上市时可能返回空结果。
 
+**报告里出现“盘中实时数据暂时不可用”**
+
+东财资金流接口和页面兜底都没取到数据，其余部分不受影响。这是瞬时状态，不会被写进缓存。
+科创 50（`SH000688`）等没有资金流向页面的指数在盘中本来就没有这一段。
+
 **`market_breadth` 出现 fallback warning**
 
 首选数据源认证失败、处于冷却期或浏览器不可用时会自动回退。响应仍可使用，但应关注
@@ -422,7 +359,7 @@ python -c "from qtf_mcp import __version__; print(__version__)"
 
 ## 更多文档
 
-- [技术实现说明](docs/technical-details.md)
+- [技术实现说明](docs/technical-details.md)：架构、数据链路与回退、输出契约、报告缓存、调优边界
 - [完整报告示例](docs/SH603986-full.md)
 - [DeepChat 使用示例](docs/let-your-deepseek-analyze-stock-by-mcp.md)
 
