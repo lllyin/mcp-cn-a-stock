@@ -196,7 +196,7 @@ HTTP channel mode=direct reason=requested hooked_hosts=4
 同样这四个主机上已经能独立取到数据。关闭时不导入、不安装 `akshare_proxy_patch`，AkShare
 走原生请求链路。该开关只作为 `auto` 的判定输入，不再单独触发安装；修改后需要重启服务。
 
-支持的新变量名为：
+相关变量为：
 
 ```env
 AKSHARE_PROXY_ENABLED=1
@@ -204,10 +204,6 @@ AKSHARE_PROXY_GATEWAY=...
 AKSHARE_PROXY_TOKEN=...
 AKSHARE_PROXY_RETRY=30
 ```
-
-旧变量 `AKSHARE_PROXY_IP`、`AKSHARE_PROXY_PASSWORD`、`AKSHARE_PROXY_PORT` 继续兼容。
-`AKSHARE_PROXY_PORT` 实际表示重试次数，这是历史命名问题；新部署建议使用含义明确的
-`GATEWAY`、`TOKEN`、`RETRY`。
 
 一次 MCP 调用可能产生多个命中代理的 HTTP 请求，失败重试还会放大请求数。因此真实并发
 benchmark 应以代理尝试数设置预算，不能用 MCP 调用次数估算积分消耗。高样本并发测试应优先使用
