@@ -720,3 +720,42 @@ class TestColdSessionAttempts:
         await realtime_ff._load_page_shared("300408", require_history=True)
 
         assert len(seen) == 1
+
+# --- 风控滑块痕迹 -----------------------------------------------------------
+# 只用来解释"已经失败了"，绝不用来判定失败，所以这里同时钉住"正常页面不误报"。
+
+
+def test_captcha_marker_is_detected():
+    """被拒页面上滑块模态框的 iframe 会被认出来。"""
+    html = (
+        '<div class="title">三环集团(300408)</div>'
+        '<div class="popwscps_d"><div class="popwscps_d_shadow"></div>'
+        '<iframe class="popwscps_d_iframe" '
+        'src="https://i.eastmoney.com/websitecaptcha/slidervalid"></iframe></div>'
+        '<td data-field="f62"></td>'
+    )
+    page = parse_fund_flow_page(html)
+
+    assert page.captcha_present is True
+    assert page.has_today is False
+
+
+def test_captcha_library_alone_is_not_a_marker():
+    """popwscpc.js 是库，正常页面也会加载，不能当作被拦截的证据。"""
+    html = (
+        '<div class="title">三环集团(300408)</div>'
+        '<script src="https://i.eastmoney.com/websitecaptcha/build/popwscpc.js">'
+        "</script>"
+        '<td data-field="f62">1.59亿</td>'
+    )
+    page = parse_fund_flow_page(html)
+
+    assert page.captcha_present is False
+    assert page.has_today is True
+
+
+def test_captured_page_has_no_captcha_marker():
+    """真实成功抓取的页面不该被判成有滑块。"""
+    for name in ("eastmoney_zjlx_300408.html", "eastmoney_zjlx_full_300408.html"):
+        fixture = Path(__file__).parent / "fixtures" / name
+        assert parse_fund_flow_page(fixture.read_text(encoding="utf-8")).captcha_present is False

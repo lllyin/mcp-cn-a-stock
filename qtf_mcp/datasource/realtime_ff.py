@@ -215,10 +215,21 @@ class FundFlowPageRefused(RuntimeError):
     这不是慢：等满 10 秒也没有迟到的响应，而页面自己只轮询今日、从不重发历史。
     页面框架照常渲染，数据区留空。
 
-    被拒是逐次随机的：8 轮全新浏览器里，成功集中在前两次尝试，而失败的那几轮
-    连试三次也全败。所以既不能靠多试解决，也不值得长时间退避。
+    2026-09-04 15:50 抓到了机制：被拒时页面同时跑完整套滑块验证，且全部 200 ——
+    ``websitecaptcha/api/checkuser``、``websitecaptcha/slidervalid``、
+    ``smartvcode2.../Titan/api/captcha/get``、``icon_slide.png``，DOM 里挂着
+    ``<iframe class="popwscps_d_iframe">``。也就是说风控判定这个出口 IP 需要过
+    滑块，空响应就是风控本身，滑块是它给的解法。``captcha_present`` 就是从这些
+    痕迹认出来的，只用于把原因写进错误信息。
 
-    使用者报告过看到滑块验证，那是这类拒绝的一种可能成因，但这里不做断言。
+    进入这个状态后不是逐次随机：实测背靠背 10 次全拒、静默 75 秒后 4 次全拒、
+    16 分钟后仍拒。所以靠 ``COLD_ATTEMPTS`` 多试一次救不回来。（早先"成功集中在
+    前两次尝试"的观察来自未被风控的时段，两者不矛盾：没被风控时偶发失败重试有
+    用，被风控时重试无用。）
+
+    有头模式加上不关页面之所以"稳定能取到"，是因为人能看见并手动过掉滑块，
+    过完的会话被保留下来复用——不是有头本身躲过了检测。实测无人值守的有头模式
+    每次都丢弃页面时是 0/12，比无头还差。
     """
 
 
@@ -366,10 +377,15 @@ async def load_fund_flow_page(symbol: str, context: BrowserContext) -> FundFlowP
         # 但那时不会有请求失败，所以两个条件必须同时成立才算"被拒"。
         got_nothing = parsed is None or (not parsed.history and not parsed.has_today)
         if got_nothing and refused:
-            outcome = "blocked"
+            captcha = parsed is not None and parsed.captcha_present
+            outcome = "blocked_captcha" if captcha else "blocked"
+            reason = (
+                "东财风控要求滑块验证（页面已弹出验证框），过验证前接口不会返回数据"
+                if captcha
+                else "页面数据区为空"
+            )
             raise FundFlowPageRefused(
-                f"{symbol} 资金流接口拒绝了 {len(refused)} 个请求（空响应），"
-                "页面数据区为空"
+                f"{symbol} 资金流接口拒绝了 {len(refused)} 个请求（空响应），{reason}"
             ) from None
         if parsed is None:
             raise FundFlowPageError(f"{symbol} 页面既无今日数据也无历史表")

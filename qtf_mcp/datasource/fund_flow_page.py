@@ -70,6 +70,14 @@ QUOTE_FIELD_IDS = {
     "totalPrice": "成交额",
 }
 
+# 风控滑块被实例化时页面上出现的痕迹。用模态框自己的 iframe 而不是
+# ``websitecaptcha/build/popwscpc.js`` —— 后者是库，正常页面也会加载，只有这个
+# iframe 出现才说明验证已经弹出来了。
+# 实测 2026-09-04 15:50 被拒时的页面：<div class="popwscps_d"> 里挂着
+# <iframe class="popwscps_d_iframe" src=".../websitecaptcha/slidervalid">，
+# 同时 checkuser / Titan/api/captcha/get / icon_slide.png 全部 200。
+_CAPTCHA_MARKERS = ("popwscps_d_iframe", "websitecaptcha/slidervalid")
+
 _PLACEHOLDERS = {"", "-", "--", "—", "常规"}
 _TITLE_RE = re.compile(r"^(?P<name>.*?)[（(](?P<code>\d{6})[)）]")
 _NUMBER_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
@@ -118,6 +126,9 @@ class FundFlowPage:
     today_text: dict = field(default_factory=dict)
     # 页头实时行情的原样文本，键是中文字段名。
     quote_text: dict = field(default_factory=dict)
+    # 页面上出现了风控滑块。只用来解释"已经失败了"，绝不用来判定失败：万一正常
+    # 页面也带这个痕迹，误判会把一份好数据丢掉。
+    captcha_present: bool = False
 
     @property
     def has_quote(self) -> bool:
@@ -333,7 +344,10 @@ def parse_fund_flow_page(html: str) -> FundFlowPage:
     parser.feed(html)
     parser.close()
 
-    page = FundFlowPage(title_text=parser.title_text)
+    page = FundFlowPage(
+        title_text=parser.title_text,
+        captcha_present=any(marker in html for marker in _CAPTCHA_MARKERS),
+    )
     match = _TITLE_RE.match(parser.title_text)
     if match:
         page.name = match.group("name").strip()
