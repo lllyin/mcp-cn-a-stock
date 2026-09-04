@@ -295,6 +295,63 @@ class TestScore:
         assert verify.Score().overall == 100.0
 
 
+class TestPayloadShapes:
+    def test_a_result_wrapper_is_unwrapped(self):
+        """归档里 kline 的载荷是 {"result": "..."}（mcporter 的 json 输出模式），
+        而重放用 text 模式拿到裸正文。不脱壳就会报成"整份缺失"。
+        """
+        wrapped = verify.parse_payload('{"result": "# SH600362 K线数据\\n\\n共 3 个交易日"}')
+        bare = verify.parse_payload("# SH600362 K线数据\n\n共 3 个交易日")
+        assert wrapped.documents == bare.documents
+        assert verify.compare_documents(
+            wrapped.documents["（正文）"], bare.documents["（正文）"], "x"
+        ).clean
+
+    def test_a_reports_envelope_is_not_mistaken_for_a_wrapper(self):
+        payload = verify.parse_payload('{"reports": {"SH600519": "x"}, "errors": {}}')
+        assert list(payload.documents) == ["SH600519"]
+
+
+class TestNumericCanonicalisation:
+    def test_int_and_float_spellings_of_the_same_number_agree(self):
+        """上游把 10 写成 10.0 不是数据变化。逐字比会把它报成几十处"值变化"。"""
+        old = {"events": [{"seal_amount": 17932200, "pct": 10}]}
+        new = {"events": [{"seal_amount": 17932200.0, "pct": 10.0}]}
+        assert verify.compare_structures(old, new, "x").clean
+
+    def test_a_real_numeric_change_still_shows(self):
+        diff = verify.compare_structures({"a": 10}, {"a": 10.5}, "x")
+        assert [(d.kind, d.key, d.old, d.new) for d in diff.diffs] == [
+            ("值变化", "a", "10", "10.5")
+        ]
+
+    def test_booleans_and_nulls_are_not_numbers(self):
+        assert verify.compare_structures({"a": True}, {"a": 1}, "x").diffs
+        assert verify.compare_structures({"a": None}, {"a": 0}, "x").diffs
+
+
+class TestLostSectionCollapse:
+    def test_a_whole_section_vanishing_is_one_row(self):
+        """full 的历史资金流向是 60 行的表，拿不到时逐行列出会把别的差异挤没。"""
+        old = "## 历史资金流向\n" + "\n".join(f"| 2026-08-{d:02d} | x |" for d in range(1, 21))
+        diff = verify.compare_documents(old, "# 别的\n- a: 1\n", "x")
+        lost = [d for d in diff.hard if "整段不见了" in d.key]
+        assert len(lost) == 1 and "21 行" in lost[0].key
+
+    def test_a_section_that_only_changed_is_not_collapsed(self):
+        """段落还在、只是内容变了，就得逐行报——那才是要查的。"""
+        old = "## 价格\n" + "\n".join(f"- d{i}: {i}.0" for i in range(8))
+        new = "## 价格\n" + "\n".join(f"- d{i}: {i}.5" for i in range(8))
+        diff = verify.compare_documents(old, new, "x")
+        assert all("整段不见了" not in d.key for d in diff.diffs)
+        assert len(diff.diffs) == 8
+
+    def test_a_few_missing_lines_are_still_listed_individually(self):
+        old = "## 价格\n- a: 1\n- b: 2\n- c: 3\n"
+        diff = verify.compare_documents(old, "## 价格\n- a: 1\n", "x")
+        assert sorted(d.key for d in diff.hard) == ["价格 › - b", "价格 › - c"]
+
+
 class TestStructureDiff:
     def test_a_new_field_across_an_array_collapses_to_one_row(self):
         old = {"events": [{"code": "A"}, {"code": "B"}, {"code": "C"}]}

@@ -244,6 +244,13 @@ def parse_payload(text: str) -> Payload:
         # 所以标出来，由调用方跳过。
         return Payload(documents={"（正文）": stripped}, broken_json=True)
 
+    # 有些归档的载荷被包了一层 {"result": "..."}——mcporter 对返回标量的工具
+    # （kline_daily / kline_range）在 json 输出模式下就是这个形状，而重放用的是
+    # text 模式，拿到的是裸正文。不脱这层壳，两边一个是 JSON 一个是 markdown，
+    # 会报成"整份缺失"。
+    if set(data) == {"result"} and isinstance(data["result"], str):
+        return Payload(documents={"（正文）": data["result"].strip()})
+
     documents: dict[str, str] = {}
     structures: dict[str, object] = {}
     reports = data.get("reports")
@@ -517,7 +524,20 @@ def _flatten(node, prefix: str = "") -> dict[str, str]:
         for index, value in enumerate(node):
             flat.update(_flatten(value, f"{prefix}[{index}]"))
         return flat
+    if isinstance(node, bool) or node is None:
+        return {prefix: json.dumps(node, ensure_ascii=False)}
+    if isinstance(node, (int, float)):
+        # 10 和 10.0 是同一个数。json.dumps 会把它们写成不同的字符串，逐字比就
+        # 会把上游一次 int/float 的表示变化报成几十处"值变化"。
+        return {prefix: _canonical_number(float(node))}
     return {prefix: json.dumps(node, ensure_ascii=False)}
+
+
+def _canonical_number(value: float) -> str:
+    """数值的规范写法：整数去掉尾巴上的 .0，其余用最短往返表示。"""
+    if value == int(value) and abs(value) < 2**53:
+        return str(int(value))
+    return repr(value)
 
 
 def _volatile_path(path: str) -> bool:
@@ -634,6 +654,7 @@ def compare_documents(
         if key not in old_map:
             diffs.append(LineDiff("新增", key, new=values[0]))
 
+    diffs = _collapse_lost_sections(diffs)
     note = _drift_note(diffs)
     factor = _adjustment_drift(diffs)
     if factor is not None:
@@ -654,6 +675,28 @@ def compare_documents(
         if rounding:
             note += f"；涨跌幅/振幅另有 {rounding} 行只差在末位，是价格缩放后的精度损失"
     return DocumentDiff(name, diffs, drift_note=note)
+
+
+def _collapse_lost_sections(diffs: list[LineDiff]) -> list[LineDiff]:
+    """整段消失是一条事实，不是 N 行差异。
+
+    full 的历史资金流向是一张 60 行的表：拿不到时逐行列出来就是 62 行"缺失"，
+    把同一份报告里别的差异全挤出视野，而要知道的只是"这一段没了"。
+    段落里只要有一行是新增或值变化，就不折叠——那说明段落还在，是内容变了。
+    """
+    by_section: dict[str, list[LineDiff]] = {}
+    for diff in diffs:
+        by_section.setdefault(diff.key.split(" › ")[0], []).append(diff)
+    collapsed: list[LineDiff] = []
+    for section, members in by_section.items():
+        if len(members) >= 5 and all(d.kind == "缺失" for d in members):
+            collapsed.append(
+                LineDiff("缺失", f"{section} › 整段不见了（{len(members)} 行）",
+                         old=members[0].old)
+            )
+        else:
+            collapsed.extend(members)
+    return collapsed
 
 
 # 价格按复权因子缩放，成交量按它的倒数缩放（拆分之后股数变多），两类都跟着走。
