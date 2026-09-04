@@ -304,6 +304,16 @@ class TestScore:
     def test_nothing_measured_does_not_divide_by_zero(self):
         assert verify.Score().overall == 100.0
 
+    def test_a_regression_pass_that_did_not_run_does_not_count_as_passing(self):
+        """0/0 算成 100% 再拿去取 min，等于让"没测"冒充"测过且通过"。
+
+        --live 就是这个情形：实时输出没有可比的旧数据，那一项根本没跑。
+        """
+        ran = verify.Score(9, 9, 90, 100, docs_ok=1, docs_total=10)
+        assert round(ran.overall) == 10        # 跑了，10% 拉低总分
+        not_ran = verify.Score(9, 9, 90, 100, docs_ok=0, docs_total=0)
+        assert round(not_ran.overall) == 90    # 没跑，不参与
+
 
 class TestPayloadShapes:
     def test_a_result_wrapper_is_unwrapped(self):

@@ -317,7 +317,12 @@ class Completeness:
         return self.graded - len(self.bad)
 
 
-def check_completeness(tool: str, payload: Payload) -> Completeness:
+def check_completeness(tool: str, payload: Payload, *, live: bool = False) -> Completeness:
+    """``live`` 是"这次调用没钉日期"。
+
+    它只改一件事：钉日期时"不展示实时资金流"是正当缺席，实时调用下同一句话就是
+    真缺失——资金流只有"今天"这一个口径，实时问它还答不出来，那是真没取到。
+    """
     dimensions = CONTRACT.get(tool)
     result = Completeness()
     if not dimensions:
@@ -332,6 +337,8 @@ def check_completeness(tool: str, payload: Payload) -> Completeness:
                 result.findings.append(MissingDimension(symbol, dimension))
                 continue
             note, benign = _degraded_note(document, dimension)
+            if live:
+                benign = False
             if note:
                 result.findings.append(MissingDimension(symbol, dimension, note, benign))
                 if benign:
@@ -989,6 +996,60 @@ def probe_suite(date: str, tools: set[str]) -> list[CallSpec]:
     return [spec for spec in specs if spec.tool in tools]
 
 
+# 实时探活的标的：四大指数必跑，再两批八个覆盖沪深个股与 ETF。
+# 分批是照生产的形状来的——一次调用最多四个标的，而"四个标的抢一个兜底名额"这件事
+# 只有成批发出来才看得见。
+LIVE_BATCHES = (
+    ("四大指数", "SH000001,SZ399001,SZ399006,SH000688"),
+    ("沪深个股", "SH600519,SZ000333,SZ300750,SH688981"),
+    ("ETF与北交所", "SH512480,SZ159995,SH518880,BJ920021"),
+)
+
+
+def live_probe_suite(tools: set[str]) -> list[CallSpec]:
+    """不钉日期的实时探活：每个工具都跑，标的按上面三批走。
+
+    和钉日期那套的区别不只是少一个参数：
+
+      - 资金流向本来就只有"今天"这一个口径，钉了日期就没有，所以钉日期那套把它
+        算作正当缺席。实时调用下它**该有**，缺了就是真缺，见 ``live`` 参数怎么
+        影响 DEGRADED_MARKERS 的判定。
+      - 历史资金流向同理，只有 full 的实时调用才拿得到完整的那张表。
+
+    所以这一套是回答"线上到底缺哪些维度"的那一套，钉日期那套回答的是"数字有没有
+    漂"。两者都要跑，不能互相替代。
+    """
+    specs: list[CallSpec] = []
+    for label, symbols in LIVE_BATCHES:
+        specs.append(CallSpec("brief", {"symbol": symbols}, f"brief {label}"))
+        specs.append(CallSpec("medium", {"symbol": symbols}, f"medium {label}"))
+        specs.append(
+            CallSpec("full", {"symbol": symbols, "fund_flow_limit": "60"}, f"full {label}")
+        )
+        specs.append(CallSpec("tech", {"symbol": symbols, "days": "30"}, f"tech {label}"))
+    # kline 生产上只按单标的调用，各类各挑一个
+    today = dt.date.today().isoformat()
+    for symbol in ("SH600519", "SH512480", "SH000001", "BJ920021"):
+        # kline_daily 的 date 是必填的——这个工具本身就是按日寻址的，"实时"对它
+        # 不成立，给今天就是它的实时口径。
+        specs.append(
+            CallSpec("kline_daily", {"symbol": symbol, "date": today},
+                     f"kline_daily {symbol}")
+        )
+        specs.append(
+            CallSpec(
+                "kline_range",
+                {"symbol": symbol, "start_date": _shift(today, -30), "end_date": today},
+                f"kline_range {symbol}",
+            )
+        )
+    specs.append(CallSpec("market_breadth", {}, "market_breadth"))
+    specs.append(
+        CallSpec("market_events", {"date": today, "sources": "lhb,limit_up"}, "market_events")
+    )
+    return [spec for spec in specs if spec.tool in tools]
+
+
 def _shift(date: str, days: int) -> str:
     return (dt.date.fromisoformat(date) + dt.timedelta(days=days)).isoformat()
 
@@ -1106,12 +1167,16 @@ class Score:
 
     @property
     def overall(self) -> float:
-        """取三项里最低的那个。
+        """取跑过的那几项里最低的那个。
 
         平均会把"一个源整层挂了"稀释成看着还行的 85 分。这层是发布前的闸门，
-        闸门该按最短的那块板算。
+        闸门该按最短的那块板算。没跑的项不参与——0/0 算成 100% 再拿去取 min，
+        等于让"没测"冒充"测过且通过"。
         """
-        return min(self.tool_rate, self.dimension_rate, self.baseline_rate)
+        rates = [self.tool_rate, self.dimension_rate]
+        if self.docs_total:
+            rates.append(self.baseline_rate)
+        return min(rates)
 
     @property
     def verdict(self) -> str:
@@ -1137,11 +1202,65 @@ CORE_INDICES = {
 }
 
 
+def _render_matrix(
+    probes: list[tuple[CallResult, Payload, Completeness]],
+) -> list[str]:
+    """维度 × 标的 的矩阵。
+
+    缺失明细那张表是按"发现"排的，一个标的缺五维就是五行；要回答"线上到底缺什么"
+    得反过来看：一行一维，一列一标的，空白处一眼就出来。同一个标的在 brief /
+    medium / full 里都出现过，取最全的那次——只要有一个工具拿到了，这一维就是
+    取得到的。
+    """
+    # (标的, 维度) -> 判定符号。多个工具都覆盖同一维时取最好的结果。
+    RANK = {"✅": 3, "⚠️": 2, "❌": 1, "·": 0}
+    grid: dict[str, dict[str, str]] = {}
+    dims: list[str] = []
+    for result, payload, completeness in probes:
+        contract = CONTRACT.get(result.spec.tool)
+        if not contract or not result.ok:
+            continue
+        bad = {(m.symbol, m.dimension.name): m for m in completeness.findings}
+        for symbol in payload.documents:
+            row = grid.setdefault(symbol, {})
+            for dimension in contract:
+                if dimension.name not in dims:
+                    dims.append(dimension.name)
+                if classify(symbol) not in dimension.applies_to:
+                    row.setdefault(dimension.name, "·")
+                    continue
+                item = bad.get((symbol, dimension.name))
+                mark = "✅" if item is None else ("✅" if item.benign else "⚠️" if item.degraded_note else "❌")
+                if RANK[mark] > RANK.get(row.get(dimension.name, "·"), -1):
+                    row[dimension.name] = mark
+    if not grid:
+        return []
+
+    symbols = sorted(grid, key=lambda s: (classify(s), s))
+    lines = ["## 三、维度 × 标的 矩阵", ""]
+    lines.append(
+        "✅ 有数据　⚠️ 段落在但没值　❌ 该有却没有　· 这类标的本来就没有这一维"
+    )
+    lines.append("")
+    lines.append("| 维度 | 上游源 | " + " | ".join(symbols) + " |")
+    lines.append("| --- | --- | " + " | ".join("---" for _ in symbols) + " |")
+    sources = {d.name: d.source for group in CONTRACT.values() for d in group}
+    for dimension in dims:
+        cells = [grid[s].get(dimension, "·") for s in symbols]
+        if all(c == "·" for c in cells):
+            continue
+        lines.append(
+            f"| {dimension} | {sources.get(dimension, '-')} | " + " | ".join(cells) + " |"
+        )
+    lines.append("")
+    return lines
+
+
 def _render_index_section(
     probes: list[tuple[CallResult, Payload, Completeness]],
     regressions: list[tuple[Baseline, CallResult | None, list[DocumentDiff]]],
 ) -> list[str]:
-    lines = ["## 三、四大指数专项", ""]
+    lines = ["## 四、四大指数专项", ""]
     lines.append(
         "指数不走个股那条路：成交量单位推断整条绕过（指数的「收盘」是点位不是股价），"
         "资金流向是大盘口径，SH000688 没有资金流向页面。这几条都出过问题，单列。"
@@ -1272,12 +1391,19 @@ def render_report(
         + (f"；另有 {benign_missing} 项正当缺席，不计分" if benign_missing else "")
         + " |"
     )
-    lines.append(
-        f"| 回归一致率 | {score.baseline_rate:.0f}% | "
-        f"{score.docs_ok}/{score.docs_total} 份基线文档重放后没有未解释的漂移"
-        + (f"；{score.known} 份命中已核实的上游差异，不计分" if score.known else "")
-        + " |"
-    )
+    if score.docs_total:
+        lines.append(
+            f"| 回归一致率 | {score.baseline_rate:.0f}% | "
+            f"{score.docs_ok}/{score.docs_total} 份基线文档重放后没有未解释的漂移"
+            + (f"；{score.known} 份命中已核实的上游差异，不计分" if score.known else "")
+            + " |"
+        )
+    else:
+        # 没跑就写没跑。0/0 算成 100% 再摆出来，比不摆更容易误导。
+        lines.append(
+            "| 回归一致率 | 未跑 | 这一轮没做基线比对"
+            "（`--live` 的实时输出没有可比的旧数据，或用了 `--skip-baseline`）|"
+        )
     if score.gaps:
         lines.append(
             f"| 数据缺口 | —— | {score.gaps} 份文档整段数据没取到，"
@@ -1290,11 +1416,12 @@ def render_report(
         "≥99% 可发布，≥90% 要确认原因，低于 90% 不发。"
     )
     lines.append("")
-    lines.append(
-        "> 回归一致率的分母是**文档**而不是基线文件。kline_daily 那 4 份单标的基线"
-        "只差在同一件上游精度上，按文件计分会让一个问题占掉 4/13；按文档算它仍然是"
-        "四份，但和别的工具的四十多份文档放在一起，权重才对得上它的实际影响。"
-    )
+    if score.docs_total:
+        lines.append(
+            "> 回归一致率的分母是**文档**而不是基线文件。kline_daily 那 4 份单标的基线"
+            "只差在同一件上游精度上，按文件计分会让一个问题占掉 4/13；按文档算它仍然是"
+            "四份，但和别的工具的四十多份文档放在一起，权重才对得上它的实际影响。"
+        )
     lines.append("")
     if failed:
         lines.append("**主要问题**")
@@ -1391,9 +1518,10 @@ def render_report(
                 lines.append(f"- `{result.spec.describe()}` 失败：{result.stderr[:300] or '无 stderr'}")
     lines.append("")
 
+    lines.extend(_render_matrix(probes))
     lines.extend(_render_index_section(probes, regressions))
 
-    lines.append("## 四、与旧数据比对")
+    lines.append("## 五、与旧数据比对")
     lines.append("")
     if not regressions:
         lines.append("- 没有可用基线（`verification/baseline/` 为空或全部跳过）。")
@@ -1455,7 +1583,7 @@ def render_report(
                 lines.append("")
     lines.append("")
 
-    lines.append("## 五、怎么看这份报告")
+    lines.append("## 六、怎么看这份报告")
     lines.append("")
     lines.append("**判定符号**")
     lines.append("")
@@ -1529,6 +1657,12 @@ def main() -> int:
     parser.add_argument("--log", type=Path, default=DEFAULT_LOG_PATH)
     parser.add_argument("--probe-date", help="探活用的已收盘交易日，默认取上一个工作日")
     parser.add_argument("--only", help="只跑这些工具，逗号分隔")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="实时探活：不钉日期，跑三批十二个标的，逐维度看线上缺什么。"
+        "同时跳过回归比对——实时输出没有可比的旧数据",
+    )
     parser.add_argument("--skip-probe", action="store_true")
     parser.add_argument("--skip-baseline", action="store_true")
     parser.add_argument(
@@ -1547,6 +1681,10 @@ def main() -> int:
     config = resolve_config(args.config)
     tools = set(args.only.split(",")) if args.only else set(ALL_TOOLS)
     probe_date = args.probe_date or last_settled_trading_day()
+    if args.live:
+        # 实时输出没有可比的旧数据：归档是某一天某一刻的快照，拿今天的实时值去比
+        # 只会得到满屏噪音。所以 --live 只做探活和完整性。
+        args.skip_baseline = True
     started = dt.datetime.now().replace(microsecond=0)
 
     print(f"[验证] 配置={config}")
@@ -1554,12 +1692,13 @@ def main() -> int:
 
     probes: list[tuple[CallResult, Payload, Completeness]] = []
     if not args.skip_probe:
-        specs = probe_suite(probe_date, tools)
+        specs = live_probe_suite(tools) if args.live else probe_suite(probe_date, tools)
         print(f"[验证] 探活 {len(specs)} 个调用…")
         for result in run_calls(specs, config, args.timeout_ms, args.concurrency):
             payload = parse_payload(result.payload)
             completeness = (
-                check_completeness(result.spec.tool, payload) if result.ok
+                check_completeness(result.spec.tool, payload, live=args.live)
+                if result.ok
                 else Completeness()
             )
             probes.append((result, payload, completeness))
