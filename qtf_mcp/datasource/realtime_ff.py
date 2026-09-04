@@ -7,6 +7,7 @@ from playwright.async_api import async_playwright, Browser, BrowserContext
 
 from ..config import (
     ALL_INDICES,
+    FUND_FLOW_PAGE_COLD_ATTEMPTS,
     FUND_FLOW_PAGE_REUSE_SECONDS,
     FUND_FLOW_PAGE_TABLE_WAIT_SECONDS,
 )
@@ -199,18 +200,27 @@ class FundFlowPageUnavailable(RuntimeError):
     """该标的没有资金流向页面（三大指数之外的指数）。"""
 
 
-class FundFlowPageBlocked(RuntimeError):
-    """页面加载成功，但资金流接口被风控拦截。
+class FundFlowPageRefused(RuntimeError):
+    """页面加载成功，但资金流接口拒绝了请求。
 
-    风控表现为对 ``/fflow/`` 请求直接断连（``net::ERR_EMPTY_RESPONSE``）并要求
-    人过一次滑块，页面框架照常渲染、数据区留空。放行是按浏览器会话给的：
-    2026-09-03 手工过完滑块后，那个实例持续正常出数，而同一时刻新起的实例仍然
-    全部为空。所以这不是重试能解决的失败，调用方应当长时间退避。
+    观察到的现象，不含机制推断：对 ``/fflow/`` 的请求在发出约 240 毫秒后以
+    ``net::ERR_EMPTY_RESPONSE`` 失败——连接建立后服务端一个字节都没回就关闭。
+    这不是慢：等满 10 秒也没有迟到的响应，而页面自己只轮询今日、从不重发历史。
+    页面框架照常渲染，数据区留空。
+
+    被拒是逐次随机的：8 轮全新浏览器里，成功集中在前两次尝试，而失败的那几轮
+    连试三次也全败。所以既不能靠多试解决，也不值得长时间退避。
+
+    使用者报告过看到滑块验证，那是这类拒绝的一种可能成因，但这里不做断言。
     """
 
 
-# 本进程是否已有被风控放行的会话。盘中实时路径从 09:15 起持续加载这个页面，会话
-# 一直是热的；而窗口外冷启动的第一次加载才是最容易撞上滑块的那次。
+# 兼容旧名字。
+FundFlowPageBlocked = FundFlowPageRefused
+
+
+# 本进程是否成功从这个页面取到过数据。只用来决定"还要不要多试一次"，不代表
+# 上游给了本会话任何长期放行——实测被拒是逐次随机的。
 _session_warm = False
 
 
@@ -284,8 +294,8 @@ async def load_fund_flow_page(symbol: str, context: BrowserContext) -> FundFlowP
     """加载一次页面，解析出今日与历史两块。
 
     两块都在同一个页面上，且都由 ``/fflow/`` 接口填充，所以分两次加载既浪费一次
-    Chromium，又多一次撞风控的机会——风控是按会话放行的，页面加载次数本身就是
-    风险。两个等待并发进行，实时路径的耗时上限因此与合并前一致。
+    Chromium，又多一次被拒的机会。两个等待并发进行，实时路径的耗时上限因此与
+    合并前一致。
     """
     global _session_warm
 
@@ -308,7 +318,7 @@ async def load_fund_flow_page(symbol: str, context: BrowserContext) -> FundFlowP
         history_refused = asyncio.Event()
 
         def on_request_failed(request) -> None:
-            # 风控的特征是资金流接口被直接断连，而页面框架本身加载成功。
+            # 被拒的特征是资金流接口被直接断连，而页面框架本身加载成功。
             failed_url = request.url
             if any(part in failed_url for part in TODAY_ENDPOINTS):
                 refused.append(failed_url)
@@ -340,14 +350,14 @@ async def load_fund_flow_page(symbol: str, context: BrowserContext) -> FundFlowP
         except FundFlowPageError:
             parsed = None
 
-        # 页面渲染成功但两块都没值，同时相关请求被拒——这就是风控。停牌和开盘前
-        # 也会得到空值，但那时不会有请求失败，所以两个条件必须同时成立。
+        # 页面渲染成功但两块都没值，同时相关请求被拒。停牌和开盘前也会得到空值，
+        # 但那时不会有请求失败，所以两个条件必须同时成立才算"被拒"。
         got_nothing = parsed is None or (not parsed.history and not parsed.has_today)
         if got_nothing and refused:
             outcome = "blocked"
-            raise FundFlowPageBlocked(
-                f"{symbol} 资金流接口被拒 {len(refused)} 次，页面数据区为空；"
-                "本进程会话未获风控放行"
+            raise FundFlowPageRefused(
+                f"{symbol} 资金流接口拒绝了 {len(refused)} 个请求（空响应），"
+                "页面数据区为空"
             ) from None
         if parsed is None:
             raise FundFlowPageError(f"{symbol} 页面既无今日数据也无历史表")
@@ -460,19 +470,55 @@ def _complete_page_inflight(symbol: str, task: asyncio.Task) -> None:
         task.exception()  # 取一次异常，避免"never retrieved"告警
 
 
-async def _load_page_shared(symbol: str) -> FundFlowPage:
+def _satisfies(page: FundFlowPage, require_history: bool, require_today: bool) -> bool:
+    if require_history and not page.history:
+        return False
+    if require_today and not page.has_today:
+        return False
+    return True
+
+
+async def _load_page_shared(
+    symbol: str, *, require_history: bool = False, require_today: bool = False
+) -> FundFlowPage:
+    """加载页面；会话还冷时按配置多试几次。
+
+    重试条件是"这次拿到的还不满足调用方"，不只是"被拒"：一次加载可能只拿到两块
+    中的一块，而调用方要的恰好是另一块。
+
+    次数上限见 FUND_FLOW_PAGE_COLD_ATTEMPTS 的注释——实测第三次不再带来成功，
+    所以默认只有两次。本进程一旦成功取过数，就只试一次。
+    """
     context = await get_context()
-    try:
-        return await load_fund_flow_page(symbol, context)
-    except FundFlowPageBlocked:
-        if _session_warm:
+    attempts = FUND_FLOW_PAGE_COLD_ATTEMPTS if not _session_warm else 1
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            page = await load_fund_flow_page(symbol, context)
+        except FundFlowPageRefused as e:
+            last_error = e
+            if attempt < attempts:
+                logger.info(
+                    "资金流向页面被拒，重试 symbol=%s 第%d/%d次",
+                    symbol,
+                    attempt + 1,
+                    attempts,
+                )
+                continue
             raise
-        # 冷会话的第一次加载几乎总是被拒，同一个 context 的第二次就过了。
-        # 2026-09-03 是 [0, 121, 121] 行，2026-09-04 复测是第 1 次两个端点全拒、
-        # 第 2/3 次全成功。所以这里重试一次，且只在会话还没热起来时重试——
-        # 会话热了之后的被拒是真的被拒，再加载一次只是白费一次页面。
-        logger.info("资金流向页面首次加载被拒，用同一会话重试一次 symbol=%s", symbol)
-        return await load_fund_flow_page(symbol, context)
+        if _satisfies(page, require_history, require_today) or attempt == attempts:
+            return page
+        logger.info(
+            "资金流向页面数据不全，重试 symbol=%s 第%d/%d次 今日=%s 历史=%d",
+            symbol,
+            attempt + 1,
+            attempts,
+            page.has_today,
+            len(page.history),
+        )
+
+    raise last_error if last_error else FundFlowPageError(f"{symbol} 页面加载失败")
 
 
 async def fetch_page_shared(
@@ -492,7 +538,11 @@ async def fetch_page_shared(
         return cached
     task = _page_inflight.get(key)
     if task is None or task.done():
-        task = asyncio.create_task(_load_page_shared(symbol))
+        task = asyncio.create_task(
+            _load_page_shared(
+                symbol, require_history=require_history, require_today=require_today
+            )
+        )
         _page_inflight[key] = task
         task.add_done_callback(
             lambda completed, k=key: _complete_page_inflight(k, completed)

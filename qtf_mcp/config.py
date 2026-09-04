@@ -129,21 +129,18 @@ FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS = max(
     1.0,
     float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS", "300")),
 )
-# Risk control is a different failure from a slow or broken page. Eastmoney
-# answers /fflow/ requests with an immediate disconnect and expects a human to
-# clear a slider; clearance is granted per browser session, so retrying inside
-# the same process cannot succeed. Measured on 2026-09-03: after the slider was
-# cleared by hand that browser kept serving data for over ten minutes while
-# every freshly launched one stayed empty. Hence a much longer back-off.
-FUND_FLOW_PAGE_RISK_COOLDOWN_SECONDS = max(
-    1.0,
-    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_RISK_COOLDOWN_SECONDS", "1800")),
-)
 
+# 本进程还没成功取到过数据时，一次请求内允许的页面加载次数。
+# 实测 8 轮全新浏览器、每轮最多试三次：今日和历史都是「2 次内成功 3/8，3 次内
+# 成功 3/8」——第三次一次都没多救回来，成功全部发生在前两次。所以定 2，不是 3。
+FUND_FLOW_PAGE_COLD_ATTEMPTS = max(
+    1,
+    int(os.getenv("CN_STOCK_FUND_FLOW_PAGE_COLD_ATTEMPTS", "2")),
+)
 
 # 解析结果的复用窗口。页面级单飞只能合并并发的加载，而实时预取和资金流兜底在
 # 一次请求里是先后发生的（实测相隔约 4 秒），于是同一个页面被加载两次。每次加载
-# 都是一次撞风控的机会，不只是一次 Chromium 开销。默认与报告缓存的盘中 TTL 对齐，
+# 都可能再被拒一次，不只是一次 Chromium 开销。默认与报告缓存的盘中 TTL 对齐，
 # 不引入超出既有约定的陈旧度。置 0 关闭复用。
 FUND_FLOW_PAGE_REUSE_SECONDS = max(
     0.0,

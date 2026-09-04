@@ -29,7 +29,6 @@ from ..config import (
     FUND_FLOW_PAGE_FALLBACK_ENABLED,
     FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD,
     FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS,
-    FUND_FLOW_PAGE_RISK_COOLDOWN_SECONDS,
     SOURCE_BREAKER_COOLDOWN_SECONDS,
     SOURCE_BREAKER_ENABLED,
     SOURCE_BREAKER_THRESHOLD,
@@ -1171,13 +1170,11 @@ class CNStockDataSource(DataSource):
 
         try:
             page = await realtime_ff.fetch_history_page(symbol)
-        except realtime_ff.FundFlowPageBlocked as e:
-            # 风控要求人过一次滑块，放行按浏览器会话给，本进程内重试不可能成功。
-            # 所以退避时间比普通失败长得多，否则只是按固定节奏反复撞墙。
-            logger.warning("资金流向页面被风控拦截 %s: %s", symbol, e)
-            _FUND_FLOW_PAGE_BREAKER.record(
-                success=False, cooldown=FUND_FLOW_PAGE_RISK_COOLDOWN_SECONDS
-            )
+        except realtime_ff.FundFlowPageRefused as e:
+            # 与普通失败用同一个冷却：实测被拒是逐次随机的，8 轮里有 3 轮当场重试
+            # 就能成功，长时间退避只会把本可以拿到的数据挡在外面。
+            logger.warning("资金流向页面接口被拒 %s: %s", symbol, e)
+            _FUND_FLOW_PAGE_BREAKER.record(success=False)
             return None
         except Exception as e:
             logger.warning("资金流向页面兜底失败 %s: %s", symbol, e)

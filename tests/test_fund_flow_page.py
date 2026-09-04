@@ -394,7 +394,7 @@ class TestPageIdentityAcrossCallers:
 
         loads = []
 
-        async def fake_load(symbol):
+        async def fake_load(symbol, **kwargs):
             loads.append(symbol)
             await asyncio.sleep(0.02)
             return parse_fund_flow_page(FULL_PAGE.read_text(encoding="utf-8"))
@@ -614,3 +614,108 @@ class TestPageReuseRespectsWhatTheCallerNeeds:
         assert module._cached_page(
             "300408", require_history=False, require_today=False
         ) is None
+
+
+class TestColdSessionAttempts:
+    """冷会话要多试几次才过风控。
+
+    实测三轮冷启动：「五次全拒」「前两次拒、第三次起正常」「第一次拒、第二次只
+    拿到今日、第三次两块齐全」。所以重试条件是"还不满足调用方"，不只是"被拒"。
+    """
+
+    def _pages(self):
+        full = parse_fund_flow_page(FULL_PAGE.read_text(encoding="utf-8"))
+        partial = type(full)(
+            name=full.name, code=full.code, title_text=full.title_text,
+            today=full.today, today_text=full.today_text, history=[],
+        )
+        return partial, full
+
+    @pytest.mark.asyncio
+    async def test_retries_until_the_requirement_is_met(self, monkeypatch):
+        """第二次只拿到今日，要历史的调用方应该继续试。"""
+        from qtf_mcp.datasource import realtime_ff
+
+        partial, full = self._pages()
+        results = [realtime_ff.FundFlowPageBlocked("cold"), partial, full]
+        seen = []
+
+        async def flaky(symbol, context):
+            item = results[len(seen)]
+            seen.append(item)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        monkeypatch.setattr(realtime_ff, "load_fund_flow_page", flaky)
+        monkeypatch.setattr(realtime_ff, "get_context", _fake_context)
+        monkeypatch.setattr(realtime_ff, "_session_warm", False)
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_COLD_ATTEMPTS", 3)
+
+        page = await realtime_ff._load_page_shared("300408", require_history=True)
+
+        assert len(seen) == 3
+        assert len(page.history) == 121
+
+    @pytest.mark.asyncio
+    async def test_stops_at_the_configured_ceiling(self, monkeypatch):
+        """次数用完就返回手上的结果，不无限试。"""
+        from qtf_mcp.datasource import realtime_ff
+
+        partial, _ = self._pages()
+        seen = []
+
+        async def always_partial(symbol, context):
+            seen.append(symbol)
+            return partial
+
+        monkeypatch.setattr(realtime_ff, "load_fund_flow_page", always_partial)
+        monkeypatch.setattr(realtime_ff, "get_context", _fake_context)
+        monkeypatch.setattr(realtime_ff, "_session_warm", False)
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_COLD_ATTEMPTS", 3)
+
+        page = await realtime_ff._load_page_shared("300408", require_history=True)
+
+        assert len(seen) == 3
+        assert page.history == []
+
+    @pytest.mark.asyncio
+    async def test_a_warm_session_gets_one_attempt(self, monkeypatch):
+        """会话热了之后的失败是真的失败，多加载只是多一次撞风控。"""
+        from qtf_mcp.datasource import realtime_ff
+
+        partial, _ = self._pages()
+        seen = []
+
+        async def always_partial(symbol, context):
+            seen.append(symbol)
+            return partial
+
+        monkeypatch.setattr(realtime_ff, "load_fund_flow_page", always_partial)
+        monkeypatch.setattr(realtime_ff, "get_context", _fake_context)
+        monkeypatch.setattr(realtime_ff, "_session_warm", True)
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_COLD_ATTEMPTS", 3)
+
+        await realtime_ff._load_page_shared("300408", require_history=True)
+
+        assert len(seen) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_satisfied_first_attempt_does_not_retry(self, monkeypatch):
+        from qtf_mcp.datasource import realtime_ff
+
+        _, full = self._pages()
+        seen = []
+
+        async def good(symbol, context):
+            seen.append(symbol)
+            return full
+
+        monkeypatch.setattr(realtime_ff, "load_fund_flow_page", good)
+        monkeypatch.setattr(realtime_ff, "get_context", _fake_context)
+        monkeypatch.setattr(realtime_ff, "_session_warm", False)
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_COLD_ATTEMPTS", 3)
+
+        await realtime_ff._load_page_shared("300408", require_history=True)
+
+        assert len(seen) == 1
