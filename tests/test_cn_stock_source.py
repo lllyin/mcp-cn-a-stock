@@ -1586,3 +1586,142 @@ class TestBeijingExchangeMapping:
         assert source._akshare_to_symbol("430047", "bj") == "BJ430047"
         assert source._akshare_to_symbol("600547", "sh") == "SH600547"
         assert source._akshare_to_symbol("300408", "sz") == "SZ300408"
+
+
+# --- P1：兜底名额的等待改成按请求计预算 -----------------------------------
+# 要解决的是"同一个请求里的标的在互相抢名额"：mcp_app 对 raw_symbols 是全并发，
+# 4 个标的各自独立去抢，输给自己兄弟的那几个在碰到上游之前就被判了缺数据。
+
+
+class TestFallbackRequestBudget:
+    @pytest.mark.asyncio
+    async def test_symbols_of_one_request_share_one_budget(self, monkeypatch):
+        monkeypatch.setattr(
+            source_module, "FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS", 8.0
+        )
+        monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", 3.0)
+        clock = [1000.0]
+        monkeypatch.setattr(source_module.time, "monotonic", lambda: clock[0])
+
+        first = source_module._fund_flow_page_wait_budget("req-1")
+        assert first == pytest.approx(3.0)     # 单标的上限先咬住
+
+        clock[0] += 6                          # 这一批已经花了 6 秒
+        second = source_module._fund_flow_page_wait_budget("req-1")
+        assert second == pytest.approx(2.0)    # 只剩 2 秒预算
+
+        clock[0] += 3                          # 预算用尽
+        assert source_module._fund_flow_page_wait_budget("req-1") == 0.0
+
+    @pytest.mark.asyncio
+    async def test_a_different_request_gets_its_own_budget(self, monkeypatch):
+        """一个批次把预算花光，不能连累下一个批次。"""
+        monkeypatch.setattr(
+            source_module, "FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS", 8.0
+        )
+        monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", 3.0)
+        clock = [2000.0]
+        monkeypatch.setattr(source_module.time, "monotonic", lambda: clock[0])
+
+        source_module._fund_flow_page_wait_budget("req-a")
+        clock[0] += 9
+        assert source_module._fund_flow_page_wait_budget("req-a") == 0.0
+        assert source_module._fund_flow_page_wait_budget("req-b") == pytest.approx(3.0)
+
+    @pytest.mark.asyncio
+    async def test_a_missing_request_id_does_not_share_a_budget(self, monkeypatch):
+        """request_id 缺失时每个标的独享，别让互不相关的调用互相扣预算。"""
+        monkeypatch.setattr(
+            source_module, "FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS", 8.0
+        )
+        monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", 3.0)
+        clock = [3000.0]
+        monkeypatch.setattr(source_module.time, "monotonic", lambda: clock[0])
+
+        assert source_module._fund_flow_page_wait_budget("-") == pytest.approx(3.0)
+        clock[0] += 100
+        assert source_module._fund_flow_page_wait_budget("-") == pytest.approx(3.0)
+        assert source_module._fund_flow_page_wait_budget("") == pytest.approx(3.0)
+
+    @pytest.mark.asyncio
+    async def test_zero_switches_the_request_budget_off(self, monkeypatch):
+        monkeypatch.setattr(
+            source_module, "FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS", 0.0
+        )
+        monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", 3.0)
+        clock = [4000.0]
+        monkeypatch.setattr(source_module.time, "monotonic", lambda: clock[0])
+
+        assert source_module._fund_flow_page_wait_budget("req-z") == pytest.approx(3.0)
+        clock[0] += 1000
+        assert source_module._fund_flow_page_wait_budget("req-z") == pytest.approx(3.0)
+
+    @pytest.mark.asyncio
+    async def test_the_budget_table_does_not_grow_without_bound(self, monkeypatch):
+        monkeypatch.setattr(
+            source_module, "FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS", 8.0
+        )
+        monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", 3.0)
+        loop = asyncio.get_running_loop()
+        setattr(loop, source_module._FUND_FLOW_PAGE_BUDGET_ATTR, {})
+
+        for i in range(source_module._FUND_FLOW_PAGE_BUDGET_MAX_ENTRIES * 2):
+            source_module._fund_flow_page_wait_budget(f"req-{i}")
+
+        budgets = getattr(loop, source_module._FUND_FLOW_PAGE_BUDGET_ATTR)
+        assert len(budgets) <= source_module._FUND_FLOW_PAGE_BUDGET_MAX_ENTRIES
+
+    @pytest.mark.asyncio
+    async def test_an_exhausted_budget_skips_the_page_without_loading_it(
+        self, monkeypatch
+    ):
+        """预算用尽就直接跳过，不许再付一次页面加载。"""
+        from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+
+        datasource = _page_fallback_datasource(
+            monkeypatch, source_module._fetch_failure("fund_flow")
+        )
+        monkeypatch.setattr(source_module, "_fund_flow_page_wait_budget", lambda _: 0.0)
+
+        async def unexpected(symbol):
+            raise AssertionError("预算用尽时不应加载页面")
+
+        monkeypatch.setattr(realtime_ff_module, "fetch_history_page", unexpected)
+
+        result = await datasource.fetch_stock_data(
+            "SZ300408", "2024-01-01", "2026-09-03"
+        )
+        assert result.fetch_failures == ["fund_flow"]
+
+    @pytest.mark.asyncio
+    async def test_a_symbol_still_waits_when_the_budget_allows(self, monkeypatch):
+        """名额短暂占满、预算还有，就该等到并拿到数据——这是 P1 的正收益。"""
+        from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+
+        datasource = _page_fallback_datasource(
+            monkeypatch, source_module._fetch_failure("fund_flow")
+        )
+        page = _captured_page()
+
+        busy = asyncio.Semaphore(1)
+        await busy.acquire()
+        monkeypatch.setattr(source_module, "_get_fund_flow_page_slots", lambda: busy)
+        monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", 3.0)
+
+        async def working(symbol):
+            return page
+
+        monkeypatch.setattr(realtime_ff_module, "fetch_history_page", working)
+
+        async def free_it_soon():
+            await asyncio.sleep(0.05)
+            busy.release()
+
+        asyncio.get_running_loop().create_task(free_it_soon())
+        result = await datasource.fetch_stock_data(
+            "SZ300408", "2024-01-01", "2026-09-03"
+        )
+
+        # 老行为（等 0.5s 就放弃）在这里也会通过，所以关键断言是"真的拿到了"。
+        assert result.fetch_failures == []
+        assert len(result.fund_flow_history["DATE"]) == 121

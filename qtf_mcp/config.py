@@ -96,19 +96,54 @@ SOURCE_BREAKER_COOLDOWN_SECONDS = max(
 FUND_FLOW_PAGE_FALLBACK_ENABLED = _parse_bool(
     os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_ENABLED"), True
 )
-# Page loads allowed to run at once, on top of whatever the realtime tier is
-# doing. Kept below the browser semaphore so the fallback cannot starve the
-# intraday realtime path, which has no alternative source at all.
+# 同时允许几次页面加载。2026-09-04 实测（一批 4 标的 × 3 批，逐次记录）：
+#
+#   名额  获取率    最慢一批   单次加载
+#     1   12/12     12.6s     ~2.3s
+#     2   12/12      4.6s     ~2.3s     ← 取这个
+#     4   12/12      5.4s      4.6s     并发再高就开始互相拖慢
+#
+# 并发不降获取率——风控没有因为同一出口 IP 并发而加严，所以"不敢并发"这个顾虑
+# 不成立。4 不取：获取率没涨、单次加载反而变慢、内存最贵。
+#
+# 取 2 正好等于 BROWSER_PAGE_CONCURRENCY 的默认值，也就是兜底可以用满浏览器。
+# 原先刻意留成 1 是为了不挤掉没有替代来源的盘中实时路径，那个顾虑仍然成立，但
+# 实时路径有 FUND_FLOW_PAGE_REUSE_SECONDS 的结果复用和页面级单飞兜着，而资金流
+# 缺一段是没法补的。要恢复"给实时路径留一个名额"，把 BROWSER_PAGE_CONCURRENCY
+# 提到 3——代价见那一项的注释。
 FUND_FLOW_PAGE_FALLBACK_CONCURRENCY = max(
     1,
-    int(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_CONCURRENCY", "1")),
+    int(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_CONCURRENCY", "2")),
 )
-# How long a request waits for a fallback slot before giving up and rendering
-# the "no fund-flow data" line. Skipping is the right answer under load: queueing
-# here would trade a missing section for a much slower response.
+# 单个标的等一个名额的上限。
+#
+# 原值 0.5s 是这条链上最贵的一个数：实测每个标的持有名额约 2.26s（要重试的到
+# 6.6s，名额是在整个 fetch_history_page 外面持有的），于是
+#
+#     W / hold = 0.5 / 2.26 = 0.22
+#
+# 一批 4 个标的同时到达，算术上最多 1 个排得到，另外 3 个在碰到上游之前就被判了
+# 缺数据。这不是负载下的偶发，是必然。补全优先，就得让 W 至少大于 hold。
+#
+# 但单纯放大 W 会把补全问题换成无界延迟问题：10×4 = 40 个标的、名额 1 个，就是
+# 40×2.26 ≈ 90s。所以 W 只管单个标的，整体上界交给下面的请求预算。两者都置 0
+# 可以退回"不等，直接跳过"。
 FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS = max(
     0.0,
-    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", "0.5")),
+    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", "3")),
+)
+# 一次请求里所有标的加起来最多为等名额花掉多少秒。
+#
+# 要解决的是"同一个请求里的标的在互相抢名额"：mcp_app 对 raw_symbols 是
+# asyncio.gather 全并发，4 个标的各自独立去抢，3 个输给了自己的兄弟。按标的
+# 计时无法表达"这一批整体值得等多久",所以预算按 request_id 归集。
+#
+# 默认 8s 的来历：名额 2 个、每标的约 2.26s,一批 4 个标的两轮就够（约 4.5s）,
+# 8s 留了余量;40 个标的的批则拿到前 7 个左右,其余降级——延迟有界,补全率远高
+# 于现状。置 0 关闭请求级预算,退回纯按标的计时。
+FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS = max(
+    0.0,
+    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS", "8")),
 )
 # Upper bound on waiting for the historical table to fill. It is only a
 # backstop: the wait aborts as soon as a fund-flow request is refused, so a

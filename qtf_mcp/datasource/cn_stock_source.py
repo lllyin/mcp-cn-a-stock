@@ -28,6 +28,7 @@ from ..config import (
     FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS,
     FUND_FLOW_PAGE_FALLBACK_ENABLED,
     FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD,
+    FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS,
     FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS,
     SOURCE_BREAKER_COOLDOWN_SECONDS,
     SOURCE_BREAKER_ENABLED,
@@ -443,6 +444,13 @@ _executor = ThreadPoolExecutor(
 _DATA_FETCH_SLOTS_ATTR = "_cn_stock_data_fetch_slots"
 _FINANCE_INFLIGHT_ATTR = "_cn_stock_finance_inflight"
 _FUND_FLOW_PAGE_SLOTS_ATTR = "_cn_stock_fund_flow_page_slots"
+_FUND_FLOW_PAGE_BUDGET_ATTR = "_cn_stock_fund_flow_page_budgets"
+# 同时记住多少个请求的预算。请求预算只活 8 秒，正常情况下这张表里只有几条；
+# 上限是防"日志上下文缺失导致 key 退化"之类的意外把它撑爆。
+_FUND_FLOW_PAGE_BUDGET_MAX_ENTRIES = 256
+# 预算到期后还要把记录留多久。见 _fund_flow_page_wait_budget 里的说明：一到期
+# 就删等于允许无限续期。取 60 秒——远长于一次请求，又不至于让表堆积。
+_FUND_FLOW_PAGE_BUDGET_GRACE_SECONDS = 60.0
 _finance_cache: dict[str, tuple[float, Dict]] = {}
 _finance_cache_lock = threading.Lock()
 
@@ -465,6 +473,51 @@ def _get_fund_flow_page_slots() -> asyncio.Semaphore:
         slots = asyncio.Semaphore(FUND_FLOW_PAGE_FALLBACK_CONCURRENCY)
         setattr(loop, _FUND_FLOW_PAGE_SLOTS_ATTR, slots)
     return slots
+
+
+def _fund_flow_page_wait_budget(request_id: str) -> float:
+    """这个标的还能为等名额花多少秒。
+
+    要解决的是"同一个请求里的标的在互相抢名额"：``mcp_app`` 对 raw_symbols 是
+    ``asyncio.gather`` 全并发，每个标的各自独立地去抢那几个名额，输给自己兄弟的
+    那几个在碰到上游之前就被判了缺数据。按标的计时表达不了"这一批整体值得等多久"，
+    所以预算按 ``request_id`` 归集，第一个标的进来时开始计时。
+
+    返回值已经和单标的上限 ``FALLBACK_WAIT_SECONDS`` 取过小：前者管整批，后者管
+    单个，两个都置 0 就退回"不等，直接跳过"的老行为。
+    """
+    per_symbol = FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS
+    if FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS <= 0:
+        return per_symbol
+
+    loop = asyncio.get_running_loop()
+    budgets = getattr(loop, _FUND_FLOW_PAGE_BUDGET_ATTR, None)
+    if budgets is None:
+        budgets = {}
+        setattr(loop, _FUND_FLOW_PAGE_BUDGET_ATTR, budgets)
+
+    now = time.monotonic()
+    # 就地剪枝，和 _page_cache 一个模式：不引入后台任务，也不让表无界增长。
+    #
+    # 必须留一段宽限期，不能一到期就删：到期正是"这一批预算已经用尽"的状态，
+    # 删掉它下一个标的就会拿到一份全新的预算，于是 40 个标的的批次可以无限续期，
+    # 预算这层等于不存在。宽限期要长于一次请求的合理时长。
+    horizon = now - _FUND_FLOW_PAGE_BUDGET_GRACE_SECONDS
+    for stale in [k for k, deadline in budgets.items() if deadline < horizon]:
+        budgets.pop(stale, None)
+    if len(budgets) >= _FUND_FLOW_PAGE_BUDGET_MAX_ENTRIES:
+        budgets.pop(next(iter(budgets)), None)
+
+    # request_id 缺失时（直接调用、测试）退化成每个标的独享一份预算，而不是让
+    # 所有调用共享同一个 key —— 那会让互不相关的调用互相扣预算。
+    if not request_id or request_id == "-":
+        return per_symbol
+
+    deadline = budgets.get(request_id)
+    if deadline is None:
+        deadline = now + FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS
+        budgets[request_id] = deadline
+    return min(per_symbol, max(0.0, deadline - now))
 
 
 def _release_data_fetch_slot(slots: asyncio.Semaphore, future: asyncio.Future) -> None:
@@ -1265,20 +1318,25 @@ class CNStockDataSource(DataSource):
             logger.debug("资金流向页面兜底跳过 %s: 熔断器打开", symbol)
             return None
 
+        request_id, _, _ = log_context()
+        wait_budget = _fund_flow_page_wait_budget(request_id)
         slots = _get_fund_flow_page_slots()
         try:
-            await asyncio.wait_for(
-                slots.acquire(), timeout=FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS
-            )
+            await asyncio.wait_for(slots.acquire(), timeout=wait_budget)
         except (asyncio.TimeoutError, TimeoutError):
-            # 满的是兜底层自己那 CONCURRENCY 个名额，不是 realtime_ff 的浏览器
-            # 信号量——兜底刻意开得比它小，免得把没有替代来源的盘中实时路径挤掉。
-            # 这里排队等于把"缺一段"换成"整体变慢"，所以直接放弃。
+            # 名额是兜底层自己那 CONCURRENCY 个，不是 realtime_ff 的浏览器信号量。
+            # 等不到就放弃而不是无限排队：排队会把"缺一段"换成"整批都慢"，而
+            # 请求级预算已经表达了"这一批整体愿意为补全等多久"。
+            reason = (
+                f"请求预算 {FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS:.0f}s 已用尽"
+                if wait_budget <= 0
+                else f"等 {wait_budget:.1f}s 未排到"
+            )
             logger.info(
-                "资金流向页面兜底跳过 %s: 兜底名额已满(上限 %d)，等 %.1fs 未排到",
+                "资金流向页面兜底跳过 %s: 兜底名额已满(上限 %d)，%s",
                 symbol,
                 FUND_FLOW_PAGE_FALLBACK_CONCURRENCY,
-                FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS,
+                reason,
             )
             return None
 
