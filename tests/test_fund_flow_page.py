@@ -448,8 +448,8 @@ class TestRefusalSignals:
         assert not any(part in history for part in TODAY_ENDPOINTS)
 
 
-class TestColdSessionRetry:
-    """冷会话的第一次加载被拒时重试一次。
+class TestLoadRetry:
+    """第一次加载被拒时重试一次。
 
     实测形状：新 context 的第 1 次加载两个端点全被拒，第 2、3 次全部成功
     （2026-09-03 是 [0, 121, 121] 行，2026-09-04 复测一致）。不重试的话，
@@ -457,7 +457,7 @@ class TestColdSessionRetry:
     """
 
     @pytest.mark.asyncio
-    async def test_retries_once_when_the_session_is_cold(self, monkeypatch):
+    async def test_retries_after_a_refusal(self, monkeypatch):
         from qtf_mcp.datasource import realtime_ff
 
         attempts = []
@@ -471,35 +471,13 @@ class TestColdSessionRetry:
 
         monkeypatch.setattr(realtime_ff, "load_fund_flow_page", flaky)
         monkeypatch.setattr(realtime_ff, "get_context", _fake_context)
-        monkeypatch.setattr(realtime_ff, "_session_warm", False)
-        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_COLD_ATTEMPTS", 4)
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_MAX_LOADS", 4)
 
         page = await realtime_ff._load_page_shared("300408")
 
         # 预算 4 次加载 = 两个 tab，每个 tab 拿到 2 次（goto + reload）
         assert attempts == [2, 2]
         assert len(page.history) == 121
-
-    @pytest.mark.asyncio
-    async def test_does_not_retry_once_the_session_is_warm(self, monkeypatch):
-        """会话热了之后的被拒是真的被拒，重试只是白费一次页面加载。"""
-        from qtf_mcp.datasource import realtime_ff
-
-        attempts = []
-
-        async def always_blocked(symbol, context, *, loads=1, satisfies=None):
-            attempts.append(symbol)
-            raise realtime_ff.FundFlowPageBlocked("blocked")
-
-        monkeypatch.setattr(realtime_ff, "load_fund_flow_page", always_blocked)
-        monkeypatch.setattr(realtime_ff, "get_context", _fake_context)
-        monkeypatch.setattr(realtime_ff, "_session_warm", True)
-
-        with pytest.raises(realtime_ff.FundFlowPageBlocked):
-            await realtime_ff._load_page_shared("300408")
-
-        assert len(attempts) == 1
-
 
 async def _fake_context():
     return object()
@@ -510,7 +488,7 @@ class TestEmptyTodayBlockIsNotSuccess:
 
     2026-09-04 10:06 的日志：outcome=today=True history=0，两次加载都这样，
     报告里今日一栏全是 0。因为占位符以 None 存进字典，字典非空就被当成有数据，
-    于是既不抛 FundFlowPageBlocked、也就不会触发冷会话重试和熔断。
+    于是既不抛 FundFlowPageBlocked、也就不会触发重试和熔断。
 
     解析器本身不抛错：停牌和开盘前同样是占位符，那是正常状态，老逻辑输出 0。
     """
@@ -618,11 +596,11 @@ class TestPageReuseRespectsWhatTheCallerNeeds:
         ) is None
 
 
-class TestColdSessionAttempts:
+class TestLoadAttempts:
     """本进程还没取到过数据时多试一次。
 
     重试条件是"还不满足调用方"，不只是"被拒"：一次加载可能只拿回两块中的一块，
-    而调用方要的恰好是另一块。次数上限见 FUND_FLOW_PAGE_COLD_ATTEMPTS——8 轮实测
+    而调用方要的恰好是另一块。次数上限见 FUND_FLOW_PAGE_MAX_LOADS——8 轮实测
     第三次不再带来成功，所以默认只有两次。
     """
 
@@ -652,8 +630,7 @@ class TestColdSessionAttempts:
 
         monkeypatch.setattr(realtime_ff, "load_fund_flow_page", flaky)
         monkeypatch.setattr(realtime_ff, "get_context", _fake_context)
-        monkeypatch.setattr(realtime_ff, "_session_warm", False)
-        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_COLD_ATTEMPTS", 3)
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_MAX_LOADS", 3)
 
         page = await realtime_ff._load_page_shared("300408", require_history=True)
 
@@ -675,34 +652,12 @@ class TestColdSessionAttempts:
 
         monkeypatch.setattr(realtime_ff, "load_fund_flow_page", always_partial)
         monkeypatch.setattr(realtime_ff, "get_context", _fake_context)
-        monkeypatch.setattr(realtime_ff, "_session_warm", False)
-        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_COLD_ATTEMPTS", 3)
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_MAX_LOADS", 3)
 
         page = await realtime_ff._load_page_shared("300408", require_history=True)
 
         assert len(seen) == 2       # 3 次加载预算 -> 2 个 tab
         assert page.history == []
-
-    @pytest.mark.asyncio
-    async def test_a_warm_session_gets_one_attempt(self, monkeypatch):
-        """已经取到过数据之后，再失败就只试一次——多加载只是多一次被拒。"""
-        from qtf_mcp.datasource import realtime_ff
-
-        partial, _ = self._pages()
-        seen = []
-
-        async def always_partial(symbol, context, *, loads=1, satisfies=None):
-            seen.append(symbol)
-            return partial
-
-        monkeypatch.setattr(realtime_ff, "load_fund_flow_page", always_partial)
-        monkeypatch.setattr(realtime_ff, "get_context", _fake_context)
-        monkeypatch.setattr(realtime_ff, "_session_warm", True)
-        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_COLD_ATTEMPTS", 3)
-
-        await realtime_ff._load_page_shared("300408", require_history=True)
-
-        assert len(seen) == 1
 
     @pytest.mark.asyncio
     async def test_a_satisfied_first_attempt_does_not_retry(self, monkeypatch):
@@ -717,8 +672,7 @@ class TestColdSessionAttempts:
 
         monkeypatch.setattr(realtime_ff, "load_fund_flow_page", good)
         monkeypatch.setattr(realtime_ff, "get_context", _fake_context)
-        monkeypatch.setattr(realtime_ff, "_session_warm", False)
-        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_COLD_ATTEMPTS", 3)
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_MAX_LOADS", 3)
 
         await realtime_ff._load_page_shared("300408", require_history=True)
 

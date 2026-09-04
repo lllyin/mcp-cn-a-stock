@@ -954,5 +954,96 @@ class TestRetryDelayParsing:
             _parse_range_ms(",", "1,2")
 
 
+# --- P0：加载预算不受"之前成功过"影响 -------------------------------------
+# 原先的逻辑是本进程成功取到过一次数据就把预算塌到 1（只 goto、不 reload）。
+# 那个区分在依据上和代价上都站不住，见 FUND_FLOW_PAGE_MAX_LOADS 的注释。
+
+
+class TestLoadBudget:
+    @pytest.mark.asyncio
+    async def test_an_empty_page_still_gets_its_reload(self, monkeypatch):
+        """第一次拿到空页面（不是被拒）也要 reload。
+
+        这条路是真实存在的：页面框架渲染成功、解析成功、两块都空、且没有任何
+        请求被拒（停牌、开盘前、上游静默返回空都是这样）。原先的代码把这种空
+        页面也算成"取到过数据"，于是本进程后面所有标的都只加载一次。
+        """
+        page = _FakeTabPage([EMPTY_HTML, _full_html()])
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+        monkeypatch.setattr(realtime_ff, "_wait_for_today", _no_wait)
+        monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
+        monkeypatch.setattr(realtime_ff, "_sleep_before_retry", lambda: _resolved(0.0))
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_MAX_LOADS", 2)
+
+        async def one_context():
+            return _TabPageContext(page)
+
+        monkeypatch.setattr(realtime_ff, "get_context", one_context)
+
+        parsed = await realtime_ff._load_page_shared("300408", require_history=True)
+
+        assert page.calls == ["goto", "reload"]
+        assert len(parsed.history) == 121
+
+    @pytest.mark.asyncio
+    async def test_an_earlier_success_does_not_shrink_a_later_budget(
+        self, monkeypatch
+    ):
+        """前一个标的成功，不能让后一个标的少一次重试。
+
+        这正是并发 4×4 实测里丢掉 SH603986 和 SH600030 的原因：批 1 有一个标的
+        成功之后，它们都只加载了一次就拿着 history=0 放弃了。
+        """
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+        monkeypatch.setattr(realtime_ff, "_wait_for_today", _no_wait)
+        monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
+        monkeypatch.setattr(realtime_ff, "_sleep_before_retry", lambda: _resolved(0.0))
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_MAX_LOADS", 2)
+        realtime_ff._page_cache.clear()
+
+        first = _FakeTabPage([_full_html()])
+        second = _FakeTabPage([EMPTY_HTML, _full_html()])
+        pages = [first, second]
+
+        async def next_context():
+            return _TabPageContext(pages.pop(0))
+
+        monkeypatch.setattr(realtime_ff, "get_context", next_context)
+
+        await realtime_ff._load_page_shared("300408", require_history=True)
+        assert first.calls == ["goto"]          # 一次就拿到，不多花
+
+        realtime_ff._page_cache.clear()
+        await realtime_ff._load_page_shared("600519", require_history=True)
+        assert second.calls == ["goto", "reload"]   # 预算没被前一个标的吃掉
+
+    @pytest.mark.asyncio
+    async def test_the_happy_path_still_costs_one_load(self, monkeypatch):
+        """预算是上限不是配额：一次就拿到就不再加载，顺利路径零额外开销。"""
+        page = _FakeTabPage([_full_html()])
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+        monkeypatch.setattr(realtime_ff, "_wait_for_today", _no_wait)
+        monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
+        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_MAX_LOADS", 2)
+        realtime_ff._page_cache.clear()
+
+        async def one_context():
+            return _TabPageContext(page)
+
+        monkeypatch.setattr(realtime_ff, "get_context", one_context)
+        await realtime_ff._load_page_shared("300408", require_history=True)
+
+        assert page.calls == ["goto"]
+
+    def test_the_old_env_name_is_still_accepted(self):
+        """部署里配着 COLD_ATTEMPTS 的不用改。"""
+        from qtf_mcp import config
+
+        assert config.FUND_FLOW_PAGE_COLD_ATTEMPTS == config.FUND_FLOW_PAGE_MAX_LOADS
+
+
 async def _resolved(value):
     return value

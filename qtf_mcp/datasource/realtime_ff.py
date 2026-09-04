@@ -11,10 +11,10 @@ from playwright.async_api import async_playwright, Browser, BrowserContext
 from ..config import (
     ALL_INDICES,
     FUND_FLOW_PAGE_CLAIM_PLATFORM,
-    FUND_FLOW_PAGE_COLD_ATTEMPTS,
     FUND_FLOW_PAGE_DISGUISE,
     FUND_FLOW_PAGE_HEADFUL,
     FUND_FLOW_PAGE_KEEP_PAGES,
+    FUND_FLOW_PAGE_MAX_LOADS,
     FUND_FLOW_PAGE_RETRY_DELAY_MS,
     FUND_FLOW_PAGE_REUSE_SECONDS,
     FUND_FLOW_PAGE_TABLE_WAIT_SECONDS,
@@ -412,7 +412,7 @@ class FundFlowPageRefused(RuntimeError):
 
     - **瞬时**：立刻重试就过。2026-09-04 15:51 的 SH512480 第一次
       ``blocked_captcha``、593 毫秒后的第二次拿到 ``today=True history=121``。
-      早先 8 轮全新浏览器的观察也是"成功集中在前两次尝试"。``COLD_ATTEMPTS=2``
+      早先 8 轮全新浏览器的观察也是"成功集中在前两次尝试"。``MAX_LOADS=2``
       就是为这一种设的，删掉它会白丢这些本可以拿到的数据。
     - **持续**：分钟级，重试无用。2026-09-04 15:35-15:50 实测背靠背 10 次全拒、
       静默 75 秒后 4 次全拒、16 分钟后仍拒。这一种只能等，多试只是白付页面加载。
@@ -429,16 +429,6 @@ class FundFlowPageRefused(RuntimeError):
 
 # 兼容旧名字。
 FundFlowPageBlocked = FundFlowPageRefused
-
-
-# 本进程是否成功从这个页面取到过数据。只用来决定"还要不要多试一次"，不代表
-# 上游给了本会话任何长期放行——实测被拒是逐次随机的。
-_session_warm = False
-
-
-def session_is_warm() -> bool:
-    """本进程是否已经成功从这个页面取到过数据。"""
-    return _session_warm
 
 
 async def _race_with_refusal(coro, refused: asyncio.Event):
@@ -522,8 +512,6 @@ async def load_fund_flow_page(
     ``SEMAPHORE`` 隐式限住的（页面在这段区间里创建也在这段区间里关闭），tab 一旦
     活过这段区间，那个上限就失效了——4 个标的并发时会变成 4 个 tab、每个约 120 MiB。
     """
-    global _session_warm
-
     wait_started_at = time.perf_counter()
     await SEMAPHORE.acquire()
     semaphore_wait = time.perf_counter() - wait_started_at
@@ -591,7 +579,6 @@ async def load_fund_flow_page(
                 logged = True
                 if parsed is None:
                     continue
-                _session_warm = True
                 if satisfies is None or satisfies(parsed):
                     return parsed
             if parsed is not None:
@@ -824,12 +811,12 @@ async def _sleep_before_retry() -> float:
 async def _load_page_shared(
     symbol: str, *, require_history: bool = False, require_today: bool = False
 ) -> FundFlowPage:
-    """加载页面；会话还冷时按配置多试几次。
+    """加载页面；没拿到调用方要的那一块时按配置多试几次。
 
     重试条件是"这次拿到的还不满足调用方"，不只是"被拒"：一次加载可能只拿到两块
     中的一块，而调用方要的恰好是另一块。
 
-    次数上限见 FUND_FLOW_PAGE_COLD_ATTEMPTS 的注释——它数的是页面加载次数，
+    次数上限见 FUND_FLOW_PAGE_MAX_LOADS 的注释——它数的是页面加载次数，
     不是 tab 数。一个 tab 消耗两次（goto + reload），所以默认 2 就是"一个 tab 试
     两次"，与改动前的总加载次数一致；调到 3 才会开第二个 tab。
 
@@ -839,7 +826,7 @@ async def _load_page_shared(
         4 次  reload
     """
     context = await get_context()
-    budget = FUND_FLOW_PAGE_COLD_ATTEMPTS if not _session_warm else 1
+    budget = FUND_FLOW_PAGE_MAX_LOADS
     predicate = lambda page: _satisfies(page, require_history, require_today)
     last_error = None
     used = 0

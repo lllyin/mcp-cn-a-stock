@@ -132,13 +132,42 @@ FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS = max(
     float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS", "300")),
 )
 
-# 本进程还没成功取到过数据时，一次请求内允许的页面加载次数。
-# 实测 8 轮全新浏览器、每轮最多试三次：今日和历史都是「2 次内成功 3/8，3 次内
-# 成功 3/8」——第三次一次都没多救回来，成功全部发生在前两次。所以定 2，不是 3。
-FUND_FLOW_PAGE_COLD_ATTEMPTS = max(
+# 一次请求内允许的页面加载次数。
+#
+# 定 2 的依据重测过一次。原注释写的是「8 轮全新浏览器,第三次一次都没多救回来」,
+# 但那次实测早于 TABLE_WAIT_SECONDS 改到 15s 的修复,而那条注释自己写着"小预算
+# 会静默返回空表"——当时量到的失败里混着表没填完的超时,依据不成立。
+#
+# 2026-09-04 重测,16 个沪深标的串行、逐次记录结果:
+#
+#   第 1 次加载命中   14 个
+#   第 2 次加载命中    1 个   ← SH601318: captcha -> reload -> ok,只有 reload 救得回来
+#   全部失败           1 个   ← SH600519: 三次全是 captcha,第三次也没救回来
+#
+# 结论和原来一致但依据换了:2 是对的——第 2 次（同一个 tab 上 reload）确实能救
+# 回标的,第 3 次（开新 tab）在两次实测里都是零收益,而它要多付一次开页面。
+#
+# 改名的原因:这个值原先只在"本进程还没成功取到过数据"时生效,成功过一次之后
+# 预算就塌到 1（只 goto、不 reload）。那个区分站不住:
+#
+#   - 依据上站不住。它假设"成功过一次说明上游在放行",而项目自己的注释记着被拒
+#     是逐次随机的、8 轮里有 3 轮当场重试就能成功。
+#   - 代价是实测的。2026-09-04 并发 4×4 实测,批 1 有一个标的成功之后,后面
+#     SH603986 和 SH600030 都只加载了一次就拿着 history=0 放弃了。
+#   - 收益是零。重试只在"这次没拿到想要的数据"时才发生,顺利路径一次都不多花,
+#     所以省不下任何东西。
+#
+# 旧环境变量名继续认,部署里已经配着的不用改。
+FUND_FLOW_PAGE_MAX_LOADS = max(
     1,
-    int(os.getenv("CN_STOCK_FUND_FLOW_PAGE_COLD_ATTEMPTS", "2")),
+    int(
+        os.getenv("CN_STOCK_FUND_FLOW_PAGE_MAX_LOADS")
+        or os.getenv("CN_STOCK_FUND_FLOW_PAGE_COLD_ATTEMPTS")
+        or "2"
+    ),
 )
+# 兼容旧名字。
+FUND_FLOW_PAGE_COLD_ATTEMPTS = FUND_FLOW_PAGE_MAX_LOADS
 
 # 把无头浏览器的自报特征改成普通浏览器的样子。默认开。
 #
