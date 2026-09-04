@@ -525,3 +525,75 @@ class TestFinancialSectionSymbolCorrection:
 
     def test_index_still_has_no_financial_section(self):
         assert self._has_section("SH000001", "SH000001") is False
+
+
+class TestEmptyRealtimeFundFlowIsNotZero:
+    """浏览器抓到页面但十档全是占位符时，不能渲染成一栏 0。
+
+    2026-09-04 10:19 的实测：历史表 120 行、今日一栏全 0。原来的分支在
+    "浏览器没值 且 接口也没有今日数据" 时会落回去打印占位符，等于声称今日
+    主力净流入为零，而实际是没拿到。
+    """
+
+    def _data(self):
+        return {
+            "SYMBOL": "SZ300408",
+            "DATE": np.array([_ns(2026, 9, 4)]),
+            "CLOSE": np.array([111.08]),
+            "CLOSE2": np.array([111.08]),
+            "OPEN": np.array([113.51]),
+            "HIGH": np.array([115.32]),
+            "LOW": np.array([110.80]),
+            "VOLUME": np.array([119881.0]),
+            "AMOUNT": np.array([1.355e9]),
+        }
+
+    async def _render(self, monkeypatch, browser_result):
+        import json as json_module
+
+        import qtf_mcp.research as research
+
+        async def fake_get_fund_flow(codes, **kwargs):
+            return json_module.dumps({codes[0]: browser_result}, ensure_ascii=False)
+
+        monkeypatch.setattr(research, "get_fund_flow", fake_get_fund_flow)
+        monkeypatch.setattr(
+            research, "is_realtime_fund_flow_window", lambda now=None: True
+        )
+        fp = StringIO()
+        await research.build_trading_data(fp, "SZ300408", self._data())
+        return fp.getvalue()
+
+    @pytest.mark.asyncio
+    async def test_placeholder_amounts_report_unavailable(self, monkeypatch):
+        empty = {
+            "标的名称": "三环集团(300408)",
+            "主力净流入": "0", "主力净比(%)": 0.0,
+            "超大单净流入": "0", "超大单净比(%)": 0.0,
+            "大单净流入": "0", "大单净比(%)": 0.0,
+            "中单净流入": "0", "中单净比(%)": 0.0,
+            "小单净流入": "0", "小单净比(%)": 0.0,
+        }
+
+        output = await self._render(monkeypatch, empty)
+
+        assert "盘中实时数据暂时不可用" in output
+        assert "今日主力净流入: 0" not in output
+
+    @pytest.mark.asyncio
+    async def test_real_values_are_still_rendered(self, monkeypatch):
+        """有值时行为不变。"""
+        live = {
+            "标的名称": "三环集团(300408)",
+            "主力净流入": "1.0477亿", "主力净比(%)": 3.37,
+            "超大单净流入": "-4725.87万", "超大单净比(%)": -1.0,
+            "大单净流入": "2.06亿", "大单净比(%)": 4.37,
+            "中单净流入": "-8426.28万", "中单净比(%)": -1.79,
+            "小单净流入": "-7447.11万", "小单净比(%)": -1.58,
+        }
+
+        output = await self._render(monkeypatch, live)
+
+        assert "标的名称: 三环集团(300408)" in output
+        assert "1.0477亿" in output
+        assert "3.37%" in output

@@ -758,26 +758,30 @@ async def build_trading_data(
                     if "error" in res:
                          if not print_api_fund_flow_if_today(fp, data):
                              print(f"- [实时抓取失败] {res['error']}", file=fp)
+                    elif res and not has_realtime_fund_flow_values(res):
+                         # 抓到了页面但十档全是占位符。之前这里会继续把占位符渲染
+                         # 成一栏 0，等于声称"今日主力净流入为零"，而实际是没拿到：
+                         # 2026-09-04 10:19 就是这样，历史表 120 行、今日全 0。
+                         # 接口有今日数据就用接口的，否则如实说取不到。
+                         if not print_api_fund_flow_if_today(fp, data):
+                             print("- 盘中实时数据暂时不可用", file=fp)
                     elif res:
-                         if not has_realtime_fund_flow_values(res) and print_api_fund_flow_if_today(fp, data):
-                             pass
-                         else:
-                             # [增加] 显式输出抓取到的标的名称，方便交叉验证
-                             print(f"- 标的名称: {res.get('标的名称', '')}", file=fp)
-                             prefix = get_realtime_fund_flow_prefix(target_code, data)
-                             # 按顺序对齐：主力, 超大单, 大单, 中单, 小单
-                             field_configs = [
-                                 ("主力", "主力净流入", "主力净比(%)"),
-                                 ("超大单", "超大单净流入", "超大单净比(%)"),
-                                 ("大单", "大单净流入", "大单净比(%)"),
-                                 ("中单", "中单净流入", "中单净比(%)"),
-                                 ("小单", "小单净流入", "小单净比(%)"),
-                             ]
-                             for name, amt_key, ratio_key in field_configs:
-                                 if amt_key in res:
-                                     amount_str = res[amt_key]
-                                     ratio = res.get(ratio_key, 0.0) / 100.0  # 修正百分比倍数
-                                     print(f"- {prefix}{name}净流入: {amount_str}  {name}净占比: {ratio:.2%}", file=fp)
+                         # [增加] 显式输出抓取到的标的名称，方便交叉验证
+                         print(f"- 标的名称: {res.get('标的名称', '')}", file=fp)
+                         prefix = get_realtime_fund_flow_prefix(target_code, data)
+                         # 按顺序对齐：主力, 超大单, 大单, 中单, 小单
+                         field_configs = [
+                             ("主力", "主力净流入", "主力净比(%)"),
+                             ("超大单", "超大单净流入", "超大单净比(%)"),
+                             ("大单", "大单净流入", "大单净比(%)"),
+                             ("中单", "中单净流入", "中单净比(%)"),
+                             ("小单", "小单净流入", "小单净比(%)"),
+                         ]
+                         for name, amt_key, ratio_key in field_configs:
+                             if amt_key in res:
+                                 amount_str = res[amt_key]
+                                 ratio = res.get(ratio_key, 0.0) / 100.0  # 修正百分比倍数
+                                 print(f"- {prefix}{name}净流入: {amount_str}  {name}净占比: {ratio:.2%}", file=fp)
                     else:
                          if not print_api_fund_flow_if_today(fp, data):
                              print("- 盘中实时数据暂时不可用", file=fp)
