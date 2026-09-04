@@ -298,6 +298,53 @@ FUND_FLOW_PAGE_REUSE_SECONDS = max(
     float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_REUSE_SECONDS", "30")),
 )
 
+# 整个浏览器同时开着的页面数上限。这也是峰值内存的直接决定项——页面在信号量
+# 持有区间内创建、也在区间内关闭,所以"同时几个页面"就是"同时几个渲染进程"。
+#
+# 原值 2 的由来是部署机规格：2C4G 上建议并发不超过 2,那是 CPU 侧的约束——每个
+# 渲染进程要跑页面上的 JS 和图表。下面的内存数据是另一条独立的约束,两条都要满足。
+#
+# 2026-09-04 单棵干净的 headless 树实测每页边际内存（macOS RSS）:
+#
+#   空载 -> 1 页  +378 MiB   含一次性 renderer/GPU 初始化
+#        -> 2 页  +127 MiB   ← 每多一个并发页的边际代价
+#        -> 3 页  +137 MiB
+#        -> 4 页   +85 MiB
+#   全部关闭后回落到 +25.9 MiB,不漏
+#
+# 保持 2 不动。提到 3 可以给盘中实时路径留一个不被兜底占满的名额（见
+# FUND_FLOW_PAGE_FALLBACK_CONCURRENCY 的注释）,但要多付约 130 MiB,而 §二 的
+# 500 MiB 判定还没在 Ubuntu 上按项目既有口径复测过——macOS 的 RSS 会把共享框架页
+# 在每个进程里重复计入,数值偏高,不能拿来下结论。所以先不花这份预算:兜底并发
+# 提到 2 已经拿到了实测的收益（最慢一批 12.6s -> 4.6s）,而峰值页面数与改动前一样。
+BROWSER_PAGE_CONCURRENCY = max(
+    1,
+    int(os.getenv("CN_STOCK_BROWSER_PAGE_CONCURRENCY", "2")),
+)
+
+# 多久没人用就把浏览器整个拆掉,秒。置 0 关闭空闲回收。
+#
+# 收益（2026-09-04 实测）:一次页面加载之后常驻的浏览器进程树是 257.6 MiB,
+# close_browser() 用 0.03s 就回收到 0 MiB / 0 进程,不留残余。257.6 MiB 是 §二
+# 预算 500 MiB 的一半,收盘后到次日开盘有 18 个小时,这半份预算是白占的。
+# 附带收益:实测"4 个页面全部关闭后仍回落 +25.9 MiB",即每轮留下约 26 MiB 的
+# 慢渗漏,定期整体拆掉能把它清零。
+#
+# 代价:空闲后第一个请求多付 +2.19s（冷 2.88s vs 热 0.69s,其中建浏览器
+# 0.38~0.65s）。收益远大于代价,量级清楚。
+#
+# 取 90 分钟是为了盖住午休（11:30-13:00 正好 90 分钟）。注意这是个边界值:真的
+# 一整个午休零调用时会恰好在 13:00 前后拆掉,开盘第一个请求付那 2.2s。要确保
+# 盖过午休就设 95 分钟以上,但收盘后也会跟着多留一段。
+#
+# 与 P0 的联动（重要）:拆掉浏览器等于会话回到全新冷态,所以 close_browser() 必须
+# 连带复位 _session_warm,否则标志还是 True 而预算塌到 1,只 goto 不 reload,这条
+# 特性会反过来降低获取率。
+BROWSER_IDLE_TIMEOUT_SECONDS = max(
+    0.0,
+    float(os.getenv("CN_STOCK_BROWSER_IDLE_TIMEOUT_SECONDS", "5400")),
+)
+
 
 class HttpModeError(ValueError):
     """Raised when an explicitly requested channel mode cannot be honoured."""

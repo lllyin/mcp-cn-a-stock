@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -10,6 +11,8 @@ from playwright.async_api import async_playwright, Browser, BrowserContext
 
 from ..config import (
     ALL_INDICES,
+    BROWSER_IDLE_TIMEOUT_SECONDS,
+    BROWSER_PAGE_CONCURRENCY,
     FUND_FLOW_PAGE_CLAIM_PLATFORM,
     FUND_FLOW_PAGE_DISGUISE,
     FUND_FLOW_PAGE_HEADFUL,
@@ -36,8 +39,19 @@ _browser: Browser | None = None
 _context: BrowserContext | None = None
 _lock = asyncio.Lock()
 
-# 2C4G 建议并发数不超过 2
-SEMAPHORE = asyncio.Semaphore(2)
+# 正在借用浏览器的调用方数量，以及空闲回收的定时器。
+#
+# 引用计数不是为了限并发（那是 SEMAPHORE 的事），而是为了让空闲回收不会在别人
+# 用到一半时把浏览器拆掉。少了它就有一个真实的竞态：get_context() 返回后就释放
+# 了 _lock，调用方随后才 new_page()，定时器如果落在这个窗口里，new_page() 抛异常
+# 会被计成兜底失败、喂给熔断器——一个省内存的改动反过来制造数据丢失。
+_browser_users = 0
+_idle_timer: asyncio.TimerHandle | None = None
+_idle_task: asyncio.Task | None = None
+
+# 整个浏览器同时开着的页面数上限。页面在这段区间内创建也在区间内关闭，所以这个
+# 值同时就是"同时几个渲染进程"，是峰值内存的直接决定项。见配置项的实测数据。
+SEMAPHORE = asyncio.Semaphore(BROWSER_PAGE_CONCURRENCY)
 _inflight: dict[str, asyncio.Task[dict]] = {}
 _inflight_waiters: dict[str, int] = {}
 _inflight_keep_alive: dict[str, bool] = {}
@@ -375,8 +389,83 @@ async def get_context() -> BrowserContext:
         return _context
 
 
+@contextlib.asynccontextmanager
+async def browser_lease():
+    """借出浏览器上下文，借用期间空闲回收不会把它拆掉。
+
+    计数刻意在 ``get_context()`` **之前**加，而不是之后：浏览器还不存在时把计数
+    加上没有坏处（回收器只在计数为 0 时才拆），但反过来就有一个窗口——建好之后、
+    计数加上之前，定时器可以插进来把它关掉。
+
+    一次借用要盖住这个标的的全部重试。中途换浏览器意味着 tab 和 CDP 覆盖一起失效，
+    而重试正是被拒之后最需要稳定的时候。
+    """
+    global _browser_users
+    async with _lock:
+        _cancel_idle_timer()
+        _browser_users += 1
+    try:
+        yield await get_context()
+    finally:
+        async with _lock:
+            _browser_users -= 1
+            if _browser_users <= 0:
+                _browser_users = 0
+                _arm_idle_timer()
+
+
+def _cancel_idle_timer() -> None:
+    """撤掉待决的回收定时器。调用方必须已持有 ``_lock``。"""
+    global _idle_timer
+    if _idle_timer is not None:
+        _idle_timer.cancel()
+        _idle_timer = None
+
+
+def _arm_idle_timer() -> None:
+    """最后一个借用者离开时排一个回收定时器。调用方必须已持有 ``_lock``。
+
+    用 ``call_later`` 而不是轮询循环：到点即拆，空闲期一次也不唤醒。全仓现有的
+    ``create_task`` 全是请求内的，这是唯一一个常驻定时器，所以刻意做成"没有借用
+    者时才存在"——有人在用的时候它是被撤掉的状态。
+    """
+    global _idle_timer
+    _cancel_idle_timer()
+    if BROWSER_IDLE_TIMEOUT_SECONDS <= 0 or _browser is None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _idle_timer = loop.call_later(BROWSER_IDLE_TIMEOUT_SECONDS, _on_idle_timeout)
+
+
+def _on_idle_timeout() -> None:
+    """定时器回调。留住任务引用，否则可能在跑完之前被 GC 掉。"""
+    global _idle_task
+    _idle_task = asyncio.ensure_future(_close_if_idle())
+
+
+async def _close_if_idle() -> None:
+    async with _lock:
+        if _browser_users > 0 or _browser is None:
+            # 定时器排下之后又来了请求。撤销由 browser_lease 负责，这里只是兜底。
+            return
+        logger.info(
+            "浏览器空闲 %.0f 分钟，回收实例", BROWSER_IDLE_TIMEOUT_SECONDS / 60
+        )
+        await _close_browser_locked()
+
+
 async def close_browser():
-    """服务退出时调用，清理资源"""
+    """服务退出时调用，清理资源。"""
+    async with _lock:
+        _cancel_idle_timer()
+        await _close_browser_locked()
+
+
+async def _close_browser_locked():
+    """真正的拆除。调用方必须已持有 ``_lock``。"""
     global _playwright, _browser, _context, _identity
     # 身份是从具体这个构建探出来的，换浏览器要重探。
     _identity = None
@@ -825,43 +914,45 @@ async def _load_page_shared(
         3 次  关掉，开下一个 tab + goto
         4 次  reload
     """
-    context = await get_context()
-    budget = FUND_FLOW_PAGE_MAX_LOADS
-    predicate = lambda page: _satisfies(page, require_history, require_today)
-    last_error = None
-    used = 0
+    # 整段重试盖在一次借用里：中途被空闲回收拆掉浏览器，会让 tab 和 CDP 覆盖一起
+    # 失效，而被拒之后的重试正是最需要稳定的时候。
+    async with browser_lease() as context:
+        budget = FUND_FLOW_PAGE_MAX_LOADS
+        predicate = lambda page: _satisfies(page, require_history, require_today)
+        last_error = None
+        used = 0
 
-    while used < budget:
-        # 每个 tab 最多两次加载：goto，没数据就 reload。剩余预算不足就少给。
-        loads = min(2, budget - used)
-        used += loads
-        try:
-            page = await load_fund_flow_page(
-                symbol, context, loads=loads, satisfies=predicate
-            )
-        except FundFlowPageRefused as e:
-            last_error = e
-            if used < budget:
-                logger.info(
-                    "资金流向页面被拒，换一个 tab symbol=%s 已用%d/%d次加载",
-                    symbol,
-                    used,
-                    budget,
+        while used < budget:
+            # 每个 tab 最多两次加载：goto，没数据就 reload。剩余预算不足就少给。
+            loads = min(2, budget - used)
+            used += loads
+            try:
+                page = await load_fund_flow_page(
+                    symbol, context, loads=loads, satisfies=predicate
                 )
-                continue
-            raise
-        if predicate(page) or used >= budget:
-            return page
-        logger.info(
-            "资金流向页面数据不全，换一个 tab symbol=%s 已用%d/%d次加载 今日=%s 历史=%d",
-            symbol,
-            used,
-            budget,
-            page.has_today,
-            len(page.history),
-        )
+            except FundFlowPageRefused as e:
+                last_error = e
+                if used < budget:
+                    logger.info(
+                        "资金流向页面被拒，换一个 tab symbol=%s 已用%d/%d次加载",
+                        symbol,
+                        used,
+                        budget,
+                    )
+                    continue
+                raise
+            if predicate(page) or used >= budget:
+                return page
+            logger.info(
+                "资金流向页面数据不全，换一个 tab symbol=%s 已用%d/%d次加载 今日=%s 历史=%d",
+                symbol,
+                used,
+                budget,
+                page.has_today,
+                len(page.history),
+            )
 
-    raise last_error if last_error else FundFlowPageError(f"{symbol} 页面加载失败")
+        raise last_error if last_error else FundFlowPageError(f"{symbol} 页面加载失败")
 
 
 async def fetch_page_shared(

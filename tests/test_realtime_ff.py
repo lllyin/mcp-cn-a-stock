@@ -954,6 +954,10 @@ class TestRetryDelayParsing:
             _parse_range_ms(",", "1,2")
 
 
+async def _resolved(value):
+    return value
+
+
 # --- P0：加载预算不受"之前成功过"影响 -------------------------------------
 # 原先的逻辑是本进程成功取到过一次数据就把预算塌到 1（只 goto、不 reload）。
 # 那个区分在依据上和代价上都站不住，见 FUND_FLOW_PAGE_MAX_LOADS 的注释。
@@ -1045,5 +1049,141 @@ class TestLoadBudget:
         assert config.FUND_FLOW_PAGE_COLD_ATTEMPTS == config.FUND_FLOW_PAGE_MAX_LOADS
 
 
-async def _resolved(value):
-    return value
+# --- P4：90 分钟空闲回收 -------------------------------------------------
+# 回收本身（close_browser）早就写好了，缺的是"什么时候调"，以及别在别人用到
+# 一半的时候调。
+
+
+class _FakeBrowserForIdle:
+    def __init__(self):
+        self.closed = False
+
+    def is_connected(self):
+        return not self.closed
+
+    async def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def idle_browser(monkeypatch):
+    """装一个假的已建好的浏览器，并保证测试结束后全局状态复原。"""
+    browser = _FakeBrowserForIdle()
+    monkeypatch.setattr(realtime_ff, "_browser", browser)
+    monkeypatch.setattr(realtime_ff, "_context", object())
+    monkeypatch.setattr(realtime_ff, "_playwright", None)
+    monkeypatch.setattr(realtime_ff, "_browser_users", 0)
+    monkeypatch.setattr(realtime_ff, "_idle_timer", None)
+    yield browser
+    if realtime_ff._idle_timer is not None:
+        realtime_ff._idle_timer.cancel()
+        realtime_ff._idle_timer = None
+
+
+class TestIdleTeardown:
+    @pytest.mark.asyncio
+    async def test_the_lease_blocks_teardown_while_in_use(
+        self, monkeypatch, idle_browser
+    ):
+        """借用期间到点也不能拆——这正是那个会制造数据丢失的竞态。"""
+        monkeypatch.setattr(realtime_ff, "BROWSER_IDLE_TIMEOUT_SECONDS", 3600)
+
+        async def fake_get_context():
+            return realtime_ff._context
+
+        monkeypatch.setattr(realtime_ff, "get_context", fake_get_context)
+
+        async with realtime_ff.browser_lease():
+            assert realtime_ff._browser_users == 1
+            # 借用期间定时器必须是撤掉的状态
+            assert realtime_ff._idle_timer is None
+            await realtime_ff._close_if_idle()
+            assert idle_browser.closed is False
+
+        # 最后一个借用者离开，定时器排上
+        assert realtime_ff._browser_users == 0
+        assert realtime_ff._idle_timer is not None
+
+    @pytest.mark.asyncio
+    async def test_teardown_happens_once_nobody_holds_it(
+        self, monkeypatch, idle_browser
+    ):
+        monkeypatch.setattr(realtime_ff, "BROWSER_IDLE_TIMEOUT_SECONDS", 3600)
+
+        await realtime_ff._close_if_idle()
+
+        assert idle_browser.closed is True
+        assert realtime_ff._browser is None
+        assert realtime_ff._context is None
+
+    @pytest.mark.asyncio
+    async def test_zero_switches_idle_teardown_off(self, monkeypatch, idle_browser):
+        monkeypatch.setattr(realtime_ff, "BROWSER_IDLE_TIMEOUT_SECONDS", 0)
+
+        async def fake_get_context():
+            return realtime_ff._context
+
+        monkeypatch.setattr(realtime_ff, "get_context", fake_get_context)
+
+        async with realtime_ff.browser_lease():
+            pass
+
+        assert realtime_ff._idle_timer is None
+        assert idle_browser.closed is False
+
+    @pytest.mark.asyncio
+    async def test_the_lease_releases_even_when_the_body_raises(
+        self, monkeypatch, idle_browser
+    ):
+        """计数漏减一次，浏览器就永远拆不掉了。"""
+        monkeypatch.setattr(realtime_ff, "BROWSER_IDLE_TIMEOUT_SECONDS", 3600)
+
+        async def fake_get_context():
+            return realtime_ff._context
+
+        monkeypatch.setattr(realtime_ff, "get_context", fake_get_context)
+
+        with pytest.raises(RuntimeError):
+            async with realtime_ff.browser_lease():
+                raise RuntimeError("boom")
+
+        assert realtime_ff._browser_users == 0
+
+    @pytest.mark.asyncio
+    async def test_the_lease_releases_even_when_launching_fails(
+        self, monkeypatch, idle_browser
+    ):
+        """建浏览器本身失败也要还计数——否则一次启动失败就锁死回收。"""
+        monkeypatch.setattr(realtime_ff, "BROWSER_IDLE_TIMEOUT_SECONDS", 3600)
+
+        async def boom():
+            raise RuntimeError("launch failed")
+
+        monkeypatch.setattr(realtime_ff, "get_context", boom)
+
+        with pytest.raises(RuntimeError):
+            async with realtime_ff.browser_lease():
+                pass
+
+        assert realtime_ff._browser_users == 0
+
+    @pytest.mark.asyncio
+    async def test_a_second_lease_cancels_the_pending_timer(
+        self, monkeypatch, idle_browser
+    ):
+        """定时器排下之后又来了请求，必须撤掉，不能让它在用到一半时开火。"""
+        monkeypatch.setattr(realtime_ff, "BROWSER_IDLE_TIMEOUT_SECONDS", 3600)
+
+        async def fake_get_context():
+            return realtime_ff._context
+
+        monkeypatch.setattr(realtime_ff, "get_context", fake_get_context)
+
+        async with realtime_ff.browser_lease():
+            pass
+        armed = realtime_ff._idle_timer
+        assert armed is not None
+
+        async with realtime_ff.browser_lease():
+            assert armed.cancelled()
+            assert realtime_ff._idle_timer is None
