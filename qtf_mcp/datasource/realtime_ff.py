@@ -334,16 +334,23 @@ async def load_fund_flow_page(symbol: str, context: BrowserContext) -> FundFlowP
         try:
             parsed = parse_fund_flow_page(content)
         except FundFlowPageError:
-            if refused:
-                outcome = "blocked"
-                raise FundFlowPageBlocked(
-                    f"{symbol} 资金流接口被拒 {len(refused)} 次，页面数据区为空；"
-                    "本进程会话未获风控放行"
-                ) from None
-            raise
+            parsed = None
 
-        _session_warm = True
-        outcome = f"today={parsed.today is not None} history={len(parsed.history)}"
+        # 页面渲染成功但两块都没值，同时相关请求被拒——这就是风控。停牌和开盘前
+        # 也会得到空值，但那时不会有请求失败，所以两个条件必须同时成立。
+        got_nothing = parsed is None or (not parsed.history and not parsed.has_today)
+        if got_nothing and refused:
+            outcome = "blocked"
+            raise FundFlowPageBlocked(
+                f"{symbol} 资金流接口被拒 {len(refused)} 次，页面数据区为空；"
+                "本进程会话未获风控放行"
+            ) from None
+        if parsed is None:
+            raise FundFlowPageError(f"{symbol} 页面既无今日数据也无历史表")
+
+        if not got_nothing:
+            _session_warm = True
+        outcome = f"today={parsed.has_today} history={len(parsed.history)}"
         return parsed
     finally:
         SEMAPHORE.release()

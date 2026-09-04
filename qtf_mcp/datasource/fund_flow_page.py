@@ -106,6 +106,17 @@ class FundFlowPage:
     # 今日各字段的原样文本，供需要逐字一致输出的调用方使用。
     today_text: dict = field(default_factory=dict)
 
+    @property
+    def has_today(self) -> bool:
+        """今日一栏是否真的有值。
+
+        字典存在不等于有数据：占位符会以 None 存进来，十档全是 None 时字典
+        依然非空。被风控拒掉时页面就是这个样子——单元格在，值是空的。停牌和
+        开盘前也一样，所以这里只回答"有没有值"，是不是被拦截由调用方结合
+        请求失败情况判断。
+        """
+        return bool(self.today) and any(v is not None for v in self.today.values())
+
     def history_records(self) -> list:
         return [row.as_record() for row in self.history]
 

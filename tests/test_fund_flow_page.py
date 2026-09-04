@@ -501,3 +501,45 @@ class TestColdSessionRetry:
 
 async def _fake_context():
     return object()
+
+
+class TestEmptyTodayBlockIsNotSuccess:
+    """十档全是占位符时，has_today 必须是 False。
+
+    2026-09-04 10:06 的日志：outcome=today=True history=0，两次加载都这样，
+    报告里今日一栏全是 0。因为占位符以 None 存进字典，字典非空就被当成有数据，
+    于是既不抛 FundFlowPageBlocked、也就不会触发冷会话重试和熔断。
+
+    解析器本身不抛错：停牌和开盘前同样是占位符，那是正常状态，老逻辑输出 0。
+    """
+
+    def _html(self, values: dict) -> str:
+        cells = "".join(
+            f'<td data-field="{fid}">{text}</td>' for fid, text in values.items()
+        )
+        return (
+            '<div class="title">三环集团(300408)</div>'
+            f"<table><tr>{cells}</tr></table>"
+        )
+
+    def test_all_placeholders_have_no_today_data(self):
+        page = parse_fund_flow_page(self._html({fid: "--" for fid in TODAY_FIELDS}))
+
+        assert page.today is not None      # 字典还在，供逐字输出用
+        assert page.has_today is False     # 但没有任何值
+
+    def test_empty_cells_have_no_today_data(self):
+        page = parse_fund_flow_page(self._html({fid: "" for fid in TODAY_FIELDS}))
+
+        assert page.has_today is False
+
+    def test_one_real_value_counts_as_data(self):
+        """部分档位缺失是正常的，不能因为有 None 就整块丢掉。"""
+        values = {fid: "--" for fid in TODAY_FIELDS}
+        values["f62"] = "1.59亿"
+
+        page = parse_fund_flow_page(self._html(values))
+
+        assert page.has_today is True
+        assert page.today["主力净流入-净额"] == pytest.approx(1.59e8)
+        assert page.today["超大单净流入-净额"] is None
