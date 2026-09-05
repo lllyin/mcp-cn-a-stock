@@ -84,11 +84,16 @@ Xvfb；未安装也不影响其他工具。
 
 ## 启动和停止
 
-复制一份配置，然后用脚本后台运行：
+**零配置即可启动**，不需要任何账号、密钥或网关：
+
+```bash
+./start.sh
+```
+
+要微调行为再复制一份配置来改（每一项都可省略，省略即用默认值，见[配置](#配置)）：
 
 ```bash
 cp .env.example .env
-./start.sh
 ```
 
 默认 MCP 地址：
@@ -117,9 +122,124 @@ cn-stock-mcp --transport stdio
 cn-stock-mcp --transport sse --port 8686
 ```
 
+## MCP 客户端接入
+
+支持 Streamable HTTP 的客户端填写：
+
+```text
+名称: cn-stock
+类型: streamableHttp
+地址: http://localhost:8686/cnstock/mcp
+```
+
+CherryStudio 中进入“设置 → MCP 设置 → 添加服务器”，选择
+“可流式传输的 HTTP（streamableHttp）”并填写上述地址。
+
+![CherryStudio MCP 配置](docs/cherrystudio.jpg)
+
+其他客户端的操作示例见[让 DeepSeek 通过 MCP 分析股票](docs/let-your-deepseek-analyze-stock-by-mcp.md)。
+
+## 使用 mcporter 调用
+
+以下示例假设 `mcporter` 已配置名为 `cn-stock` 的服务：
+
+```bash
+export MCPORTER_CONFIG=~/.openclaw/workspace/config/mcporter.json
+```
+
+查询简要、财务和完整报告：
+
+```bash
+mcporter call cn-stock brief symbol=SH600000
+mcporter call cn-stock medium symbol=SZ000333
+mcporter call cn-stock full symbol=SH603986 fund_flow_limit=30
+```
+
+单次批量查询，标的之间使用半角逗号：
+
+```bash
+mcporter call cn-stock brief symbol=SH600000,SZ000333,SZ300750,SH688981
+```
+
+超过 4 个标的时只处理前 4 个，其余代码会写入响应的 `warnings`。
+
+查询机器可读技术指标：
+
+```bash
+mcporter call cn-stock tech symbol=SZ002463 days=30
+mcporter call cn-stock tech symbol=SZ002463,SH688981 days=10
+mcporter call cn-stock tech symbol=SZ002463 fields=macd,kdj include_derived=true
+```
+
+查询指定历史截止日期：
+
+```bash
+mcporter call cn-stock brief symbol=SZ002463 date=2026-06-05
+mcporter call cn-stock tech symbol=SZ002463 days=30 date=2026-06-05
+```
+
+查询单日或区间 K 线，`adjust` 可选 `qfq`（前复权）、`hfq`（后复权）和 `none`（不复权）：
+
+```bash
+mcporter call cn-stock kline_daily symbol=SH603986 date=2026-05-29 adjust=qfq
+mcporter call cn-stock kline_range symbol=SH603986 start_date=2026-05-22 end_date=2026-05-29
+```
+
+查询全市场涨跌分布：
+
+```bash
+mcporter call cn-stock market_breadth
+```
+
+查询指定日期的公开事件池：
+
+```bash
+mcporter call cn-stock market_events \
+  date=2026-08-20 \
+  sources=lhb,limit_up,announcements \
+  announcement_lookback_days=3 \
+  keywords=中标,订单,涨价,投产,收购,重组 \
+  symbols=SH600000,SZ000001 \
+  max_rows_per_source=200
+```
+
+`sources` 可组合 `lhb`、`limit_up`、`strong`、`previous_limit_up`、`broken_board`、
+`announcements` 和 `earnings_forecast`。`symbols` 可选，使用标准 `SH/SZ/BJ + 6 位代码`，
+在 `max_rows_per_source` 截断前过滤；省略时保持全市场行为。
+
+## 常见问题
+
+**首次调用较慢**
+
+首次请求可能包含模块初始化、浏览器启动、认证刷新或上游连接建立。请结合
+`logs/cn-stock-mcp.log` 中的分段耗时判断，不要只比较单次冷启动。
+
+**指定日期没有数据**
+
+周末和节假日通常返回截止日期之前最近一个交易日的数据；代码错误或标的尚未上市时可能返回空结果。
+
+**报告里出现“盘中实时数据暂时不可用”**
+
+东财资金流接口和页面兜底都没取到数据，其余部分不受影响。这是瞬时状态，不会被写进缓存。
+科创 50（`SH000688`）等没有资金流向页面的指数在盘中本来就没有这一段。
+
+**`market_breadth` 出现 fallback warning**
+
+首选数据源认证失败、处于冷却期或浏览器不可用时会自动回退。响应仍可使用，但应关注
+`source`、`trade_date` 和 `warnings`。
+
+**批量请求被截断**
+
+每次 tool 调用最多处理 4 个标的。需要更多标的时由客户端拆分请求，并控制并发，避免集中冲击上游接口。
+
 ## 配置
 
-所有配置都通过 `.env` 提供，全部可省略，省略即使用下表的默认值。改完需要重启服务。
+**这一节是用来微调的，不配也能跑。** 所有配置都通过 `.env` 提供，全部可省略，省略即
+使用下表的默认值；改完需要重启服务。
+
+大多数人只会用到这几项：`HTTP_CHANNEL`（出站方式）、`BROWSER_HEADFUL`（排查时看浏览器
+在干什么）、`REPORT_CACHE_ENABLED`（压测时关掉缓存）。其余的默认值都是拿实测数据定的，
+调之前建议先读一遍那一项的说明——`.env.example` 里每一项都写了为什么是这个值。
 
 > 入口执行的是 `load_dotenv(override=True)`，**`.env` 的取值优先于 shell 环境变量**。
 > `HTTP_CHANNEL=direct ./start.sh` 这种写法会被 `.env` 里的同名项覆盖掉，
@@ -175,8 +295,8 @@ cn-stock-mcp --transport sse --port 8686
 | `INTRADAY_QUOTE_CROSS_CHECK_PCT` | 百分比，`0` 关闭（默认 `0`） | 拿到第一个可用报价后再问剩下的源一遍，字段相差超过这个值就打 WARNING。开着每个标的多一次上游请求，只在怀疑某个源口径不对时开——创业板指成交量差 3.5% 那件事，开着的话日志里当场就有一行 |
 | `TRADING_CALENDAR_PROVIDERS` | `sina`<br>`weekday`<br>`off`<br>（默认 `sina,weekday`） | 判"今天开不开市"的日历来源：<br>`sina` 上交所公布的交易日名单（经 AkShare），8797 行 / 0.18s<br>`weekday` 兜底，周一到周五算交易日，即接入日历之前的行为<br>降级路径做成平台而不是 if/else，好处是看得见、能单独关掉 |
 | `TRADING_CALENDAR_TTL_SECONDS` | 秒（默认 `86400`） | 日历的进程内缓存时长。交易日历提前一年公布，一天刷一次够了 |
-| `KLINE_PROVIDERS_INDEX` | 同上（默认 `tonghuashun,tencent,sina`） | **指数**用的兜底顺序，和上一项分开配。判据是哪家更贴近主源东财：创业板指成交量东财与同花顺一致，腾讯/新浪低 3.52%；个股则相反（美的 120 日均价东财与腾讯一致，同花顺 −0.059%），所以两类分两条 |
 | `SECTOR_FUND_FLOW_PROVIDERS` | `eastmoney`<br>`eastmoney_dataapi`<br>`off`<br>（默认 `eastmoney,eastmoney_dataapi`） | 板块资金流的取数顺序：<br>`eastmoney` push2 clist，字段全<br>`eastmoney_dataapi` 只有主力净额，但不在伪装通道接管名单里，push2 连不上时它还通；返回会标注是降级源 |
+| `KLINE_PROVIDERS_INDEX` | 同上（默认 `tonghuashun,tencent,sina`） | **指数**用的兜底顺序，和上一项分开配。判据是哪家更贴近主源东财：创业板指成交量东财与同花顺一致，腾讯/新浪低 3.52%；个股则相反（美的 120 日均价东财与腾讯一致，同花顺 −0.059%），所以两类分两条 |
 | `KLINE_PROVIDERS` | `tonghuashun`<br>`tencent`<br>`sina`<br>`off`<br>（默认 `tencent,sina`） | 东财那一级取不到时，**个股/ETF** 的兜底顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`tonghuashun` 免鉴权接口，指数口径和东财一致，但个股的前复权基准不同；不覆盖北交所<br>`tencent` 个股/ETF/指数都覆盖，北交所大半不认<br>`sina` 覆盖腾讯不认的北交所代码，但 ETF 和创业板指是 JSONDecodeError<br>三家各补各的洞。接新源只需写一个 `platforms/<名字>.py` 再把名字加进来 |
 | `FUND_FLOW_PAGE_ENABLED` | `0`<br>`1`<br>（默认 `1`） | 东财资金流接口不可用时，是否回退到资金流向页面 |
 | `FUND_FLOW_PAGE_CONCURRENCY` | 正整数（默认 `3`） | 同时进行的兜底页面加载数。要和 `BROWSER_MAX_PAGES` 一起调，两者是串联的闸门，只提其中一个另一个立刻变成新瓶颈 |
@@ -253,139 +373,10 @@ AkShare 和 efinance 的接口是同步网络调用，由一个有界线程池�
 | `BROWSER_HEADFUL` | `0`<br>`1`<br>（默认 `0`） | 调试开关：资金流页面用有头浏览器加载，便于人工观察渲染结果 |
 | `BROWSER_KEEP_PAGES` | `0`<br>`1`<br>（默认 `0`） | 调试开关：抓完不关页面。每个页面是一个独立渲染进程，会显著抬高内存 |
 
-## 使用 mcporter 调用
-
-以下示例假设 `mcporter` 已配置名为 `cn-stock` 的服务：
-
-```bash
-export MCPORTER_CONFIG=~/.openclaw/workspace/config/mcporter.json
-```
-
-查询简要、财务和完整报告：
-
-```bash
-mcporter call cn-stock brief symbol=SH600000
-mcporter call cn-stock medium symbol=SZ000333
-mcporter call cn-stock full symbol=SH603986 fund_flow_limit=30
-```
-
-单次批量查询，标的之间使用半角逗号：
-
-```bash
-mcporter call cn-stock brief symbol=SH600000,SZ000333,SZ300750,SH688981
-```
-
-超过 4 个标的时只处理前 4 个，其余代码会写入响应的 `warnings`。
-
-查询机器可读技术指标：
-
-```bash
-mcporter call cn-stock tech symbol=SZ002463 days=30
-mcporter call cn-stock tech symbol=SZ002463,SH688981 days=10
-mcporter call cn-stock tech symbol=SZ002463 fields=macd,kdj include_derived=true
-```
-
-查询指定历史截止日期：
-
-```bash
-mcporter call cn-stock brief symbol=SZ002463 date=2026-06-05
-mcporter call cn-stock tech symbol=SZ002463 days=30 date=2026-06-05
-```
-
-查询单日或区间 K 线，`adjust` 可选 `qfq`（前复权）、`hfq`（后复权）和 `none`（不复权）：
-
-```bash
-mcporter call cn-stock kline_daily symbol=SH603986 date=2026-05-29 adjust=qfq
-mcporter call cn-stock kline_range symbol=SH603986 start_date=2026-05-22 end_date=2026-05-29
-```
-
-查询全市场涨跌分布：
-
-```bash
-mcporter call cn-stock market_breadth
-```
-
-查询指定日期的公开事件池：
-
-```bash
-mcporter call cn-stock market_events \
-  date=2026-08-20 \
-  sources=lhb,limit_up,announcements \
-  announcement_lookback_days=3 \
-  keywords=中标,订单,涨价,投产,收购,重组 \
-  symbols=SH600000,SZ000001 \
-  max_rows_per_source=200
-```
-
-`sources` 可组合 `lhb`、`limit_up`、`strong`、`previous_limit_up`、`broken_board`、
-`announcements` 和 `earnings_forecast`。`symbols` 可选，使用标准 `SH/SZ/BJ + 6 位代码`，
-在 `max_rows_per_source` 截断前过滤；省略时保持全市场行为。
-
-## MCP 客户端接入
-
-支持 Streamable HTTP 的客户端填写：
-
-```text
-名称: cn-stock
-类型: streamableHttp
-地址: http://localhost:8686/cnstock/mcp
-```
-
-CherryStudio 中进入“设置 → MCP 设置 → 添加服务器”，选择
-“可流式传输的 HTTP（streamableHttp）”并填写上述地址。
-
-![CherryStudio MCP 配置](docs/cherrystudio.jpg)
-
-其他客户端的操作示例见[让 DeepSeek 通过 MCP 分析股票](docs/let-your-deepseek-analyze-stock-by-mcp.md)。
-
-## 调试与测试
-
-使用 MCP Inspector：
-
-```bash
-npx @modelcontextprotocol/inspector --url http://localhost:8686/cnstock/mcp
-```
-
-运行单元测试：
-
-```bash
-uv sync --extra dev
-pytest tests --ignore=tests/test_akshare_source.py
-```
-
-查看版本：
-
-```bash
-python -c "from qtf_mcp import __version__; print(__version__)"
-```
-
-## 常见问题
-
-**首次调用较慢**
-
-首次请求可能包含模块初始化、浏览器启动、认证刷新或上游连接建立。请结合
-`logs/cn-stock-mcp.log` 中的分段耗时判断，不要只比较单次冷启动。
-
-**指定日期没有数据**
-
-周末和节假日通常返回截止日期之前最近一个交易日的数据；代码错误或标的尚未上市时可能返回空结果。
-
-**报告里出现“盘中实时数据暂时不可用”**
-
-东财资金流接口和页面兜底都没取到数据，其余部分不受影响。这是瞬时状态，不会被写进缓存。
-科创 50（`SH000688`）等没有资金流向页面的指数在盘中本来就没有这一段。
-
-**`market_breadth` 出现 fallback warning**
-
-首选数据源认证失败、处于冷却期或浏览器不可用时会自动回退。响应仍可使用，但应关注
-`source`、`trade_date` 和 `warnings`。
-
-**批量请求被截断**
-
-每次 tool 调用最多处理 4 个标的。需要更多标的时由客户端拆分请求，并控制并发，避免集中冲击上游接口。
-
 ## 更多文档
 
+- [开发与维护](docs/development.md)：跑测试、调试、发布前验证、重构时怎么证明行为没变
+- [取数架构：平台 → 能力 → 归一](docs/data-provider-architecture.md)：接一个新数据源要做什么
 - [技术实现说明](docs/technical-details.md)：架构、数据链路与回退、输出契约、报告缓存、调优边界
 - [完整报告示例](docs/SH603986-full.md)
 - [DeepChat 使用示例](docs/let-your-deepseek-analyze-stock-by-mcp.md)
