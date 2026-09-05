@@ -17,6 +17,7 @@ from numpy import ndarray
 from .datafeed import load_data_msd
 from .config import ALL_INDICES
 from .datasource.base import FetchRequirements
+from .datasource import trading_calendar
 from .datasource.realtime_ff import get_fund_flow
 from .symbols import symbol_with_name
 
@@ -385,8 +386,16 @@ def today_volume_est_ratio(data: Dict[str, ndarray], now: int = 0) -> float:
 
 
 def is_realtime_fund_flow_window(now: Optional[datetime.datetime] = None) -> bool:
-    """Return whether reports should use the Playwright live fund-flow source."""
-    now_time = (now or datetime.datetime.now()).time()
+    """Return whether reports should use the Playwright live fund-flow source.
+
+    非交易日一律返回 False。修之前这里只看时钟不看日期，代价实测过：2026-09-05
+    是周六，15:11 那一轮服务照样为一个不存在的交易日拉起 Chromium——66 次页面加载、
+    65 次撞上验证码，还把出口 IP 打热，连累了后面几轮的取数。
+    """
+    moment = now or datetime.datetime.now()
+    if not trading_calendar.is_trading_day(moment.date()):
+        return False
+    now_time = moment.time()
     return (now_time.hour == 9 and now_time.minute >= 15) or (10 <= now_time.hour <= 16)
 
 

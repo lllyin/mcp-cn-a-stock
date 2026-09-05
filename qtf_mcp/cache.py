@@ -193,11 +193,27 @@ def _render_fingerprint() -> str:
 RENDER_FINGERPRINT = _render_fingerprint()
 
 
-def _previous_weekday(day: datetime.date) -> datetime.date:
-    cursor = day - datetime.timedelta(days=1)
-    while cursor.weekday() >= 5:
-        cursor -= datetime.timedelta(days=1)
-    return cursor
+def _is_trading_day(day: datetime.date) -> bool:
+    """这天开不开市。取不到日历时退回按星期判断，也就是接入日历之前的行为。
+
+    延迟 import：本模块被 mcp_app 先于 datasource 导入，模块级 import 会把
+    datasource 的导入副作用（安装出站 HTTP 通道）提前，那是另一件事，不该由缓存
+    层顺手改掉。
+    """
+    from .datasource import trading_calendar
+
+    return trading_calendar.is_trading_day(day)
+
+
+def _previous_trading_day(day: datetime.date) -> datetime.date:
+    """上一个交易日。
+
+    原来是"上一个工作日"，长假里这个锚点天天在变——国庆八天里纪元 token 每天换
+    一次，磁盘缓存跟着每天作废，而那几天数据其实是冻住的。
+    """
+    from .datasource import trading_calendar
+
+    return trading_calendar.previous_trading_day(day)
 
 
 def market_phase(now: Optional[datetime.datetime] = None) -> tuple[str, str]:
@@ -212,8 +228,10 @@ def market_phase(now: Optional[datetime.datetime] = None) -> tuple[str, str]:
     day = local_now.date()
     clock = local_now.replace(tzinfo=None).time()
 
-    if day.weekday() >= 5 or clock < PRE_OPEN:
-        return PHASE_CLOSED, f"closed-{_previous_weekday(day)}"
+    if not _is_trading_day(day) or clock < PRE_OPEN:
+        # 非交易日整天都是 CLOSED。修之前用的是 weekday()>=5，于是国庆
+        # 10-01~10-08 被判成盘中，报告缓存退化成 30 秒 TTL，八天等于没有缓存。
+        return PHASE_CLOSED, f"closed-{_previous_trading_day(day)}"
     if clock < LUNCH_START:
         return PHASE_LIVE, f"live-{day}"
     if clock < LUNCH_SETTLE:

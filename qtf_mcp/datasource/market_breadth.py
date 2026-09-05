@@ -511,9 +511,16 @@ _market_breadth_fetch_lock = asyncio.Lock()
 
 
 def _market_breadth_cache_ttl(now: datetime | None = None) -> float:
+    """盘中 15 秒、其余 300 秒。
+
+    非交易日走 300 秒那一支：原来判的是 weekday()<5，节假日会按盘中对待，
+    上游请求多 20 倍，而那几天数据根本不动。
+    """
+    from . import trading_calendar
+
     current = now or _shanghai_now()
     hhmm = current.hour * 100 + current.minute
-    if current.weekday() < 5 and 915 <= hhmm <= 1510:
+    if trading_calendar.is_trading_day(current.date()) and 915 <= hhmm <= 1510:
         return 15.0
     return 300.0
 
