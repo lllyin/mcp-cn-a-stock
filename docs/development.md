@@ -5,8 +5,10 @@
 ## 环境
 
 ```bash
-uv sync --extra dev
+./install.sh --dev
 ```
+
+`--dev` 比 `./install.sh` 多装测试依赖。两者都会把 Chromium 装好。
 
 ## 运行测试
 

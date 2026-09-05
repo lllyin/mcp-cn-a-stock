@@ -41,36 +41,21 @@ CnStock 是一个面向大模型和 MCP 客户端的 A 股数据服务。
 
 ## 快速安装
 
-### 1. 获取代码
-
 ```bash
 git clone https://github.com/lllyin/mcp-cn-a-stock.git
 cd mcp-cn-a-stock
+./install.sh
 ```
 
-### 2. 创建环境并安装依赖
-
-使用 uv：
-
-```bash
-uv sync
-source .venv/bin/activate
-```
-
-或使用标准 venv 和 pip：
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install .
-```
+`install.sh` 装 Python 依赖和 Chromium，只需执行一次。有 `uv` 就用 `uv`，没有就用
+标准 venv + pip。
 
 无桌面的 Ubuntu 可额外安装 `xvfb`，`start.sh` 会在没有 `DISPLAY` 时自动启动并管理它；
 未安装也不影响其他工具。
 
 ## 启动和停止
 
-零配置即可启动，不需要账号、密钥或网关。首次启动会自动装好 Chromium：
+零配置即可启动，不需要账号、密钥或网关：
 
 ```bash
 ./start.sh
