@@ -995,6 +995,104 @@ async def kline_range(
   return report
 
 
+def _render_sector_fund_flow(board, top: int) -> str:
+  """把板块资金流渲染成报告。
+
+  返回 Markdown 而不是 JSON，是因为这一维的用途是"今天哪个方向在被买"——调用方
+  拿到之后是要转述的，和 brief/medium/full 同一类。金额在这里折成亿，调用方不用
+  再换算。（要精确数值的场景走 tech 那种 JSON 工具，两类分开。）
+  """
+  from .research import format_fund_flow_amount
+
+  names = {"industry": "行业", "concept": "概念", "region": "地域"}
+  periods = {"today": "今日", "5d": "5日", "10d": "10日"}
+  buf = StringIO()
+  print(f"# {names.get(board.sector_type, board.sector_type)}板块资金流"
+        f"（{periods.get(board.period, board.period)}）\n", file=buf)
+
+  ranked = sorted(board.sectors, key=lambda s: (s.main_net is None, -(s.main_net or 0)))
+  inflow = [s for s in ranked if (s.main_net or 0) > 0][:top]
+  outflow = [s for s in reversed(ranked) if (s.main_net or 0) < 0][:top]
+
+  # 缺字段的降级源只画得出两列。少画几列，好过画一堆空格子让人以为数据丢了。
+  wide = not board.partial
+  header = ("| 板块 | 涨跌幅 | 主力净流入 | 主力净占比 | 超大单 | 大单 | 主力净流入最大股 |\n"
+            "| --- | ---: | ---: | ---: | ---: | ---: | --- |") if wide else (
+           "| 板块 | 主力净流入 |\n| --- | ---: |")
+
+  for title, rows in (("净流入前", inflow), ("净流出前", outflow)):
+    if not rows:
+      continue
+    print(f"## {title} {len(rows)}\n", file=buf)
+    print(header, file=buf)
+    for item in rows:
+      if wide:
+        pct = f"{item.change_pct:+.2f}%" if item.change_pct is not None else "--"
+        mpct = f"{item.main_pct:+.2f}%" if item.main_pct is not None else "--"
+        print(f"| {item.name} | {pct} | {format_fund_flow_amount(item.main_net)} | {mpct} "
+              f"| {format_fund_flow_amount(item.xl_net)} | {format_fund_flow_amount(item.l_net)} "
+              f"| {item.leader or '--'} |", file=buf)
+      else:
+        print(f"| {item.name} | {format_fund_flow_amount(item.main_net)} |", file=buf)
+    print("", file=buf)
+
+  print(f"- 口径：{periods.get(board.period, board.period)}"
+        f" | 覆盖 {len(board.sectors)} 个{names.get(board.sector_type, '')}板块"
+        f" | 来源：{board.source}", file=buf)
+  if board.partial:
+    print("- ⚠️ 这一份来自降级源，只有主力净额；涨跌幅和四档明细取不到。", file=buf)
+  return buf.getvalue()
+
+
+@mcp_app.tool()
+async def sector_fund_flow(
+  sector_type: str = "industry",
+  period: str = "today",
+  top: int = 10,
+  ctx: Context = None,  # type: ignore
+) -> str:
+  """获取行业/概念/地域板块的资金流排行。
+
+  回答个股资金流答不了的问题：报告说"某只票主力净流入 3.68亿"，但没有语境——是
+  整个板块在被买，还是只有它。
+
+  Args:
+    sector_type (str): industry（行业，默认）| concept（概念）| region（地域）
+    period (str): today（今日，默认）| 5d | 10d
+    top (int): 净流入和净流出各取前几名，默认 10
+
+  Returns:
+    Markdown 报告，含净流入/净流出两张表，金额已折成亿。
+  """
+  from .datasource import sector_fund_flow as sff
+
+  sector_type = (sector_type or "industry").strip().lower()
+  period = (period or "today").strip().lower()
+  if sector_type not in sff.SECTOR_TYPES:
+    return f"不支持的板块类型 {sector_type}，可选：{'、'.join(sff.SECTOR_TYPES)}"
+  if period not in sff.PERIODS:
+    return f"不支持的口径 {period}，可选：{'、'.join(sff.PERIODS)}"
+  top = max(1, min(int(top or 10), 50))
+
+  started_at = time.perf_counter()
+  status: dict = {}
+  board = await asyncio.to_thread(
+    sff.resolve, sff.SectorFundFlowRequest(sector_type=sector_type, period=period),
+    status=status,
+  )
+  if board is None:
+    logger.warning("板块资金流取数失败 sector_type=%s period=%s status=%s",
+                   sector_type, period, status)
+    return (f"暂时取不到{sector_type}板块的资金流数据。"
+            f"上游状态：{status or '无'}")
+  report = _render_sector_fund_flow(board, top)
+  logger.info("Finished sector_fund_flow sector_type=%s period=%s source=%s "
+              "sectors=%s elapsed=%.3fs",
+              sector_type, period, board.source, len(board.sectors),
+              time.perf_counter() - started_at)
+  return report
+
+
 @mcp_app.tool()
 async def market_breadth(ctx: Context = None) -> MarketBreadthResponse:  # type: ignore
   """获取全 A 股上涨、下跌、平盘、涨跌停家数和涨跌幅分布。

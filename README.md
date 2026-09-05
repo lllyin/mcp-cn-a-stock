@@ -26,6 +26,7 @@ CnStock 是一个面向大模型和 MCP 客户端的 A 股数据服务。
 | `tech` | 严格 JSON | OHLCV、KDJ、MACD、RSI、布林带 |
 | `kline_daily` | Markdown | 指定交易日的 K 线 |
 | `kline_range` | Markdown 表格 | 指定日期区间的 K 线 |
+| `sector_fund_flow` | Markdown 表格 | 行业/概念/地域板块的资金流排行 |
 | `market_breadth` | 严格 JSON | 全市场涨跌家数、涨跌停和十档分布 |
 | `market_events` | 严格 JSON | 指定日期的龙虎榜、涨停池、公告和业绩预告 |
 
@@ -175,6 +176,7 @@ cn-stock-mcp --transport sse --port 8686
 | `TRADING_CALENDAR_PROVIDERS` | `sina`<br>`weekday`<br>`off`<br>（默认 `sina,weekday`） | 判"今天开不开市"的日历来源：<br>`sina` 上交所公布的交易日名单（经 AkShare），8797 行 / 0.18s<br>`weekday` 兜底，周一到周五算交易日，即接入日历之前的行为<br>降级路径做成平台而不是 if/else，好处是看得见、能单独关掉 |
 | `TRADING_CALENDAR_TTL_SECONDS` | 秒（默认 `86400`） | 日历的进程内缓存时长。交易日历提前一年公布，一天刷一次够了 |
 | `KLINE_PROVIDERS_INDEX` | 同上（默认 `tonghuashun,tencent,sina`） | **指数**用的兜底顺序，和上一项分开配。判据是哪家更贴近主源东财：创业板指成交量东财与同花顺一致，腾讯/新浪低 3.52%；个股则相反（美的 120 日均价东财与腾讯一致，同花顺 −0.059%），所以两类分两条 |
+| `SECTOR_FUND_FLOW_PROVIDERS` | `eastmoney`<br>`eastmoney_dataapi`<br>`off`<br>（默认 `eastmoney,eastmoney_dataapi`） | 板块资金流的取数顺序：<br>`eastmoney` push2 clist，字段全<br>`eastmoney_dataapi` 只有主力净额，但不在伪装通道接管名单里，push2 连不上时它还通；返回会标注是降级源 |
 | `KLINE_PROVIDERS` | `tonghuashun`<br>`tencent`<br>`sina`<br>`off`<br>（默认 `tencent,sina`） | 东财那一级取不到时，**个股/ETF** 的兜底顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`tonghuashun` 免鉴权接口，指数口径和东财一致，但个股的前复权基准不同；不覆盖北交所<br>`tencent` 个股/ETF/指数都覆盖，北交所大半不认<br>`sina` 覆盖腾讯不认的北交所代码，但 ETF 和创业板指是 JSONDecodeError<br>三家各补各的洞。接新源只需写一个 `platforms/<名字>.py` 再把名字加进来 |
 | `FUND_FLOW_PAGE_ENABLED` | `0`<br>`1`<br>（默认 `1`） | 东财资金流接口不可用时，是否回退到资金流向页面 |
 | `FUND_FLOW_PAGE_CONCURRENCY` | 正整数（默认 `3`） | 同时进行的兜底页面加载数。要和 `BROWSER_MAX_PAGES` 一起调，两者是串联的闸门，只提其中一个另一个立刻变成新瓶颈 |
