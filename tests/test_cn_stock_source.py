@@ -16,6 +16,16 @@ from qtf_mcp.datasource.cn_stock_source import CNStockDataSource
 from qtf_mcp.datasource.base import DataSource, FetchRequirements, StockData
 from qtf_mcp import datafeed
 
+
+@pytest.fixture(autouse=True)
+def _pin_kline_order(monkeypatch):
+    """这个文件桩的都是腾讯和新浪，把 K 线源的顺序钉到这两家。
+
+    默认顺序里同花顺排第一，不钉的话它会真发网络请求，测的就不是这里想测的东西了。
+    同花顺自己的行为归 test_kline_source.py 和平台层的测试管。
+    """
+    monkeypatch.setenv("KLINE_PROVIDERS", "tencent,sina")
+
 def _sample_kline_frame():
     return pd.DataFrame(
         [

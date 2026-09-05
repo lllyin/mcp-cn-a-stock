@@ -174,7 +174,8 @@ cn-stock-mcp --transport sse --port 8686
 | `INTRADAY_QUOTE_CROSS_CHECK_PCT` | 百分比，`0` 关闭（默认 `0`） | 拿到第一个可用报价后再问剩下的源一遍，字段相差超过这个值就打 WARNING。开着每个标的多一次上游请求，只在怀疑某个源口径不对时开——创业板指成交量差 3.5% 那件事，开着的话日志里当场就有一行 |
 | `TRADING_CALENDAR_PROVIDERS` | `sina`<br>`weekday`<br>`off`<br>（默认 `sina,weekday`） | 判"今天开不开市"的日历来源：<br>`sina` 上交所公布的交易日名单（经 AkShare），8797 行 / 0.18s<br>`weekday` 兜底，周一到周五算交易日，即接入日历之前的行为<br>降级路径做成平台而不是 if/else，好处是看得见、能单独关掉 |
 | `TRADING_CALENDAR_TTL_SECONDS` | 秒（默认 `86400`） | 日历的进程内缓存时长。交易日历提前一年公布，一天刷一次够了 |
-| `KLINE_PROVIDERS` | `tencent`<br>`sina`<br>`off`<br>（默认 `tencent,sina`） | 东财那一级取不到时，历史 K 线的兜底顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`tencent` 走 `stock_zh_a_hist_tx`，个股/ETF/指数都覆盖，北交所大半不认<br>`sina` 走 `stock_zh_a_daily`，覆盖腾讯不认的北交所代码，但 ETF 和创业板指是 JSONDecodeError<br>接新源只需写一个 provider 再注册，然后把名字加进来 |
+| `KLINE_PROVIDERS_INDEX` | 同上（默认 `tonghuashun,tencent,sina`） | **指数**用的兜底顺序，和上一项分开配。判据是哪家更贴近主源东财：创业板指成交量东财与同花顺一致，腾讯/新浪低 3.52%；个股则相反（美的 120 日均价东财与腾讯一致，同花顺 −0.059%），所以两类分两条 |
+| `KLINE_PROVIDERS` | `tonghuashun`<br>`tencent`<br>`sina`<br>`off`<br>（默认 `tencent,sina`） | 东财那一级取不到时，**个股/ETF** 的兜底顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`tonghuashun` 免鉴权接口，指数口径和东财一致，但个股的前复权基准不同；不覆盖北交所<br>`tencent` 个股/ETF/指数都覆盖，北交所大半不认<br>`sina` 覆盖腾讯不认的北交所代码，但 ETF 和创业板指是 JSONDecodeError<br>三家各补各的洞。接新源只需写一个 `platforms/<名字>.py` 再把名字加进来 |
 | `FUND_FLOW_PAGE_ENABLED` | `0`<br>`1`<br>（默认 `1`） | 东财资金流接口不可用时，是否回退到资金流向页面 |
 | `FUND_FLOW_PAGE_CONCURRENCY` | 正整数（默认 `3`） | 同时进行的兜底页面加载数。要和 `BROWSER_MAX_PAGES` 一起调，两者是串联的闸门，只提其中一个另一个立刻变成新瓶颈 |
 | `FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS` | 秒（默认 `8`） | 单个标的等一个名额的上限，等不到就跳过兜底、改渲染“盘中实时数据暂时不可用”。必须大于一次页面加载的耗时（部署机实测 p50 3.4s / p90 7.5s），否则一批 4 个标的里的最后一个结构上永远排不到 |

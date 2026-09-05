@@ -101,12 +101,34 @@ def test_a_platform_returning_a_bad_frame_is_skipped_not_trusted(monkeypatch):
 
 
 def test_the_builtin_platforms_provide_this_capability():
-    assert set(kline_source.registered()) >= {"tencent", "sina"}
+    assert set(kline_source.registered()) >= {"tencent", "sina", "tonghuashun"}
+
+
+def test_indices_and_the_rest_use_different_orders():
+    """判据是"哪一家更贴近主源东财"，两边都是实测出来的。
+
+    指数：创业板指成交量东财/同花顺一致，腾讯/新浪低 3.52%。
+    个股：美的 120 日均价东财/腾讯一致，同花顺 -0.059%（前复权基准不同）。
+    """
+    assert kline_source.DEFAULT_PROVIDER_ORDER == ("tencent", "sina")
+    assert kline_source.INDEX_PROVIDER_ORDER == ("tonghuashun", "tencent", "sina")
+    assert kline_source.configured_order(_request("SZ399006"))[0] == "tonghuashun"
+    assert kline_source.configured_order(_request("SH600519"))[0] == "tencent"
+
+
+@pytest.mark.parametrize("symbol,expected", [
+    ("SH000001", True), ("SZ399006", True), ("BJ899050", True),
+    ("SH600519", False), ("SH512480", False), ("BJ920021", False),
+])
+def test_the_request_knows_whether_it_is_an_index(symbol, expected):
+    assert _request(symbol).is_index is expected
 
 
 def test_the_configured_order_is_read_from_the_env(monkeypatch):
-    monkeypatch.setenv("KLINE_PROVIDERS", "sina,tencent")
-    assert kline_source.configured_order() == ("sina", "tencent")
+    monkeypatch.setenv("KLINE_PROVIDERS", "tonghuashun,tencent")
+    assert kline_source.configured_order() == ("tonghuashun", "tencent")
+    monkeypatch.setenv("KLINE_PROVIDERS_INDEX", "tencent")
+    assert kline_source.configured_order(_request("SZ399006")) == ("tencent",)
 
 
 def test_the_whole_tier_can_be_turned_off(monkeypatch):
