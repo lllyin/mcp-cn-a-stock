@@ -24,7 +24,7 @@ CnStock 是一个面向大模型和 MCP 客户端的 A 股数据服务。
 | `tech` | OHLCV、KDJ、MACD、RSI、布林带 | 严格 JSON |
 | `kline_daily` | 指定交易日的 K 线 | Markdown |
 | `kline_range` | 指定日期区间的 K 线 | Markdown 表格 |
-| `sector_fund_flow` | 行业/概念/地域板块的资金流排行 | Markdown 表格 |
+| `sector_fund_flow` | 行业/概念/地域板块的资金流排行，与东财官网同口径 | Markdown 表格 |
 | `market_breadth` | 全市场涨跌家数、涨跌停和十档分布 | 严格 JSON |
 | `market_events` | 指定日期的龙虎榜、涨停池、公告和业绩预告 | 严格 JSON |
 
@@ -252,7 +252,7 @@ mcporter call cn-stock market_events \
 | `TRADING_CALENDAR_PROVIDERS` | 判「今天开不开市」的日历来源：<br>`sina` 上交所公布的交易日名单<br>`weekday` 兜底，周一到周五算交易日 | `sina`<br>`weekday`<br>`off`<br>（默认 `sina,weekday`） |
 | `TRADING_CALENDAR_TTL_SECONDS` | 日历的进程内缓存时长 | 秒（默认 `86400`） |
 | `SECTOR_FUND_FLOW_PROVIDERS` | 板块资金流的取数顺序：<br>`eastmoney` 字段全<br>`eastmoney_dataapi` 只有主力净额，但主源连不上时它还通；报告备注里会标出是降级源 | `eastmoney`<br>`eastmoney_dataapi`<br>`off`<br>（默认 `eastmoney,eastmoney_dataapi`） |
-| `SECTOR_TAXONOMY_PROVIDERS` | 板块分级表的来源，用来只排同一层——东财的行业板块名单是一棵树摊平的，不分级会让父子板块同时上榜、同一笔钱数两遍：<br>`shenwan` 申万宏源的行业分类<br>`off` 退回全部板块一起排，报告里会标出来 | `shenwan`<br>`off`<br>（默认 `shenwan`） |
+| `SECTOR_TAXONOMY_PROVIDERS` | 板块分级表的来源，用来只排同一层——东财的行业板块名单是一棵树摊平的（496 个），不分级会让父子板块同时上榜、同一笔钱数两遍。默认排申万二级，和东财官网那张榜逐位一致：<br>`shenwan` 申万宏源的行业分类<br>`off` 退回全部板块一起排，报告里会标出来 | `shenwan`<br>`off`<br>（默认 `shenwan`） |
 | `SECTOR_TAXONOMY_TTL_SECONDS` | 分级表的进程内缓存时长 | 秒（默认 `86400`） |
 | `KLINE_PROVIDERS_INDEX` | **指数**用的兜底顺序，和下一项分开配：指数的成交量各源口径差得多（创业板指相差 3.52%），同花顺与东财一致 | 同上（默认 `tonghuashun,tencent,sina`） |
 | `KLINE_PROVIDERS` | 东财那一级取不到时，**个股/ETF** 的兜底顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`tonghuashun` 不覆盖北交所<br>`tencent` 个股/ETF/指数都覆盖，北交所大半不认<br>`sina` 覆盖腾讯不认的北交所代码，但不认 ETF 和创业板指<br>三家各补各的洞 | `tonghuashun`<br>`tencent`<br>`sina`<br>`off`<br>（默认 `tencent,sina`） |

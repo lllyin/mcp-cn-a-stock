@@ -1013,7 +1013,7 @@ _LEVEL_NAMES = {1: "一级", 2: "二级", 3: "三级"}
 _SCHEME_NAMES = {"shenwan": "申万"}
 
 
-def _render_sector_fund_flow(board, top: int) -> str:
+def _render_sector_fund_flow(board, top: int, level: Optional[int] = None) -> str:
   """把板块资金流渲染成报告。
 
   返回 Markdown 而不是 JSON，是因为这一维的用途是"哪个方向在被买"——调用方拿到
@@ -1024,8 +1024,10 @@ def _render_sector_fund_flow(board, top: int) -> str:
   进来：2026-09-05 实测，电子 -817.95亿 和它的子板块 半导体 -602.46亿 各占一格，
   十行里没有十个独立的板块。层级由 sector_taxonomy 补，补不到就如实说。
   """
-  from .datasource.sector_taxonomy import TOP_LEVEL
+  from .datasource.sector_taxonomy import DEFAULT_RANK_LEVEL
   from .research import format_fund_flow_amount
+
+  level = DEFAULT_RANK_LEVEL if level is None else level
 
   kind = _SECTOR_NAMES.get(board.sector_type, board.sector_type)
   period = _SECTOR_PERIODS.get(board.period, board.period)
@@ -1036,11 +1038,11 @@ def _render_sector_fund_flow(board, top: int) -> str:
 
   # 排名的范围：分得出层级就只排最粗的那一层，分不出就全排并在备注里说明。
   notes = []
-  pool = board.at_level(TOP_LEVEL) if board.levels_known else ()
+  pool = board.at_level(level) if board.levels_known else ()
   if pool:
     scheme = _SCHEME_NAMES.get(board.level_scheme, board.level_scheme or "未注明")
-    coverage = (f"{len(pool)} 个{scheme}{_LEVEL_NAMES.get(TOP_LEVEL, TOP_LEVEL)}{kind}"
-                f"（源共 {len(board.sectors)} 个，其余为更细的分级）")
+    coverage = (f"{len(pool)} 个{scheme}{_LEVEL_NAMES.get(level, level)}{kind}"
+                f"（源共 {len(board.sectors)} 个，含更粗和更细的分级）")
   else:
     pool = board.sectors
     coverage = f"{len(board.sectors)} 个{kind}板块"
@@ -1088,6 +1090,7 @@ async def sector_fund_flow(
   sector_type: str = "industry",
   period: str = "today",
   top: int = 10,
+  level: int = 2,
   ctx: Context = None,  # type: ignore
 ) -> str:
   """获取行业/概念/地域板块的资金流排行。
@@ -1097,13 +1100,16 @@ async def sector_fund_flow(
 
   Args:
     sector_type (str): industry（行业，默认）| concept（概念）| region（地域）
-    period (str): today（今日，默认）| 5d | 10d
+    period (str): today（当日，默认）| 5d | 10d
     top (int): 净流入和净流出各取前几名，默认 10
+    level (int): 行业排到第几级，2（申万二级，131 个，与东财官网同口径，默认）
+      | 1（申万一级，31 个，更粗）。只对 industry 有效——概念和地域没有分级
 
   Returns:
     Markdown 报告，含净流入/净流出两张表，金额已折成亿。
   """
   from .datasource import sector_fund_flow as sff
+  from .datasource.sector_taxonomy import RANK_LEVELS
 
   sector_type = (sector_type or "industry").strip().lower()
   period = (period or "today").strip().lower()
@@ -1112,6 +1118,9 @@ async def sector_fund_flow(
   if period not in sff.PERIODS:
     return f"不支持的口径 {period}，可选：{'、'.join(sff.PERIODS)}"
   top = max(1, min(int(top or 10), 50))
+  level = int(level or 2)
+  if level not in RANK_LEVELS:
+    return f"不支持的行业级别 {level}，可选：{'、'.join(str(x) for x in RANK_LEVELS)}"
 
   started_at = time.perf_counter()
   status: dict = {}
@@ -1128,14 +1137,14 @@ async def sector_fund_flow(
     reason = ("没有数据源支持这个组合（可换 period=today 再试）" if unsupported
               else "上游暂时没有给出结果")
     return f"取不到{_SECTOR_NAMES.get(sector_type, sector_type)}板块的资金流：{reason}。"
-  report = _render_sector_fund_flow(board, top)
+  report = _render_sector_fund_flow(board, top, level)
   # 日志和报告脚注对齐：同样先说是哪天的、哪个源、覆盖多少，再说降级与否。
   # 出问题时报告和日志能直接对上，不用在两套措辞之间做翻译。
   logger.info(
       "Finished sector_fund_flow sector_type=%s period=%s as_of=%s source=%s "
       "sectors=%s ranked=%s partial=%s elapsed=%.3fs",
       sector_type, period, board.as_of, board.source, len(board.sectors),
-      len(board.at_level(1)) if board.levels_known else "未分级",
+      len(board.at_level(level)) if board.levels_known else "未分级",
       int(board.partial), time.perf_counter() - started_at)
   return report
 

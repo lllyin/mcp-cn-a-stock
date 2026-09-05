@@ -59,13 +59,27 @@ def test_a_board_without_levels_says_so():
     assert _board(levels=(1, 2, 3)).levels_known is True
 
 
-def test_only_the_top_level_is_ranked():
+def test_only_one_level_is_ranked():
     """父子同时上榜就是同一笔钱数两遍。实测过：电子 -817.95亿 里含着半导体 -602.46亿。"""
-    text = _render_sector_fund_flow(
-        _board(levels=(1, 2, None), level_scheme="申万"), top=5)
-    assert "传媒" in text          # 一级，进榜
-    assert "半导体" not in text    # 二级，不和一级混排
-    assert "申万一级行业" in text and "源共 3 个" in text
+    board = _board(levels=(1, 2, None), level_scheme="申万")
+    two = _render_sector_fund_flow(board, top=5)
+    assert "半导体" in two          # 二级，默认排它
+    assert "传媒" not in two        # 一级，不和二级混排
+    assert "申万二级行业" in two and "源共 3 个" in two
+
+    one = _render_sector_fund_flow(board, top=5, level=1)
+    assert "传媒" in one and "半导体" not in one
+    assert "申万一级行业" in one
+
+
+def test_the_default_level_matches_what_eastmoney_shows():
+    """东财官网的行业板块资金流排行 3 页 50 行全是申万二级，一个一级都没有。
+
+    排一级不算错，但和用户在东财、券商 App 上看到的那张榜对不上——对不上就得
+    解释，解释不清会被当成数据错了。
+    """
+    assert stx.DEFAULT_RANK_LEVEL == 2
+    assert stx.RANK_LEVELS == (1, 2)
 
 
 def test_an_unlevelled_industry_board_ranks_everything_and_warns():

@@ -48,8 +48,17 @@ CAPABILITY = "sector_taxonomy"
 PROVIDER_ORDER_ENV = "SECTOR_TAXONOMY_PROVIDERS"
 DEFAULT_PROVIDER_ORDER = ("shenwan",)
 
-#: 排名默认排哪一级。一级是"哪个方向在被买"这个问题的粒度，31 个也正好排得开。
-TOP_LEVEL = 1
+#: 排名默认排哪一级。**二级**——判据是东财官网自己就这么排：
+#: data.eastmoney.com/bkzj/hy.html 的"行业板块资金流向排行"共 3 页 × 50 行，
+#: 2026-09-05 抓下来的三页 HTML 里，第一页 50 个板块**全部**是申万二级，一个一级
+#: 都没有（传媒当日 61.74亿 是全场最大，但它是一级，页面上根本没有它）。
+#: 东财 496 个板块按申万分：一级 31、二级 127、其余 338 为三级。
+#:
+#: 排一级也不算错（不重不漏），但 31 个太粗，而且和用户在东财、券商 App 上看到的
+#: 那张榜对不上——对不上就得解释，解释不清就会被当成数据错了。
+DEFAULT_RANK_LEVEL = 2
+#: 能排的层级。三级不进来：sw_index_third_info 是 HTML 抓取，实测 4 次成 2 次。
+RANK_LEVELS = (1, 2)
 
 
 @dataclass(frozen=True)
@@ -136,7 +145,8 @@ __all__ = [
     "applies_to",
     "DEFAULT_PROVIDER_ORDER",
     "PROVIDER_ORDER_ENV",
-    "TOP_LEVEL",
+    "DEFAULT_RANK_LEVEL",
+    "RANK_LEVELS",
     "SectorTaxonomy",
     "SectorTaxonomyRequest",
     "load",
