@@ -601,53 +601,37 @@ class TestNegativeZero:
         assert not verify.compare_documents(old, new, "t").clean
 
 
-# --- 资金流向这一维要按标的判，不能按类别一刀切 ---------------------------
+# --- 资金流向按类别判，不按具体标的判 ---------------------------------------
 
 
 class TestFundFlowApplicability:
-    def test_only_the_three_indices_with_a_page_have_it(self):
-        for symbol in ("SH000001", "SZ399001", "SZ399006"):
-            assert verify.has_fund_flow(symbol), symbol
-        assert not verify.has_fund_flow("SH000688")
+    """这里曾经有一份"有资金流页面的指数"名单，把 SH000688 判成"本来就没有"。
 
-    def test_stocks_and_etfs_always_have_it(self):
-        for symbol in ("SH600519", "SZ300750", "SH512480", "SZ159995", "BJ920021"):
-            assert verify.has_fund_flow(symbol), symbol
+    2026-09-04 服务器开着网关采的 logs/s1_index.json 推翻了它：同一个 SH000688，
+    今日主力净流入 -42.67亿。那份名单记的是**某一条源**的覆盖范围，不是标的的
+    属性，于是那台机器上一处真实的缺失被记成了满分。判据回到只按类别。
+    """
 
-    def test_the_mirror_stays_in_sync_with_the_server(self):
-        """镜像常量漂了就会开盲区：服务端加一个有资金流页面的指数，这里不跟着加，
-        那个指数的缺失就永远查不出来。"""
-        import ast
-        from pathlib import Path
-
-        source = (
-            Path(__file__).resolve().parents[1]
-            / "qtf_mcp" / "datasource" / "realtime_ff.py"
-        ).read_text(encoding="utf-8")
-        codes = set()
-        for node in ast.walk(ast.parse(source)):
-            if isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id == "INDEX_FUND_FLOW_URLS"
-                for t in node.targets
-            ):
-                codes = {k.value for k in node.value.keys}
-        assert codes, "没在 realtime_ff.py 里找到 INDEX_FUND_FLOW_URLS"
-        assert codes == set(verify._INDEX_FUND_FLOW_CODES)
-
-    def test_the_dimension_carries_the_predicate(self):
+    def test_every_class_is_expected_to_have_it(self):
         flow = [d for d in verify.CONTRACT["brief"] if d.name == "资金流向"]
-        assert flow and flow[0].applies_when is verify.has_fund_flow
+        assert flow
+        for symbol in ("SH600519", "SH512480", "SH000001", "SH000688", "BJ920021"):
+            assert flow[0].applies(symbol), symbol
 
-    def test_a_missing_section_for_kechuang50_is_not_counted(self):
-        """科创50 渲染"暂无实时资金流向"是如实降级，不该扣可用率。"""
-        payload = verify.Payload(documents={"SH000688": "# 基本数据\n- 股票代码: SH000688\n"})
-        result = verify.check_completeness("brief", payload)
-        assert not any(f.dimension.name == "资金流向" for f in result.findings)
+    def test_a_missing_section_is_counted_for_every_symbol(self):
+        for symbol in ("SH000688", "SH000001", "SH600519"):
+            payload = verify.Payload(
+                documents={symbol: f"# 基本数据\n- 股票代码: {symbol}\n"}
+            )
+            result = verify.check_completeness("brief", payload)
+            assert any(
+                f.dimension.name == "资金流向" for f in result.findings
+            ), symbol
 
-    def test_a_missing_section_for_the_other_indices_is_counted(self):
-        payload = verify.Payload(documents={"SH000001": "# 基本数据\n- 股票代码: SH000001\n"})
-        result = verify.check_completeness("brief", payload)
-        assert any(f.dimension.name == "资金流向" for f in result.findings)
+    def test_history_flow_is_expected_for_indices_too(self):
+        """实测 full 对 SH000001 和 SZ399006 都渲染了完整历史表，排除等于不计分。"""
+        flow = [d for d in verify.CONTRACT["full"] if d.name == "历史资金流向"]
+        assert flow and flow[0].applies("SH000001")
 
 
 # --- 性能一节 --------------------------------------------------------------
@@ -729,7 +713,9 @@ class TestIndexFlowVerdict:
                                        "## 资金流向\n- 暂无实时资金流向\n" if tool != "full" else self.FULL_688)
             for tool in ("brief", "medium", "full")
         }
-        assert verdicts == {"— 没有这个页面"}
+        # 科创50 在本机的兜底源上确实没取到，就如实报没取到——它不是"本来
+        # 就没有"。三个工具口径一致这件事不变。
+        assert verdicts == {"❌ 实时资金流没取到（主源被拒且页面兜底也没成）"}
 
     def test_a_history_table_header_no_longer_fakes_a_hit(self):
         """原来判的是全文 '净流入'，而历史表**表头**里就有这三个字。"""

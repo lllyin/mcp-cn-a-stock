@@ -76,38 +76,26 @@ ALL_CLASSES = frozenset((STOCK, ETF, INDEX))
 STOCK_ONLY = frozenset((STOCK,))
 
 
-# 有资金流向页面的指数。与 realtime_ff.INDEX_FUND_FLOW_URLS 保持一致——那份是
-# 判据的源头，这里只是镜像，tests/test_verify_release.py 有一条用例钉住两者同步。
+# 这里只按"哪一类标的本来就没有这一维"排除，不按具体是哪个标的排除。
 #
-# 为什么需要它：资金流向对个股和 ETF 都适用，对指数则要看有没有这个页面。科创50
-# (SH000688) 没有，主源对它也取不到，报告如实渲染"暂无实时资金流向"。按类别一刀切
-# 会误判——要么把 SH000688 算成缺失（2026-09-05 的报告就是这样，白扣 3 项，而它
-# 自己的第四节又写着"科创50 没有这个页面"，同一份报告前后矛盾），要么把三个真有
-# 数据的指数一起排除，那就在这一层开了个盲区。
-_INDEX_FUND_FLOW_CODES = frozenset({"000001", "399001", "399006"})
-
-
-def has_fund_flow(symbol: str) -> bool:
-    """这个标的有没有资金流向这一维。指数看有没有对应页面，其余都有。"""
-    if not is_index(symbol):
-        return True
-    return "".join(ch for ch in (symbol or "") if ch.isdigit()) in _INDEX_FUND_FLOW_CODES
-
-
+# 区别在于是不是会变：ETF 没有市盈率，是因为它没有盈利这个东西，换任何源都不会
+# 有——这是标的本身的属性。而"科创50 拿不到资金流向"是**当前这条源**的属性：
+# 浏览器兜底走的 data.eastmoney.com/zjlx/ 没有科创50 的页面，但 2026-09-04 服务器
+# 开着网关采的 logs/s1_index.json 里，SH000688 的今日主力净流入是 -42.67亿——同
+# 一个标的，换条源就有了。曾经这里硬编码了一份"有页面的指数"名单，把 SH000688
+# 判成"本来就没有"，于是那台机器上真实的一处缺失被记成了满分。
+#
+# 所以按标的的判据一律不做，取到就是取到，没取到就是没取到。分数会因此变低，
+# 但那个低才是真的。
 @dataclass(frozen=True)
 class Dimension:
     name: str
     marker: str          # 在报告文本里的行首特征
     source: str          # 由哪个上游源提供
     applies_to: frozenset = ALL_CLASSES
-    #: 类别之外的按标的判据。类别不够用时才给——资金流向就是这种：对指数而言
-    #: "有没有这一维"取决于具体是哪个指数，不是整类的属性。
-    applies_when: object = None
 
     def applies(self, symbol: str) -> bool:
-        if classify(symbol) not in self.applies_to:
-            return False
-        return self.applies_when is None or self.applies_when(symbol)
+        return classify(symbol) in self.applies_to
 
 
 _BASIC = (
@@ -129,17 +117,18 @@ _TRADING = (
     Dimension("振幅", "## 振幅", "kline"),
     Dimension("成交量", "## 成交量(万手)", "kline"),
     Dimension("成交额", "## 成交额(亿)", "kline"),
-    Dimension("资金流向", "## 资金流向", "fund_flow", applies_when=has_fund_flow),
+    Dimension("资金流向", "## 资金流向", "fund_flow"),
     # 换手率 = 成交量 / 流通股本，分母来自 realtime 的市值，所以 realtime 挂了
     # 表现是"换手率整段不见了"，而不是数字不对。
     Dimension("换手率", "## 换手率", "realtime(流通市值)", applies_to=STOCK_ONLY),
 )
 
-# 财务报表只有个股有；历史资金流向个股和 ETF 都有页面，指数里 SH000688 压根没有
-# 页面，所以整类排除；技术指标算的是 K 线，三类都有。
+# 财务报表只有个股有。历史资金流向原先整类排除了指数，但实测 full 对 SH000001
+# 和 SZ399006 都渲染出了完整的历史表——排除等于把真实拿到的数据不计分。
+# 技术指标算的是 K 线，三类都有。
 _FINANCE = (Dimension("财务数据", "# 财务数据", "finance", STOCK_ONLY),)
 _HISTORY_FLOW = (
-    Dimension("历史资金流向", "## 历史资金流向", "fund_flow", frozenset((STOCK, ETF))),
+    Dimension("历史资金流向", "## 历史资金流向", "fund_flow"),
 )
 _TECHNICAL = (Dimension("技术指标", "# 技术指标", "kline"),)
 
@@ -1152,9 +1141,13 @@ def _render_diagnostics(scan: "LogScan") -> list[str]:
         if failed:
             lines.append(f"| **兜底救回率** | **{got}/{failed} = {got/failed:.0%}** |")
         lines.append("")
-        lines.append("> 跳过的原因要分开看：「名额已满」是容量不够，调并发；"
+        lines.append("> 分母是「主源失败」的全部次数，不为任何原因打折。"
+                     "「没有资金流向页面」是当前这条兜底源的属性，不是标的的属性——"
+                     "2026-09-04 服务器开着网关采的 logs/s1_index.json 里，"
+                     "SH000688 的今日主力净流入是 -42.67亿，换条源就有了。"
+                     "要下判断先看跳过的原因：「名额已满」是容量不够，调并发；"
                      "「熔断器打开」是上游在拒，调并发没用；「没有资金流向页面」"
-                     "是这个标的本来就没有，不该计入任何分数。")
+                     "是这条源覆盖不到，得换源或补一条。")
         lines.append("")
 
     loads = diag.get("page_loads") or []
@@ -1499,7 +1492,7 @@ def _index_flow_verdict(tool: str, symbol: str, document: str) -> str:
     if flow is None:
         return "—"                      # 这个工具不产出资金流向
     if not flow.applies(symbol):
-        return "— 没有这个页面"          # 科创50：结构性没有，不进分母
+        return "—"                      # 这一类标的没有这一维
     if flow.marker not in document:
         return "❌ 段落都不在"
     # 只看这一段的正文，不看全文——上面第二条踩的就是这个坑。
