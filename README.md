@@ -171,6 +171,7 @@ cn-stock-mcp --transport sse --port 8686
 | --- | --- | --- |
 | `BASIC_INFO_PROVIDERS` | `eastmoney`<br>`tencent`<br>`off`<br>（默认 `eastmoney,tencent`） | 基本数据（总市值、流通市值、市盈率、市净率）的尝试顺序，后面的源补前面缺的字段：<br>`eastmoney` 字段最全，需要网关或未被封的出口<br>`tencent` 走 `qt.gtimg.cn`，无需鉴权，与东财逐项比对过市值与市盈率 0.000% 一致<br>没有网关的部署靠它兜住这一组，否则会连带丢掉市盈率(静) 和换手率 |
 | `INTRADAY_QUOTE_PROVIDERS` | `fund_flow_page`<br>`tencent`<br>`off`<br>（默认 `fund_flow_page,tencent`） | 盘中实时行情的尝试顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`fund_flow_page` 复用已解析的资金流页面，不发请求但没有开高低<br>`tencent` 走 `qt.gtimg.cn`，六项俱全 |
+| `KLINE_PROVIDERS` | `tencent`<br>`sina`<br>`off`<br>（默认 `tencent,sina`） | 东财那一级取不到时，历史 K 线的兜底顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`tencent` 走 `stock_zh_a_hist_tx`，个股/ETF/指数都覆盖，北交所大半不认<br>`sina` 走 `stock_zh_a_daily`，覆盖腾讯不认的北交所代码，但 ETF 和创业板指是 JSONDecodeError<br>接新源只需写一个 provider 再注册，然后把名字加进来 |
 | `FUND_FLOW_PAGE_ENABLED` | `0`<br>`1`<br>（默认 `1`） | 东财资金流接口不可用时，是否回退到资金流向页面 |
 | `FUND_FLOW_PAGE_CONCURRENCY` | 正整数（默认 `3`） | 同时进行的兜底页面加载数。要和 `BROWSER_MAX_PAGES` 一起调，两者是串联的闸门，只提其中一个另一个立刻变成新瓶颈 |
 | `FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS` | 秒（默认 `8`） | 单个标的等一个名额的上限，等不到就跳过兜底、改渲染“盘中实时数据暂时不可用”。必须大于一次页面加载的耗时（部署机实测 p50 3.4s / p90 7.5s），否则一批 4 个标的里的最后一个结构上永远排不到 |

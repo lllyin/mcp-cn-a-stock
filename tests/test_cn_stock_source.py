@@ -11,6 +11,7 @@ import pandas as pd
 import pytest
 
 from qtf_mcp.datasource import cn_stock_source as source_module
+from qtf_mcp.datasource import kline_source
 from qtf_mcp.datasource.cn_stock_source import CNStockDataSource
 from qtf_mcp.datasource.base import DataSource, FetchRequirements, StockData
 from qtf_mcp import datafeed
@@ -298,6 +299,22 @@ def test_simple_kline_skips_unadjusted_copy(monkeypatch):
     assert result["data"][0]["收盘"] == 10.2
 
 
+
+def _tencent_kline(code, start_date, end_date, adjust, symbol=None):
+    """直接问腾讯这个 provider 要一段行情，绕开编排层。"""
+    return kline_source.provider("tencent").fetch(
+        kline_source.KlineRequest(
+            code=code, start_date=start_date, end_date=end_date,
+            adjust=adjust, symbol=symbol,
+        )
+    )
+
+
+def _stub_tencent_provider(monkeypatch, fetch):
+    """把腾讯这个源换成假的。接缝在 provider 上，不在编排层。"""
+    monkeypatch.setattr(kline_source.provider("tencent"), "fetch", fetch)
+
+
 def test_simple_kline_uses_tencent_fallback_after_provider_failure(monkeypatch):
     datasource = CNStockDataSource()
 
@@ -305,11 +322,7 @@ def test_simple_kline_uses_tencent_fallback_after_provider_failure(monkeypatch):
         raise TypeError("unexpected impersonate")
 
     monkeypatch.setattr(source_module.ef.stock, "get_quote_history", provider_failure)
-    monkeypatch.setattr(
-        datasource,
-        "_fetch_tencent_kline_sync",
-        lambda code, start_date, end_date, adjust, symbol, *args: _sample_kline_frame(),
-    )
+    _stub_tencent_provider(monkeypatch, lambda request: _sample_kline_frame())
 
     result = datasource.fetch_kline_simple_sync(
         "SH600000", "2026-06-16", "2026-06-16", "qfq"
@@ -339,7 +352,7 @@ def test_tencent_kline_fallback_normalizes_columns(monkeypatch):
         ]),
     )
 
-    frame = datasource._fetch_tencent_kline_sync(
+    frame = _tencent_kline(
         "600000", "2026-06-15", "2026-06-16", "qfq", "SH600000"
     )
 
@@ -875,7 +888,7 @@ def test_tencent_fallback_widens_the_fetch_window(monkeypatch):
     seen = {}
     _patch_tx(monkeypatch, seen=seen)
 
-    CNStockDataSource()._fetch_tencent_kline_sync(
+    _tencent_kline(
         "600000", "2026-09-01", "2026-09-02", "qfq", "SH600000"
     )
 
@@ -886,7 +899,7 @@ def test_tencent_fallback_widens_the_fetch_window(monkeypatch):
 def test_tencent_fallback_derives_first_row_from_the_prior_close(monkeypatch):
     _patch_tx(monkeypatch)
 
-    frame = CNStockDataSource()._fetch_tencent_kline_sync(
+    frame = _tencent_kline(
         "600000", "2026-09-01", "2026-09-02", "qfq", "SH600000"
     )
 
@@ -901,7 +914,7 @@ def test_tencent_fallback_single_day_is_not_zeroed(monkeypatch):
     """kline_daily 只请求一天，修复前这三列恒为 0。"""
     _patch_tx(monkeypatch)
 
-    frame = CNStockDataSource()._fetch_tencent_kline_sync(
+    frame = _tencent_kline(
         "600000", "2026-09-02", "2026-09-02", "qfq", "SH600000"
     )
 
@@ -914,7 +927,7 @@ def test_tencent_fallback_returns_none_when_window_has_no_rows(monkeypatch):
     _patch_tx(monkeypatch)
 
     assert (
-        CNStockDataSource()._fetch_tencent_kline_sync(
+        _tencent_kline(
             "600000", "2026-09-10", "2026-09-11", "qfq", "SH600000"
         )
         is None
@@ -945,11 +958,7 @@ def _failing_eastmoney(monkeypatch, calls):
 def test_breaker_opens_after_threshold_and_skips_eastmoney(monkeypatch, kline_breaker):
     calls = []
     _failing_eastmoney(monkeypatch, calls)
-    monkeypatch.setattr(
-        CNStockDataSource,
-        "_fetch_tencent_kline_sync",
-        lambda self, *a, **k: _sample_kline_frame(),
-    )
+    _stub_tencent_provider(monkeypatch, lambda request: _sample_kline_frame())
     datasource = CNStockDataSource()
 
     for _ in range(kline_breaker.threshold):
@@ -970,11 +979,7 @@ def test_breaker_opens_after_threshold_and_skips_eastmoney(monkeypatch, kline_br
 def test_breaker_stays_closed_below_threshold(monkeypatch, kline_breaker):
     calls = []
     _failing_eastmoney(monkeypatch, calls)
-    monkeypatch.setattr(
-        CNStockDataSource,
-        "_fetch_tencent_kline_sync",
-        lambda self, *a, **k: _sample_kline_frame(),
-    )
+    _stub_tencent_provider(monkeypatch, lambda request: _sample_kline_frame())
     datasource = CNStockDataSource()
 
     for _ in range(kline_breaker.threshold - 1):
@@ -998,11 +1003,7 @@ def test_a_success_clears_the_failure_streak(monkeypatch, kline_breaker):
         return _sample_kline_frame()
 
     monkeypatch.setattr(source_module.ef.stock, "get_quote_history", flaky)
-    monkeypatch.setattr(
-        CNStockDataSource,
-        "_fetch_tencent_kline_sync",
-        lambda self, *a, **k: _sample_kline_frame(),
-    )
+    _stub_tencent_provider(monkeypatch, lambda request: _sample_kline_frame())
     datasource = CNStockDataSource()
 
     while outcomes:
@@ -1024,11 +1025,7 @@ def test_half_open_probe_closes_the_breaker_on_recovery(monkeypatch, kline_break
         return _sample_kline_frame()
 
     monkeypatch.setattr(source_module.ef.stock, "get_quote_history", provider)
-    monkeypatch.setattr(
-        CNStockDataSource,
-        "_fetch_tencent_kline_sync",
-        lambda self, *a, **k: _sample_kline_frame(),
-    )
+    _stub_tencent_provider(monkeypatch, lambda request: _sample_kline_frame())
     datasource = CNStockDataSource()
     fetch = lambda: datasource._fetch_kline_sync(
         "600000", "2026-09-01", "2026-09-03", "qfq", "SH600000", False
@@ -1058,11 +1055,7 @@ def test_half_open_probe_closes_the_breaker_on_recovery(monkeypatch, kline_break
 def test_failed_probe_buys_another_cooldown(monkeypatch, kline_breaker):
     calls = []
     _failing_eastmoney(monkeypatch, calls)
-    monkeypatch.setattr(
-        CNStockDataSource,
-        "_fetch_tencent_kline_sync",
-        lambda self, *a, **k: _sample_kline_frame(),
-    )
+    _stub_tencent_provider(monkeypatch, lambda request: _sample_kline_frame())
     datasource = CNStockDataSource()
     fetch = lambda: datasource._fetch_kline_sync(
         "600000", "2026-09-01", "2026-09-03", "qfq", "SH600000", False
@@ -1083,11 +1076,7 @@ def test_failed_probe_buys_another_cooldown(monkeypatch, kline_breaker):
 def test_breaker_can_be_disabled(monkeypatch, kline_breaker):
     calls = []
     _failing_eastmoney(monkeypatch, calls)
-    monkeypatch.setattr(
-        CNStockDataSource,
-        "_fetch_tencent_kline_sync",
-        lambda self, *a, **k: _sample_kline_frame(),
-    )
+    _stub_tencent_provider(monkeypatch, lambda request: _sample_kline_frame())
     monkeypatch.setattr(source_module, "SOURCE_BREAKER_ENABLED", False)
     datasource = CNStockDataSource()
 
@@ -1102,11 +1091,7 @@ def test_breaker_can_be_disabled(monkeypatch, kline_breaker):
 
 def test_skipped_fetch_returns_the_same_shape(monkeypatch, kline_breaker):
     """跳过东财后的返回结构必须和正常路径一致。"""
-    monkeypatch.setattr(
-        CNStockDataSource,
-        "_fetch_tencent_kline_sync",
-        lambda self, *a, **k: _sample_kline_frame(),
-    )
+    _stub_tencent_provider(monkeypatch, lambda request: _sample_kline_frame())
     datasource = CNStockDataSource()
     kline_breaker._open_until = time.monotonic() + 60
 
