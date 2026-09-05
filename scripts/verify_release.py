@@ -1033,6 +1033,9 @@ def _scan_diagnostics(path: Path, since: dt.datetime) -> dict:
             lines.append((stamp, parsed.group(3)))
 
     out: dict = {"window": len(lines)}
+    # 覆盖率要用的运行区间。起点用 since（脚本开跑的时刻）而不是第一条日志，
+    # 否则一次开头就降级的运行会把自己那段算没。
+    out["span"] = (since, max((t for t, _ in lines), default=since))
 
     # 每个上游源的 service/queue 分布。这是"谁吃掉了时间"的唯一直接答案。
     sources: dict[str, list[tuple[float, float]]] = {}
@@ -1083,14 +1086,16 @@ def _scan_diagnostics(path: Path, since: dt.datetime) -> dict:
     for stamp, message in lines:
         if "suspending impersonation" in message:
             seconds = re.search(r"for ([\d.]+)s", message)
-            events.append((stamp, "通道暂停伪装",
-                           f"{float(seconds.group(1)):.0f}s" if seconds else ""))
+            hold = float(seconds.group(1)) if seconds else 0.0
+            events.append((stamp, "通道暂停伪装", f"{hold:.0f}s", hold))
         elif "Source breaker opened" in message:
             src = re.search(r"source=(\S+)", message)
-            events.append((stamp, "熔断打开", src.group(1) if src else ""))
+            cooldown = re.search(r"cooldown=([\d.]+)s", message)
+            events.append((stamp, "熔断打开", src.group(1) if src else "",
+                           float(cooldown.group(1)) if cooldown else 0.0))
         elif "Source breaker closed" in message:
             src = re.search(r"source=(\S+)", message)
-            events.append((stamp, "熔断关闭", src.group(1) if src else ""))
+            events.append((stamp, "熔断关闭", src.group(1) if src else "", 0.0))
     out["events"] = events
     return out
 
@@ -1180,15 +1185,29 @@ def _render_diagnostics(scan: "LogScan") -> list[str]:
     if events:
         lines.append("### 降级与熔断事件")
         lines.append("")
-        lines.append("| 时刻 | 事件 | 详情 |")
-        lines.append("| --- | --- | --- |")
-        for stamp, kind, detail in events:
-            lines.append(f"| {stamp:%H:%M:%S} | {kind} | {detail} |")
+        run_start, run_end = diag.get("span") or (None, None)
+        run_seconds = (run_end - run_start).total_seconds() if run_start else 0.0
+        lines.append("| 时刻 | 事件 | 详情 | 覆盖本次运行 |")
+        lines.append("| --- | --- | --- | ---: |")
+        for stamp, kind, detail, hold in events:
+            share = "—"
+            if hold and run_seconds > 0:
+                closed = next(
+                    (t for t, k, d, _ in events
+                     if k == "熔断关闭" and d == detail and t > stamp),
+                    None,
+                )
+                end = min(closed or (stamp + dt.timedelta(seconds=hold)), run_end)
+                covered = max(0.0, (end - max(stamp, run_start)).total_seconds())
+                share = f"{covered / run_seconds:.0%}（{covered:.0f}/{run_seconds:.0f}s）"
+            lines.append(f"| {stamp:%H:%M:%S} | {kind} | {detail} | {share} |")
         lines.append("")
         lines.append("> 通道暂停伪装之后，对东财那几台主机的请求会退回原生 requests，"
-                     "而它们恰恰拒绝原生 requests——所以这段窗口里东财是必败的，"
-                     "上面那张源耗时表里的慢调用基本都落在这里。看到这一行，"
-                     "先别怀疑代码，先看窗口覆盖了本次运行的多大比例。")
+                     "而它们恰恰拒绝原生 requests——所以这段窗口里东财是必败的。"
+                     "**先看覆盖率再看第六节的耗时**：覆盖率高就说明那些数字量的是"
+                     "降级路径，不是正常路径，不能拿去和别的版本比。"
+                     "覆盖率按「事件时刻 + 时长」和运行区间取交集算，中途有对应的"
+                     "「熔断关闭」就按实际关闭时刻截断。")
         lines.append("")
     return lines
 

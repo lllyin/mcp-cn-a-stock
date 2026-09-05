@@ -784,7 +784,7 @@ class TestDiagnostics:
 
     def test_degradation_events_are_ordered_with_detail(self, tmp_path):
         events = self._scan(tmp_path).diagnostics["events"]
-        kinds = [(k, d) for _, k, d in events]
+        kinds = [(k, d) for _, k, d, _ in events]
         assert kinds == [("通道暂停伪装", "300s"), ("熔断打开", "eastmoney_kline")]
 
     def test_lines_before_the_run_are_ignored(self, tmp_path):
@@ -792,6 +792,39 @@ class TestDiagnostics:
         diag = self._scan(tmp_path, dt.datetime(2026, 9, 5, 14, 46, 44)).diagnostics
         assert not diag.get("sources")
         assert len(diag["events"]) == 1
+
+    def test_the_coverage_column_says_how_much_of_the_run_was_degraded(self):
+        """降级窗口盖住多少运行时间，决定第六节的耗时能不能当基准。
+
+        2026-09-05 18:36 那次：运行 101s，伪装通道在第 2 秒暂停 300s——覆盖 98%，
+        也就是那一份报告里的耗时全都量的是降级路径。这个数原先要自己拿日志算。
+        """
+        import datetime as dt
+
+        span = (dt.datetime(2026, 9, 5, 18, 36, 47), dt.datetime(2026, 9, 5, 18, 38, 28))
+        scan = verify.LogScan(diagnostics={
+            "span": span,
+            "events": [
+                (dt.datetime(2026, 9, 5, 18, 36, 49), "通道暂停伪装", "300s", 300.0),
+                (dt.datetime(2026, 9, 5, 18, 36, 57), "熔断打开", "eastmoney_kline", 120.0),
+            ],
+        })
+        text = "\n".join(verify._render_diagnostics(scan))
+        assert "98%（99/101s）" in text
+        assert "90%（91/101s）" in text
+
+    def test_an_early_close_truncates_the_coverage(self):
+        """熔断没走满冷却就关了，按实际关闭时刻算，不按冷却时长算。"""
+        import datetime as dt
+
+        scan = verify.LogScan(diagnostics={
+            "span": (dt.datetime(2026, 9, 5, 18, 36, 47), dt.datetime(2026, 9, 5, 18, 38, 28)),
+            "events": [
+                (dt.datetime(2026, 9, 5, 18, 36, 57), "熔断打开", "eastmoney_kline", 120.0),
+                (dt.datetime(2026, 9, 5, 18, 37, 27), "熔断关闭", "eastmoney_kline", 0.0),
+            ],
+        })
+        assert "30%（30/101s）" in "\n".join(verify._render_diagnostics(scan))
 
     def test_it_renders_without_a_log(self):
         scan = verify.LogScan(available=False, note="日志不存在")
