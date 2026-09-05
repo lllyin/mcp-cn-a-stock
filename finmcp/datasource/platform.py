@@ -1,6 +1,6 @@
 """平台 → 能力 → 归一 的底座。
 
-设计说明在 docs/data-provider-architecture.md，改这个文件之前先读它。一句话版本：
+设计说明在 docs/architecture.md，改这个文件之前先读它。一句话版本：
 一个上游（东财/腾讯/新浪/同花顺/雪球）是一个 ``Platform``，它声明自己能提供哪些
 **能力**（kline / quote / basic_info / …）；每个维度按自己的环境变量决定用哪些平台、
 按什么顺序；``resolve()`` 走完逐级回退和交叉合成。

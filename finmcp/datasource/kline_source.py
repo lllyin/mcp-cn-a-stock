@@ -2,7 +2,7 @@
 
 源本身在 ``platforms/`` 下（腾讯、新浪、同花顺，以后的雪球），这里只负责三件事：
 定义请求长什么样、声明归一后的契约、把配置顺序喂给通用的 ``platform.resolve()``。
-架构见 docs/data-provider-architecture.md。
+架构见 docs/architecture.md。
 
 **接一个新的 K 线源不用改这个文件**——写一个 ``platforms/<名字>.py``，在
 ``platforms/__init__.py`` import 一行，再把名字加进 ``KLINE_PROVIDERS``。

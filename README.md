@@ -347,8 +347,8 @@ AkShare 和 efinance 的接口是同步网络调用，由一个有界线程池�
 ## 更多文档
 
 - [开发与维护](docs/development.md)：跑测试、调试、发布前验证、重构时怎么证明行为没变
-- [取数架构：平台 → 能力 → 归一](docs/data-provider-architecture.md)：接一个新数据源要做什么
-- [技术实现说明](docs/technical-details.md)：架构、数据链路与回退、输出契约、报告缓存、调优边界
+- [项目架构](docs/architecture.md)：分层、每层负责什么、加工具/加数据源该动哪里
+- [技术实现说明](docs/technical-details.md)：数据链路与回退、输出契约、报告缓存、调优边界
 - [完整报告示例](docs/SH603986-full.md)
 - [DeepChat 使用示例](docs/let-your-deepseek-analyze-stock-by-mcp.md)
 

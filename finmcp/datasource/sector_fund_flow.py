@@ -3,7 +3,7 @@
 这一维回答的是个股资金流答不了的问题——报告说"茅台主力净流入 3.68亿"，但没有语境：
 是白酒整个板块在被买，还是只有它。板块排行给的就是这个语境。
 
-架构见 docs/data-provider-architecture.md。平台在 platforms/ 下，这里只定义请求、
+架构见 docs/architecture.md。平台在 platforms/ 下，这里只定义请求、
 契约和配置接线。
 """
 
