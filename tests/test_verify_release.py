@@ -748,6 +748,76 @@ class TestIndexFlowVerdict:
         assert verify._index_flow_verdict("brief", "SH000001", doc) == "✅ 有"
 
 
+# --- 诊断一节 --------------------------------------------------------------
+
+
+class TestDiagnostics:
+    LOG = (
+        "2026-09-05 14:46:23,001 DEBUG Data task _fetch_kline_sync request_id=r tool=brief "
+        "symbol=SH600519 admission=0.000s queue=1.00s service=11.50s\n"
+        "2026-09-05 14:46:24,001 DEBUG Data task _fetch_kline_sync request_id=r tool=brief "
+        "symbol=SH600519 admission=0.000s queue=0.10s service=0.40s\n"
+        "2026-09-05 14:46:25,001 WARNING HTTP channel suspending impersonation for 300.0s "
+        "after 4 consecutive failures; falling back to plain requests\n"
+        "2026-09-05 14:46:26,001 WARNING 获取资金流向数据失败 600519: boom\n"
+        "2026-09-05 14:46:27,001 INFO 资金流向页面兜底成功 SH600519 rows=120 cost=2.24s\n"
+        "2026-09-05 14:46:28,001 INFO 资金流向页面兜底跳过 SH000688: 该标的没有资金流向页面\n"
+        "2026-09-05 14:46:29,001 INFO 资金流向页面兜底跳过 SZ399006: 兜底名额已满(上限 3)，等 3.0s 未排到\n"
+        "2026-09-05 14:46:30,001 INFO Realtime fund flow page request_id=r tool=brief "
+        "symbol=SH600519 url=http://x how=new_tab outcome=today=True history=121 "
+        "semaphore_wait=0.500s service=2.100s\n"
+        "2026-09-05 14:46:45,001 WARNING Source breaker opened source=eastmoney_kline channel=x\n"
+    )
+
+    def _scan(self, tmp_path, since=None):
+        path = tmp_path / "svc.log"
+        path.write_text(self.LOG, encoding="utf-8")
+        import datetime as dt
+        return verify.scan_log(path, since or dt.datetime(2026, 9, 5, 14, 46, 22))
+
+    def test_sources_are_aggregated_with_queue(self, tmp_path):
+        diag = self._scan(tmp_path).diagnostics
+        rows = diag["sources"]["_fetch_kline_sync"]
+        assert sorted(v for v, _ in rows) == [0.40, 11.50]
+        assert max(q for _, q in rows) == 1.00
+
+    def test_fund_flow_gates_split_by_reason(self, tmp_path):
+        gates = self._scan(tmp_path).diagnostics["fund_flow_gates"]
+        assert gates["主源失败"] == 1 and gates["兜底成功"] == 1
+        assert gates["兜底跳过：该标的没有资金流向页面"] == 1
+        # 秒数被抹掉再归并，否则每条都是一个独立原因
+        assert any("名额已满" in k and "Ns" in k for k in gates)
+
+    def test_page_loads_survive_a_spaced_outcome(self, tmp_path):
+        """outcome 里有空格（today=True history=121），用 \\S+ 会截断。"""
+        loads = self._scan(tmp_path).diagnostics["page_loads"]
+        assert len(loads) == 1
+        how, outcome, wait, service = loads[0]
+        assert how == "new_tab" and "history=121" in outcome
+        assert (wait, service) == (0.5, 2.1)
+
+    def test_degradation_events_are_ordered_with_detail(self, tmp_path):
+        events = self._scan(tmp_path).diagnostics["events"]
+        kinds = [(k, d) for _, k, d in events]
+        assert kinds == [("通道暂停伪装", "300s"), ("熔断打开", "eastmoney_kline")]
+
+    def test_lines_before_the_run_are_ignored(self, tmp_path):
+        import datetime as dt
+        diag = self._scan(tmp_path, dt.datetime(2026, 9, 5, 14, 46, 44)).diagnostics
+        assert not diag.get("sources")
+        assert len(diag["events"]) == 1
+
+    def test_it_renders_without_a_log(self):
+        scan = verify.LogScan(available=False, note="日志不存在")
+        text = "\n".join(verify._render_diagnostics(scan))
+        assert "没有可用的服务日志" in text and "日志不存在" in text
+
+    def test_the_rendered_table_carries_the_shares(self, tmp_path):
+        text = "\n".join(verify._render_diagnostics(self._scan(tmp_path)))
+        assert "_fetch_kline_sync" in text and "兜底救回率" in text
+        assert "通道暂停伪装" in text and "new_tab 1 次" in text
+
+
 # --- /proc 解析（只在 Linux 上跑，所以更要测）------------------------------
 # 开发机是 macOS，这条路本地一次都走不到，而部署机全靠它。
 

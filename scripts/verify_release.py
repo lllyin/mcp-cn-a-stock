@@ -987,6 +987,7 @@ class LogScan:
     lines_scanned: int = 0
     available: bool = True
     note: str = ""
+    diagnostics: dict = field(default_factory=dict)
 
 
 def scan_log(path: Path, since: dt.datetime) -> LogScan:
@@ -1017,7 +1018,186 @@ def scan_log(path: Path, since: dt.datetime) -> LogScan:
                 scan.signals.setdefault(f"{category}｜{explanation}", []).append(
                     message[:160]
                 )
+    scan.diagnostics = _scan_diagnostics(path, since)
     return scan
+
+
+# ── 诊断：把每次排查都要手挖的东西一次收全 ──────────────────────
+# 这一节刻意冗余。前两轮定位问题时，每个结论都要重新写一段脚本去扒日志：哪个源
+# 吃掉了时间、通道什么时候降级、资金流的名额到底卡在哪、页面加载多久。既然日志里
+# 本来就有，就在出报告的时候一次算完——多几行表格换下次不用再扒一遍。
+
+
+def _scan_diagnostics(path: Path, since: dt.datetime) -> dict:
+    """从服务日志里算出耗时分布、闸门计数和降级窗口。"""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = []
+    for line in text.splitlines():
+        parsed = _LOG_LINE.match(line)
+        if parsed is None:
+            continue
+        try:
+            stamp = dt.datetime.strptime(parsed.group(1), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        if stamp >= since:
+            lines.append((stamp, parsed.group(3)))
+
+    out: dict = {"window": len(lines)}
+
+    # 每个上游源的 service/queue 分布。这是"谁吃掉了时间"的唯一直接答案。
+    sources: dict[str, list[tuple[float, float]]] = {}
+    for _, message in lines:
+        m = re.search(
+            r"Data task (\w+) .*?queue=([\d.]+)s service=([\d.]+)s", message
+        )
+        if m:
+            sources.setdefault(m.group(1), []).append(
+                (float(m.group(3)), float(m.group(2)))
+            )
+    out["sources"] = sources
+
+    # 资金流兜底的完整账：主源失败 -> 兜底成功/跳过(按原因)/被拒。
+    gates: dict[str, int] = {}
+    for pattern, label in (
+        (r"获取资金流向数据失败", "主源失败"),
+        (r"资金流向页面兜底成功", "兜底成功"),
+        (r"资金流向页面接口被拒", "兜底被拒"),
+        (r"资金流向页面兜底失败", "兜底失败"),
+        (r"资金流向页面兜底无历史数据", "兜底无历史"),
+    ):
+        n = sum(1 for _, m in lines if re.search(pattern, m))
+        if n:
+            gates[label] = n
+    for _, message in lines:
+        m = re.search(r"资金流向页面兜底跳过 \S+: (.+)", message)
+        if m:
+            # 把具体秒数抹掉再归并，否则每条都是一个独立的原因。
+            reason = re.sub(r"[\d.]+s", "Ns", m.group(1))[:44]
+            gates[f"兜底跳过：{reason}"] = gates.get(f"兜底跳过：{reason}", 0) + 1
+    out["fund_flow_gates"] = gates
+
+    # 页面加载：how / outcome / 耗时 / 等信号量。等信号量是并发上限的直接体感。
+    loads = [
+        (m.group(1), m.group(2), float(m.group(3)), float(m.group(4)))
+        for _, message in lines
+        if (m := re.search(
+            # outcome 里有空格（today=True history=121），不能用 \S+ 截。
+            r"how=(\w+) outcome=(.+?) semaphore_wait=([\d.]+)s service=([\d.]+)s",
+            message,
+        ))
+    ]
+    out["page_loads"] = loads
+
+    # 通道降级与熔断：什么时候、开了多久、窗口里落了多少次取数。
+    events = []
+    for stamp, message in lines:
+        if "suspending impersonation" in message:
+            seconds = re.search(r"for ([\d.]+)s", message)
+            events.append((stamp, "通道暂停伪装",
+                           f"{float(seconds.group(1)):.0f}s" if seconds else ""))
+        elif "Source breaker opened" in message:
+            src = re.search(r"source=(\S+)", message)
+            events.append((stamp, "熔断打开", src.group(1) if src else ""))
+        elif "Source breaker closed" in message:
+            src = re.search(r"source=(\S+)", message)
+            events.append((stamp, "熔断关闭", src.group(1) if src else ""))
+    out["events"] = events
+    return out
+
+
+def _render_diagnostics(scan: "LogScan") -> list[str]:
+    """诊断一节。全部来自服务日志，脚本不额外采集，所以开销为零。"""
+    diag = getattr(scan, "diagnostics", None)
+    lines = ["## 诊断：时间花在哪、闸门拦了什么", ""]
+    if not scan.available or not diag:
+        lines.append(f"没有可用的服务日志：{scan.note or '未知'}。")
+        lines.append("")
+        return lines
+    lines.append("这一节是从服务日志里算出来的，不额外采集。定位问题时最先看它——"
+                 "可用率说「缺没缺」，耗时说「慢不慢」，这里说「为什么」。")
+    lines.append("")
+
+    sources = diag.get("sources") or {}
+    if sources:
+        total = sum(sum(v for v, _ in rows) for rows in sources.values()) or 1.0
+        lines.append("### 各上游源的耗时")
+        lines.append("")
+        lines.append("| 源 | 次数 | service P50 | P90 | 最慢 | 合计 | 占比 | queue 最长 |")
+        lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+        for name in sorted(sources, key=lambda n: -sum(v for v, _ in sources[n])):
+            rows = sources[name]
+            svc = [v for v, _ in rows]
+            queue = [q for _, q in rows]
+            lines.append(
+                f"| {name} | {len(rows)} | {_percentile(svc, 0.5):.2f}s | "
+                f"{_percentile(svc, 0.9):.2f}s | {max(svc):.2f}s | {sum(svc):.1f}s | "
+                f"{sum(svc)/total:.0%} | {max(queue):.2f}s |"
+            )
+        lines.append("")
+        lines.append("> P50 和 P90 差一个数量级，就是「平时很快、坏起来很慢」的双峰——"
+                     "该去看下面的降级窗口，而不是调这个源的超时。"
+                     "queue 是等线程池的时间，它长说明并发上限被别的源占满了。")
+        lines.append("")
+
+    gates = diag.get("fund_flow_gates") or {}
+    if gates:
+        lines.append("### 资金流兜底的去向")
+        lines.append("")
+        lines.append("| 环节 | 次数 |")
+        lines.append("| --- | ---: |")
+        for label in sorted(gates, key=lambda k: -gates[k]):
+            lines.append(f"| {label} | {gates[label]} |")
+        got, failed = gates.get("兜底成功", 0), gates.get("主源失败", 0)
+        if failed:
+            lines.append(f"| **兜底救回率** | **{got}/{failed} = {got/failed:.0%}** |")
+        lines.append("")
+        lines.append("> 跳过的原因要分开看：「名额已满」是容量不够，调并发；"
+                     "「熔断器打开」是上游在拒，调并发没用；「没有资金流向页面」"
+                     "是这个标的本来就没有，不该计入任何分数。")
+        lines.append("")
+
+    loads = diag.get("page_loads") or []
+    if loads:
+        svc = [x[3] for x in loads]
+        wait = [x[2] for x in loads]
+        hows: dict[str, int] = {}
+        outs: dict[str, int] = {}
+        for how, outcome, _, _ in loads:
+            hows[how] = hows.get(how, 0) + 1
+            key = outcome.split("=")[0] if "=" in outcome else outcome
+            outs[outcome if not outcome.startswith("today") else "today=…"] = (
+                outs.get(outcome if not outcome.startswith("today") else "today=…", 0) + 1
+            )
+        lines.append("### 浏览器页面加载")
+        lines.append("")
+        lines.append(f"- 共 {len(loads)} 次；加载耗时 P50 {_percentile(svc, 0.5):.2f}s、"
+                     f"P90 {_percentile(svc, 0.9):.2f}s、最慢 {max(svc):.2f}s")
+        lines.append(f"- 等浏览器信号量 P50 {_percentile(wait, 0.5):.2f}s、"
+                     f"最长 {max(wait):.2f}s")
+        lines.append("- 方式：" + "，".join(f"{k} {v} 次" for k, v in sorted(hows.items())))
+        lines.append("- 结果：" + "，".join(f"{k} {v} 次" for k, v in sorted(outs.items())))
+        lines.append("")
+        lines.append("> `reload` 出现说明第一次没拿到数据、同一个 tab 又刷了一次；"
+                     "它为 0 表示上游健康，重试预算一分钱没花。"
+                     "等信号量长而加载不慢，才是并发上限卡住了。")
+        lines.append("")
+
+    events = diag.get("events") or []
+    if events:
+        lines.append("### 降级与熔断事件")
+        lines.append("")
+        lines.append("| 时刻 | 事件 | 详情 |")
+        lines.append("| --- | --- | --- |")
+        for stamp, kind, detail in events:
+            lines.append(f"| {stamp:%H:%M:%S} | {kind} | {detail} |")
+        lines.append("")
+        lines.append("> 通道暂停伪装之后，对东财那几台主机的请求会退回原生 requests，"
+                     "而它们恰恰拒绝原生 requests——所以这段窗口里东财是必败的，"
+                     "上面那张源耗时表里的慢调用基本都落在这里。看到这一行，"
+                     "先别怀疑代码，先看窗口覆盖了本次运行的多大比例。")
+        lines.append("")
+    return lines
 
 
 # ── 八、探活套件 ────────────────────────────────────────────────
@@ -1664,11 +1844,15 @@ def render_report(
         all_calls = [result for result, _, _ in probes]
         all_calls += [r for _, r, _ in regressions if r is not None]
         section = _render_performance(watch, all_calls)
-        # 编号跟着走：性能是第六节，说明挪到第七节。
+        # 编号跟着走：性能第六、诊断第七、说明第八。
         section[0] = "## 六、性能：耗时与内存"
         lines.extend(section)
 
-    lines.append("## 七、怎么看这份报告" if watch is not None else "## 六、怎么看这份报告")
+    diagnostics = _render_diagnostics(scan)
+    diagnostics[0] = "## 七、诊断：时间花在哪、闸门拦了什么"
+    lines.extend(diagnostics)
+
+    lines.append("## 八、怎么看这份报告" if watch is not None else "## 六、怎么看这份报告")
     lines.append("")
     lines.append("**一份报告，两个部分**")
     lines.append("")
