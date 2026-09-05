@@ -1841,3 +1841,67 @@ class TestBreakerDegradedPredicate:
     def test_the_kline_breaker_consults_the_channel(self):
         from qtf_mcp.datasource import http_channel
         assert source_module._KLINE_BREAKER.degraded is http_channel.impersonated_hosts_degraded
+
+
+# --- O2：没有资金流页面的标的，抢名额之前就跳过 ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_symbol_without_a_page_never_waits_for_a_slot(monkeypatch):
+    """SH000688 没有资金流向页面，不该占用等待窗口。
+
+    它等满一个窗口再被判"名额已满"，那段等待是从整个请求的预算里扣的，等于替
+    同批的兄弟把预算花掉。2026-09-05 部署机日志里就是这样：SH000688 等 3.0s 之后
+    被跳过，同批的另外三个也跟着没排到。
+    """
+    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+
+    datasource = _page_fallback_datasource(
+        monkeypatch, source_module._fetch_failure("fund_flow")
+    )
+    waited = []
+
+    def slots_must_not_be_touched():
+        waited.append(True)
+        raise AssertionError("没有页面的标的不该去抢名额")
+
+    monkeypatch.setattr(source_module, "_get_fund_flow_page_slots", slots_must_not_be_touched)
+
+    async def unexpected(symbol):
+        raise AssertionError("没有页面的标的不该加载页面")
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", unexpected)
+
+    result = await datasource._fetch_fund_flow_from_page("SH000688")
+
+    assert result is None
+    assert waited == []
+
+
+@pytest.mark.asyncio
+async def test_a_symbol_with_a_page_still_goes_through_the_slot(monkeypatch):
+    """提前跳过只针对"根本没有页面"，别顺手把正常路径也短路了。"""
+    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+
+    datasource = _page_fallback_datasource(
+        monkeypatch, source_module._fetch_failure("fund_flow")
+    )
+    page = _captured_page()
+    used = []
+    real_slots = source_module._get_fund_flow_page_slots
+
+    def counting_slots():
+        used.append(True)
+        return real_slots()
+
+    monkeypatch.setattr(source_module, "_get_fund_flow_page_slots", counting_slots)
+
+    async def working(symbol):
+        return page
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", working)
+
+    result = await datasource._fetch_fund_flow_from_page("SZ300408")
+
+    assert result is not None
+    assert used == [True]

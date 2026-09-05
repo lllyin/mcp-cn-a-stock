@@ -1375,6 +1375,19 @@ class CNStockDataSource(DataSource):
         """
         if not FUND_FLOW_PAGE_FALLBACK_ENABLED:
             return None
+
+        from . import realtime_ff
+
+        if realtime_ff.get_fund_flow_url(symbol) is None:
+            # 这个标的根本没有资金流向页面（科创 50 这类指数就没有）。这件事在
+            # 抢名额之前就能知道，必须在这里判——否则它会白等满一个等待窗口，
+            # 而那段等待是从整个请求的预算里扣的，等于替同批的兄弟把预算花掉。
+            #
+            # 2026-09-05 部署机日志里就是这样：SH000688 等 3.0s 之后被判"名额已满"，
+            # 同一批的 SH601899 / SH000001 / SZ399006 跟着一起没排到。
+            logger.debug("资金流向页面兜底跳过 %s: 该标的没有资金流向页面", symbol)
+            return None
+
         if _FUND_FLOW_PAGE_BREAKER.should_skip():
             # 页面和主源取的是同一个端点，主源被拒时页面的表也填不上。不熔断的
             # 话每次请求都要白付一次页面加载，把"缺一段"变成"慢三倍还是缺一段"。
@@ -1404,14 +1417,13 @@ class CNStockDataSource(DataSource):
             return None
 
         started_at = time.perf_counter()
-        from . import realtime_ff
 
         try:
             page = await realtime_ff.fetch_history_page(symbol)
         except realtime_ff.FundFlowPageUnavailable:
-            # 这个标的根本没有资金流向页面（科创 50 这类指数就没有），跟数据源
-            # 的健康状况无关。计进熔断器的话，查几次这种标的就会把兜底整层关掉
-            # 一整个冷却期，代价落在所有别的标的头上。
+            # 兜底的兜底：上面已经用 get_fund_flow_url 提前拦过一次，走到这里说明
+            # 那两处的判断分叉了。仍然不计进熔断器——这跟数据源的健康状况无关，
+            # 计进去的话查几次这种标的就会把兜底整层关掉一整个冷却期。
             logger.debug("资金流向页面兜底跳过 %s: 该标的没有资金流向页面", symbol)
             return None
         except realtime_ff.FundFlowPageRefused as e:
