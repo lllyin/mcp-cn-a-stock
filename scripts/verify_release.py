@@ -1373,6 +1373,7 @@ def render_report(
     probes: list[tuple[CallResult, Payload, Completeness]],
     regressions: list[tuple[Baseline, CallResult | None, list[DocumentDiff]]],
     scan: LogScan,
+    watch: "MemoryWatch | None" = None,
 ) -> tuple[str, bool]:
     lines: list[str] = []
 
@@ -1628,7 +1629,15 @@ def render_report(
                 lines.append("")
     lines.append("")
 
-    lines.append("## 六、怎么看这份报告")
+    if watch is not None:
+        all_calls = [result for result, _, _ in probes]
+        all_calls += [r for _, r, _ in regressions if r is not None]
+        section = _render_performance(watch, all_calls)
+        # 编号跟着走：性能是第六节，说明挪到第七节。
+        section[0] = "## 六、性能：耗时与内存"
+        lines.extend(section)
+
+    lines.append("## 七、怎么看这份报告" if watch is not None else "## 六、怎么看这份报告")
     lines.append("")
     lines.append("**一份报告，两个部分**")
     lines.append("")
@@ -1704,6 +1713,234 @@ def resolve_config(explicit: Path | None) -> Path:
     )
 
 
+# ── 性能：耗时与内存 ────────────────────────────────────────────
+# 这一节回答的既不是"维度在不在"也不是"数字对不对"，而是"这一版跑起来什么样"。
+# 分开列的理由和前两部分一样：把它混进可用率会让一个慢但正确的版本看起来像坏了。
+
+
+PID_FILE = PROJECT_ROOT / "cn-stock-mcp.pid"
+
+
+def _percentile(values: list[float], q: float) -> float:
+    """最近秩法。样本量小的时候插值只会造出一个没人观测到的数。"""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, int(round(q * (len(ordered) - 1)))))
+    return ordered[index]
+
+
+def service_pid() -> int | None:
+    """服务进程号。先读 start.sh 写的 pidfile，读不到再按命令行找。"""
+    try:
+        pid = int(PID_FILE.read_text().split()[0])
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        out = subprocess.run(
+            ["ps", "-Ao", "pid=,args="], capture_output=True, text=True, timeout=10
+        ).stdout
+    except Exception:
+        return None
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and "qtf_mcp" in parts[1] and "verify_release" not in parts[1]:
+            try:
+                return int(parts[0])
+            except ValueError:
+                continue
+    return None
+
+
+def _process_table() -> tuple[dict, dict]:
+    """(pid -> (ppid, rss_kib, comm), ppid -> [pid])。
+
+    用 ``ps`` 而不是 /proc：这个脚本要在 Ubuntu 和 macOS 上都能跑，而 ps 的这三列
+    两边都有。RSS 会把进程间共享的页在每个进程里各算一次，所以进程树的和是个偏高
+    的上界——用来看趋势和相对增量足够，别拿它跟 500 MiB 硬比。
+    """
+    procs: dict[int, tuple[int, int, str]] = {}
+    kids: dict[int, list[int]] = {}
+    try:
+        out = subprocess.run(
+            ["ps", "-Ao", "pid=,ppid=,rss=,comm="], capture_output=True, text=True, timeout=10
+        ).stdout
+    except Exception:
+        return procs, kids
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid, ppid, rss = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        procs[pid] = (ppid, rss, parts[3])
+        kids.setdefault(ppid, []).append(pid)
+    return procs, kids
+
+
+_BROWSER_HINTS = ("chrome", "chromium", "headless_shell", "Xvfb")
+
+
+def tree_rss(pid: int) -> tuple[float, int, float, int]:
+    """(整棵树 MiB, 进程数, 其中浏览器相关 MiB, 浏览器进程数)。
+
+    浏览器那部分单列，因为它是峰值的主要来源，也是 BROWSER_PAGE_CONCURRENCY
+    这个旋钮直接作用的地方——两个数放在一起才看得出上调的代价落在哪。
+    """
+    procs, kids = _process_table()
+    if pid not in procs:
+        return 0.0, 0, 0.0, 0
+    total = browser = 0
+    count = browser_count = 0
+    seen: set[int] = set()
+    stack = [pid]
+    while stack:
+        current = stack.pop()
+        if current in seen or current not in procs:
+            continue
+        seen.add(current)
+        _, rss, comm = procs[current]
+        total += rss
+        count += 1
+        if any(hint.lower() in comm.lower() for hint in _BROWSER_HINTS):
+            browser += rss
+            browser_count += 1
+        stack.extend(kids.get(current, ()))
+    return total / 1024, count, browser / 1024, browser_count
+
+
+@dataclass
+class MemoryWatch:
+    """跑分期间按固定间隔采样服务进程树。
+
+    采样而不是只取首尾：浏览器页面用完即关，峰值只在页面加载的那两三秒里存在，
+    首尾两次采样必然错过它。间隔默认 1 秒——比一次页面加载（服务器实测 p50 2.3s）
+    短，够抓到峰值，又不至于让 ps 本身成为负载。
+    """
+
+    interval: float = 1.0
+    pid: int | None = None
+    samples: list[tuple[float, int, float, int]] = field(default_factory=list)
+    note: str = ""
+    _thread: object = None
+    _stop: object = None
+
+    def start(self) -> None:
+        self.pid = service_pid()
+        if self.pid is None:
+            self.note = "没找到服务进程（pidfile 不存在，命令行里也没匹配到）"
+            return
+        import threading
+
+        self._stop = threading.Event()
+
+        def loop():
+            while not self._stop.wait(self.interval):
+                sample = tree_rss(self.pid)
+                if sample[1]:
+                    self.samples.append(sample)
+
+        self.samples.append(tree_rss(self.pid))
+        self._thread = threading.Thread(target=loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._stop is not None:
+            self._stop.set()
+            self._thread.join(timeout=5)
+        if self.pid is not None and not self.samples:
+            self.note = "采样期间进程树读不到，服务可能中途重启了"
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.samples)
+
+    def summary(self) -> dict:
+        totals = [s[0] for s in self.samples]
+        browsers = [s[2] for s in self.samples]
+        peak_at = max(range(len(self.samples)), key=lambda i: self.samples[i][0])
+        return {
+            "first": totals[0],
+            "peak": max(totals),
+            "last": totals[-1],
+            "mean": sum(totals) / len(totals),
+            "peak_processes": self.samples[peak_at][1],
+            "browser_peak": max(browsers) if browsers else 0.0,
+            "browser_peak_processes": max(s[3] for s in self.samples),
+            "samples": len(self.samples),
+        }
+
+
+def _render_performance(watch: "MemoryWatch", calls: list[CallResult]) -> list[str]:
+    """性能一节。耗时按工具分组，内存给进程树峰值。"""
+    lines = ["## 性能：耗时与内存", ""]   # 标题由调用方按报告编号覆盖
+    lines.append("和前两部分分开看：这一节不进可用率。一个慢但数字全对的版本，"
+                 "可用率应当照样是满分，而它慢这件事要在这里看得见。")
+    lines.append("")
+
+    ok_calls = [c for c in calls if c.ok]
+    if not ok_calls:
+        lines.append("本次没有成功的调用，无耗时可统计。")
+        lines.append("")
+        return lines
+
+    lines.append("### 调用耗时")
+    lines.append("")
+    lines.append("| 工具 | 次数 | 平均 | P50 | P90 | P95 | 最慢 |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    by_tool: dict[str, list[float]] = {}
+    for call in ok_calls:
+        by_tool.setdefault(call.spec.tool, []).append(call.elapsed)
+    for tool in sorted(by_tool, key=lambda t: -_percentile(by_tool[t], 0.9)):
+        values = by_tool[tool]
+        lines.append(
+            f"| {tool} | {len(values)} | {sum(values)/len(values):.2f}s | "
+            f"{_percentile(values, 0.5):.2f}s | {_percentile(values, 0.9):.2f}s | "
+            f"{_percentile(values, 0.95):.2f}s | {max(values):.2f}s |"
+        )
+    everything = [c.elapsed for c in ok_calls]
+    lines.append(
+        f"| **全部** | **{len(everything)}** | **{sum(everything)/len(everything):.2f}s** | "
+        f"**{_percentile(everything, 0.5):.2f}s** | **{_percentile(everything, 0.9):.2f}s** | "
+        f"**{_percentile(everything, 0.95):.2f}s** | **{max(everything):.2f}s** |"
+    )
+    lines.append("")
+    lines.append("> 这是 mcporter 端到端的墙钟时间，含进程启动和传输，比服务日志里的 "
+                 "`cost=` 大一截。跨版本比要用同一个口径，别拿它跟日志里的数直接比。")
+    lines.append("")
+
+    lines.append("### 服务进程树内存")
+    lines.append("")
+    if not watch.ok:
+        lines.append(f"未采到：{watch.note or '原因不明'}。")
+        lines.append("")
+        return lines
+    info = watch.summary()
+    lines.append(f"| 指标 | 值 |")
+    lines.append(f"| --- | ---: |")
+    lines.append(f"| 起始 | {info['first']:.0f} MiB |")
+    lines.append(f"| **峰值** | **{info['peak']:.0f} MiB**（{info['peak_processes']} 进程）|")
+    lines.append(f"| 均值 | {info['mean']:.0f} MiB |")
+    lines.append(f"| 结束 | {info['last']:.0f} MiB |")
+    lines.append(f"| 其中浏览器峰值 | {info['browser_peak']:.0f} MiB"
+                 f"（{info['browser_peak_processes']} 进程）|")
+    lines.append(f"| 采样 | 每 {watch.interval:.0f}s 一次，共 {info['samples']} 次 |")
+    lines.append("")
+    lines.append("> 口径：`ps` 的 RSS 逐进程相加。共享页会在每个进程里各算一次，所以这个数是"
+                 "**偏高的上界**，不能直接拿去和 500 MiB 的预算比对；它的用处是看趋势，以及"
+                 "看 `BROWSER_PAGE_CONCURRENCY` 这类旋钮上调之后代价落在哪。要跟预算硬比，"
+                 "得用 PSS（Linux 上读 `/proc/<pid>/smaps_rollup`）。")
+    lines.append("")
+    lines.append("> 浏览器那一行单列，是因为峰值基本由它决定：页面用完即关，所以峰值只在"
+                 "页面加载的那两三秒里存在，采样间隔必须比一次加载短才抓得到。")
+    lines.append("")
+    return lines
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=Path, help="mcporter 配置路径")
@@ -1720,6 +1957,12 @@ def main() -> int:
         help="把本次探活的成功返回冻成归档，留给下一次改动当基线",
     )
     parser.add_argument("--concurrency", type=int, default=2)
+    parser.add_argument(
+        "--memory-interval",
+        type=float,
+        default=1.0,
+        help="服务进程树 RSS 的采样间隔，秒；置 0 关闭内存采样",
+    )
     parser.add_argument("--timeout-ms", type=int, default=120000)
     args = parser.parse_args()
 
@@ -1732,6 +1975,13 @@ def main() -> int:
 
     print(f"[验证] 配置={config}")
     print(f"[验证] 工具={','.join(sorted(tools))}")
+
+    watch = MemoryWatch(interval=args.memory_interval)
+    if args.memory_interval > 0:
+        watch.start()
+        print(f"[验证] 内存采样 pid={watch.pid or '未找到'} 间隔={args.memory_interval}s")
+    else:
+        watch.note = "--memory-interval 0，本次没开内存采样"
 
     probes: list[tuple[CallResult, Payload, Completeness]] = []
     if not args.skip_probe:
@@ -1811,8 +2061,11 @@ def main() -> int:
             print(f"  [{'OK ' if not bad else 'DIFF'}] {baseline.path.name}{note}")
             regressions.append((baseline, result, diffs))
 
+    watch.stop()
     scan = scan_log(args.log, started)
-    report, failed, verdict = render_report(started, config, probes, regressions, scan)
+    report, failed, verdict = render_report(
+        started, config, probes, regressions, scan, watch
+    )
 
     destination = args.report or (DEFAULT_REPORT_DIR / f"{started:%Y%m%d_%H%M%S}.md")
     destination.parent.mkdir(parents=True, exist_ok=True)

@@ -648,3 +648,55 @@ class TestFundFlowApplicability:
         payload = verify.Payload(documents={"SH000001": "# 基本数据\n- 股票代码: SH000001\n"})
         result = verify.check_completeness("brief", payload)
         assert any(f.dimension.name == "资金流向" for f in result.findings)
+
+
+# --- 性能一节 --------------------------------------------------------------
+
+
+class TestPerformanceSection:
+    def test_percentile_uses_nearest_rank(self):
+        values = [1.0, 2.0, 3.0, 4.0, 5.0]
+        assert verify._percentile(values, 0.5) == 3.0
+        assert verify._percentile(values, 0.9) == 5.0
+        assert verify._percentile([], 0.5) == 0.0
+        assert verify._percentile([7.0], 0.9) == 7.0
+
+    def _call(self, tool, elapsed, ok=True):
+        spec = verify.CallSpec(tool=tool, args={})
+        return verify.CallResult(
+            spec=spec, exit_code=0 if ok else 1,
+            payload="x" if ok else "", stderr="", elapsed=elapsed,
+        )
+
+    def test_timings_are_grouped_per_tool_and_overall(self):
+        calls = [self._call("brief", 1.0), self._call("brief", 3.0),
+                 self._call("full", 10.0)]
+        text = "\n".join(verify._render_performance(verify.MemoryWatch(), calls))
+        assert "| brief | 2 |" in text
+        assert "| full | 1 |" in text
+        assert "**全部**" in text and "**3**" in text
+
+    def test_failed_calls_do_not_pollute_the_timings(self):
+        calls = [self._call("brief", 1.0), self._call("brief", 99.0, ok=False)]
+        text = "\n".join(verify._render_performance(verify.MemoryWatch(), calls))
+        assert "| brief | 1 |" in text
+        assert "99.00s" not in text
+
+    def test_it_says_so_when_memory_was_not_sampled(self):
+        watch = verify.MemoryWatch()
+        watch.note = "没找到服务进程"
+        text = "\n".join(verify._render_performance(watch, [self._call("brief", 1.0)]))
+        assert "未采到" in text and "没找到服务进程" in text
+
+    def test_memory_summary_reports_peak_not_just_endpoints(self):
+        """峰值只在页面加载那两三秒里存在，只看首尾必然错过。"""
+        watch = verify.MemoryWatch()
+        watch.samples = [(100.0, 3, 0.0, 0), (800.0, 9, 700.0, 6), (120.0, 3, 0.0, 0)]
+        info = watch.summary()
+        assert info["peak"] == 800.0 and info["peak_processes"] == 9
+        assert info["browser_peak"] == 700.0
+        assert info["first"] == 100.0 and info["last"] == 120.0
+
+    def test_no_successful_call_degrades_gracefully(self):
+        text = "\n".join(verify._render_performance(verify.MemoryWatch(), []))
+        assert "没有成功的调用" in text
