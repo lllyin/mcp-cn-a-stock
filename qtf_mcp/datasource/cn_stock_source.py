@@ -965,7 +965,21 @@ class CNStockDataSource(DataSource):
         include_unadjusted: bool = True,
         status: dict = None,
     ) -> Optional[Dict]:
-        """Build the same result shape from the fallback providers alone."""
+        """Build the same result shape from the fallback providers alone.
+
+        这里对同一个标的取**两次**（复权 + 不复权），是这条路径最贵的一段。
+        2026-09-05 部署机上兜底变成常态路径之后，_fetch_kline_sync 占了全部取数
+        时间的 63.8%，所以查过能不能省掉第二次。结论是不能，记在这里免得重查：
+
+        - 不复权序列喂 ``close_unadj`` -> ``CLOSE2``，被 research.py 的市盈率(静)
+          用来取"当前价格"，去掉就少一维。
+        - 看着可以省：前复权的定义就是把最新那根归一到真实价，所以 ``[-1]`` 两者
+          相等。但这只在"区间结尾正好是最新交易日"时成立；钉了 ``date=`` 的查询
+          里 qfq 仍按今天归一，最后一根不等于那天的实际收盘，省掉会把市盈率(静)
+          算错。而钉日期恰恰是基线比对天天在走的路径。
+        - 改成两次并发取能省一半墙钟，但会把对腾讯/新浪的并发翻倍，而它们在同一
+          轮里本来就在 Max retries——收益和副作用都说不清量级，所以不动。
+        """
         df = self._fetch_fallback_kline_sync(
             code, start_date, end_date, adjust, symbol, status
         )
