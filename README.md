@@ -3,8 +3,6 @@
 CnStock 是一个面向大模型和 MCP 客户端的 A 股数据服务。
 提供股票、指数和场内 ETF 的行情、财务、资金流、技术指标、K 线与全市场涨跌分布数据。
 
-项目基于 [elsejj/mcp-cn-a-stock](https://github.com/elsejj/mcp-cn-a-stock) 改造，使用 [AkShare](https://github.com/akfamily/akshare) 和 [efinance](https://github.com/nelsonie/efinance) 作为公开数据源，不依赖原项目的私有 API。
-
 ## 项目亮点
 
 - 覆盖沪深京股票、主要指数和场内 ETF。
@@ -18,17 +16,17 @@ CnStock 是一个面向大模型和 MCP 客户端的 A 股数据服务。
 
 ## MCP 工具
 
-| 工具 | 返回格式 | 用途 |
+| 工具 | 用途 | 返回格式 |
 | --- | --- | --- |
-| `brief` | JSON 外壳 + Markdown 报告 | 基本信息、行情和资金流 |
-| `medium` | JSON 外壳 + Markdown 报告 | 在 `brief` 基础上增加财务摘要 |
-| `full` | JSON 外壳 + Markdown 报告 | 完整财务、历史资金流和技术分析 |
-| `tech` | 严格 JSON | OHLCV、KDJ、MACD、RSI、布林带 |
-| `kline_daily` | Markdown | 指定交易日的 K 线 |
-| `kline_range` | Markdown 表格 | 指定日期区间的 K 线 |
-| `sector_fund_flow` | Markdown 表格 | 行业/概念/地域板块的资金流排行 |
-| `market_breadth` | 严格 JSON | 全市场涨跌家数、涨跌停和十档分布 |
-| `market_events` | 严格 JSON | 指定日期的龙虎榜、涨停池、公告和业绩预告 |
+| `brief` | 基本信息、行情和资金流 | JSON 外壳 + Markdown 报告 |
+| `medium` | 在 `brief` 基础上增加财务摘要 | JSON 外壳 + Markdown 报告 |
+| `full` | 完整财务、历史资金流和技术分析 | JSON 外壳 + Markdown 报告 |
+| `tech` | OHLCV、KDJ、MACD、RSI、布林带 | 严格 JSON |
+| `kline_daily` | 指定交易日的 K 线 | Markdown |
+| `kline_range` | 指定日期区间的 K 线 | Markdown 表格 |
+| `sector_fund_flow` | 行业/概念/地域板块的资金流排行 | Markdown 表格 |
+| `market_breadth` | 全市场涨跌家数、涨跌停和十档分布 | 严格 JSON |
+| `market_events` | 指定日期的龙虎榜、涨停池、公告和业绩预告 | 严格 JSON |
 
 完整报告示例：[兆易创新 SH603986](docs/SH603986-full.md)。
 各工具的返回字段见[技术实现说明](docs/technical-details.md#9-输出与错误契约)。
@@ -39,7 +37,7 @@ CnStock 是一个面向大模型和 MCP 客户端的 A 股数据服务。
 - Linux、macOS；生产部署推荐 Ubuntu。
 - 推荐使用 [uv](https://docs.astral.sh/uv/) 管理依赖。
 - 可访问 AkShare、efinance 使用的公开行情接口。
-- Chromium：盘中实时资金流和 `market_breadth` 的首选数据源需要，缺失时会回退到备用源。
+- Chromium：盘中实时资金流和 `market_breadth` 的首选数据源需要，`start.sh` 会在缺失时自动安装。
 
 ## 快速安装
 
@@ -67,33 +65,15 @@ source .venv/bin/activate
 pip install .
 ```
 
-### 3. 安装浏览器
-
-```bash
-playwright install chromium
-```
-
-Ubuntu 用下面这条命令，会一并安装浏览器所需的系统依赖：
-
-```bash
-playwright install --with-deps chromium
-```
-
-无桌面的 Ubuntu 可额外安装 `xvfb`。`start.sh` 会在没有 `DISPLAY` 时自动启动并管理一个项目专用的
-Xvfb；未安装也不影响其他工具。
+无桌面的 Ubuntu 可额外安装 `xvfb`，`start.sh` 会在没有 `DISPLAY` 时自动启动并管理它；
+未安装也不影响其他工具。
 
 ## 启动和停止
 
-**零配置即可启动**，不需要任何账号、密钥或网关：
+零配置即可启动，不需要账号、密钥或网关。首次启动会自动装好 Chromium：
 
 ```bash
 ./start.sh
-```
-
-要微调行为再复制一份配置来改（每一项都可省略，省略即用默认值，见[配置](#配置)）：
-
-```bash
-cp .env.example .env
 ```
 
 默认 MCP 地址：
@@ -234,144 +214,135 @@ mcporter call cn-stock market_events \
 
 ## 配置
 
-**这一节是用来微调的，不配也能跑。** 所有配置都通过 `.env` 提供，全部可省略，省略即
-使用下表的默认值；改完需要重启服务。
+所有配置都通过 `.env` 提供，全部可省略，省略即使用下表的默认值；改完需要重启服务。
+可以从 `.env.example` 复制一份来改。
 
-大多数人只会用到这几项：`HTTP_CHANNEL`（出站方式）、`BROWSER_HEADFUL`（排查时看浏览器
-在干什么）、`REPORT_CACHE_ENABLED`（压测时关掉缓存）。其余的默认值都是拿实测数据定的，
-调之前建议先读一遍那一项的说明——`.env.example` 里每一项都写了为什么是这个值。
+> `.env` 的取值优先于 shell 环境变量。`HTTP_CHANNEL=direct ./start.sh` 会被 `.env` 里的
+> 同名项覆盖，临时改配置请直接改 `.env`。
 
-> 入口执行的是 `load_dotenv(override=True)`，**`.env` 的取值优先于 shell 环境变量**。
-> `HTTP_CHANNEL=direct ./start.sh` 这种写法会被 `.env` 里的同名项覆盖掉，
-> 临时改配置请直接改 `.env` 或注释掉其中对应的行。
-
-配置名一律不带前缀，`AKSHARE_PROXY_*` 那一组除外——那是第三方插件 akshare-proxy-patch 的
-名字。要和别的程序共存、担心重名时设 `ENV_PREFIX`，之后所有配置都读带前缀的名字——
-`ENV_PREFIX=CNSTOCK_` 时读的就是 `CNSTOCK_HTTP_CHANNEL`。`start.sh` 读的 `XVFB_*`
-也遵守同一规则。
+要和别的程序共存时设 `ENV_PREFIX`，之后所有配置名都带上这个前缀（`ENV_PREFIX=CNSTOCK_`
+时写 `CNSTOCK_HTTP_CHANNEL`）。`AKSHARE_PROXY_*` 属于第三方插件，不受影响。
 
 ### 出站 HTTP 通道
 
 部分东方财富接口会直接断开普通 HTTP 客户端的连接，`HTTP_CHANNEL` 决定用哪种方式访问这些
 主机。默认的 `auto` 在没有配置网关时使用 `impersonate`，无需任何额外账号。
 
-| 配置名 | 可选参数 | 作用 |
+| 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
-| `HTTP_CHANNEL` | `auto`<br>`proxy`<br>`impersonate`<br>`direct`<br>（默认 `auto`） | 访问东财行情主机的方式：<br>`auto` 网关可用时走 `proxy`，否则降级 `impersonate`<br>`proxy` 经授权网关和代理出口，按积分计费<br>`impersonate` 本机直连 + 浏览器 TLS 指纹<br>`direct` 本机直连 + 原生 `requests`，可写作 `off` |
-| `IMPERSONATE_RETRY` | 正整数（默认 `3`） | 单个请求的伪装尝试次数，用尽后改用原生 `requests` 重放一次 |
-| `IMPERSONATE_TIMEOUT_SECONDS` | 秒（默认 `8`） | 单次伪装请求的超时 |
-| `IMPERSONATE_BROWSER` | curl_cffi 浏览器名（默认 `chrome`） | 伪装的浏览器指纹；固定取值才能复用 TLS 连接 |
-| `IMPERSONATE_SUSPEND_AFTER_FAILURES` | 正整数（默认 `4`） | 连续多少次请求打满重试仍失败后暂停伪装通道 |
-| `IMPERSONATE_SUSPEND_SECONDS` | 秒（默认 `300`） | 暂停时长。期间这四个主机退回原生 `requests`，而它们被接管的理由正是拒绝原生 `requests`，所以东财源会在这段时间直接跳过，不再逐个源重新发现一遍 |
+| `HTTP_CHANNEL` | 访问东财行情主机的方式：<br>`auto` 网关可用时走 `proxy`，否则降级 `impersonate`<br>`proxy` 经授权网关和代理出口，按积分计费<br>`impersonate` 本机直连 + 浏览器 TLS 指纹<br>`direct` 本机直连 + 原生 `requests`，可写作 `off` | `auto`<br>`proxy`<br>`impersonate`<br>`direct`<br>（默认 `auto`） |
+| `IMPERSONATE_RETRY` | 单个请求的伪装尝试次数，用尽后改用原生 `requests` 重放一次 | 正整数（默认 `3`） |
+| `IMPERSONATE_TIMEOUT_SECONDS` | 单次伪装请求的超时 | 秒（默认 `8`） |
+| `IMPERSONATE_BROWSER` | 伪装的浏览器指纹 | curl_cffi 浏览器名（默认 `chrome`） |
+| `IMPERSONATE_SUSPEND_AFTER_FAILURES` | 连续多少次请求打满重试仍失败后暂停伪装通道 | 正整数（默认 `4`） |
+| `IMPERSONATE_SUSPEND_SECONDS` | 暂停时长。期间东财源直接跳过，改用备用源 | 秒（默认 `300`） |
 
-只有 `push2`、`push2his`、`fund`、`emweb.securities` 四个东方财富主机会被接管，其余主机原样直连。
-四种模式互斥，同一进程只安装一个；详见[出站 HTTP 通道](docs/technical-details.md#6-出站-http-通道)。
+只有 4 个东方财富主机会被接管，其余主机原样直连；详见[出站 HTTP 通道](docs/technical-details.md#6-出站-http-通道)。
 
 ### AkShare Proxy Patch（可选，付费）
 
 **默认关闭。** 这是一个按积分计费的授权网关，不配置也能正常使用全部工具；上游对本机出口 IP
 限流严重时可以启用它来提高东财接口的成功率。
 
-| 配置名 | 可选参数 | 作用 |
+| 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
-| `AKSHARE_PROXY_ENABLED` | `0`<br>`1`<br>（默认 `0`） | 是否启用网关。只作为 `HTTP_CHANNEL=auto` 的判定输入 |
-| `AKSHARE_PROXY_GATEWAY` | 主机名或 IP（默认空） | 授权网关地址，不含协议和端口 |
-| `AKSHARE_PROXY_TOKEN` | 字符串（默认空） | 网关访问令牌 |
-| `AKSHARE_PROXY_RETRY` | 正整数（默认 `30`） | 网关请求的失败重试次数。插件的第三个参数是重试次数不是端口，早年误名为 `AKSHARE_PROXY_PORT`，那个名字仍然认 |
+| `AKSHARE_PROXY_ENABLED` | 是否启用网关。只作为 `HTTP_CHANNEL=auto` 的判定输入 | `0`<br>`1`<br>（默认 `0`） |
+| `AKSHARE_PROXY_GATEWAY` | 授权网关地址，不含协议和端口 | 主机名或 IP（默认空） |
+| `AKSHARE_PROXY_TOKEN` | 网关访问令牌 | 字符串（默认空） |
+| `AKSHARE_PROXY_RETRY` | 网关请求的失败重试次数（旧名 `AKSHARE_PROXY_PORT` 仍然认） | 正整数（默认 `30`） |
 
-从旧版本升级时注意：这个开关以前默认开启。如果原来只配了 `GATEWAY` 和 `TOKEN`、没有写
-`AKSHARE_PROXY_ENABLED`，现在需要显式写 `AKSHARE_PROXY_ENABLED=1` 才会继续走网关，否则会
-自动降级到 `impersonate`，启动日志里的 `reason` 会是 `auto:proxy_disabled`。
+从旧版本升级时注意：这个开关以前默认开启，现在需要显式写 `AKSHARE_PROXY_ENABLED=1`
+才会继续走网关，否则自动降级到 `impersonate`。
 
 ### 盘中行情与资金流
 
 盘中的当日 K 线 bar 由一层可插拔的实时行情 provider 补齐，资金流在东财接口不可用时回退到
 浏览器加载的资金流向页面。两者都可以整层关闭。
 
-| 配置名 | 可选参数 | 作用 |
+| 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
-| `BASIC_INFO_PROVIDERS` | `eastmoney`<br>`tencent`<br>`off`<br>（默认 `eastmoney,tencent`） | 基本数据（总市值、流通市值、市盈率、市净率）的尝试顺序，后面的源补前面缺的字段：<br>`eastmoney` 字段最全，需要网关或未被封的出口<br>`tencent` 走 `qt.gtimg.cn`，无需鉴权，与东财逐项比对过市值与市盈率 0.000% 一致<br>没有网关的部署靠它兜住这一组，否则会连带丢掉市盈率(静) 和换手率 |
-| `INTRADAY_QUOTE_PROVIDERS` | `fund_flow_page`<br>`tencent`<br>`off`<br>（默认 `fund_flow_page,tencent`） | 盘中实时行情的尝试顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`fund_flow_page` 复用已解析的资金流页面，不发请求但没有开高低<br>`tencent` 走 `qt.gtimg.cn`，六项俱全 |
-| `INTRADAY_QUOTE_CROSS_CHECK_PCT` | 百分比，`0` 关闭（默认 `0`） | 拿到第一个可用报价后再问剩下的源一遍，字段相差超过这个值就打 WARNING。开着每个标的多一次上游请求，只在怀疑某个源口径不对时开——创业板指成交量差 3.5% 那件事，开着的话日志里当场就有一行 |
-| `TRADING_CALENDAR_PROVIDERS` | `sina`<br>`weekday`<br>`off`<br>（默认 `sina,weekday`） | 判"今天开不开市"的日历来源：<br>`sina` 上交所公布的交易日名单（经 AkShare），8797 行 / 0.18s<br>`weekday` 兜底，周一到周五算交易日，即接入日历之前的行为<br>降级路径做成平台而不是 if/else，好处是看得见、能单独关掉 |
-| `TRADING_CALENDAR_TTL_SECONDS` | 秒（默认 `86400`） | 日历的进程内缓存时长。交易日历提前一年公布，一天刷一次够了 |
-| `SECTOR_FUND_FLOW_PROVIDERS` | `eastmoney`<br>`eastmoney_dataapi`<br>`off`<br>（默认 `eastmoney,eastmoney_dataapi`） | 板块资金流的取数顺序：<br>`eastmoney` push2 clist，字段全<br>`eastmoney_dataapi` 只有主力净额，但不在伪装通道接管名单里，push2 连不上时它还通；返回会标注是降级源 |
-| `KLINE_PROVIDERS_INDEX` | 同上（默认 `tonghuashun,tencent,sina`） | **指数**用的兜底顺序，和上一项分开配。判据是哪家更贴近主源东财：创业板指成交量东财与同花顺一致，腾讯/新浪低 3.52%；个股则相反（美的 120 日均价东财与腾讯一致，同花顺 −0.059%），所以两类分两条 |
-| `KLINE_PROVIDERS` | `tonghuashun`<br>`tencent`<br>`sina`<br>`off`<br>（默认 `tencent,sina`） | 东财那一级取不到时，**个股/ETF** 的兜底顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`tonghuashun` 免鉴权接口，指数口径和东财一致，但个股的前复权基准不同；不覆盖北交所<br>`tencent` 个股/ETF/指数都覆盖，北交所大半不认<br>`sina` 覆盖腾讯不认的北交所代码，但 ETF 和创业板指是 JSONDecodeError<br>三家各补各的洞。接新源只需写一个 `platforms/<名字>.py` 再把名字加进来 |
-| `FUND_FLOW_PAGE_ENABLED` | `0`<br>`1`<br>（默认 `1`） | 东财资金流接口不可用时，是否回退到资金流向页面 |
-| `FUND_FLOW_PAGE_CONCURRENCY` | 正整数（默认 `3`） | 同时进行的兜底页面加载数。要和 `BROWSER_MAX_PAGES` 一起调，两者是串联的闸门，只提其中一个另一个立刻变成新瓶颈 |
-| `FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS` | 秒（默认 `8`） | 单个标的等一个名额的上限，等不到就跳过兜底、改渲染“盘中实时数据暂时不可用”。必须大于一次页面加载的耗时（部署机实测 p50 3.4s / p90 7.5s），否则一批 4 个标的里的最后一个结构上永远排不到 |
-| `FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS` | 秒，`0` 关闭（默认 `15`） | 一次请求里所有标的加起来最多为等名额花掉多少秒。是截止时间不是配额，必须大于上一项，否则上一项提了也会被它削回来 |
-| `FUND_FLOW_PAGE_TABLE_WAIT_SECONDS` | 秒（默认 `15`） | 等历史表渲染完成的上限。请求被拒时会提前结束，不会白等满 |
-| `FUND_FLOW_PAGE_REUSE_SECONDS` | 秒，`0` 关闭复用（默认 `30`） | 同一标的页面解析结果的复用窗口，避免一次请求内重复加载同一页面 |
-| `FUND_FLOW_PAGE_MAX_LOADS` | 正整数（默认 `2`） | 单次请求允许的页面加载次数：第 2 次是同一个 tab 上 reload，第 3 次起才换 tab。只在没拿到想要的数据时才会用掉，顺利路径一次都不多花 |
-| `FUND_FLOW_PAGE_RETRY_DELAY_MS` | `下界,上界` 毫秒<br>单个数字为固定值<br>`0` 关闭<br>（默认 `250,350`） | reload 之前的随机等待区间。只作用在重试路径上，顺利路径不受影响；没拿到数据后 0 毫秒就刷新同一个页面是个机器节奏 |
-| `FUND_FLOW_PAGE_OPEN_AFTER_FAILURES` | 正整数（默认 `4`） | 多少次徒劳加载后暂停整层兜底 |
-| `FUND_FLOW_PAGE_FAILURE_WINDOW_SECONDS` | 秒，`0` 退回连续计数（默认 `60`） | 上一项按这个滑动窗口计数，不是连续计数——被拒是逐次随机的，连续计数两头都不准 |
-| `FUND_FLOW_PAGE_COOLDOWN_SECONDS` | 秒（默认 `60`） | 暂停时长 |
+| `BASIC_INFO_PROVIDERS` | 基本数据（市值、市盈率、市净率）的尝试顺序，后面的源补前面缺的字段：<br>`eastmoney` 字段最全，需要网关或未被封的出口<br>`tencent` 无需鉴权，没有网关的部署靠它兜住这一组 | `eastmoney`<br>`tencent`<br>`off`<br>（默认 `eastmoney,tencent`） |
+| `INTRADAY_QUOTE_PROVIDERS` | 盘中实时行情的尝试顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`fund_flow_page` 复用已解析的资金流页面，不发请求但没有开高低<br>`tencent` 六项俱全 | `fund_flow_page`<br>`tencent`<br>`off`<br>（默认 `fund_flow_page,tencent`） |
+| `INTRADAY_QUOTE_CROSS_CHECK_PCT` | 拿到第一个可用报价后再问剩下的源一遍，字段相差超过这个值就打 WARNING。每个标的多一次上游请求，只在怀疑某个源口径不对时开 | 百分比，`0` 关闭（默认 `0`） |
+| `TRADING_CALENDAR_PROVIDERS` | 判「今天开不开市」的日历来源：<br>`sina` 上交所公布的交易日名单<br>`weekday` 兜底，周一到周五算交易日 | `sina`<br>`weekday`<br>`off`<br>（默认 `sina,weekday`） |
+| `TRADING_CALENDAR_TTL_SECONDS` | 日历的进程内缓存时长 | 秒（默认 `86400`） |
+| `SECTOR_FUND_FLOW_PROVIDERS` | 板块资金流的取数顺序：<br>`eastmoney` 字段全<br>`eastmoney_dataapi` 只有主力净额，但主源连不上时它还通；返回会标注是降级源 | `eastmoney`<br>`eastmoney_dataapi`<br>`off`<br>（默认 `eastmoney,eastmoney_dataapi`） |
+| `KLINE_PROVIDERS_INDEX` | **指数**用的兜底顺序，和下一项分开配：指数的成交量各源口径差得多（创业板指相差 3.52%），同花顺与东财一致 | 同上（默认 `tonghuashun,tencent,sina`） |
+| `KLINE_PROVIDERS` | 东财那一级取不到时，**个股/ETF** 的兜底顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`tonghuashun` 不覆盖北交所<br>`tencent` 个股/ETF/指数都覆盖，北交所大半不认<br>`sina` 覆盖腾讯不认的北交所代码，但不认 ETF 和创业板指<br>三家各补各的洞 | `tonghuashun`<br>`tencent`<br>`sina`<br>`off`<br>（默认 `tencent,sina`） |
+| `FUND_FLOW_PAGE_ENABLED` | 东财资金流接口不可用时，是否回退到资金流向页面 | `0`<br>`1`<br>（默认 `1`） |
+| `FUND_FLOW_PAGE_CONCURRENCY` | 同时进行的兜底页面加载数。要和 `BROWSER_MAX_PAGES` 一起调，只提一个另一个就成了新瓶颈 | 正整数（默认 `3`） |
+| `FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS` | 单个标的等一个名额的上限，等不到就跳过兜底。必须大于一次页面加载的耗时（实测 p90 7.5s） | 秒（默认 `8`） |
+| `FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS` | 一次请求里所有标的等名额的总时长上限，必须大于上一项 | 秒，`0` 关闭（默认 `15`） |
+| `FUND_FLOW_PAGE_TABLE_WAIT_SECONDS` | 等历史表渲染完成的上限 | 秒（默认 `15`） |
+| `FUND_FLOW_PAGE_REUSE_SECONDS` | 同一标的页面解析结果的复用窗口，避免一次请求内重复加载同一页面 | 秒，`0` 关闭复用（默认 `30`） |
+| `FUND_FLOW_PAGE_MAX_LOADS` | 单次请求允许的页面加载次数，只在没拿到数据时才会用掉 | 正整数（默认 `2`） |
+| `FUND_FLOW_PAGE_RETRY_DELAY_MS` | 重试刷新之前的随机等待区间，只作用在重试路径上 | `下界,上界` 毫秒<br>单个数字为固定值<br>`0` 关闭<br>（默认 `250,350`） |
+| `FUND_FLOW_PAGE_OPEN_AFTER_FAILURES` | 多少次徒劳加载后暂停整层兜底 | 正整数（默认 `4`） |
+| `FUND_FLOW_PAGE_FAILURE_WINDOW_SECONDS` | 上一项按这个滑动窗口计数 | 秒，`0` 退回连续计数（默认 `60`） |
+| `FUND_FLOW_PAGE_COOLDOWN_SECONDS` | 暂停时长 | 秒（默认 `60`） |
 
 ### 上游源熔断
 
 某个上游源连续失败时直接跳过它，不必每次请求都把整条 provider 链走完。
 
-| 配置名 | 可选参数 | 作用 |
+| 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
-| `SOURCE_BREAKER_ENABLED` | `0`<br>`1`<br>（默认 `1`） | 是否启用熔断 |
-| `SOURCE_BREAKER_OPEN_AFTER_FAILURES` | 正整数（默认 `3`） | 连续失败多少次后跳过该源 |
-| `SOURCE_BREAKER_COOLDOWN_SECONDS` | 秒（默认 `120`） | 冷却时长，结束后放行一次探测请求 |
+| `SOURCE_BREAKER_ENABLED` | 是否启用熔断 | `0`<br>`1`<br>（默认 `1`） |
+| `SOURCE_BREAKER_OPEN_AFTER_FAILURES` | 连续失败多少次后跳过该源 | 正整数（默认 `3`） |
+| `SOURCE_BREAKER_COOLDOWN_SECONDS` | 冷却时长，结束后放行一次探测请求 | 秒（默认 `120`） |
 
 ### 并发与线程池
 
 AkShare 和 efinance 的接口是同步网络调用，由一个有界线程池执行。Ubuntu 2 核 4G 建议保持默认值，
 调高会增加上游压力，并不保证降低延迟。
 
-| 配置名 | 可选参数 | 作用 |
+| 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
-| `FETCH_MAX_WORKERS` | 正整数（默认 `8`） | 同时执行同步数据任务的线程数 |
-| `FETCH_MAX_IN_FLIGHT` | 正整数（默认 `16`） | 已运行和已提交任务的总上限，超出后请求以协程等待 |
-| `BATCH_CONCURRENCY` | 正整数（默认 `2`） | `brief/medium/full` 共享的活跃批次数上限 |
-| `FINANCE_CACHE_TTL_SECONDS` | 秒，`0` 关闭（默认 `21600`） | 成功且非空的财务摘要缓存时间。财务数据只在定期报告发布后变动 |
-| `FINANCE_CACHE_MAX_ENTRIES` | 正整数（默认 `512`） | 财务缓存的最大标的数，超出后淘汰最早项 |
+| `FETCH_MAX_WORKERS` | 同时执行同步数据任务的线程数 | 正整数（默认 `8`） |
+| `FETCH_MAX_IN_FLIGHT` | 已运行和已提交任务的总上限，超出后请求以协程等待 | 正整数（默认 `16`） |
+| `BATCH_CONCURRENCY` | `brief/medium/full` 共享的活跃批次数上限 | 正整数（默认 `2`） |
+| `FINANCE_CACHE_TTL_SECONDS` | 财务摘要的缓存时间。财务数据只在定期报告发布后变动 | 秒，`0` 关闭（默认 `21600`） |
+| `FINANCE_CACHE_MAX_ENTRIES` | 财务缓存的最大标的数，超出后淘汰最早项 | 正整数（默认 `512`） |
 
 ### 报告缓存
 
 按标的缓存已渲染的报告。缓存条目绑定“市场纪元”，只在重新生成会得到同样字节的窗口内复用，
 因此命中与否不改变返回内容。
 
-| 配置名 | 可选参数 | 作用 |
+| 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
-| `REPORT_CACHE_ENABLED` | `0`<br>`1`<br>（默认 `1`） | 关闭后缓存完全不参与调用链，可用于冷热对照压测 |
-| `REPORT_CACHE_INTRADAY_TTL_SECONDS` | 秒，`0` 表示盘中绝不复用（默认 `30`） | 盘中数值持续变动，这个 TTL 只用于合并突发重复请求 |
-| `REPORT_CACHE_SETTLE_TIME` | 四位 HHMM，夹在 `1500`–`1700`（默认 `1530`） | 收盘后进入完全复用纪元的时间。默认留 30 分钟缓冲等东财资金流页面定稿 |
-| `REPORT_CACHE_MAX_ENTRIES` | 正整数（默认 `512`） | 内存缓存的最大条目数 |
-| `REPORT_CACHE_DISK_ENABLED` | `0`<br>`1`<br>（默认 `1`） | 跨重启保留闭市纪元的条目。傍晚纪元长达 16 小时，周末达 64 小时 |
-| `REPORT_CACHE_DIR` | 路径，相对项目根目录（默认 `.runtime/report-cache`） | 磁盘缓存目录 |
+| `REPORT_CACHE_ENABLED` | 关闭后缓存完全不参与调用链，可用于冷热对照压测 | `0`<br>`1`<br>（默认 `1`） |
+| `REPORT_CACHE_INTRADAY_TTL_SECONDS` | 盘中的缓存时间，只用于合并突发重复请求 | 秒，`0` 表示盘中绝不复用（默认 `30`） |
+| `REPORT_CACHE_SETTLE_TIME` | 收盘后进入完全复用的时间，默认留 30 分钟等资金流数据定稿 | 四位 HHMM，夹在 `1500`–`1700`（默认 `1530`） |
+| `REPORT_CACHE_MAX_ENTRIES` | 内存缓存的最大条目数 | 正整数（默认 `512`） |
+| `REPORT_CACHE_DISK_ENABLED` | 跨重启保留闭市期间的缓存 | `0`<br>`1`<br>（默认 `1`） |
+| `REPORT_CACHE_DIR` | 磁盘缓存目录 | 路径，相对项目根目录（默认 `.runtime/report-cache`） |
 
-盘中命中返回的必然是一份稍旧的快照，TTL 决定这份快照能有多旧。对资金流精度要求高时设为 `0`。
-纪元划分、TTL 取值依据和实测数据见[报告缓存](docs/technical-details.md#10-报告缓存)。
+盘中命中返回的是一份稍旧的快照，TTL 决定它能有多旧；对资金流精度要求高时设为 `0`。
+取值依据和实测数据见[报告缓存](docs/technical-details.md#10-报告缓存)。
 
 ### 市场宽度（同花顺）
 
-| 配置名 | 可选参数 | 作用 |
+| 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
-| `MARKET_BREADTH_AUTH_FILE` | 路径（默认 `.runtime/tonghuashun-auth.json`） | 同花顺认证缓存文件 |
-| `MARKET_BREADTH_COOLDOWN_SECONDS` | 秒（默认 `300`） | 同花顺认证失败后的冷却时间，冷却期内 `market_breadth` 直接用 efinance |
+| `MARKET_BREADTH_AUTH_FILE` | 同花顺认证缓存文件 | 路径（默认 `.runtime/tonghuashun-auth.json`） |
+| `MARKET_BREADTH_COOLDOWN_SECONDS` | 同花顺认证失败后的冷却时间，冷却期内 `market_breadth` 直接用 efinance | 秒（默认 `300`） |
 
 ### 浏览器与虚拟显示
 
 资金流兜底和 `market_breadth` 共用同一个浏览器实例，下面几项对两者同时生效。
 
-| 配置名 | 可选参数 | 作用 |
+| 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
-| `BROWSER_MAX_PAGES` | 正整数（默认 `3`） | 整个浏览器同时开着的页面数上限。这同时就是同时有几个渲染进程，是峰值内存的直接决定项：每多一个并发页约 +130 MiB |
-| `BROWSER_IDLE_TIMEOUT_SECONDS` | 秒，`0` 关闭空闲回收（默认 `5400`） | 多久没人调用就把浏览器整个拆掉。90 分钟是为了盖住午休，拆早了下一批调用要重新付一次冷启动 |
-| `BROWSER_DISGUISE` | `0`<br>`1`<br>（默认 `1`） | 把无头浏览器的自报特征改成普通浏览器的样子。不改的话 `sec-ch-ua` 请求头里写着 `HeadlessChrome`，容易被上游风控挑出来 |
-| `BROWSER_CLAIM_PLATFORM` | `auto`<br>`real`<br>`macos`<br>`windows`<br>（默认 `auto`） | 对外声明哪个平台。`auto` 下 Windows/macOS 照实报，其余（服务器上的 Linux）统一报 macOS —— Linux 桌面在真实访客里占比极低。`real` 用于在部署机上做对照 |
-| `BROWSER_NO_SANDBOX` | `0`<br>`1`<br>（默认 `0`） | 为 Chromium 添加 `--no-sandbox`。会降低浏览器隔离，仅在受控容器且 sandbox 确实不可用时启用 |
-| `XVFB_DISPLAY_NUMBER` | 整数（默认 `99`） | 无 `DISPLAY` 时 `start.sh` 使用的 Xvfb 起始显示号，被占用则依次往后试到 109 |
-| `XVFB_SCREEN` | `宽x高x色深`（默认 `1920x1080x24`） | Xvfb 屏幕配置 |
-| `BROWSER_HEADFUL` | `0`<br>`1`<br>（默认 `0`） | 调试开关：资金流页面用有头浏览器加载，便于人工观察渲染结果 |
-| `BROWSER_KEEP_PAGES` | `0`<br>`1`<br>（默认 `0`） | 调试开关：抓完不关页面。每个页面是一个独立渲染进程，会显著抬高内存 |
+| `BROWSER_MAX_PAGES` | 整个浏览器同时开着的页面数上限。这同时就是同时有几个渲染进程，是峰值内存的直接决定项：每多一个并发页约 +130 MiB | 正整数（默认 `3`） |
+| `BROWSER_IDLE_TIMEOUT_SECONDS` | 多久没人调用就关掉浏览器。默认 90 分钟盖住午休，关早了下一批调用要重新等冷启动 | 秒，`0` 关闭空闲回收（默认 `5400`） |
+| `BROWSER_DISGUISE` | 把无头浏览器的自报特征改成普通浏览器的样子，避免被上游风控挑出来 | `0`<br>`1`<br>（默认 `1`） |
+| `BROWSER_CLAIM_PLATFORM` | 对外声明哪个平台。`auto` 下 Windows/macOS 照实报，Linux 报 macOS | `auto`<br>`real`<br>`macos`<br>`windows`<br>（默认 `auto`） |
+| `BROWSER_NO_SANDBOX` | 为 Chromium 添加 `--no-sandbox`。会降低隔离，仅在 sandbox 确实不可用时启用 | `0`<br>`1`<br>（默认 `0`） |
+| `XVFB_DISPLAY_NUMBER` | 无 `DISPLAY` 时 `start.sh` 使用的 Xvfb 起始显示号，被占用则依次往后试到 109 | 整数（默认 `99`） |
+| `XVFB_SCREEN` | Xvfb 屏幕配置 | `宽x高x色深`（默认 `1920x1080x24`） |
+| `BROWSER_HEADFUL` | 调试开关：用有头浏览器加载，便于人工观察 | `0`<br>`1`<br>（默认 `0`） |
+| `BROWSER_KEEP_PAGES` | 调试开关：抓完不关页面。每个页面是一个独立渲染进程，会显著抬高内存 | `0`<br>`1`<br>（默认 `0`） |
 
 ## 更多文档
 
