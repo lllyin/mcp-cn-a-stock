@@ -8,7 +8,7 @@ from io import StringIO
 import numpy as np
 import pytest
 
-from qtf_mcp.research import (
+from finmcp.research import (
     build_basic_data,
     build_financial_data,
     build_trading_data,
@@ -551,7 +551,7 @@ class TestEmptyRealtimeFundFlowIsNotZero:
     async def _render(self, monkeypatch, browser_result):
         import json as json_module
 
-        import qtf_mcp.research as research
+        import finmcp.research as research
 
         async def fake_get_fund_flow(codes, **kwargs):
             return json_module.dumps({codes[0]: browser_result}, ensure_ascii=False)

@@ -45,7 +45,7 @@ AKSHARE_PROXY_RETRY = int(env("AKSHARE_PROXY_RETRY", env("AKSHARE_PROXY_PORT", "
 # akshare-proxy-patch treats the third argument as retry count.
 AKSHARE_PROXY_PORT = AKSHARE_PROXY_RETRY
 
-# --- Outbound HTTP channel (qtf_mcp/datasource/http_channel.py) ---
+# --- Outbound HTTP channel (finmcp/datasource/http_channel.py) ---
 # Some upstream quote hosts drop connections from plain HTTP clients, so requests
 # to them are issued through one of three channels. The modes are mutually
 # exclusive: the two non-plain implementations rewrite the same requests module
@@ -79,7 +79,7 @@ IMPERSONATE_SUSPEND_SECONDS = max(
 )
 
 
-# --- Upstream source breaker (qtf_mcp/datasource/cn_stock_source.py) ---
+# --- Upstream source breaker (finmcp/datasource/cn_stock_source.py) ---
 # Eastmoney rate-limits per endpoint: on 2026-09-03 the K-line and fund-flow
 # endpoints on push2his refused this egress IP for over half an hour while the
 # host's other paths stayed reachable. Every request then burned the full
@@ -99,7 +99,7 @@ SOURCE_BREAKER_COOLDOWN_SECONDS = max(
 )
 
 
-# --- Fund-flow page fallback (qtf_mcp/datasource/fund_flow_page.py) ---
+# --- Fund-flow page fallback (finmcp/datasource/fund_flow_page.py) ---
 # When the Eastmoney fund-flow endpoint refuses us, the same data is on
 # data.eastmoney.com/zjlx/<code>.html, which the browser tier can already load.
 # That path costs no gateway credits, but it costs a Chromium page load, so it
@@ -470,7 +470,7 @@ FINANCE_CACHE_MAX_ENTRIES = max(
     int(env("FINANCE_CACHE_MAX_ENTRIES", "512")),
 )
 
-# --- Report cache (qtf_mcp/cache.py) ---
+# --- Report cache (finmcp/cache.py) ---
 # A rendered report is reusable only inside the market epoch that produced it,
 # so the cache never changes what a tool would return. Disabling the master
 # switch removes the cache from the call path entirely.

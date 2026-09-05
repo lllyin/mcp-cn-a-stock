@@ -4,7 +4,7 @@ import logging
 
 import pytest
 
-from qtf_mcp.mcp_app import RequestLifecycleLogMiddleware
+from finmcp.mcp_app import RequestLifecycleLogMiddleware
 
 
 def _scope(method: str = "POST"):
@@ -41,7 +41,7 @@ async def _run_disconnect(scope, caplog):
         await receive()
         await receive()
 
-    caplog.set_level(logging.DEBUG, logger="qtf_mcp")
+    caplog.set_level(logging.DEBUG, logger="finmcp")
     await RequestLifecycleLogMiddleware(app)(scope, receive, send)
 
 
@@ -94,7 +94,7 @@ async def test_request_lifecycle_logs_client_disconnect(caplog):
         await receive()
         await receive()
 
-    caplog.set_level(logging.INFO, logger="qtf_mcp")
+    caplog.set_level(logging.INFO, logger="finmcp")
     await RequestLifecycleLogMiddleware(app)(_scope(), receive, send)
 
     assert "HTTP client disconnected before response finished" in caplog.text
@@ -116,7 +116,7 @@ async def test_request_lifecycle_logs_response_size(caplog):
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b"abc"})
 
-    caplog.set_level(logging.INFO, logger="qtf_mcp")
+    caplog.set_level(logging.INFO, logger="finmcp")
     await RequestLifecycleLogMiddleware(app)(_scope(), receive, send)
 
     assert len(sent) == 2
@@ -138,7 +138,7 @@ async def test_request_lifecycle_does_not_count_failed_response_send(caplog):
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b"abc"})
 
-    caplog.set_level(logging.INFO, logger="qtf_mcp")
+    caplog.set_level(logging.INFO, logger="finmcp")
     with pytest.raises(ConnectionError, match="client closed"):
         await RequestLifecycleLogMiddleware(app)(_scope(), receive, send)
 

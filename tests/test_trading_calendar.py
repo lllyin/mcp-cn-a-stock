@@ -10,9 +10,9 @@ import datetime
 
 import pytest
 
-from qtf_mcp import research as _research
-from qtf_mcp.datasource import platform as pf
-from qtf_mcp.datasource import trading_calendar as tc
+from finmcp import research as _research
+from finmcp.datasource import platform as pf
+from finmcp.datasource import trading_calendar as tc
 
 #: conftest 的 autouse fixture 会把 research.is_realtime_fund_flow_window 换成桩，
 #: 这里在导入期先抓住真身，测它本身时放回去。
@@ -131,7 +131,7 @@ def test_a_failing_source_falls_through_to_the_weekday_platform(monkeypatch):
 
 def test_the_live_fund_flow_window_is_closed_on_a_non_trading_day(monkeypatch):
     """2026-09-05 周六 15:11 那一轮，服务为一个不存在的交易日抓了 66 次页面。"""
-    from qtf_mcp import research
+    from finmcp import research
 
     # conftest 有个 autouse fixture 把这个函数整个换成了返回 False 的桩（免得测试
     # 真去拉浏览器）。这一条测的就是它本身，得先把真身放回来。
@@ -150,7 +150,7 @@ def test_the_live_fund_flow_window_is_closed_on_a_non_trading_day(monkeypatch):
 
 def test_a_holiday_is_a_closed_epoch_anchored_on_the_last_trading_day(monkeypatch):
     """国庆整周原来被判成盘中，缓存退化成 30 秒 TTL。"""
-    from qtf_mcp import cache
+    from finmcp import cache
 
     monkeypatch.setattr(tc, "load", lambda: FAKE)
     for day, hour in ((datetime.date(2026, 10, 1), 11), (datetime.date(2026, 10, 7), 14)):
@@ -163,7 +163,7 @@ def test_a_holiday_is_a_closed_epoch_anchored_on_the_last_trading_day(monkeypatc
 
 
 def test_a_trading_day_still_reports_live(monkeypatch):
-    from qtf_mcp import cache
+    from finmcp import cache
 
     monkeypatch.setattr(tc, "load", lambda: FAKE)
     phase, _ = cache.market_phase(datetime.datetime(2026, 9, 4, 11, 0))
@@ -171,7 +171,7 @@ def test_a_trading_day_still_reports_live(monkeypatch):
 
 
 def test_market_breadth_ttl_is_long_on_a_non_trading_day(monkeypatch):
-    from qtf_mcp.datasource import market_breadth
+    from finmcp.datasource import market_breadth
 
     monkeypatch.setattr(tc, "load", lambda: FAKE)
     holiday = datetime.datetime(2026, 10, 1, 10, 0)

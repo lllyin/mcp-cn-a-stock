@@ -48,7 +48,7 @@ from typing import Optional
 from .. import platform as pf
 from ..kline_frame import _finalize_fallback_frame
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 
 _BASE = "https://d.10jqka.com.cn/v6/line"
 _HEADERS = {

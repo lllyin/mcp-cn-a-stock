@@ -31,7 +31,7 @@ from .fund_flow_page import (
     parse_percent,
 )
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 
 # ── 全局单例 ──────────────────────────────────────────────
 _playwright = None

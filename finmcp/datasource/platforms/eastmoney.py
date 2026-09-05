@@ -22,7 +22,7 @@ from typing import Optional
 from .. import platform as pf
 from ..sector_fund_flow import SectorFlow, SectorFundFlowBoard
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 
 #: 本项目的板块类型 → 东财 m:90 下的 t 值
 _SECTOR_T = {"industry": "2", "concept": "3", "region": "1"}

@@ -39,7 +39,7 @@ from typing import Optional
 from ..config import TRADING_CALENDAR_TTL_SECONDS
 from . import platform as pf
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 
 CAPABILITY = "trading_calendar"
 PROVIDER_ORDER_ENV = "TRADING_CALENDAR_PROVIDERS"

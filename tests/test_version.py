@@ -5,7 +5,7 @@ import logging
 import tomllib
 from pathlib import Path
 
-from qtf_mcp import __version__
+from finmcp import __version__
 
 
 def test_runtime_version_matches_project_metadata():
@@ -19,7 +19,7 @@ def test_runtime_version_matches_project_metadata():
 
 def test_application_version_is_logged(caplog):
     app_main = importlib.import_module("main")
-    caplog.set_level(logging.INFO, logger="qtf_mcp")
+    caplog.set_level(logging.INFO, logger="finmcp")
 
     app_main.log_application_version()
 
@@ -28,7 +28,7 @@ def test_application_version_is_logged(caplog):
 
 def test_http_channel_is_logged_at_startup(caplog):
     app_main = importlib.import_module("main")
-    caplog.set_level(logging.INFO, logger="qtf_mcp")
+    caplog.set_level(logging.INFO, logger="finmcp")
 
     app_main.log_http_channel()
 

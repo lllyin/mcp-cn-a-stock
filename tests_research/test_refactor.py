@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 # Add project root to sys.path
 sys.path.append(os.getcwd())
 
-from qtf_mcp.mcp_app import full
+from finmcp.mcp_app import full
 from mcp.server.fastmcp import Context
 
 async def test():

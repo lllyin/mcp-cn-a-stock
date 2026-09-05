@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from qtf_mcp.datasource.cn_stock_source import CNStockDataSource
+from finmcp.datasource.cn_stock_source import CNStockDataSource
 
 
 class TestSymbolConversion:

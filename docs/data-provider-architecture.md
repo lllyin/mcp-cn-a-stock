@@ -87,7 +87,7 @@ provider 应该降级到旧的，而不是把脏数据灌进报告：报告里�
 ## 三、基类
 
 ```python
-# qtf_mcp/datasource/platform.py
+# finmcp/datasource/platform.py
 
 class Platform(abc.ABC):
     name: str = ""                       # 配置里写的标识符，小写英文
@@ -189,7 +189,7 @@ class Resolved:
 以雪球为例，它能给行情、热度、内部交易：
 
 ```python
-# qtf_mcp/datasource/platforms/xueqiu.py
+# finmcp/datasource/platforms/xueqiu.py
 class XueqiuPlatform(HttpPlatform):
     name, label = "xueqiu", "雪球"
     capabilities = frozenset({"quote", "popularity", "insider_trade"})

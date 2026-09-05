@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import pytest
 
-from qtf_mcp.datasource import platform as pf
-from qtf_mcp.datasource import sector_fund_flow as sff
-from qtf_mcp.mcp_app import _render_sector_fund_flow
+from finmcp.datasource import platform as pf
+from finmcp.datasource import sector_fund_flow as sff
+from finmcp.mcp_app import _render_sector_fund_flow
 
 
 def _board(partial=False, source="eastmoney"):

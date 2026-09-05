@@ -9,7 +9,7 @@ load_dotenv(override=True)
 
 from io import StringIO
 
-from qtf_mcp import research
+from finmcp import research
 
 import logging
 

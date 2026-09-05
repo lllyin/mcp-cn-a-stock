@@ -29,5 +29,5 @@ dev = [
 cn-stock-mcp = "main:main"
 
 [tool.setuptools]
-packages = ["qtf_mcp"]
+packages = ["finmcp"]
 py-modules = ["main", "data"]

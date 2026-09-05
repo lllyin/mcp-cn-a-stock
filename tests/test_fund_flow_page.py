@@ -11,8 +11,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from qtf_mcp.datasource.cn_stock_source import CNStockDataSource
-from qtf_mcp.datasource.fund_flow_page import (
+from finmcp.datasource.cn_stock_source import CNStockDataSource
+from finmcp.datasource.fund_flow_page import (
     FundFlowPageError,
     HISTORY_COLUMNS,
     TODAY_FIELDS,
@@ -21,7 +21,7 @@ from qtf_mcp.datasource.fund_flow_page import (
     parse_percent,
     parse_price,
 )
-from qtf_mcp.research import build_historical_fund_flow_data
+from finmcp.research import build_historical_fund_flow_data
 
 FIXTURE = Path(__file__).parent / "fixtures" / "eastmoney_zjlx_300408.html"
 
@@ -275,7 +275,7 @@ def _legacy_realtime_dict(html: str, symbol: str) -> dict:
     """
     import re
 
-    from qtf_mcp.datasource.realtime_ff import get_fund_flow_display_name
+    from finmcp.datasource.realtime_ff import get_fund_flow_display_name
 
     def get(field_id: str) -> str:
         m = re.search(
@@ -313,7 +313,7 @@ def test_merged_load_reproduces_the_legacy_realtime_dict():
 
     fixture 是 2026-09-03 抓下的完整页面（今日块 + 121 行历史）。
     """
-    from qtf_mcp.datasource.realtime_ff import _page_to_realtime_dict
+    from finmcp.datasource.realtime_ff import _page_to_realtime_dict
 
     html = FULL_PAGE.read_text(encoding="utf-8")
     parsed = parse_fund_flow_page(html)
@@ -334,7 +334,7 @@ def test_merged_load_yields_both_blocks_from_one_page():
 
 def test_placeholders_fall_back_to_zero_like_the_legacy_script():
     """停牌时页面是 -- ，合并前会输出 "0"，合并后必须一样。"""
-    from qtf_mcp.datasource.realtime_ff import _page_to_realtime_dict
+    from finmcp.datasource.realtime_ff import _page_to_realtime_dict
 
     cells = "".join(
         f'<td data-field="{fid}">--</td>' for fid in TODAY_FIELDS
@@ -360,7 +360,7 @@ class TestPageIdentityAcrossCallers:
     """
 
     def test_prefixed_symbol_resolves_to_the_same_url(self):
-        from qtf_mcp.datasource.realtime_ff import get_fund_flow_url
+        from finmcp.datasource.realtime_ff import get_fund_flow_url
 
         expected = "https://data.eastmoney.com/zjlx/300408.html"
         assert get_fund_flow_url("300408") == expected
@@ -370,13 +370,13 @@ class TestPageIdentityAcrossCallers:
         )
 
     def test_both_callers_share_one_singleflight_key(self):
-        from qtf_mcp.datasource.realtime_ff import page_key
+        from finmcp.datasource.realtime_ff import page_key
 
         assert page_key("300408") == page_key("SZ300408") == "300408"
         assert page_key("600547") == page_key("SH600547") == "600547"
 
     def test_index_pages_are_unchanged(self):
-        from qtf_mcp.datasource.realtime_ff import get_fund_flow_url, page_key
+        from finmcp.datasource.realtime_ff import get_fund_flow_url, page_key
 
         assert get_fund_flow_url("000001") == (
             "https://data.eastmoney.com/zjlx/zs000001.html"
@@ -390,7 +390,7 @@ class TestPageIdentityAcrossCallers:
     async def test_one_load_serves_both_key_spellings(self, monkeypatch):
         import asyncio
 
-        from qtf_mcp.datasource import realtime_ff
+        from finmcp.datasource import realtime_ff
 
         loads = []
 
@@ -422,7 +422,7 @@ class TestRefusalSignals:
     """
 
     def test_quote_endpoint_is_not_a_today_signal(self):
-        from qtf_mcp.datasource.realtime_ff import (
+        from finmcp.datasource.realtime_ff import (
             HISTORY_ENDPOINTS,
             TODAY_ENDPOINTS,
         )
@@ -432,7 +432,7 @@ class TestRefusalSignals:
         assert not any(part in quote for part in HISTORY_ENDPOINTS)
 
     def test_each_block_watches_only_its_own_endpoint(self):
-        from qtf_mcp.datasource.realtime_ff import (
+        from finmcp.datasource.realtime_ff import (
             HISTORY_ENDPOINTS,
             TODAY_ENDPOINTS,
         )
@@ -458,7 +458,7 @@ class TestLoadRetry:
 
     @pytest.mark.asyncio
     async def test_retries_after_a_refusal(self, monkeypatch):
-        from qtf_mcp.datasource import realtime_ff
+        from finmcp.datasource import realtime_ff
 
         attempts = []
         good = parse_fund_flow_page(FULL_PAGE.read_text(encoding="utf-8"))
@@ -534,7 +534,7 @@ class TestPageReuseRespectsWhatTheCallerNeeds:
     """
 
     def _page(self, *, history: int, today: bool):
-        from qtf_mcp.datasource.fund_flow_page import FundFlowRow
+        from finmcp.datasource.fund_flow_page import FundFlowRow
 
         full = parse_fund_flow_page(FULL_PAGE.read_text(encoding="utf-8"))
         rows = full.history[:history] if history else []
@@ -548,7 +548,7 @@ class TestPageReuseRespectsWhatTheCallerNeeds:
         )
 
     def _seed(self, page):
-        from qtf_mcp.datasource import realtime_ff
+        from finmcp.datasource import realtime_ff
 
         realtime_ff._page_cache.clear()
         realtime_ff._remember_page("300408", page)
@@ -586,7 +586,7 @@ class TestPageReuseRespectsWhatTheCallerNeeds:
         ) is not None
 
     def test_reuse_expires(self, monkeypatch):
-        from qtf_mcp.datasource import realtime_ff
+        from finmcp.datasource import realtime_ff
 
         module = self._seed(self._page(history=5, today=True))
         monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_REUSE_SECONDS", 0.0)
@@ -615,7 +615,7 @@ class TestLoadAttempts:
     @pytest.mark.asyncio
     async def test_retries_until_the_requirement_is_met(self, monkeypatch):
         """第二次只拿到今日，要历史的调用方应该继续试。"""
-        from qtf_mcp.datasource import realtime_ff
+        from finmcp.datasource import realtime_ff
 
         partial, full = self._pages()
         results = [partial, full]
@@ -641,7 +641,7 @@ class TestLoadAttempts:
     @pytest.mark.asyncio
     async def test_stops_at_the_configured_ceiling(self, monkeypatch):
         """次数用完就返回手上的结果，不无限试。"""
-        from qtf_mcp.datasource import realtime_ff
+        from finmcp.datasource import realtime_ff
 
         partial, _ = self._pages()
         seen = []
@@ -661,7 +661,7 @@ class TestLoadAttempts:
 
     @pytest.mark.asyncio
     async def test_a_satisfied_first_attempt_does_not_retry(self, monkeypatch):
-        from qtf_mcp.datasource import realtime_ff
+        from finmcp.datasource import realtime_ff
 
         _, full = self._pages()
         seen = []

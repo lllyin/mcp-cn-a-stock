@@ -20,7 +20,7 @@ from typing import Optional
 from .. import platform as pf
 from ..kline_frame import _finalize_fallback_frame, _is_index_code
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 
 _COLUMN_MAP = {
     "date": "日期", "open": "开盘", "close": "收盘", "high": "最高",

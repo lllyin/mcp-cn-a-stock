@@ -1186,7 +1186,7 @@ def _render_disagreements(scan: "LogScan") -> list[str]:
     这一节**不进可用率**：一处分歧不代表数据缺了，它代表"有两个说法、还没定谁对"。
     把它算进分数会逼着人为了绿而草率裁决，那正好是反的。
     """
-    # 从 .env 读而不是 import qtf_mcp：这个脚本是独立跑的，不在包的搜索路径上；
+    # 从 .env 读而不是 import finmcp：这个脚本是独立跑的，不在包的搜索路径上；
     # 而且它验的是**服务**的配置，服务读的就是 .env。
     tolerance = _env_number("INTRADAY_QUOTE_CROSS_CHECK_PCT", 0.0)
 
@@ -2118,7 +2118,7 @@ def service_pid() -> int | None:
         return None
     for line in out.splitlines():
         parts = line.split(None, 1)
-        if len(parts) == 2 and "qtf_mcp" in parts[1] and "verify_release" not in parts[1]:
+        if len(parts) == 2 and "finmcp" in parts[1] and "verify_release" not in parts[1]:
             try:
                 return int(parts[0])
             except ValueError:

@@ -18,7 +18,7 @@ from typing import Optional
 from . import platform as pf
 from .kline_frame import FALLBACK_FRAME_COLUMNS, _market_prefixed_symbol
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 
 CAPABILITY = "kline"
 PROVIDER_ORDER_ENV = "KLINE_PROVIDERS"

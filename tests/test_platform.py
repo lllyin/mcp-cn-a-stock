@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from qtf_mcp.datasource import platform as pf
+from finmcp.datasource import platform as pf
 
 
 @pytest.fixture(autouse=True)

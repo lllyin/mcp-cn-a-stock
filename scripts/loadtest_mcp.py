@@ -512,7 +512,7 @@ async def wait_ready(log_path: Path, process: subprocess.Popen, timeout: float =
 
 async def main_async(args: argparse.Namespace) -> int:
     _quiet_client_logs()
-    from qtf_mcp.symbols import SYMBOLS_SHSZ, load_symbols
+    from finmcp.symbols import SYMBOLS_SHSZ, load_symbols
 
     load_symbols()
     pool = [

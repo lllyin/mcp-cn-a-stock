@@ -4,7 +4,7 @@ from typing import Dict, Iterable, Tuple
 
 SYMBOLS_SHSZ: Dict[str, Tuple[str, int, int]] = {}
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 
 
 def load_markets(fname: str):

@@ -47,7 +47,7 @@ from .http_channel import (
 )
 from ..observability import bind_log_context, log_context
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 
 _FETCH_FAILURE_MARKER = "_fetch_failure"
 

@@ -16,7 +16,7 @@ def test_disabled_proxy_does_not_import_patch_package():
             "-c",
             (
                 "import sys; "
-                "import qtf_mcp; "
+                "import finmcp; "
                 "assert 'akshare_proxy_patch' not in sys.modules"
             ),
         ],

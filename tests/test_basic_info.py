@@ -7,7 +7,7 @@
 
 import pytest
 
-from qtf_mcp.datasource import basic_info as bi
+from finmcp.datasource import basic_info as bi
 
 
 class _Provider(bi.BasicInfoProvider):
@@ -315,7 +315,7 @@ class TestAdapterQueryCodes:
             seen.update(query=query, symbol=symbol, kwargs=kwargs)
             return bi.BasicInfo(symbol=symbol, source="fake", name="x", last=1.0)
 
-        from qtf_mcp.datasource import cn_stock_source as css
+        from finmcp.datasource import cn_stock_source as css
 
         monkeypatch.setattr(css.basic_info, "resolve", fake_resolve)
         return seen, css
@@ -328,9 +328,9 @@ class TestAdapterQueryCodes:
         assert seen["kwargs"]["require_valuation"] is True
 
     def test_an_index_is_queried_by_name_when_one_is_known(self, monkeypatch):
-        import qtf_mcp.symbols
+        import finmcp.symbols
 
-        monkeypatch.setattr(qtf_mcp.symbols, "get_symbol_name", lambda _s: "上证指数")
+        monkeypatch.setattr(finmcp.symbols, "get_symbol_name", lambda _s: "上证指数")
         seen, css = self._capture(monkeypatch)
         css.CNStockDataSource()._fetch_realtime_sync("000001", "SH000001")
         assert seen["query"] == "上证指数"        # 东财按代码查不到指数
@@ -345,9 +345,9 @@ class TestAdapterQueryCodes:
         逐字一致——改动前的结果是整个 realtime 判失败，现在是腾讯把名称和最新价
         补上，报告里那三行（代码/名称/日期）不变。
         """
-        import qtf_mcp.symbols
+        import finmcp.symbols
 
-        monkeypatch.setattr(qtf_mcp.symbols, "get_symbol_name", lambda _s: "")
+        monkeypatch.setattr(finmcp.symbols, "get_symbol_name", lambda _s: "")
         seen, css = self._capture(monkeypatch)
         css.CNStockDataSource()._fetch_realtime_sync("000001", "SH000001")
         assert seen["query"] == "SH000001"
@@ -364,7 +364,7 @@ class TestAdapterQueryCodes:
 
         让它们凭空多出来是新功能不是补缺，要单独决定，别让"修回退"顺手改了输出。
         """
-        from qtf_mcp.datasource import cn_stock_source as css
+        from finmcp.datasource import cn_stock_source as css
 
         def rich(query, symbol, **kwargs):
             return bi.BasicInfo(symbol=symbol, source="tencent", name="x", last=2.0,

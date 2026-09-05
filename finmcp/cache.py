@@ -62,7 +62,7 @@ from .config import (
 )
 from .version import __version__
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 

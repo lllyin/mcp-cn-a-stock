@@ -30,7 +30,7 @@ env_file_value() {
 }
 
 # 取一项配置。配置名不带前缀写，前缀由 ENV_PREFIX 决定——和 Python 侧的
-# qtf_mcp.config.env() 同一套规则，两边不能各认各的。
+# finmcp.config.env() 同一套规则，两边不能各认各的。
 # .env 优先于 shell 环境变量，也是为了和 Python 侧一致：入口是
 # load_dotenv(override=True)。同一个文件在两处按相反的优先级解释，迟早坑人。
 conf() {

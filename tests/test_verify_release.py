@@ -474,7 +474,7 @@ class TestCompleteness:
         import ast
         import re as _re
 
-        source = (Path(__file__).resolve().parents[1] / "qtf_mcp" / "research.py").read_text(
+        source = (Path(__file__).resolve().parents[1] / "finmcp" / "research.py").read_text(
             encoding="utf-8"
         )
         phrases = set()

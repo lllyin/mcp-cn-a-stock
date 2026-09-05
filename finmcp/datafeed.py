@@ -14,7 +14,7 @@ import numpy as np
 from .datasource import get_datasource
 from .datasource.base import FetchRequirements
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 
 # 股票板块数据配置文件路径
 stock_sector_data = "confs/stock_sector.json"

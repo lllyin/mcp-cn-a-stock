@@ -5,10 +5,10 @@ from contextvars import ContextVar
 from typing import Iterator
 
 
-request_id_var: ContextVar[str] = ContextVar("qtf_mcp_request_id", default="-")
-http_trace_id_var: ContextVar[str] = ContextVar("qtf_mcp_http_trace_id", default="-")
-tool_var: ContextVar[str] = ContextVar("qtf_mcp_tool", default="-")
-symbol_var: ContextVar[str] = ContextVar("qtf_mcp_symbol", default="-")
+request_id_var: ContextVar[str] = ContextVar("finmcp_request_id", default="-")
+http_trace_id_var: ContextVar[str] = ContextVar("finmcp_http_trace_id", default="-")
+tool_var: ContextVar[str] = ContextVar("finmcp_tool", default="-")
+symbol_var: ContextVar[str] = ContextVar("finmcp_symbol", default="-")
 
 
 @contextmanager

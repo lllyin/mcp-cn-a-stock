@@ -10,11 +10,11 @@ import time
 import pandas as pd
 import pytest
 
-from qtf_mcp.datasource import cn_stock_source as source_module
-from qtf_mcp.datasource import kline_source
-from qtf_mcp.datasource.cn_stock_source import CNStockDataSource
-from qtf_mcp.datasource.base import DataSource, FetchRequirements, StockData
-from qtf_mcp import datafeed
+from finmcp.datasource import cn_stock_source as source_module
+from finmcp.datasource import kline_source
+from finmcp.datasource.cn_stock_source import CNStockDataSource
+from finmcp.datasource.base import DataSource, FetchRequirements, StockData
+from finmcp import datafeed
 
 
 @pytest.fixture(autouse=True)
@@ -125,7 +125,7 @@ async def test_executor_tasks_carry_the_request_context():
     "Source breaker opened" 这类最需要串起来的行，request_id/tool/symbol 全是
     "-"，生产日志里就是这样。
     """
-    from qtf_mcp.observability import bind_log_context, log_context
+    from finmcp.observability import bind_log_context, log_context
 
     seen = []
 
@@ -736,7 +736,7 @@ def test_tencent_volume_logs_an_unexpected_magnitude(caplog):
     """量级既不像股也不像手时要留下痕迹，而不是静默猜一个。"""
     import logging
 
-    caplog.set_level(logging.WARNING, logger="qtf_mcp")
+    caplog.set_level(logging.WARNING, logger="finmcp")
     source_module._normalize_volume_to_lots(_tencent_frame(89817200.0 / 8), "600000")
 
     assert "成交量量级异常" in caplog.text
@@ -758,7 +758,7 @@ def test_a_ratio_pushed_across_the_boundary_cannot_be_silent(caplog):
     """压低到 10 倍以上会改判成"手"，但一定会打 WARNING，不会静默错到 100 倍。"""
     import logging
 
-    caplog.set_level(logging.WARNING, logger="qtf_mcp")
+    caplog.set_level(logging.WARNING, logger="finmcp")
     # 收盘被压到 1/20，ratio 从 ~1 掉到 ~0.05，越过 0.1 判成"手"
     frame = _tencent_frame(89817200.0, close=9.27 / 20)
     result = source_module._normalize_volume_to_lots(frame, "600000")
@@ -805,7 +805,7 @@ def test_index_volume_is_quiet_when_the_implied_price_is_plausible(prefixed, cap
     close, volume, amount, avg_price = INDEX_SAMPLES[prefixed]
     assert 1.0 <= avg_price <= 1000.0
 
-    caplog.set_level(logging.WARNING, logger="qtf_mcp")
+    caplog.set_level(logging.WARNING, logger="finmcp")
     source_module._normalize_volume_to_lots(
         _tencent_frame(volume, amount=amount, close=close),
         prefixed[2:],
@@ -820,7 +820,7 @@ def test_index_volume_warns_when_the_implied_price_is_absurd(caplog):
     import logging
 
     close, volume, amount, _ = INDEX_SAMPLES["sh000001"]
-    caplog.set_level(logging.WARNING, logger="qtf_mcp")
+    caplog.set_level(logging.WARNING, logger="finmcp")
     source_module._normalize_volume_to_lots(
         _tencent_frame(volume / 100, amount=amount, close=close),
         "000001",
@@ -1290,7 +1290,7 @@ def _page_fallback_datasource(monkeypatch, fund_flow_result):
 def _captured_page():
     from pathlib import Path
 
-    from qtf_mcp.datasource.fund_flow_page import parse_fund_flow_page
+    from finmcp.datasource.fund_flow_page import parse_fund_flow_page
 
     fixture = Path(__file__).parent / "fixtures" / "eastmoney_zjlx_300408.html"
     return parse_fund_flow_page(fixture.read_text(encoding="utf-8"))
@@ -1299,7 +1299,7 @@ def _captured_page():
 @pytest.mark.asyncio
 async def test_page_fallback_is_not_used_while_the_api_works(monkeypatch):
     """主源正常时一次页面都不该加载——兜底不能变成常态开销。"""
-    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+    from finmcp.datasource import realtime_ff as realtime_ff_module
 
     datasource = _page_fallback_datasource(
         monkeypatch, {"fund_flow": pd.DataFrame(_captured_page().history_records())}
@@ -1319,7 +1319,7 @@ async def test_page_fallback_is_not_used_while_the_api_works(monkeypatch):
 @pytest.mark.asyncio
 async def test_page_fallback_supplies_history_and_clears_the_failure(monkeypatch):
     """兜底成功后不能再留失败标记，否则报告整体不进缓存。"""
-    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+    from finmcp.datasource import realtime_ff as realtime_ff_module
 
     datasource = _page_fallback_datasource(
         monkeypatch, source_module._fetch_failure("fund_flow")
@@ -1347,7 +1347,7 @@ async def test_page_fallback_supplies_history_and_clears_the_failure(monkeypatch
 @pytest.mark.asyncio
 async def test_page_fallback_is_skipped_when_the_browser_tier_is_full(monkeypatch):
     """没有空位就直接放弃：排队会把"缺一段"换成"整体变慢"。"""
-    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+    from finmcp.datasource import realtime_ff as realtime_ff_module
 
     datasource = _page_fallback_datasource(
         monkeypatch, source_module._fetch_failure("fund_flow")
@@ -1370,7 +1370,7 @@ async def test_page_fallback_is_skipped_when_the_browser_tier_is_full(monkeypatc
 
 @pytest.mark.asyncio
 async def test_page_fallback_can_be_disabled(monkeypatch):
-    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+    from finmcp.datasource import realtime_ff as realtime_ff_module
 
     datasource = _page_fallback_datasource(
         monkeypatch, source_module._fetch_failure("fund_flow")
@@ -1390,7 +1390,7 @@ async def test_page_fallback_can_be_disabled(monkeypatch):
 @pytest.mark.asyncio
 async def test_page_fallback_survives_a_page_error(monkeypatch):
     """页面加载失败要退回今天的行为，不能把异常抛给调用方。"""
-    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+    from finmcp.datasource import realtime_ff as realtime_ff_module
 
     datasource = _page_fallback_datasource(
         monkeypatch, source_module._fetch_failure("fund_flow")
@@ -1410,7 +1410,7 @@ async def test_page_fallback_survives_a_page_error(monkeypatch):
 @pytest.mark.asyncio
 async def test_page_fallback_releases_its_slot_after_a_failure(monkeypatch):
     """失败也要归还名额，否则一次超时就永久关掉了兜底。"""
-    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+    from finmcp.datasource import realtime_ff as realtime_ff_module
 
     datasource = _page_fallback_datasource(
         monkeypatch, source_module._fetch_failure("fund_flow")
@@ -1430,8 +1430,8 @@ async def test_page_fallback_releases_its_slot_after_a_failure(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_page_fallback_ignores_an_empty_history(monkeypatch):
-    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
-    from qtf_mcp.datasource.fund_flow_page import FundFlowPage
+    from finmcp.datasource import realtime_ff as realtime_ff_module
+    from finmcp.datasource.fund_flow_page import FundFlowPage
 
     datasource = _page_fallback_datasource(
         monkeypatch, source_module._fetch_failure("fund_flow")
@@ -1454,8 +1454,8 @@ async def test_page_fallback_stops_after_repeated_futile_attempts(monkeypatch):
     页面的历史表由主源同一个端点填充，端点拒绝时这条路必然徒劳，而每次徒劳都
     要付一次 Chromium 页面加载：2026-09-03 实测一次把请求从 6.7s 拖到 20.1s。
     """
-    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
-    from qtf_mcp.datasource.fund_flow_page import FundFlowPageError
+    from finmcp.datasource import realtime_ff as realtime_ff_module
+    from finmcp.datasource.fund_flow_page import FundFlowPageError
 
     datasource = _page_fallback_datasource(
         monkeypatch, source_module._fetch_failure("fund_flow")
@@ -1488,7 +1488,7 @@ async def test_page_fallback_ignores_symbols_without_a_page(monkeypatch):
     FundFlowPageUnavailable。把它算成一次源失败的话，查几次就到了阈值，兜底对
     所有别的标的一起关闭一整个冷却期。
     """
-    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+    from finmcp.datasource import realtime_ff as realtime_ff_module
 
     datasource = _page_fallback_datasource(
         monkeypatch, source_module._fetch_failure("fund_flow")
@@ -1508,7 +1508,7 @@ async def test_page_fallback_ignores_symbols_without_a_page(monkeypatch):
 @pytest.mark.asyncio
 async def test_page_fallback_breaker_closes_after_a_success(monkeypatch):
     """端点恢复后要能自动回到兜底可用状态。"""
-    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+    from finmcp.datasource import realtime_ff as realtime_ff_module
 
     datasource = _page_fallback_datasource(
         monkeypatch, source_module._fetch_failure("fund_flow")
@@ -1735,7 +1735,7 @@ class TestFallbackRequestBudget:
         self, monkeypatch
     ):
         """预算用尽就直接跳过，不许再付一次页面加载。"""
-        from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+        from finmcp.datasource import realtime_ff as realtime_ff_module
 
         datasource = _page_fallback_datasource(
             monkeypatch, source_module._fetch_failure("fund_flow")
@@ -1755,7 +1755,7 @@ class TestFallbackRequestBudget:
     @pytest.mark.asyncio
     async def test_a_symbol_still_waits_when_the_budget_allows(self, monkeypatch):
         """名额短暂占满、预算还有，就该等到并拿到数据——这是 P1 的正收益。"""
-        from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+        from finmcp.datasource import realtime_ff as realtime_ff_module
 
         datasource = _page_fallback_datasource(
             monkeypatch, source_module._fetch_failure("fund_flow")
@@ -1833,7 +1833,7 @@ class TestBreakerDegradedPredicate:
         assert not breaker.should_skip()
 
     def test_the_kline_breaker_consults_the_channel(self):
-        from qtf_mcp.datasource import http_channel
+        from finmcp.datasource import http_channel
         assert source_module._KLINE_BREAKER.degraded is http_channel.impersonated_hosts_degraded
 
 
@@ -1848,7 +1848,7 @@ async def test_a_symbol_without_a_page_never_waits_for_a_slot(monkeypatch):
     同批的兄弟把预算花掉。2026-09-05 部署机日志里就是这样：SH000688 等 3.0s 之后
     被跳过，同批的另外三个也跟着没排到。
     """
-    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+    from finmcp.datasource import realtime_ff as realtime_ff_module
 
     datasource = _page_fallback_datasource(
         monkeypatch, source_module._fetch_failure("fund_flow")
@@ -1875,7 +1875,7 @@ async def test_a_symbol_without_a_page_never_waits_for_a_slot(monkeypatch):
 @pytest.mark.asyncio
 async def test_a_symbol_with_a_page_still_goes_through_the_slot(monkeypatch):
     """提前跳过只针对"根本没有页面"，别顺手把正常路径也短路了。"""
-    from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+    from finmcp.datasource import realtime_ff as realtime_ff_module
 
     datasource = _page_fallback_datasource(
         monkeypatch, source_module._fetch_failure("fund_flow")

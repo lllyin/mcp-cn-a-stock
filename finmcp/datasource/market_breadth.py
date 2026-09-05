@@ -20,7 +20,7 @@ from playwright.async_api import Browser, Playwright, async_playwright
 from ..config import env
 
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 
 
 MARKET_BREADTH_RANGES = (

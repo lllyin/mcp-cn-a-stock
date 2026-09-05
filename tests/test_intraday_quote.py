@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from qtf_mcp.datasource import intraday_quote as iq
-from qtf_mcp.datasource.fund_flow_page import parse_fund_flow_page
+from finmcp.datasource import intraday_quote as iq
+from finmcp.datasource.fund_flow_page import parse_fund_flow_page
 
 FULL_PAGE = Path(__file__).parent / "fixtures" / "eastmoney_zjlx_full_300408.html"
 
@@ -217,7 +217,7 @@ class TestAppendIntradayBar:
 
         import pandas as pd
 
-        from qtf_mcp.datasource.cn_stock_source import FALLBACK_FRAME_COLUMNS
+        from finmcp.datasource.cn_stock_source import FALLBACK_FRAME_COLUMNS
 
         return pd.DataFrame(
             [{
@@ -241,7 +241,7 @@ class TestAppendIntradayBar:
     def test_appends_todays_bar(self):
         import datetime
 
-        from qtf_mcp.datasource.cn_stock_source import append_intraday_bar
+        from finmcp.datasource.cn_stock_source import append_intraday_bar
 
         result = append_intraday_bar(self._frame(), self._quote())
 
@@ -254,7 +254,7 @@ class TestAppendIntradayBar:
 
     def test_derives_change_from_the_previous_bar(self):
         """涨跌以表里最后一根的收盘为前收，保证序列连续。"""
-        from qtf_mcp.datasource.cn_stock_source import append_intraday_bar
+        from finmcp.datasource.cn_stock_source import append_intraday_bar
 
         row = append_intraday_bar(self._frame(close=110.91), self._quote()).iloc[-1]
 
@@ -264,21 +264,21 @@ class TestAppendIntradayBar:
 
     def test_does_not_append_when_the_quote_is_not_newer(self):
         """休市时行情的日期就是最后一根的日期，不该重复追加。"""
-        from qtf_mcp.datasource.cn_stock_source import append_intraday_bar
+        from finmcp.datasource.cn_stock_source import append_intraday_bar
 
         quote = self._quote(as_of="20260903150000")
         assert len(append_intraday_bar(self._frame(), quote)) == 1
 
     def test_requires_a_full_bar(self):
         """页头行情没有开高低，拼不出 bar 就不要拼。"""
-        from qtf_mcp.datasource.cn_stock_source import append_intraday_bar
+        from finmcp.datasource.cn_stock_source import append_intraday_bar
 
         partial = self._quote(open=None, high=None, low=None)
         assert len(append_intraday_bar(self._frame(), partial)) == 1
 
     def test_requires_a_timestamp(self):
         """没有自报日期就无法判断新旧，宁可不补——不去猜本地时钟。"""
-        from qtf_mcp.datasource.cn_stock_source import append_intraday_bar
+        from finmcp.datasource.cn_stock_source import append_intraday_bar
 
         assert len(append_intraday_bar(self._frame(), self._quote(as_of=None))) == 1
 
@@ -289,7 +289,7 @@ class TestAppendIntradayBar:
         "数据日期"就变成今天，5/20/60 日窗口也跟着漂——生产归档比对时就是这样
         暴露出来的。
         """
-        from qtf_mcp.datasource.cn_stock_source import append_intraday_bar
+        from finmcp.datasource.cn_stock_source import append_intraday_bar
 
         frame = self._frame(last_date="2026-08-27")
         assert len(append_intraday_bar(frame, self._quote(), not_after="2026-08-27")) == 1
@@ -299,7 +299,7 @@ class TestAppendIntradayBar:
     def test_end_date_accepts_dates_and_datetimes(self):
         import datetime
 
-        from qtf_mcp.datasource.cn_stock_source import append_intraday_bar
+        from finmcp.datasource.cn_stock_source import append_intraday_bar
 
         frame = self._frame()
         for limit in (
@@ -313,13 +313,13 @@ class TestAppendIntradayBar:
 
     def test_skips_backward_adjusted_series(self):
         """后复权的最新价被缩放过，接一根原始价上去是错的。"""
-        from qtf_mcp.datasource.cn_stock_source import append_intraday_bar
+        from finmcp.datasource.cn_stock_source import append_intraday_bar
 
         result = append_intraday_bar(self._frame(), self._quote(), adjust="hfq")
         assert len(result) == 1
 
     def test_no_quote_leaves_the_frame_untouched(self):
-        from qtf_mcp.datasource.cn_stock_source import append_intraday_bar
+        from finmcp.datasource.cn_stock_source import append_intraday_bar
 
         frame = self._frame()
         assert append_intraday_bar(frame, None) is frame
@@ -362,7 +362,7 @@ def test_cross_check_is_off_by_default(two_disagreeing_sources, monkeypatch, cap
     a, b = two_disagreeing_sources
     monkeypatch.setattr(iq, "INTRADAY_QUOTE_CROSS_CHECK_PCT", 0.0)
 
-    with caplog.at_level(logging.WARNING, logger="qtf_mcp"):
+    with caplog.at_level(logging.WARNING, logger="finmcp"):
         assert iq.resolve("SH600000").source == "a"
 
     assert b.calls == 0
@@ -373,7 +373,7 @@ def test_cross_check_reports_a_disagreement(two_disagreeing_sources, monkeypatch
     a, b = two_disagreeing_sources
     monkeypatch.setattr(iq, "INTRADAY_QUOTE_CROSS_CHECK_PCT", 1.0)
 
-    with caplog.at_level(logging.WARNING, logger="qtf_mcp"):
+    with caplog.at_level(logging.WARNING, logger="finmcp"):
         quote = iq.resolve("SH600000")
 
     # 采用的仍然是第一个源，校验只是观察，不改选择。
@@ -390,7 +390,7 @@ def test_cross_check_stays_quiet_when_sources_agree(monkeypatch, caplog):
     monkeypatch.setenv("INTRADAY_QUOTE_PROVIDERS", "a,b")
     monkeypatch.setattr(iq, "INTRADAY_QUOTE_CROSS_CHECK_PCT", 1.0)
     try:
-        with caplog.at_level(logging.WARNING, logger="qtf_mcp"):
+        with caplog.at_level(logging.WARNING, logger="finmcp"):
             iq.resolve("SH600000")
         assert "跨源不一致" not in caplog.text
     finally:

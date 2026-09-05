@@ -11,8 +11,8 @@ import datetime
 import pandas as pd
 import pytest
 
-from qtf_mcp.datasource import kline_source, platform as pf
-from qtf_mcp.datasource.kline_frame import FALLBACK_FRAME_COLUMNS
+from finmcp.datasource import kline_source, platform as pf
+from finmcp.datasource.kline_frame import FALLBACK_FRAME_COLUMNS
 
 
 def _request(symbol="SH600000", adjust="qfq"):

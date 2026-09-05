@@ -14,15 +14,15 @@ import types
 import numpy as np
 import pytest
 
-import qtf_mcp.mcp_app  # noqa: F401  确保子模块已加载
-from qtf_mcp import cache as cache_module
-from qtf_mcp import research
-from qtf_mcp.cache import ReportCache
-from qtf_mcp.datasource.base import FETCH_FAILURES_KEY, StockData
+import finmcp.mcp_app  # noqa: F401  确保子模块已加载
+from finmcp import cache as cache_module
+from finmcp import research
+from finmcp.cache import ReportCache
+from finmcp.datasource.base import FETCH_FAILURES_KEY, StockData
 
-# qtf_mcp/__init__.py 把 `mcp_app` 这个名字重绑定成了 QtfMCP 实例，
+# finmcp/__init__.py 把 `mcp_app` 这个名字重绑定成了 QtfMCP 实例，
 # 因此必须从 sys.modules 取真正的模块对象。
-mcp_app = sys.modules["qtf_mcp.mcp_app"]
+mcp_app = sys.modules["finmcp.mcp_app"]
 
 
 def build_raw_data(symbol: str = "SH600000", bars: int = 300) -> dict:
@@ -395,7 +395,7 @@ async def test_report_cache_hit_is_logged(mode, tmp_path, caplog, deterministic_
     install_cache(tmp_path)
     await mcp_app.fetch_batch_reports("SH600000", mode, "test")
 
-    caplog.set_level(logging.INFO, logger="qtf_mcp")
+    caplog.set_level(logging.INFO, logger="finmcp")
     await mcp_app.fetch_batch_reports("SH600000", mode, "test")
 
     hits = [r for r in caplog.records if "Report cache hit" in r.getMessage()]
@@ -411,7 +411,7 @@ async def test_tech_cache_hit_is_logged(tmp_path, caplog, deterministic_render):
     install_cache(tmp_path)
     await mcp_app.fetch_technical_reports("SH600000", days=30)
 
-    caplog.set_level(logging.INFO, logger="qtf_mcp")
+    caplog.set_level(logging.INFO, logger="finmcp")
     await mcp_app.fetch_technical_reports("SH600000", days=30)
 
     hits = [r for r in caplog.records if "Report cache hit" in r.getMessage()]
@@ -442,7 +442,7 @@ async def test_cache_faults_do_not_damage_reports(mode, tmp_path, caplog, determ
     cache_module.set_report_cache(
         ExplodingCache(enabled=True, disk_enabled=False, directory=str(tmp_path / "boom"))
     )
-    caplog.set_level(logging.WARNING, logger="qtf_mcp")
+    caplog.set_level(logging.WARNING, logger="finmcp")
     broken = await mcp_app.fetch_batch_reports("SH600000", mode, "test")
 
     assert broken.errors == {}

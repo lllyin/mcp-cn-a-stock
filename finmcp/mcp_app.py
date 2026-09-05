@@ -21,7 +21,7 @@ from .datasource.public_events import PublicEventPoolResponse, get_public_market
 from .config import BATCH_CONCURRENCY
 from .observability import bind_log_context, http_trace_id_var
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 _active_report_requests = 0
 _BATCH_QUERY_ADMISSION_ATTR = "_cn_stock_batch_query_admission"
 

@@ -15,7 +15,7 @@ from typing import Optional
 
 from . import platform as pf
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 
 CAPABILITY = "sector_fund_flow"
 PROVIDER_ORDER_ENV = "SECTOR_FUND_FLOW_PROVIDERS"

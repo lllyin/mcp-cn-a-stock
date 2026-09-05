@@ -9,7 +9,7 @@
 
 import logging
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 
 
 # 指数的六位码：沪市个股是 60/68 开头，000 开头的六位码只可能是指数；深市指数

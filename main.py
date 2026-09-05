@@ -37,14 +37,14 @@ logging.basicConfig(level=logging.WARN, format="%(asctime)s %(levelname)s %(mess
 # 级，连接池真正出事时仍然可见。
 logging.getLogger("urllib3").setLevel(logging.ERROR)
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 logger.setLevel(logging.DEBUG)
 
 import click
 
-from qtf_mcp import __version__, mcp_app
-from qtf_mcp.datasource.http_channel import describe_installed_channel
-from qtf_mcp.symbols import load_symbols
+from finmcp import __version__, mcp_app
+from finmcp.datasource.http_channel import describe_installed_channel
+from finmcp.symbols import load_symbols
 
 
 def log_application_version() -> None:

@@ -12,12 +12,12 @@ import numpy as np
 import pytest
 from pathlib import Path
 
-from qtf_mcp import research
-from qtf_mcp.config import _parse_range_ms
-from qtf_mcp.datasource import realtime_ff
-from qtf_mcp.datasource.realtime_ff import get_fund_flow_display_name, get_fund_flow_url
+from finmcp import research
+from finmcp.config import _parse_range_ms
+from finmcp.datasource import realtime_ff
+from finmcp.datasource.realtime_ff import get_fund_flow_display_name, get_fund_flow_url
 
-app_module = importlib.import_module("qtf_mcp.mcp_app")
+app_module = importlib.import_module("finmcp.mcp_app")
 
 
 def test_core_indices_use_specific_index_pages():
@@ -763,7 +763,7 @@ async def test_an_unsupported_symbol_still_logs_one_line(monkeypatch, caplog):
     """
     monkeypatch.setattr(realtime_ff, "get_fund_flow_url", lambda _s: None)
 
-    with caplog.at_level(logging.INFO, logger="qtf_mcp.datasource.realtime_ff"):
+    with caplog.at_level(logging.INFO, logger="finmcp.datasource.realtime_ff"):
         with pytest.raises(realtime_ff.FundFlowPageUnavailable):
             await realtime_ff.load_fund_flow_page("SH000688", _TabPageContext(None))
 
@@ -784,7 +784,7 @@ async def test_a_load_that_blows_up_still_logs_one_line(monkeypatch, caplog):
 
     monkeypatch.setattr(realtime_ff, "_load_once", boom)
 
-    with caplog.at_level(logging.INFO, logger="qtf_mcp.datasource.realtime_ff"):
+    with caplog.at_level(logging.INFO, logger="finmcp.datasource.realtime_ff"):
         with pytest.raises(TimeoutError):
             await realtime_ff.load_fund_flow_page("300408", _TabPageContext(page))
 
@@ -804,7 +804,7 @@ async def test_each_load_logs_exactly_one_line(monkeypatch, caplog):
     monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
     monkeypatch.setattr(realtime_ff, "_sleep_before_retry", lambda: _resolved(0.0))
 
-    with caplog.at_level(logging.INFO, logger="qtf_mcp.datasource.realtime_ff"):
+    with caplog.at_level(logging.INFO, logger="finmcp.datasource.realtime_ff"):
         await realtime_ff.load_fund_flow_page(
             "300408", _TabPageContext(page), loads=2,
             satisfies=lambda p: bool(p.history),

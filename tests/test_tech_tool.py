@@ -10,9 +10,9 @@ import json
 import numpy as np
 import pytest
 
-from qtf_mcp.datasource.base import FetchRequirements
+from finmcp.datasource.base import FetchRequirements
 
-app_module = importlib.import_module("qtf_mcp.mcp_app")
+app_module = importlib.import_module("finmcp.mcp_app")
 
 
 def _make_raw_data(symbol: str, name: str = "测试股票", n: int = 40):

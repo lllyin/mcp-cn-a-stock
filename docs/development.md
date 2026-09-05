@@ -27,7 +27,7 @@ npx @modelcontextprotocol/inspector --url http://localhost:8686/cnstock/mcp
 查看版本：
 
 ```bash
-python -c "from qtf_mcp import __version__; print(__version__)"
+python -c "from finmcp import __version__; print(__version__)"
 ```
 
 ## 改数据源之前先读

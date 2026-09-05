@@ -50,7 +50,7 @@ def _code_configs() -> dict[str, str | None]:
         # provider 链的顺序开关
         re.compile(r'PROVIDER_ORDER_ENV = "([A-Z0-9_]+)"()()'),
     )
-    for path in sorted((ROOT / "qtf_mcp").rglob("*.py")):
+    for path in sorted((ROOT / "finmcp").rglob("*.py")):
         text = path.read_text(encoding="utf-8")
         for pattern in patterns:
             for match in pattern.finditer(text):

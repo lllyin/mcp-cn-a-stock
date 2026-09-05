@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from qtf_mcp.datasource.market_breadth import (
+from finmcp.datasource.market_breadth import (
     MARKET_BREADTH_RANGES,
     MarketBreadthBucket,
     MarketBreadthData,
@@ -22,8 +22,8 @@ from qtf_mcp.datasource.market_breadth import (
     parse_tonghuashun_market_breadth,
 )
 
-app_module = importlib.import_module("qtf_mcp.mcp_app")
-market_module = importlib.import_module("qtf_mcp.datasource.market_breadth")
+app_module = importlib.import_module("finmcp.mcp_app")
+market_module = importlib.import_module("finmcp.datasource.market_breadth")
 
 
 TONGHUASHUN_PAYLOAD = {

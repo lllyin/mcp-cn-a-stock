@@ -14,9 +14,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from qtf_mcp import cache as cache_module
-from qtf_mcp import config
-from qtf_mcp.cache import (
+from finmcp import cache as cache_module
+from finmcp import config
+from finmcp.cache import (
     PHASE_CLOSED,
     PHASE_LIVE,
     PHASE_LUNCH,

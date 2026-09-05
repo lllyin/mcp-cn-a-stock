@@ -7,9 +7,9 @@ import types
 import pytest
 import requests as std_requests
 
-from qtf_mcp.config import HttpModeError, resolve_http_mode
+from finmcp.config import HttpModeError, resolve_http_mode
 
-channel = importlib.import_module("qtf_mcp.datasource.http_channel")
+channel = importlib.import_module("finmcp.datasource.http_channel")
 
 
 @pytest.fixture(autouse=True)
@@ -387,7 +387,7 @@ def test_failures_in_flight_at_suspension_do_not_re_arm_it(caplog):
 
     channel._breaker["failures"] = 0
     channel._breaker["suspended_until"] = 0.0
-    caplog.set_level(logging.WARNING, logger="qtf_mcp")
+    caplog.set_level(logging.WARNING, logger="finmcp")
 
     for _ in range(channel.IMPERSONATE_SUSPEND_AFTER_FAILURES):
         channel._record_impersonation(success=False)
@@ -502,7 +502,7 @@ def test_impersonation_failure_reason_is_logged(monkeypatch, caplog):
     )
     original = getattr(std_requests, "_qtf_original_session")
     monkeypatch.setattr(original, "request", lambda self, m, u, **k: "plain")
-    caplog.set_level(logging.DEBUG, logger="qtf_mcp")
+    caplog.set_level(logging.DEBUG, logger="finmcp")
 
     std_requests.Session().request("GET", "https://push2his.eastmoney.com/api/x")
 

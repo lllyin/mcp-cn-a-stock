@@ -5,7 +5,7 @@ StockData 数据类单元测试
 import numpy as np
 import pytest
 
-from qtf_mcp.datasource.base import StockData
+from finmcp.datasource.base import StockData
 
 
 class TestStockDataInit:

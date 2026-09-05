@@ -71,7 +71,7 @@ from typing import Optional
 from ..config import env
 from .intraday_quote import tencent_code
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 
 PROVIDER_ORDER_ENV = "BASIC_INFO_PROVIDERS"
 DEFAULT_PROVIDER_ORDER = ("eastmoney", "tencent")

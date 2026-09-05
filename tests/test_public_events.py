@@ -3,7 +3,7 @@ import importlib
 import pandas as pd
 import pytest
 
-from qtf_mcp.datasource.public_events import (
+from finmcp.datasource.public_events import (
     PublicEventPoolResponse,
     fetch_public_market_events_sync,
     get_public_market_events,
@@ -11,7 +11,7 @@ from qtf_mcp.datasource.public_events import (
     parse_public_event_sources,
 )
 
-events_module = importlib.import_module("qtf_mcp.datasource.public_events")
+events_module = importlib.import_module("finmcp.datasource.public_events")
 
 
 class FakeAk:
@@ -209,7 +209,7 @@ def test_nan_text_is_normalized_to_null():
 async def test_market_events_tool_delegates(monkeypatch):
     import importlib
 
-    app_module = importlib.import_module("qtf_mcp.mcp_app")
+    app_module = importlib.import_module("finmcp.mcp_app")
 
     expected = PublicEventPoolResponse(
         query_date="2026-08-20",
@@ -253,7 +253,7 @@ async def test_public_event_requests_have_bounded_concurrency(monkeypatch):
     import threading
     import time
 
-    module = importlib.import_module("qtf_mcp.datasource.public_events")
+    module = importlib.import_module("finmcp.datasource.public_events")
     active = 0
     max_active = 0
     lock = threading.Lock()

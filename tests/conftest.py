@@ -9,7 +9,7 @@ import os
 # 就没人读，表现是十几个测试莫名其妙地失败，而不是提示"你设了前缀"。
 os.environ.pop("ENV_PREFIX", None)
 
-# 通道安装会全局改写 requests，且发生在 qtf_mcp.datasource 导入期。
+# 通道安装会全局改写 requests，且发生在 finmcp.datasource 导入期。
 # 测试固定为 direct（原生 requests），保证断言的是业务逻辑而不是某个通道的转发行为；
 # 需要验证通道本身的测试自行调用 install_http_channel。
 os.environ.setdefault("HTTP_CHANNEL", "direct")
@@ -17,9 +17,9 @@ os.environ.setdefault("HTTP_CHANNEL", "direct")
 import numpy as np
 import pytest
 
-from qtf_mcp import cache as cache_module
-from qtf_mcp import research as research_module
-from qtf_mcp.datasource import realtime_ff as realtime_ff_module
+from finmcp import cache as cache_module
+from finmcp import research as research_module
+from finmcp.datasource import realtime_ff as realtime_ff_module
 
 
 @pytest.fixture(autouse=True)

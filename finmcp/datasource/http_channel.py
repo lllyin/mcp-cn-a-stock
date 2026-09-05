@@ -32,7 +32,7 @@ from ..config import (
 )
 from ..observability import log_context
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 
 # Hosts whose plain-client requests get refused. Everything else -- Tonghuashun,
 # and the Eastmoney datacenter/push2ex hosts used by public_events -- passes

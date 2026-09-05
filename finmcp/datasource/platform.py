@@ -18,7 +18,7 @@ from typing import Callable, Optional
 
 from ..config import env
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 
 _DISABLED = {"", "off", "none", "0", "false"}
 

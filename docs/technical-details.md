@@ -11,11 +11,11 @@
 MCP client
     |
     v
-FastMCP tools (qtf_mcp/mcp_app.py)
+FastMCP tools (finmcp/mcp_app.py)
     |
-    +-- report/indicator assembly (qtf_mcp/research.py)
+    +-- report/indicator assembly (finmcp/research.py)
     |
-    +-- compatibility data layer (qtf_mcp/datafeed.py)
+    +-- compatibility data layer (finmcp/datafeed.py)
             |
             v
        DataSource contract
@@ -33,17 +33,17 @@ FastMCP tools (qtf_mcp/mcp_app.py)
 | 文件 | 职责 |
 | --- | --- |
 | `main.py` | 加载环境、记录版本、启动 MCP transport |
-| `qtf_mcp/mcp_app.py` | MCP tool、参数和 Pydantic 输出模型 |
-| `qtf_mcp/research.py` | 报告组装及技术指标计算 |
-| `qtf_mcp/datafeed.py` | 将统一数据对象转换为旧研究层字典格式 |
-| `qtf_mcp/datasource/base.py` | `DataSource`、`StockData`、`FetchRequirements` |
-| `qtf_mcp/datasource/cn_stock_source.py` | AkShare/efinance 数据源实现和执行器 |
-| `qtf_mcp/datasource/realtime_ff.py` | 交易时段实时资金流浏览器路径 |
-| `qtf_mcp/datasource/fund_flow_page.py` | 资金流向页面解析，纯标准库、不联网 |
-| `qtf_mcp/datasource/intraday_quote.py` | 盘中行情 provider 注册表与多级回退 |
-| `qtf_mcp/datasource/http_channel.py` | 出站 HTTP 通道的解析、安装与卸载 |
-| `qtf_mcp/datasource/market_breadth.py` | 全市场涨跌分布、缓存和回退 |
-| `qtf_mcp/cache.py` | 报告缓存与市场纪元判定 |
+| `finmcp/mcp_app.py` | MCP tool、参数和 Pydantic 输出模型 |
+| `finmcp/research.py` | 报告组装及技术指标计算 |
+| `finmcp/datafeed.py` | 将统一数据对象转换为旧研究层字典格式 |
+| `finmcp/datasource/base.py` | `DataSource`、`StockData`、`FetchRequirements` |
+| `finmcp/datasource/cn_stock_source.py` | AkShare/efinance 数据源实现和执行器 |
+| `finmcp/datasource/realtime_ff.py` | 交易时段实时资金流浏览器路径 |
+| `finmcp/datasource/fund_flow_page.py` | 资金流向页面解析，纯标准库、不联网 |
+| `finmcp/datasource/intraday_quote.py` | 盘中行情 provider 注册表与多级回退 |
+| `finmcp/datasource/http_channel.py` | 出站 HTTP 通道的解析、安装与卸载 |
+| `finmcp/datasource/market_breadth.py` | 全市场涨跌分布、缓存和回退 |
+| `finmcp/cache.py` | 报告缓存与市场纪元判定 |
 
 服务路径为：
 
@@ -356,7 +356,7 @@ CDP 方案只 +2/+16 MiB。
 
 ## 10. 报告缓存
 
-`qtf_mcp/cache.py` 按标的缓存已渲染的输出，目的是降低 AkShare Proxy Patch 的积分消耗。
+`finmcp/cache.py` 按标的缓存已渲染的输出，目的是降低 AkShare Proxy Patch 的积分消耗。
 它与数据源层解耦，`REPORT_CACHE_ENABLED=0` 时完全不参与调用链。
 
 ### 纪元模型

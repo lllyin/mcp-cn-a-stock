@@ -31,7 +31,7 @@ from typing import Optional
 from ..config import INTRADAY_QUOTE_CROSS_CHECK_PCT, env
 from .fund_flow_page import FundFlowPage, parse_amount, parse_percent, parse_price
 
-logger = logging.getLogger("qtf_mcp")
+logger = logging.getLogger("finmcp")
 
 # 启用哪些 provider、按什么顺序。留空或设为 off 则整层关闭，调用方拿到 None。
 PROVIDER_ORDER_ENV = "INTRADAY_QUOTE_PROVIDERS"
