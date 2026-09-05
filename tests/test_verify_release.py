@@ -700,3 +700,42 @@ class TestPerformanceSection:
     def test_no_successful_call_degrades_gracefully(self):
         text = "\n".join(verify._render_performance(verify.MemoryWatch(), []))
         assert "没有成功的调用" in text
+
+
+# --- 指数专项的"资金流向"一列 ---------------------------------------------
+# 三个坑都真出过：tech 没这一维却被判 ❌、full 的历史表头里有"净流入"导致
+# SH000688 被判成 ✅ 有、"没有这一维"和"有但没取到"混成同一个符号。
+
+
+class TestIndexFlowVerdict:
+    FULL_688 = ("# 基本数据\n## 资金流向\n- 暂无实时资金流向\n"
+                "## 历史资金流向\n| 日期 | 主力净流入 |\n")
+
+    def test_a_tool_without_the_dimension_says_dash(self):
+        assert verify._index_flow_verdict("tech", "SH000001", "## 资金流向\n- 今日主力净流入: 1亿\n") == "—"
+        assert verify._index_flow_verdict("tech", "SH000688", self.FULL_688) == "—"
+
+    def test_kechuang50_reads_the_same_in_every_tool(self):
+        """同一个标的同一件事，brief / medium / full 不能三种说法。"""
+        verdicts = {
+            verify._index_flow_verdict(tool, "SH000688",
+                                       "## 资金流向\n- 暂无实时资金流向\n" if tool != "full" else self.FULL_688)
+            for tool in ("brief", "medium", "full")
+        }
+        assert verdicts == {"— 没有这个页面"}
+
+    def test_a_history_table_header_no_longer_fakes_a_hit(self):
+        """原来判的是全文 '净流入'，而历史表**表头**里就有这三个字。"""
+        assert "✅ 有" not in verify._index_flow_verdict("full", "SH000688", self.FULL_688)
+
+    def test_real_data_and_real_absence_are_distinguishable(self):
+        assert verify._index_flow_verdict(
+            "brief", "SH000001", "## 资金流向\n- 今日主力净流入: -224.7亿\n") == "✅ 有"
+        assert verify._index_flow_verdict(
+            "brief", "SH000001", "## 资金流向\n- 暂无实时资金流向\n").startswith("❌")
+        assert verify._index_flow_verdict("brief", "SH000001", "# 基本数据\n") == "❌ 段落都不在"
+
+    def test_the_pinned_date_note_is_scoped_to_the_section(self):
+        """别再用全文子串——这正是上一个 bug 的成因。"""
+        doc = "## 资金流向\n- 今日主力净流入: 1亿\n\n# 附注\n指定日期查询暂不展示实时资金流向\n"
+        assert verify._index_flow_verdict("brief", "SH000001", doc) == "✅ 有"

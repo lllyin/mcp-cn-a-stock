@@ -1287,6 +1287,40 @@ def _render_matrix(
     return lines
 
 
+def _index_flow_verdict(tool: str, symbol: str, document: str) -> str:
+    """指数专项里"资金流向"那一列的判定。
+
+    三个坑都踩过：
+
+    一、按工具判。``tech`` 的契约里根本没有资金流向这一维,拿同一套逻辑去判它,
+    结果是三个指数都被标成"❌ 无"——它们不是缺,是这个工具本来就不产出这一维。
+
+    二、别用全文子串。原先判的是 ``"净流入" in document``,而 ``full`` 的历史
+    资金流向**表头**里就有"净流入"三个字,于是 SH000688 在 full 里被判成"✅ 有"、
+    在 brief/medium 里被判成"✅ 没有这个页面"——同一个标的同一件事两种说法。
+    改成认段落标记 + 降级文案,和 check_completeness 用同一套判据,不会再分叉。
+
+    三、"没有这一维"和"有这一维但没取到"要分开。前者是 ``—``,后者才是 ❌。
+    """
+    flow = next(
+        (d for d in CONTRACT.get(tool, ()) if d.name == "资金流向"), None
+    )
+    if flow is None:
+        return "—"                      # 这个工具不产出资金流向
+    if not flow.applies(symbol):
+        return "— 没有这个页面"          # 科创50：结构性没有，不进分母
+    if flow.marker not in document:
+        return "❌ 段落都不在"
+    # 只看这一段的正文，不看全文——上面第二条踩的就是这个坑。
+    body = document.partition(flow.marker)[2].split("\n#", 1)[0]
+    if "指定日期查询暂不展示实时资金流向" in body:
+        # 钉了日期本就不展示实时资金流，不是缺。探活不该钉日期，钉了是调用参数
+        # 的问题，那由维度矩阵去报，这一列只如实说明为什么这里没有数值。
+        return "✅ 钉日期不展示"
+    note = _degraded_note(document, flow)
+    return "✅ 有" if not note else f"❌ {note}"
+
+
 def _render_index_section(
     probes: list[tuple[CallResult, Payload, Completeness]],
     regressions: list[tuple[Baseline, CallResult | None, list[DocumentDiff]]],
@@ -1307,16 +1341,13 @@ def _render_index_section(
             volume = _extract(document, "## 成交量(万手)", "- 当日")
             amount = _extract(document, "## 成交额(亿)", "- 当日")
             close = _extract(document, "## 价格", "- 当日").split(" ")[0]
-            if "净流入" in document:
-                flow = "✅ 有"
-            elif "指定日期查询暂不展示实时资金流向" in document:
-                flow = "✅ 钉日期不展示"
-            elif symbol == "SH000688":
-                flow = "✅ 科创50 没有这个页面"
-            else:
-                flow = "❌ 无"
-            mark = "✅" if not bad else "❌ " + "、".join(
-                sorted({item.dimension.name for item in bad})
+            flow = _index_flow_verdict(result.spec.tool, symbol, document)
+            # tech 没有维度契约，`bad` 必然是空的——那不是"全都有"，是"一项都没查"。
+            # 打 ✅ 会让人以为查过了。
+            mark = (
+                "—" if not CONTRACT.get(result.spec.tool)
+                else "✅" if not bad
+                else "❌ " + "、".join(sorted({item.dimension.name for item in bad}))
             )
             rows.append(
                 f"| {symbol} {CORE_INDICES[symbol]} | {result.spec.tool} | {close} | "
