@@ -1419,12 +1419,18 @@ def _render_matrix(
     """维度 × 标的 的矩阵。
 
     缺失明细那张表是按"发现"排的，一个标的缺五维就是五行；要回答"线上到底缺什么"
-    得反过来看：一行一维，一列一标的，空白处一眼就出来。同一个标的在 brief /
-    medium / full 里都出现过，取最全的那次——只要有一个工具拿到了，这一维就是
-    取得到的。
+    得反过来看：一行一维，一列一标的，空白处一眼就出来。
+
+    同一个标的在 brief / medium / full 里都出现过，**只有每个工具都拿到了才算 ✅**。
+    原先取的是"最好的那次"，理由是"只要有一个工具拿到，这一维就是取得到的"——听着
+    成立，实际制造了自相矛盾的报告：2026-09-05 那份里缺失明细列了 8 项，矩阵却全绿，
+    而可用率(按 工具×标的×维度 计)又确实扣了分。三处说法不一致，读的人只能挨个去
+    核对。
+
+    工具之间结果不一致时给一个独立符号 ◐，这样"这一维取得到"和"这一次没取到"两件事
+    都还在，不用牺牲其中一件。
     """
-    # (标的, 维度) -> 判定符号。多个工具都覆盖同一维时取最好的结果。
-    RANK = {"✅": 3, "⚠️": 2, "❌": 1, "·": 0}
+    # (标的, 维度) -> 判定符号。工具之间不一致时降级成 ◐，不再取最好的那个。
     grid: dict[str, dict[str, str]] = {}
     dims: list[str] = []
     for result, payload, completeness in probes:
@@ -1442,15 +1448,20 @@ def _render_matrix(
                     continue
                 item = bad.get((symbol, dimension.name))
                 mark = "✅" if item is None else ("⚠️" if item.degraded_note else "❌")
-                if RANK[mark] > RANK.get(row.get(dimension.name, "·"), -1):
+                seen = row.get(dimension.name)
+                if seen is None or seen == "·":
                     row[dimension.name] = mark
+                elif seen != mark:
+                    # 工具之间不一致：有的拿到了、有的没有。给 ◐，别让任何一边消失。
+                    row[dimension.name] = "◐"
     if not grid:
         return []
 
     symbols = sorted(grid, key=lambda s: (classify(s), s))
     lines = ["## 三、维度 × 标的 矩阵", ""]
     lines.append(
-        "✅ 有数据　⚠️ 段落在但没值　❌ 该有却没有　· 这类标的本来就没有这一维"
+        "✅ 每个工具都拿到了　◐ 有的工具拿到、有的没有（见缺失明细）　"
+        "⚠️ 段落在但没值　❌ 该有却没有　· 这类标的本来就没有这一维"
     )
     lines.append("")
     lines.append("| 维度 | 上游源 | " + " | ".join(symbols) + " |")
@@ -1585,7 +1596,7 @@ def render_report(
     regressions: list[tuple[Baseline, CallResult | None, list[DocumentDiff]]],
     scan: LogScan,
     watch: "MemoryWatch | None" = None,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, str]:
     lines: list[str] = []
 
     probe_failures = [result for result, _, _ in probes if not result.ok]
@@ -2367,6 +2378,7 @@ def main() -> int:
     print()
     print(f"[验证] 报告已写入 {destination}")
     # 与报告里那一行同一个判定，别一边说"全部通过"一边在报告里标着数据缺口。
+    # 和报告标题同一句式：先给分数，再给定性。控制台常常是唯一被看到的输出。
     print(f"[验证] 结论：{verdict}")
     return 1 if failed else 0
 

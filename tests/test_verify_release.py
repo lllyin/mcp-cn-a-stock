@@ -856,3 +856,70 @@ class TestProcStatParsing:
     def test_malformed_lines_are_skipped_not_raised(self):
         for bad in ("", "no-parens-here", "42 (x) R", "notapid (x) " + " ".join(["0"] * 50)):
             assert verify._parse_proc_stat(bad) is None
+
+
+# --- 矩阵要和缺失明细、可用率三者一致 -------------------------------------
+# 2026-09-05 那份报告里缺失明细列了 8 项、可用率扣到 98%，矩阵却全绿——因为矩阵
+# 取的是"跨工具最好的那次"。三处说法不一致，读的人只能挨个核对。
+
+
+class TestMatrixAgreesWithFindings:
+    def _probe(self, tool, symbol, document):
+        spec = verify.CallSpec(tool, {"symbol": symbol})
+        result = verify.CallResult(spec=spec, exit_code=0, payload=document,
+                                   stderr="", elapsed=1.0)
+        payload = verify.Payload(documents={symbol: document})
+        return result, payload, verify.check_completeness(tool, payload)
+
+    #: 一份个股报告，可以按需抽掉某一维
+    def _doc(self, with_pb=True):
+        parts = ["# 基本数据", "- 股票代码: SZ000333", "- 股票名称: 美的",
+                 "- 数据日期: 2026-09-05", "- 行业概念: 家电",
+                 "- 总市值: 1亿", "- 流通市值: 1亿",
+                 "- 市盈率(静): 10", "- 市盈率(动): 9"]
+        if with_pb:
+            parts += ["- 市净率: 2", "- 净资产收益率: 10%"]
+        parts += ["## 价格", "- 当日: 1", "## 涨跌幅", "- 当日: 1%",
+                  "## 振幅", "- 当日: 1%", "## 成交量(万手)", "- 当日: 1",
+                  "## 成交额(亿)", "- 当日: 1",
+                  "## 资金流向", "- 今日主力净流入: 1亿",
+                  "## 换手率", "- 当日: 1%"]
+        return "\n".join(parts) + "\n"
+
+    def test_a_dimension_one_tool_missed_is_not_green(self):
+        """brief 没拿到、medium 拿到了——不能显示成 ✅。"""
+        probes = [self._probe("brief", "SZ000333", self._doc(with_pb=False)),
+                  self._probe("medium", "SZ000333", self._doc(with_pb=True))]
+        text = "\n".join(verify._render_matrix(probes))
+        row = next(l for l in text.splitlines() if l.startswith("| 市净率 "))
+        assert "◐" in row, row
+        assert "✅" not in row, row
+
+    def test_all_tools_ok_stays_green(self):
+        probes = [self._probe(t, "SZ000333", self._doc()) for t in ("brief", "medium")]
+        row = next(l for l in "\n".join(verify._render_matrix(probes)).splitlines()
+                   if l.startswith("| 市净率 "))
+        assert "✅" in row and "◐" not in row
+
+    def test_all_tools_missed_keeps_the_hard_mark(self):
+        probes = [self._probe(t, "SZ000333", self._doc(with_pb=False))
+                  for t in ("brief", "medium")]
+        row = next(l for l in "\n".join(verify._render_matrix(probes)).splitlines()
+                   if l.startswith("| 市净率 "))
+        assert "❌" in row and "◐" not in row
+
+    def test_the_legend_explains_the_new_symbol(self):
+        probes = [self._probe("brief", "SZ000333", self._doc())]
+        text = "\n".join(verify._render_matrix(probes))
+        assert "◐" in text and "有的工具拿到" in text
+
+    def test_a_matrix_cell_never_contradicts_the_findings(self):
+        """凡是缺失明细里出现过的 (标的,维度)，矩阵那一格就不能是 ✅。"""
+        probes = [self._probe("brief", "SZ000333", self._doc(with_pb=False)),
+                  self._probe("medium", "SZ000333", self._doc(with_pb=True))]
+        flagged = {(f.symbol, f.dimension.name)
+                   for _, _, c in probes for f in c.findings}
+        text = "\n".join(verify._render_matrix(probes))
+        for _, dim in flagged:
+            row = next(l for l in text.splitlines() if l.startswith(f"| {dim} "))
+            assert "✅" not in row, f"{dim} 在缺失明细里，矩阵却是 ✅：{row}"
