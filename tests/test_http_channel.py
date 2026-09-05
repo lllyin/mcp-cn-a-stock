@@ -509,3 +509,40 @@ def test_impersonation_failure_reason_is_logged(monkeypatch, caplog):
     assert "Impersonation failed" in caplog.text
     assert "host=push2his.eastmoney.com" in caplog.text
     assert "RuntimeError: no route" in caplog.text
+
+
+# --- 通道降级要能被源查询到 -------------------------------------------------
+
+
+class TestImpersonatedHostsDegraded:
+    def test_false_when_the_channel_is_healthy(self, monkeypatch):
+        monkeypatch.setattr(channel, "_installed_mode", "impersonate")
+        channel._breaker.update(failures=0, suspended_until=0.0)
+        assert not channel.impersonated_hosts_degraded()
+
+    def test_true_while_impersonation_is_suspended(self, monkeypatch):
+        import time as _time
+        monkeypatch.setattr(channel, "_installed_mode", "impersonate")
+        channel._breaker.update(failures=0, suspended_until=_time.monotonic() + 60)
+        try:
+            assert channel.impersonated_hosts_degraded()
+        finally:
+            channel._breaker.update(failures=0, suspended_until=0.0)
+
+    def test_false_in_other_modes(self, monkeypatch):
+        """只有 impersonate 模式装了伪装通道，别的模式下这个冷却没有意义。"""
+        import time as _time
+        channel._breaker.update(failures=0, suspended_until=_time.monotonic() + 60)
+        try:
+            for mode in ("proxy", "direct", None):
+                monkeypatch.setattr(channel, "_installed_mode", mode)
+                assert not channel.impersonated_hosts_degraded(), mode
+        finally:
+            channel._breaker.update(failures=0, suspended_until=0.0)
+
+    def test_it_clears_once_the_cooldown_expires(self, monkeypatch):
+        import time as _time
+        monkeypatch.setattr(channel, "_installed_mode", "impersonate")
+        channel._breaker.update(failures=0, suspended_until=_time.monotonic() + 0.01)
+        _time.sleep(0.02)
+        assert not channel.impersonated_hosts_degraded()

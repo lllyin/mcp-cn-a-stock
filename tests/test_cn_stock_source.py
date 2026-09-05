@@ -1790,3 +1790,54 @@ class TestFallbackRequestBudget:
         # 老行为（等 0.5s 就放弃）在这里也会通过，所以关键断言是"真的拿到了"。
         assert result.fetch_failures == []
         assert len(result.fund_flow_history["DATE"]) == 121
+
+
+# --- O1：通道降级时，依赖它的源直接停手 -----------------------------------
+# 伪装通道一进冷却，对 IMPERSONATED_HOSTS 的请求就退回原生 requests，而那几台
+# 主机被列进名单的理由正是它们拒绝原生 requests。冷却期内每次尝试都是已知必败。
+
+
+class TestBreakerDegradedPredicate:
+    def test_degraded_skips_without_any_failure_recorded(self):
+        """不用先失败几次再"发现"——判据说必败就直接跳过。"""
+        degraded = {"on": True}
+        breaker = source_module.SourceBreaker(
+            "t", threshold=3, cooldown=60, degraded=lambda: degraded["on"]
+        )
+        assert breaker.should_skip()
+        assert not breaker.is_open          # 跳过不等于熔断打开，两件事
+
+    def test_recovers_the_moment_the_channel_does(self):
+        degraded = {"on": True}
+        breaker = source_module.SourceBreaker(
+            "t", threshold=3, cooldown=60, degraded=lambda: degraded["on"]
+        )
+        assert breaker.should_skip()
+        degraded["on"] = False
+        assert not breaker.should_skip()
+
+    def test_degraded_also_blocks_the_half_open_probe(self):
+        """半开探测也走同一条降级的通道，放它出去只是白付一次。"""
+        degraded = {"on": False}
+        breaker = source_module.SourceBreaker(
+            "t", threshold=1, cooldown=0.001, degraded=lambda: degraded["on"]
+        )
+        breaker.record(success=False)
+        assert breaker.is_open
+        time.sleep(0.01)
+        assert not breaker.should_skip()     # 冷却过了，正常会放一次探测
+        breaker.reset(); breaker.record(success=False)
+        degraded["on"] = True
+        time.sleep(0.01)
+        assert breaker.should_skip()         # 通道降级时不放
+
+    def test_a_broken_predicate_does_not_break_fetching(self):
+        """判据自己抛异常，不能连累取数——退回按失败计数走。"""
+        def boom():
+            raise RuntimeError("x")
+        breaker = source_module.SourceBreaker("t", threshold=2, cooldown=60, degraded=boom)
+        assert not breaker.should_skip()
+
+    def test_the_kline_breaker_consults_the_channel(self):
+        from qtf_mcp.datasource import http_channel
+        assert source_module._KLINE_BREAKER.degraded is http_channel.impersonated_hosts_degraded

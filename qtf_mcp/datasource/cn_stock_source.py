@@ -40,7 +40,11 @@ from ..config import (
 )
 from . import basic_info
 from .base import DataSource, FetchRequirements, StockData
-from .http_channel import install_http_channel, installed_mode
+from .http_channel import (
+    impersonated_hosts_degraded,
+    install_http_channel,
+    installed_mode,
+)
 from ..observability import bind_log_context, log_context
 
 logger = logging.getLogger("qtf_mcp")
@@ -79,13 +83,25 @@ class SourceBreaker:
         来源——连续计数在持续 50% 拒绝率下几乎永远开不了，因为总有一次成功把它
         清零，于是每次请求都白付一次代价。资金流向页面就是这一类，见配置项里的
         实测数据。
+
+    ``degraded`` 是一个可选判据：返回 True 就直接跳过这个源，不看失败计数。用于
+    "这一刻已经知道必败"的情形，省掉用失败去重新发现它的那一段。判据由调用方注入
+    而不是写死，源这一层不该知道出站通道是怎么实现的。
     """
 
-    def __init__(self, name: str, threshold: int, cooldown: float, window: float = 0.0):
+    def __init__(
+        self,
+        name: str,
+        threshold: int,
+        cooldown: float,
+        window: float = 0.0,
+        degraded=None,
+    ):
         self.name = name
         self.threshold = threshold
         self.cooldown = cooldown
         self.window = window
+        self.degraded = degraded
         self._lock = threading.Lock()
         self._failures = 0
         self._failed_at: collections.deque = collections.deque()
@@ -101,6 +117,14 @@ class SourceBreaker:
         """Whether to bypass the source. Grants exactly one probe per cooldown."""
         if not SOURCE_BREAKER_ENABLED:
             return False
+        if self.degraded is not None:
+            try:
+                if self.degraded():
+                    # 已知必败，连半开探测都不放：探测也要走同一条降级的通道。
+                    return True
+            except Exception:
+                # 判据自己坏了不能拖垮取数——退回按失败计数走。
+                logger.debug("熔断器降级判据异常 source=%s", self.name, exc_info=True)
         with self._lock:
             if self._open_until <= 0.0:
                 return False
@@ -175,10 +199,16 @@ class SourceBreaker:
 # The K-line tier gets a breaker because it has an equivalent fallback; the
 # HTTP fund-flow tier does not, since skipping it would return the same empty
 # result without buying anything.
+#
+# 带上降级判据：这个源打的是 push2his.eastmoney.com，正是 IMPERSONATED_HOSTS 之一。
+# 伪装通道一进冷却，它的请求就退回原生 requests，而那台主机被列进名单的理由就是
+# 它拒绝原生 requests——冷却期内每次尝试都是已知必败。2026-09-05 部署机实测这段
+# 空转的代价：8 次 K 线调用各 12.9~14.7s，占该窗口 K 线总耗时的 87%。
 _KLINE_BREAKER = SourceBreaker(
     "eastmoney_kline",
     SOURCE_BREAKER_THRESHOLD,
     SOURCE_BREAKER_COOLDOWN_SECONDS,
+    degraded=impersonated_hosts_degraded,
 )
 
 # The page fallback does get one, for the opposite reason: it is expensive

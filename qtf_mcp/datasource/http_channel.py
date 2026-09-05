@@ -123,6 +123,31 @@ def _impersonation_suspended() -> bool:
         return True
 
 
+def impersonated_hosts_degraded() -> bool:
+    """走 IMPERSONATED_HOSTS 的请求此刻是不是注定失败。
+
+    只有 ``impersonate`` 模式装了伪装通道；它一旦进入冷却，对这几个主机的请求
+    就退回原生 requests，而这几个主机被列进 ``IMPERSONATED_HOSTS`` 的**理由**
+    正是它们拒绝原生 requests。也就是说冷却期内这些请求是已知必败的。
+
+    这个信息原先只有通道层自己知道。2026-09-05 部署机日志里的代价：
+
+        13:52:46  暂停伪装 300s -> 退回 plain requests
+        13:52:48~13:53:01  10 次 K 线失败
+        13:53:11~13:53:12  8 次 K 线调用，各 12.9~14.7s
+        13:53:12  eastmoney_kline 熔断器这才打开
+
+    26 秒里每个请求都在为一条已知必败的通道付满重试预算（RETRY×TIMEOUT 最坏
+    24s），只因为每个源要用自己的连续失败计数独立"重新发现"这件事。让源直接问
+    通道，就不用再发现一遍。
+
+    还有一层二阶效应：源熔断的冷却（120s）比通道冷却（300s）短，所以源的半开
+    探测必然落在通道仍然降级的窗口里、必然失败、再买一个 120s。查通道状态同时
+    消掉这个空转。
+    """
+    return _installed_mode == "impersonate" and _impersonation_suspended()
+
+
 def _record_impersonation(*, success: bool) -> None:
     """Trip a cooldown once impersonation is failing for every request.
 
@@ -385,6 +410,7 @@ __all__ = [
     "HttpModeError",
     "IMPERSONATED_HOSTS",
     "describe_installed_channel",
+    "impersonated_hosts_degraded",
     "install_http_channel",
     "installed_mode",
     "uninstall_http_channel",
