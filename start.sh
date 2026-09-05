@@ -64,6 +64,48 @@ if [ -f "$PID_FILE" ]; then
     fi
 fi
 
+# Chromium 是盘中资金流和 market_breadth 的首选数据源。没装就在这里装上，装过就跳过,
+# 让"零配置启动"真的只有一条命令。
+#
+# 探测走 Playwright 自己的路径解析（本机实测 0.69s），不去猜 ms-playwright 缓存目录：
+# 那个目录能被 PLAYWRIGHT_BROWSERS_PATH 改掉，猜错的代价是每次启动重装一遍 150 MB。
+# 0.69s 摊在一次 start.sh 上可以接受——这个脚本本来就要 sleep 2 等服务起来。
+ensure_chromium() {
+    local status=0
+    python - > /dev/null 2>&1 <<'PY' || status=$?
+import os, sys
+
+try:
+    from playwright.sync_api import sync_playwright
+except Exception:
+    sys.exit(2)
+try:
+    with sync_playwright() as p:
+        found = os.path.exists(p.chromium.executable_path)
+except Exception:
+    sys.exit(2)
+sys.exit(0 if found else 1)
+PY
+    if [ "$status" -eq 0 ]; then
+        return 0
+    fi
+    # 1 = 装了 Playwright 但没下浏览器；2 = 连探测都跑不起来，装了也白装。
+    if [ "$status" -ne 1 ]; then
+        echo "警告: 无法探测 Chromium，跳过安装；浏览器相关的数据源会回退到备用源。"
+        return 0
+    fi
+
+    echo "未检测到 Chromium，正在安装（约 150 MB，只装这一次）..."
+    if playwright install chromium; then
+        echo "✅ Chromium 安装完成"
+    else
+        echo "警告: Chromium 安装失败；服务照常启动，浏览器相关的数据源会回退到备用源。"
+        if [ "$(uname -s)" = "Linux" ]; then
+            echo "      缺系统依赖时用: sudo \$(which playwright) install --with-deps chromium"
+        fi
+    fi
+}
+
 cleanup_stale_xvfb_pid() {
     if [ -f "$XVFB_PID_FILE" ]; then
         local xvfb_pid xvfb_display xvfb_command
@@ -140,6 +182,7 @@ start_xvfb_if_needed() {
     echo "已启动虚拟显示 $DISPLAY (PID: $xvfb_pid)"
 }
 
+ensure_chromium
 start_xvfb_if_needed
 
 # 启动服务
