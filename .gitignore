@@ -25,3 +25,6 @@ libs
 *.pid
 .env*
 !.env.example
+
+# 等价性比对的抓取结果、报告缓存等运行期产物
+.runtime/
