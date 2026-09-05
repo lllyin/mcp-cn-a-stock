@@ -115,13 +115,14 @@ FUND_FLOW_PAGE_FALLBACK_ENABLED = _parse_bool(
 #     3   9/11    多救回 2 个
 #     4   11/11   多救回 4 个
 #
-# 机制是 可服务数 ≈ 名额 × ⌈等待上限/持有时长⌉，服务器上持有时长 p50 2.32s、
-# 等待上限 3s，所以每个名额大致只够服务两个标的。
-#
 # 取 3 不取 4：4 要把浏览器页面上限也推到 4，多两个并发渲染进程，而 §三 的
-# 500 MiB 判定还没在 Ubuntu 上复测过；3 只多一个，且能把 5 次丢失里的 2 次补回来。
-# 必须和 BROWSER_PAGE_CONCURRENCY 一起提——只提这一个，浏览器信号量会立刻变成
-# 新的瓶颈，收益为零。
+# 500 MiB 判定还没在 Ubuntu 上复测过；3 只多一个。必须和 BROWSER_PAGE_CONCURRENCY
+# 一起提——只提这一个，浏览器信号量会立刻变成新的瓶颈，收益为零。
+#
+# 2026-09-05 复盘：上面那段回放当时把"名额"当成了主要旋钮，其实不是。名额只决定
+# 「前几个能立刻拿到」，第 N+1 个能不能等到，取决于 W 和 hold 的关系——见下一项。
+# 名额留在 3 是因为它对慢尾巴更稳：批 4 标的、名额 3 时第 4 个只等一个 hold，
+# p90 也在 W 之内；名额 2 时第 4 个要等两个 hold，p90 下就超了。
 FUND_FLOW_PAGE_FALLBACK_CONCURRENCY = max(
     1,
     int(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_CONCURRENCY", "3")),
@@ -139,9 +140,24 @@ FUND_FLOW_PAGE_FALLBACK_CONCURRENCY = max(
 # 但单纯放大 W 会把补全问题换成无界延迟问题：10×4 = 40 个标的、名额 1 个，就是
 # 40×2.26 ≈ 90s。所以 W 只管单个标的，整体上界交给下面的请求预算。两者都置 0
 # 可以退回"不等，直接跳过"。
+#
+# 2026-09-05 部署机实测把它从 3s 提到 8s。上一次我调错了旋钮：算出 W/hold 不对
+# 之后去提名额（1→2→3），但决定成败的一直是 W 和 hold 的关系，名额只决定"前几个
+# 能立刻拿到"。服务器上 hold 是 p50 3.38s / p90 7.49s（本机只有 2.26s，所以本机
+# 量不出这个问题），于是：
+#
+#     一批 4 个标的，前 3 个立刻拿到名额，第 4 个要等一个 hold
+#     第 4 个需等 3.38s  vs  W=3.0s  ->  超上限，必被跳过
+#
+# **每一批 4 标的的第 4 个，结构上永远拿不到名额。** 那一轮丢的 4 项资金流正好
+# 全部来自这里（名额已满 2 + 请求预算用尽 2），一次上游拒绝都没有。
+#
+# 取 8 是为了盖住 p90 的 7.49s，不是盖 p50——盖 p50 只是把必丢变成一半丢。
+# 代价：需要兜底且满批时，尾部多等 3.4s（p90 情形 7.5s）。那一轮全程只有 20 次
+# 页面加载，这条路不热，按第一条"数据完整 > 性能"这个换法是划算的。
 FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS = max(
     0.0,
-    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", "3")),
+    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", "8")),
 )
 # 一次请求里所有标的加起来最多为等名额花掉多少秒。
 #
@@ -149,12 +165,17 @@ FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS = max(
 # asyncio.gather 全并发，4 个标的各自独立去抢，3 个输给了自己的兄弟。按标的
 # 计时无法表达"这一批整体值得等多久",所以预算按 request_id 归集。
 #
-# 默认 8s 的来历：名额 2 个、每标的约 2.26s,一批 4 个标的两轮就够（约 4.5s）,
-# 8s 留了余量;40 个标的的批则拿到前 7 个左右,其余降级——延迟有界,补全率远高
-# 于现状。置 0 关闭请求级预算,退回纯按标的计时。
+# 这是个**截止时间**不是配额：从这一批第一个标的进来时开始计时，每个标的拿到的
+# 耐心是 min(W, 剩余)。所以它必须大于 W，否则 W 提上去也会立刻被它削回来。
+#
+# 2026-09-05 随 W 从 3s 提到 8s 一起，这里从 8s 提到 15s。同一轮里有 2 项资金流
+# 是被"请求预算已用尽"挡掉的（另 2 项是"名额已满"），说明 8s 对满批已经不够。
+# 15s 的量级：4 个标的、名额 3 个，最坏是第 4 个等一个 p90 hold(7.5s) 再加自己的
+# 加载，落在 15s 内。40 个标的的大批仍然会在 15s 处截断——延迟有界这一点不变。
+# 置 0 关闭请求级预算,退回纯按标的计时。
 FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS = max(
     0.0,
-    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS", "8")),
+    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS", "15")),
 )
 # Upper bound on waiting for the historical table to fill. It is only a
 # backstop: the wait aborts as soon as a fund-flow request is refused, so a
