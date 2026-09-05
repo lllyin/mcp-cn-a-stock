@@ -429,9 +429,29 @@ def build_fund_flow(field: tuple[str, str], data: Dict[str, ndarray]) -> str:
     else:
         amount_str = f"{raw_amount / 1e4:.2f}万"
     
-    # 针对大盘数据增加前缀标识（沪深两市），解决歧义
-    prefix = "沪深两市" if data.get("IS_MARKET", False) else "今日"
+    # 前缀只标"是谁的钱"（沪深两市 / 这只标的）。**不标时间**——哪一天的写在
+    # "## 资金流向（YYYY-MM-DD）"标题上，一处即可。原先每行都写"今日"，周末查出来
+    # 就是"今日主力净流入"配着 09-04 的数，读的人无从知道是哪天。
+    prefix = "沪深两市" if data.get("IS_MARKET", False) else ""
     return f"{prefix}{kind}净流入: {amount_str}  {kind}净占比: {ratio:.2%}"
+
+
+def fund_flow_date(data: Dict[str, ndarray]) -> Optional[datetime.date]:
+    """这批资金流数据是哪一天的。取自资金流历史的最后一行。
+
+    可能和报告顶部的"数据日期"差一天——东财的资金流历史有时比 K 线晚一个交易日。
+    正因为会差，才要单独标出来，不能借用 K 线那个日期。
+    """
+    fund_flow = data.get("_DS_FUND_FLOW")
+    if not fund_flow:
+        return None
+    dates = fund_flow.get("DATE", np.array([], dtype=np.int64))
+    if len(dates) == 0:
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(dates[-1] / 1e9).date()
+    except Exception:
+        return None
 
 
 def has_today_fund_flow_from_api(data: Dict[str, ndarray], today: Optional[datetime.date] = None) -> bool:
@@ -590,10 +610,13 @@ def get_realtime_fund_flow_target(symbol: str, data: Dict[str, ndarray]) -> Opti
 
 
 def get_realtime_fund_flow_prefix(target_code: str, data: Dict[str, ndarray]) -> str:
-    """Return the display prefix for realtime fund-flow rows."""
+    """Return the display prefix for realtime fund-flow rows.
+
+    只标"是谁的钱"，不标时间——日期写在段标题上，见 ``build_fund_flow``。
+    """
     if data.get("IS_MARKET", False) and target_code == "dpzjlx":
         return "沪深两市"
-    return "今日"
+    return ""
 
 
 def resolve_realtime_fund_flow_target(symbol: str) -> Optional[str]:
@@ -734,8 +757,13 @@ async def build_trading_data(
         print(f"- {p}日均额(亿): {amt_for_mean[-p:].mean():.2f}", file=fp)
     print("", file=fp)
 
-    # 资金流向部分
-    print("## 资金流向", file=fp)
+    # 资金流向部分。盘中走实时抓取，那批数就是当天的；否则用资金流历史最后一行的
+    # 日期——它可能比报告顶部的"数据日期"晚一天，所以在这里单独标。
+    if is_realtime_fund_flow_window() and not data.get("IS_HISTORICAL_QUERY", False):
+        flow_date = datetime.datetime.now().date()
+    else:
+        flow_date = fund_flow_date(data)
+    print(f"## 资金流向（{flow_date:%Y-%m-%d}）" if flow_date else "## 资金流向", file=fp)
 
     if data.get("IS_HISTORICAL_QUERY", False):
         print("- 指定日期查询暂不展示实时资金流向", file=fp)
@@ -831,7 +859,7 @@ async def build_trading_data(
             vol_for_mean = volume_actual.copy()
             vol_for_mean[-1] = volume_est[-1]
             print(f"- {p}日均换手: {vol_for_mean[-p:].mean() * 100 / fcap[-1]:.2%}", file=fp)
-            print(f"- {p}日总换手 (含今日): {vol_for_mean[-p:].sum() * 100 / fcap[-1]:.2%}", file=fp)
+            print(f"- {p}日总换手 (含当日): {vol_for_mean[-p:].sum() * 100 / fcap[-1]:.2%}", file=fp)
         print("", file=fp)
 
 

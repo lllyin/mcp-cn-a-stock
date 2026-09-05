@@ -282,10 +282,11 @@ class TestRealtimeFundFlowTarget:
     def test_stock_uses_plain_code(self):
         assert get_realtime_fund_flow_target("SZ300308", {"IS_MARKET": False}) == "300308"
 
-    def test_specific_index_prefix_uses_today(self):
-        assert get_realtime_fund_flow_prefix("000001", {"IS_MARKET": True}) == "今日"
-        assert get_realtime_fund_flow_prefix("399001", {"IS_MARKET": True}) == "今日"
-        assert get_realtime_fund_flow_prefix("399006", {"IS_MARKET": True}) == "今日"
+    def test_a_single_index_carries_no_scope_prefix(self):
+        """前缀只标"是谁的钱"。时间标在段标题上，不再逐行写"今日"。"""
+        assert get_realtime_fund_flow_prefix("000001", {"IS_MARKET": True}) == ""
+        assert get_realtime_fund_flow_prefix("399001", {"IS_MARKET": True}) == ""
+        assert get_realtime_fund_flow_prefix("399006", {"IS_MARKET": True}) == ""
 
     def test_market_page_prefix_keeps_market_label(self):
         assert get_realtime_fund_flow_prefix("dpzjlx", {"IS_MARKET": True}) == "沪深两市"
@@ -326,7 +327,8 @@ class TestRealtimeFundFlowFallback:
         printed = print_api_fund_flow_if_today(fp, data, datetime.date(2026, 7, 6))
 
         assert printed is True
-        assert "今日主力净流入: 1.23亿" in fp.getvalue()
+        assert "主力净流入: 1.23亿" in fp.getvalue()
+        assert "今日" not in fp.getvalue()
         assert "主力净占比: 12.34%" in fp.getvalue()
 
     def test_realtime_zero_values_are_treated_as_empty(self):
