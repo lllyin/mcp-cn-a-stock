@@ -98,11 +98,11 @@ AkShare 和 efinance 的主要接口是同步网络调用。服务通过进程�
 
 | 变量 | 默认值 | 含义 |
 | --- | ---: | --- |
-| `CN_STOCK_DATA_FETCH_MAX_WORKERS` | 8 | 同时执行同步数据任务的线程数 |
-| `CN_STOCK_DATA_FETCH_MAX_IN_FLIGHT` | 16 | 已运行和已提交任务的总上限 |
-| `CN_STOCK_BATCH_QUERY_CONCURRENCY` | 2 | `brief/medium/full` 共享的活跃批次数上限 |
-| `CN_STOCK_FINANCE_CACHE_TTL_SECONDS` | 21600 | 成功且非空的财务摘要缓存时间 |
-| `CN_STOCK_FINANCE_CACHE_MAX_ENTRIES` | 512 | 财务缓存最大标的数，超过后淘汰最早项 |
+| `FETCH_MAX_WORKERS` | 8 | 同时执行同步数据任务的线程数 |
+| `FETCH_MAX_IN_FLIGHT` | 16 | 已运行和已提交任务的总上限 |
+| `BATCH_CONCURRENCY` | 2 | `brief/medium/full` 共享的活跃批次数上限 |
+| `FINANCE_CACHE_TTL_SECONDS` | 21600 | 成功且非空的财务摘要缓存时间 |
+| `FINANCE_CACHE_MAX_ENTRIES` | 512 | 财务缓存最大标的数，超过后淘汰最早项 |
 
 Python 的 `ThreadPoolExecutor` 内部队列没有业务级上限，因此服务在提交前使用事件循环所属的
 `asyncio.Semaphore` 做 admission control。达到上限后的请求以轻量协程等待，不会继续向线程池
@@ -150,7 +150,7 @@ HTTP 层记录响应字节数、是否完成发送及 `client_disconnected`，
 ## 6. 出站 HTTP 通道
 
 部分东方财富接口会直接断开普通 HTTP 客户端的连接，表现为空响应体和
-`Expecting value: line 1 column 1 (char 0)`。`CN_STOCK_HTTP_MODE` 决定用哪种方式访问这些主机。
+`Expecting value: line 1 column 1 (char 0)`。`HTTP_CHANNEL` 决定用哪种方式访问这些主机。
 四种模式互斥，同一进程只安装一个：两个非 `direct` 的实现改写的是同一组 requests 模块属性，
 同时安装只会剩下最后一个生效。
 
@@ -166,12 +166,17 @@ HTTP 层记录响应字节数、是否完成发送及 `client_disconnected`，
 `market_events` 用到的 `datacenter-web`、`push2ex` 均原样直连。
 
 `impersonate` 只更换 TLS 指纹，不涉及浏览器；抓实时资金流的 Playwright 是另一条独立链路。
-连续 `CN_STOCK_HTTP_IMPERSONATE_FAILURE_THRESHOLD` 个目标主机完全失败后，该通道进入
-`CN_STOCK_HTTP_IMPERSONATE_COOLDOWN_SECONDS` 冷却，期间直接走原生 `requests`——否则一个
+连续 `IMPERSONATE_SUSPEND_AFTER_FAILURES` 次请求打满重试仍失败后，该通道进入
+`IMPERSONATE_SUSPEND_SECONDS` 冷却，期间直接走原生 `requests`——否则一个
 根本无法完成伪装的环境会在每次调用上白付一遍重试预算，外加一次原生重放。
 
+冷却期内这四个主机注定失败（它们被接管的理由正是拒绝原生 `requests`），所以数据源层
+通过 `impersonated_hosts_degraded()` 直接跳过它们，不再逐个源用自己的连续失败计数
+重新发现一遍。2026-09-05 部署机日志里，少了这一步的代价是 26 秒内 18 次必败的 K 线
+请求，每次都付满 `IMPERSONATE_RETRY × IMPERSONATE_TIMEOUT_SECONDS`。
+
 `auto` 永不因配置缺失而启动失败，只会降级并打印 WARNING；只有显式写
-`CN_STOCK_HTTP_MODE=proxy` 却没有配 `AKSHARE_PROXY_GATEWAY` 时才会启动即报错。
+`HTTP_CHANNEL=proxy` 却没有配 `AKSHARE_PROXY_GATEWAY` 时才会启动即报错。
 
 启动日志会在版本信息之后打印实际生效的通道：
 
@@ -187,7 +192,7 @@ HTTP channel mode=direct reason=requested hooked_hosts=4
 （`curl_cffi_unavailable`、`requests_already_patched`），降级同时记 WARNING。
 
 注意入口执行 `load_dotenv(override=True)`，**`.env` 的取值优先于 shell 环境变量**。临时切换
-通道要改 `.env` 或注释掉其中的 `CN_STOCK_HTTP_MODE`，`CN_STOCK_HTTP_MODE=direct ./start.sh`
+通道要改 `.env` 或注释掉其中的 `HTTP_CHANNEL`，`HTTP_CHANNEL=direct ./start.sh`
 这种写法会被 `.env` 覆盖掉。
 
 ### AkShare Proxy Patch
@@ -235,7 +240,7 @@ benchmark 应以代理尝试数设置预算，不能用 MCP 调用次数估算�
 无头浏览器会被这个页面识别。2026-09-04 实测同一组 16 个沪深标的各加载一次：加上
 `--disable-blink-features=AutomationControlled` 之前，今日块 2/16 成功、历史表 0/16；加上之后
 分别是 15/16 和 14/16。这个启动参数是必需项，不是可选优化。另有 8 轮全新浏览器、每轮最多三次
-的实测显示成功全部发生在前两次，所以 `COLD_ATTEMPTS` 定为 2。
+的实测显示成功全部发生在前两次，所以 `FUND_FLOW_PAGE_MAX_LOADS` 定为 2。
 
 ### 被拒的机制与无头特征
 
@@ -255,7 +260,7 @@ user-agent: Mozilla/5.0 (Macintosh; ...) Chrome/120.0.0.0 Safari/537.36
 
 `HeadlessChrome` 是自报身份，不是细微指纹；而且硬编码的 UA 说 Chrome/120、client hints 说 145，
 自相矛盾——在 Linux 服务器上还会变成 UA 说 Macintosh、`sec-ch-ua-platform` 说 Linux 的第二重矛盾。
-`FUND_FLOW_PAGE_DISGUISE` 用 CDP `Network.setUserAgentOverride` 把 UA 与 client hints 一起改成
+`BROWSER_DISGUISE` 用 CDP `Network.setUserAgentOverride` 把 UA 与 client hints 一起改成
 自洽的非 Headless（版本号和平台都从真实构建现算），配合 `locale=zh-CN`、1920x1080 视口，以及一段
 只补 `window.chrome` / `plugins` / `pdfViewerEnabled` 的 init script。
 
@@ -268,7 +273,7 @@ user-agent: Mozilla/5.0 (Macintosh; ...) Chrome/120.0.0.0 Safari/537.36
 CDP 方案只 +2/+16 MiB。
 
 被拒的**时长有两种**，不要混为一谈：瞬时的立刻重试就过（2026-09-04 15:51 的 SH512480 第一次
-`blocked_captcha`、593 毫秒后第二次拿到 `today=True history=121`），这是 `COLD_ATTEMPTS=2`
+`blocked_captcha`、593 毫秒后第二次拿到 `today=True history=121`），这是 `FUND_FLOW_PAGE_MAX_LOADS=2`
 存在的理由；持续的可达分钟级（15:35-15:50 实测背靠背 10 次全拒、静默 75 秒仍拒、16 分钟后仍拒），
 重试无用只能等。单次日志区分不了两者，所以策略是最多试两次然后放弃。
 
@@ -276,7 +281,7 @@ CDP 方案只 +2/+16 MiB。
 
 兜底 K 线源（腾讯日 K）在盘中不包含当天，直接用会让报告在 09-04 盘中返回 09-03 的收盘数据。
 `intraday_quote.py` 是一层可插拔的实时行情解析：provider 各自注册，
-`CN_STOCK_INTRADAY_QUOTE_PROVIDERS` 按逗号顺序决定尝试次序，`off` 关闭整层。
+`INTRADAY_QUOTE_PROVIDERS` 按逗号顺序决定尝试次序，`off` 关闭整层。
 
 | provider | 网络成本 | 字段 |
 | --- | --- | --- |
@@ -293,7 +298,7 @@ CDP 方案只 +2/+16 MiB。
 都要把整条 provider 链走完——efinance 重试、三次 impersonate 尝试、AkShare 重试——才轮到
 0.2 秒就能返回的腾讯兜底。跳过一个明确在拒绝的源，每次请求省 1.5–3.7 秒。
 
-`SOURCE_BREAKER_THRESHOLD` 默认 3：历史基线是约 1.5% 的散点失败率，连续三次偶然发生的概率是
+`SOURCE_BREAKER_OPEN_AFTER_FAILURES` 默认 3：历史基线是约 1.5% 的散点失败率，连续三次偶然发生的概率是
 0.003%，而一次真实封禁产生了 111 次连续失败。冷却结束后半开放行一次探测，因此该值只决定
 恢复延迟，不决定熔断打开期间的成本。
 
@@ -310,13 +315,13 @@ CDP 方案只 +2/+16 MiB。
 
 | 变量 | 用途 |
 | --- | --- |
-| `CN_STOCK_TONGHUASHUN_AUTH_FILE` | 覆盖认证缓存文件路径 |
-| `CN_STOCK_TONGHUASHUN_COOLDOWN_SECONDS` | 认证失败后的冷却时间，默认 300 秒 |
-| `CN_STOCK_CHROME_NO_SANDBOX` | 为 Chromium 增加 no-sandbox 参数 |
-| `CN_STOCK_XVFB_DISPLAY_NUMBER` | `start.sh` 使用的 Xvfb 显示号，默认 99 |
-| `CN_STOCK_XVFB_SCREEN` | Xvfb 屏幕配置，默认 `1920x1080x24` |
+| `MARKET_BREADTH_AUTH_FILE` | 覆盖认证缓存文件路径 |
+| `MARKET_BREADTH_COOLDOWN_SECONDS` | 认证失败后的冷却时间，默认 300 秒 |
+| `BROWSER_NO_SANDBOX` | 为 Chromium 增加 no-sandbox 参数 |
+| `XVFB_DISPLAY_NUMBER` | `start.sh` 使用的 Xvfb 显示号，默认 99 |
+| `XVFB_SCREEN` | Xvfb 屏幕配置，默认 `1920x1080x24` |
 
-`CN_STOCK_CHROME_NO_SANDBOX` 会降低浏览器隔离，仅应在受控容器且 Chromium sandbox 确实不可用
+`BROWSER_NO_SANDBOX` 会降低浏览器隔离，仅应在受控容器且 Chromium sandbox 确实不可用
 时启用。
 
 市场宽度结果带有短 TTL 缓存，并通过锁合并并发 cache miss，避免多个请求同时刷新同一份全市场
@@ -352,7 +357,7 @@ CDP 方案只 +2/+16 MiB。
 ## 10. 报告缓存
 
 `qtf_mcp/cache.py` 按标的缓存已渲染的输出，目的是降低 AkShare Proxy Patch 的积分消耗。
-它与数据源层解耦，`CN_STOCK_REPORT_CACHE_ENABLED=0` 时完全不参与调用链。
+它与数据源层解耦，`REPORT_CACHE_ENABLED=0` 时完全不参与调用链。
 
 ### 纪元模型
 
@@ -367,7 +372,7 @@ CDP 方案只 +2/+16 MiB。
 | 17:00–17:05 | live | 傍晚缓冲，同上 |
 | 17:05–次日 09:15、周末 | closed | 纪元内完全复用 |
 
-`SETTLE` 由 `CN_STOCK_REPORT_CACHE_SETTLE_HHMM` 配置，默认 15:30，取值夹在 `[1500, 1700]`。
+`SETTLE` 由 `REPORT_CACHE_SETTLE_TIME` 配置，默认 15:30，取值夹在 `[1500, 1700]`。
 闭市纪元锚定在刚结束的交易日上，因此周五傍晚到周一开盘是一个连续纪元。
 
 ### 缓冲窗口的必要性
@@ -404,7 +409,7 @@ CDP 方案只 +2/+16 MiB。
 
 ### 磁盘层
 
-写在 `CN_STOCK_REPORT_CACHE_DIR`，用于跨重启保留闭市纪元的条目。目录名带 `epoch-` 前缀，
+写在 `REPORT_CACHE_DIR`，用于跨重启保留闭市纪元的条目。目录名带 `epoch-` 前缀，
 清理只删自己创建的目录且需超过保留期，因此把该变量指向已有目录不会破坏其内容。
 
 ### 实测
