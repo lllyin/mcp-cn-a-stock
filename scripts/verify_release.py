@@ -76,12 +76,38 @@ ALL_CLASSES = frozenset((STOCK, ETF, INDEX))
 STOCK_ONLY = frozenset((STOCK,))
 
 
+# 有资金流向页面的指数。与 realtime_ff.INDEX_FUND_FLOW_URLS 保持一致——那份是
+# 判据的源头，这里只是镜像，tests/test_verify_release.py 有一条用例钉住两者同步。
+#
+# 为什么需要它：资金流向对个股和 ETF 都适用，对指数则要看有没有这个页面。科创50
+# (SH000688) 没有，主源对它也取不到，报告如实渲染"暂无实时资金流向"。按类别一刀切
+# 会误判——要么把 SH000688 算成缺失（2026-09-05 的报告就是这样，白扣 3 项，而它
+# 自己的第四节又写着"科创50 没有这个页面"，同一份报告前后矛盾），要么把三个真有
+# 数据的指数一起排除，那就在这一层开了个盲区。
+_INDEX_FUND_FLOW_CODES = frozenset({"000001", "399001", "399006"})
+
+
+def has_fund_flow(symbol: str) -> bool:
+    """这个标的有没有资金流向这一维。指数看有没有对应页面，其余都有。"""
+    if not is_index(symbol):
+        return True
+    return "".join(ch for ch in (symbol or "") if ch.isdigit()) in _INDEX_FUND_FLOW_CODES
+
+
 @dataclass(frozen=True)
 class Dimension:
     name: str
     marker: str          # 在报告文本里的行首特征
     source: str          # 由哪个上游源提供
     applies_to: frozenset = ALL_CLASSES
+    #: 类别之外的按标的判据。类别不够用时才给——资金流向就是这种：对指数而言
+    #: "有没有这一维"取决于具体是哪个指数，不是整类的属性。
+    applies_when: object = None
+
+    def applies(self, symbol: str) -> bool:
+        if classify(symbol) not in self.applies_to:
+            return False
+        return self.applies_when is None or self.applies_when(symbol)
 
 
 _BASIC = (
@@ -103,7 +129,7 @@ _TRADING = (
     Dimension("振幅", "## 振幅", "kline"),
     Dimension("成交量", "## 成交量(万手)", "kline"),
     Dimension("成交额", "## 成交额(亿)", "kline"),
-    Dimension("资金流向", "## 资金流向", "fund_flow"),
+    Dimension("资金流向", "## 资金流向", "fund_flow", applies_when=has_fund_flow),
     # 换手率 = 成交量 / 流通股本，分母来自 realtime 的市值，所以 realtime 挂了
     # 表现是"换手率整段不见了"，而不是数字不对。
     Dimension("换手率", "## 换手率", "realtime(流通市值)", applies_to=STOCK_ONLY),
@@ -327,17 +353,17 @@ class Completeness:
 def check_completeness(tool: str, payload: Payload) -> Completeness:
     """按维度契约检查一份返回。探活一律实时，所以这里没有"正当缺席"这回事。
 
-    唯一的例外由 ``applies_to`` 处理：ETF 没有财务报表和市盈率，指数连市值都没有，
-    那不是缺失，是这类标的本来就没有这一维。
+    唯一的例外由 ``applies_to`` / ``applies_when`` 处理：ETF 没有财务报表和市盈率，
+    指数连市值都没有，科创50 没有资金流向页面——那不是缺失，是这个标的本来就没有
+    这一维。前者按类别判，后者按标的判。
     """
     dimensions = CONTRACT.get(tool)
     result = Completeness()
     if not dimensions:
         return result
     for symbol, document in payload.documents.items():
-        symbol_class = classify(symbol)
         for dimension in dimensions:
-            if symbol_class not in dimension.applies_to:
+            if not dimension.applies(symbol):
                 continue
             result.expected += 1
             if dimension.marker not in document:
@@ -1231,7 +1257,7 @@ def _render_matrix(
             for dimension in contract:
                 if dimension.name not in dims:
                     dims.append(dimension.name)
-                if classify(symbol) not in dimension.applies_to:
+                if not dimension.applies(symbol):
                     row.setdefault(dimension.name, "·")
                     continue
                 item = bad.get((symbol, dimension.name))

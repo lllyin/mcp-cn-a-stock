@@ -599,3 +599,52 @@ class TestNegativeZero:
         old = "# 历史资金流向\n| 2026-06-30 | -1.10万 | -0.01% | 2.08亿 |"
         new = "# 历史资金流向\n| 2026-06-30 | -1.10万 | 0.01% | 2.08亿 |"
         assert not verify.compare_documents(old, new, "t").clean
+
+
+# --- 资金流向这一维要按标的判，不能按类别一刀切 ---------------------------
+
+
+class TestFundFlowApplicability:
+    def test_only_the_three_indices_with_a_page_have_it(self):
+        for symbol in ("SH000001", "SZ399001", "SZ399006"):
+            assert verify.has_fund_flow(symbol), symbol
+        assert not verify.has_fund_flow("SH000688")
+
+    def test_stocks_and_etfs_always_have_it(self):
+        for symbol in ("SH600519", "SZ300750", "SH512480", "SZ159995", "BJ920021"):
+            assert verify.has_fund_flow(symbol), symbol
+
+    def test_the_mirror_stays_in_sync_with_the_server(self):
+        """镜像常量漂了就会开盲区：服务端加一个有资金流页面的指数，这里不跟着加，
+        那个指数的缺失就永远查不出来。"""
+        import ast
+        from pathlib import Path
+
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "qtf_mcp" / "datasource" / "realtime_ff.py"
+        ).read_text(encoding="utf-8")
+        codes = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "INDEX_FUND_FLOW_URLS"
+                for t in node.targets
+            ):
+                codes = {k.value for k in node.value.keys}
+        assert codes, "没在 realtime_ff.py 里找到 INDEX_FUND_FLOW_URLS"
+        assert codes == set(verify._INDEX_FUND_FLOW_CODES)
+
+    def test_the_dimension_carries_the_predicate(self):
+        flow = [d for d in verify.CONTRACT["brief"] if d.name == "资金流向"]
+        assert flow and flow[0].applies_when is verify.has_fund_flow
+
+    def test_a_missing_section_for_kechuang50_is_not_counted(self):
+        """科创50 渲染"暂无实时资金流向"是如实降级，不该扣可用率。"""
+        payload = verify.Payload(documents={"SH000688": "# 基本数据\n- 股票代码: SH000688\n"})
+        result = verify.check_completeness("brief", payload)
+        assert not any(f.dimension.name == "资金流向" for f in result.findings)
+
+    def test_a_missing_section_for_the_other_indices_is_counted(self):
+        payload = verify.Payload(documents={"SH000001": "# 基本数据\n- 股票代码: SH000001\n"})
+        result = verify.check_completeness("brief", payload)
+        assert any(f.dimension.name == "资金流向" for f in result.findings)
