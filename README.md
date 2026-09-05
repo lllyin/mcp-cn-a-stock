@@ -251,7 +251,7 @@ mcporter call cn-stock market_events \
 | `INTRADAY_QUOTE_CROSS_CHECK_PCT` | 拿到第一个可用报价后再问剩下的源一遍，字段相差超过这个值就打 WARNING。每个标的多一次上游请求，只在怀疑某个源口径不对时开 | 百分比，`0` 关闭（默认 `0`） |
 | `TRADING_CALENDAR_PROVIDERS` | 判「今天开不开市」的日历来源：<br>`sina` 上交所公布的交易日名单<br>`weekday` 兜底，周一到周五算交易日 | `sina`<br>`weekday`<br>`off`<br>（默认 `sina,weekday`） |
 | `TRADING_CALENDAR_TTL_SECONDS` | 日历的进程内缓存时长 | 秒（默认 `86400`） |
-| `SECTOR_FUND_FLOW_PROVIDERS` | 板块资金流的取数顺序：<br>`eastmoney` 字段全<br>`eastmoney_dataapi` 只有主力净额，但主源连不上时它还通；返回会标注是降级源 | `eastmoney`<br>`eastmoney_dataapi`<br>`off`<br>（默认 `eastmoney,eastmoney_dataapi`） |
+| `SECTOR_FUND_FLOW_PROVIDERS` | 板块资金流的取数顺序：<br>`eastmoney` 字段全<br>`eastmoney_dataapi` 只有主力净额，但主源连不上时它还通；报告备注里会标出是降级源 | `eastmoney`<br>`eastmoney_dataapi`<br>`off`<br>（默认 `eastmoney,eastmoney_dataapi`） |
 | `SECTOR_TAXONOMY_PROVIDERS` | 板块分级表的来源，用来只排同一层——东财的行业板块名单是一棵树摊平的，不分级会让父子板块同时上榜、同一笔钱数两遍：<br>`shenwan` 申万宏源的行业分类<br>`off` 退回全部板块一起排，报告里会标出来 | `shenwan`<br>`off`<br>（默认 `shenwan`） |
 | `SECTOR_TAXONOMY_TTL_SECONDS` | 分级表的进程内缓存时长 | 秒（默认 `86400`） |
 | `KLINE_PROVIDERS_INDEX` | **指数**用的兜底顺序，和下一项分开配：指数的成交量各源口径差得多（创业板指相差 3.52%），同花顺与东财一致 | 同上（默认 `tonghuashun,tencent,sina`） |

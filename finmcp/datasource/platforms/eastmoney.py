@@ -86,39 +86,54 @@ class EastmoneyPlatform(pf.Platform):
         )
 
 
-class EastmoneyDataApiPlatform(pf.Platform):
-    """东财 dataapi 端点。字段少一半，但在 push2 连不上时它还通。
+#: 本项目的口径 → 东财的主力净额字段号。三个口径在 push2 和 dataapi 两个端点上是
+#: 同一套字段号：push2 用它做 ``fid0``，dataapi 用它做 ``key``，返回值也以它为键。
+#:
+#: 这张表曾经写死成 f174，代价是**当日口径拿到的其实是 10 日的数**——2026-09-05
+#: 实测传媒：当日 61.74亿、5日 65.46亿、10日 68.52亿，报告上写着"当日"的是 68.52亿。
+#: 一个字段号错配不会报错、不会缺数，只会安静地给出另一个口径的值。
+_PERIOD_FIELD = {"today": "f62", "5d": "f164", "10d": "f174"}
 
-    只支持"今日"——这个端点没有 5 日/10 日口径。别的口径直接 supports() 返回 False，
-    让上层继续找下一个平台，而不是返回一份口径不对的数据。
+
+class EastmoneyDataApiPlatform(pf.Platform):
+    """东财 dataapi 端点。只给板块名和主力净额，但在 push2 连不上时它还通。
+
+    三个口径都支持——``key`` 选哪个字段就是哪个口径，和 push2 用的是同一套字段号。
     """
 
     name, label = "eastmoney_dataapi", "东财(dataapi)"
     capabilities = frozenset({"sector_fund_flow"})
 
     def supports(self, capability: str, request) -> bool:
-        return request.period == "today" and request.sector_type in _SECTOR_T
+        return request.sector_type in _SECTOR_T and request.period in _PERIOD_FIELD
+
+    @staticmethod
+    def url_for(sector_type: str, period: str) -> str:
+        """这次请求的 URL。单拎出来是为了能不联网就验字段号配对。"""
+        return ("https://data.eastmoney.com/dataapi/bkzj/getbkzj"
+                f"?key={_PERIOD_FIELD[period]}&code=m%3A90%2Bt%3A{_SECTOR_T[sector_type]}")
 
     def fetch_sector_fund_flow(self, request) -> Optional[SectorFundFlowBoard]:
         import json
 
         import requests
 
-        t = _SECTOR_T[request.sector_type]
-        url = ("https://data.eastmoney.com/dataapi/bkzj/getbkzj"
-               f"?key=f174&code=m%3A90%2Bt%3A{t}")
-        response = requests.get(url, timeout=15, headers={
-            "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                           "Chrome/145.0.0.0 Safari/537.36"),
-        })
+        field = _PERIOD_FIELD[request.period]
+        response = requests.get(
+            self.url_for(request.sector_type, request.period), timeout=15, headers={
+                "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/145.0.0.0 Safari/537.36"),
+            })
         payload = json.loads(response.text)
         diff = ((payload or {}).get("data") or {}).get("diff") or []
         if not diff:
             return None
+        # 取值用的字段号必须和请求时那个是同一个变量，不能各写各的——写岔了就是
+        # 上面那种"标着当日、其实是 10 日"的错，而且悄无声息。
         sectors = tuple(
             SectorFlow(name=str(item.get("f14", "")), code=str(item.get("f12", "")),
-                       main_net=float(item["f174"]) if item.get("f174") is not None else None)
+                       main_net=float(item[field]) if item.get(field) is not None else None)
             for item in diff
         )
         return SectorFundFlowBoard(

@@ -128,13 +128,32 @@ def test_the_title_carries_the_date_not_a_relative_word():
 # --- 降级源：字段少一半，但要标出来 ------------------------------------------
 
 
-def test_the_degraded_source_only_serves_today():
-    """dataapi 没有 5 日/10 日口径，与其返回口径不对的数据，不如让位。"""
+def test_the_degraded_source_serves_every_period():
+    """三个口径 dataapi 都能给——key 选哪个字段就是哪个口径。"""
     platform = pf.get("eastmoney_dataapi")
-    assert platform.supports(sff.CAPABILITY,
-                             sff.SectorFundFlowRequest(period="today")) is True
-    assert platform.supports(sff.CAPABILITY,
-                             sff.SectorFundFlowRequest(period="5d")) is False
+    for period in sff.PERIODS:
+        assert platform.supports(
+            sff.CAPABILITY, sff.SectorFundFlowRequest(period=period)) is True
+
+
+@pytest.mark.parametrize("period,field", [
+    ("today", "f62"), ("5d", "f164"), ("10d", "f174"),
+])
+def test_each_period_asks_for_its_own_field(period, field):
+    """口径和字段号必须配对。
+
+    这条是补的：字段号一度写死成 f174（10 日），于是"当日"拿到的是 10 日的数——
+    2026-09-05 实测传媒 当日 61.74亿 / 5日 65.46亿 / 10日 68.52亿，报告上标着
+    "当日"的是 68.52亿。错配不报错、不缺数，只会安静地换一个口径。
+    """
+    url = pf.get("eastmoney_dataapi").url_for("industry", period)
+    assert f"key={field}" in url
+
+
+def test_a_wrong_sector_type_is_not_served():
+    platform = pf.get("eastmoney_dataapi")
+    assert platform.supports(
+        sff.CAPABILITY, sff.SectorFundFlowRequest(sector_type="不存在")) is False
 
 
 def test_the_degraded_render_drops_columns_instead_of_showing_blanks():
