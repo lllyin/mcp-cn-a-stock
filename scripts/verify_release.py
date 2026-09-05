@@ -1785,15 +1785,77 @@ def service_pid() -> int | None:
     return None
 
 
-def _process_table() -> tuple[dict, dict]:
-    """(pid -> (ppid, rss_kib, comm), ppid -> [pid])。
+_HAS_PROC = Path("/proc/self/stat").exists()
+_CLOCK_TICKS = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 
-    用 ``ps`` 而不是 /proc：这个脚本要在 Ubuntu 和 macOS 上都能跑，而 ps 的这三列
-    两边都有。RSS 会把进程间共享的页在每个进程里各算一次，所以进程树的和是个偏高
-    的上界——用来看趋势和相对增量足够，别拿它跟 500 MiB 硬比。
+
+def _parse_proc_stat(raw: str):
+    """把一行 /proc/<pid>/stat 解析成 (pid, ppid, rss_kib, comm, cpu_seconds)。
+
+    单独拎出来是为了能测：这条路只在 Linux 上跑，而 Linux 正是部署环境——
+    开发机（macOS）根本走不到它，不测就等于裸奔上线。
+
+    解析的坑在 comm：它是进程名，**带括号且可能含空格甚至括号本身**
+    （``(Web Content)``、``(a (b))``），所以必须按第一个 " (" 和最后一个 ") "
+    切，不能整行 split()。字段序号见 proc(5)：ppid 是第 4 个字段，utime/stime
+    第 14/15，rss（页数）第 24——都从 1 数起，去掉 pid 和 comm 之后要各减 2。
     """
-    procs: dict[int, tuple[int, int, str]] = {}
+    head, sep, tail = raw.partition(" (")
+    if not sep:
+        return None
+    comm, sep, rest = tail.rpartition(") ")
+    if not sep:
+        return None
+    fields = rest.split()
+    if len(fields) < 22:
+        return None
+    try:
+        pid = int(head)
+        ppid = int(fields[1])
+        utime, stime = int(fields[11]), int(fields[12])
+        rss_pages = int(fields[21])
+    except ValueError:
+        return None
+    page_kib = (os.sysconf("SC_PAGE_SIZE") // 1024) if hasattr(os, "sysconf") else 4
+    return pid, ppid, rss_pages * page_kib, comm, (utime + stime) / _CLOCK_TICKS
+
+
+def _process_table() -> tuple[dict, dict]:
+    """(pid -> (ppid, rss_kib, comm, cpu_seconds), ppid -> [pid])。
+
+    Linux 上直读 /proc，不起子进程：``ps`` 每次要 fork+exec，实测本机 32.5ms CPU，
+    1Hz 下就是单核的 3.25%——在 2 核部署机上，测量工具自己吃掉这么多是不合适的,
+    而且它测的正是"这台机器忙不忙"。读 /proc 是纯文件读，成本低两个数量级。
+    macOS 没有 /proc，退回 ``ps``（那里只有开发机在跑，成本无所谓）。
+
+    顺带取 CPU 时间：内存回答"占了多少",CPU 回答"是不是算力打满了"。
+    2026-09-05 那轮就需要这个来分辨——单标的工具变快、多标的变慢,到底是机器忙
+    还是上游慢。
+    """
+    procs: dict[int, tuple[int, int, str, float]] = {}
     kids: dict[int, list[int]] = {}
+    if _HAS_PROC:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat", "rb") as handle:
+                    raw = handle.read().decode("utf-8", "replace")
+            except OSError:
+                continue
+            row = _parse_proc_stat(raw)
+            if row is None:
+                continue
+            pid, ppid, rss_kib, comm, cpu = row
+            procs[pid] = (ppid, rss_kib, comm, cpu)
+            kids.setdefault(ppid, []).append(pid)
+        if procs:
+            return procs, kids
+        # /proc 在但一条都读不出来（hidepid 之类的挂载选项）。这台机器我测不到，
+        # 所以留一条退路，别让采样静默变成空。
+        procs.clear()
+        kids.clear()
+
     try:
         out = subprocess.run(
             ["ps", "-Ao", "pid=,ppid=,rss=,comm="], capture_output=True, text=True, timeout=10
@@ -1808,7 +1870,7 @@ def _process_table() -> tuple[dict, dict]:
             pid, ppid, rss = int(parts[0]), int(parts[1]), int(parts[2])
         except ValueError:
             continue
-        procs[pid] = (ppid, rss, parts[3])
+        procs[pid] = (ppid, rss, parts[3], 0.0)
         kids.setdefault(ppid, []).append(pid)
     return procs, kids
 
@@ -1816,17 +1878,18 @@ def _process_table() -> tuple[dict, dict]:
 _BROWSER_HINTS = ("chrome", "chromium", "headless_shell", "Xvfb")
 
 
-def tree_rss(pid: int) -> tuple[float, int, float, int]:
-    """(整棵树 MiB, 进程数, 其中浏览器相关 MiB, 浏览器进程数)。
+def tree_rss(pid: int) -> tuple[float, int, float, int, float]:
+    """(整棵树 MiB, 进程数, 其中浏览器 MiB, 浏览器进程数, 累计 CPU 秒)。
 
     浏览器那部分单列，因为它是峰值的主要来源，也是 BROWSER_PAGE_CONCURRENCY
     这个旋钮直接作用的地方——两个数放在一起才看得出上调的代价落在哪。
     """
     procs, kids = _process_table()
     if pid not in procs:
-        return 0.0, 0, 0.0, 0
+        return 0.0, 0, 0.0, 0, 0.0
     total = browser = 0
     count = browser_count = 0
+    cpu = 0.0
     seen: set[int] = set()
     stack = [pid]
     while stack:
@@ -1834,14 +1897,15 @@ def tree_rss(pid: int) -> tuple[float, int, float, int]:
         if current in seen or current not in procs:
             continue
         seen.add(current)
-        _, rss, comm = procs[current]
+        _, rss, comm, proc_cpu = procs[current]
         total += rss
+        cpu += proc_cpu
         count += 1
         if any(hint.lower() in comm.lower() for hint in _BROWSER_HINTS):
             browser += rss
             browser_count += 1
         stack.extend(kids.get(current, ()))
-    return total / 1024, count, browser / 1024, browser_count
+    return total / 1024, count, browser / 1024, browser_count, cpu
 
 
 @dataclass
@@ -1855,7 +1919,7 @@ class MemoryWatch:
 
     interval: float = 1.0
     pid: int | None = None
-    samples: list[tuple[float, int, float, int]] = field(default_factory=list)
+    samples: list[tuple[float, int, float, int, float]] = field(default_factory=list)
     note: str = ""
     _thread: object = None
     _stop: object = None
@@ -1893,7 +1957,11 @@ class MemoryWatch:
     def summary(self) -> dict:
         totals = [s[0] for s in self.samples]
         browsers = [s[2] for s in self.samples]
+        cpus = [s[4] for s in self.samples]
         peak_at = max(range(len(self.samples)), key=lambda i: self.samples[i][0])
+        # 累计 CPU 秒是单调的，首尾之差就是这段窗口里真正烧掉的算力。
+        cpu_used = max(0.0, cpus[-1] - cpus[0]) if len(cpus) > 1 else 0.0
+        span = max(1e-9, (len(self.samples) - 1) * self.interval)
         return {
             "first": totals[0],
             "peak": max(totals),
@@ -1903,6 +1971,9 @@ class MemoryWatch:
             "browser_peak": max(browsers) if browsers else 0.0,
             "browser_peak_processes": max(s[3] for s in self.samples),
             "samples": len(self.samples),
+            "cpu_seconds": cpu_used,
+            "cpu_cores": cpu_used / span,
+            "span": span,
         }
 
 
@@ -1959,8 +2030,16 @@ def _render_performance(watch: "MemoryWatch", calls: list[CallResult]) -> list[s
     lines.append(f"| 结束 | {info['last']:.0f} MiB |")
     lines.append(f"| 其中浏览器峰值 | {info['browser_peak']:.0f} MiB"
                  f"（{info['browser_peak_processes']} 进程）|")
+    if info["cpu_seconds"] > 0:
+        lines.append(f"| **CPU** | **{info['cpu_seconds']:.0f}s / {info['span']:.0f}s"
+                     f" = 平均占 {info['cpu_cores']:.2f} 核** |")
     lines.append(f"| 采样 | 每 {watch.interval:.0f}s 一次，共 {info['samples']} 次 |")
     lines.append("")
+    if info["cpu_seconds"] > 0:
+        lines.append("> CPU 那一行回答的是「慢是因为算力打满，还是因为上游慢」。"
+                     "接近核数就是算力打满；远低于核数而调用又慢，那是在等网络。"
+                     "只统计服务进程树，不含本脚本自己和它拉起的 mcporter。")
+        lines.append("")
     lines.append("> 口径：`ps` 的 RSS 逐进程相加。共享页会在每个进程里各算一次，所以这个数是"
                  "**偏高的上界**，不能直接拿去和 500 MiB 的预算比对；它的用处是看趋势，以及"
                  "看 `BROWSER_PAGE_CONCURRENCY` 这类旋钮上调之后代价落在哪。要跟预算硬比，"

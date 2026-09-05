@@ -691,11 +691,18 @@ class TestPerformanceSection:
     def test_memory_summary_reports_peak_not_just_endpoints(self):
         """峰值只在页面加载那两三秒里存在，只看首尾必然错过。"""
         watch = verify.MemoryWatch()
-        watch.samples = [(100.0, 3, 0.0, 0), (800.0, 9, 700.0, 6), (120.0, 3, 0.0, 0)]
+        watch.samples = [
+            (100.0, 3, 0.0, 0, 10.0),
+            (800.0, 9, 700.0, 6, 14.0),
+            (120.0, 3, 0.0, 0, 16.0),
+        ]
         info = watch.summary()
         assert info["peak"] == 800.0 and info["peak_processes"] == 9
         assert info["browser_peak"] == 700.0
         assert info["first"] == 100.0 and info["last"] == 120.0
+        # 累计 CPU 秒是单调的，首尾之差才是这段窗口烧掉的算力
+        assert info["cpu_seconds"] == 6.0
+        assert info["cpu_cores"] == pytest.approx(3.0)   # 6s CPU / 2s 窗口
 
     def test_no_successful_call_degrades_gracefully(self):
         text = "\n".join(verify._render_performance(verify.MemoryWatch(), []))
@@ -739,3 +746,43 @@ class TestIndexFlowVerdict:
         """别再用全文子串——这正是上一个 bug 的成因。"""
         doc = "## 资金流向\n- 今日主力净流入: 1亿\n\n# 附注\n指定日期查询暂不展示实时资金流向\n"
         assert verify._index_flow_verdict("brief", "SH000001", doc) == "✅ 有"
+
+
+# --- /proc 解析（只在 Linux 上跑，所以更要测）------------------------------
+# 开发机是 macOS，这条路本地一次都走不到，而部署机全靠它。
+
+
+class TestProcStatParsing:
+    #: 一行真实形状的 /proc/<pid>/stat：pid comm state ppid ... utime stime ... rss
+    def _stat(self, pid=42, comm="python3", ppid=7, utime=300, stime=100, rss=25600):
+        fields = ["0"] * 50
+        fields[0] = "R"            # state（去掉 pid/comm 之后的第 1 个字段）
+        fields[1] = str(ppid)      # ppid
+        fields[11] = str(utime)
+        fields[12] = str(stime)
+        fields[21] = str(rss)      # rss，单位是页
+        return f"{pid} ({comm}) " + " ".join(fields)
+
+    def test_it_reads_ppid_rss_and_cpu(self):
+        row = verify._parse_proc_stat(self._stat())
+        pid, ppid, rss_kib, comm, cpu = row
+        assert (pid, ppid, comm) == (42, 7, "python3")
+        assert rss_kib > 0                       # 页数 × 页大小
+        assert cpu == pytest.approx(400 / verify._CLOCK_TICKS)
+
+    def test_a_comm_with_spaces_does_not_shift_the_fields(self):
+        """进程名里有空格时整行 split() 会把后面所有字段错位。"""
+        row = verify._parse_proc_stat(self._stat(comm="Web Content"))
+        assert row[3] == "Web Content"
+        assert row[1] == 7                       # ppid 没被挤走
+
+    def test_a_comm_with_parentheses_is_handled(self):
+        row = verify._parse_proc_stat(self._stat(comm="weird (name)"))
+        assert row[3] == "weird (name)" and row[1] == 7
+
+    def test_a_chromium_comm_is_recognised_as_browser(self):
+        assert any(h.lower() in "chrome_crashpad".lower() for h in verify._BROWSER_HINTS)
+
+    def test_malformed_lines_are_skipped_not_raised(self):
+        for bad in ("", "no-parens-here", "42 (x) R", "notapid (x) " + " ".join(["0"] * 50)):
+            assert verify._parse_proc_stat(bad) is None
