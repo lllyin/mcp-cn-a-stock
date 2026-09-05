@@ -28,7 +28,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from ..config import env
+from ..config import INTRADAY_QUOTE_CROSS_CHECK_PCT, env
 from .fund_flow_page import FundFlowPage, parse_amount, parse_percent, parse_price
 
 logger = logging.getLogger("qtf_mcp")
@@ -151,7 +151,8 @@ def resolve(
     而不是让调用方拿到一个填不满的结果。
     """
     context = context or QuoteContext()
-    for name in order if order is not None else configured_order():
+    names = tuple(order if order is not None else configured_order())
+    for index, name in enumerate(names):
         provider = _PROVIDERS.get(name)
         if provider is None:
             continue
@@ -165,6 +166,7 @@ def resolve(
         if require_ohlc and not quote.has_ohlc:
             logger.debug("盘中行情来源 %s 缺开高低，跳过 %s", name, symbol)
             continue
+        _cross_check(symbol, quote, context, names, after=index)
         return quote
     return None
 
@@ -215,6 +217,35 @@ def compare(
                 f"{field_name}: {left.source}={a} {right.source}={b} 相差 {drift:.2f}%"
             )
     return issues
+
+
+def _cross_check(symbol, chosen, context, names, *, after: int) -> None:
+    """拿到结果之后，再问后面的源一遍，值对不上就告警。默认关。
+
+    collect() 和 compare() 这两个零件早就有了却没人调，等于白造；这里就是把它们
+    接进主链。源之间的口径差会在日志里当场暴露，而不是等到有人拿两台机器的报告
+    逐字比——创业板指成交量差 3.5% 那件事就是那么查出来的，花了几个钟头。
+
+    只问 ``after`` 之后的源：前面的已经试过且没给出结果，再问一遍纯属浪费。
+    整段包在 try 里——校验只是个观察点，它自己炸了不能把取数带下水。
+    """
+    if INTRADAY_QUOTE_CROSS_CHECK_PCT <= 0:
+        return
+    try:
+        for other in collect(symbol, context, order=tuple(names[after + 1:])):
+            issues = compare(chosen, other, tolerance_pct=INTRADAY_QUOTE_CROSS_CHECK_PCT)
+            if issues:
+                logger.warning(
+                    "盘中行情跨源不一致 symbol=%s 采用=%s 对照=%s %s",
+                    symbol, chosen.source, other.source, "；".join(issues),
+                )
+            else:
+                logger.debug(
+                    "盘中行情跨源一致 symbol=%s %s vs %s",
+                    symbol, chosen.source, other.source,
+                )
+    except Exception as error:  # 观察点不许把主链带下水
+        logger.debug("盘中行情跨源校验出错 symbol=%s: %s", symbol, error)
 
 
 # --- 内置来源 ---------------------------------------------------------------

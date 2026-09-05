@@ -3,6 +3,7 @@
 不联网：腾讯的响应用真实抓下来的报文做样本，页面来源用 fixture 里的真实页面。
 """
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -322,3 +323,85 @@ class TestAppendIntradayBar:
 
         frame = self._frame()
         assert append_intraday_bar(frame, None) is frame
+
+
+# --- 跨源交叉校验 -------------------------------------------------------------
+#
+# collect() 和 compare() 这两个零件早就有了却没人调，等于白造。接进 resolve()
+# 之后，源之间的口径差会在日志里当场暴露——创业板指成交量差 3.5% 那件事，
+# 是靠人工三方比对花了几个钟头才定位的。
+
+
+class _FixedQuote(iq.QuoteProvider):
+    def __init__(self, name, **fields):
+        self.name = name
+        self._quote = iq.IntradayQuote(symbol="SH600000", source=name, **fields)
+        self.calls = 0
+
+    def fetch(self, symbol, context):
+        self.calls += 1
+        return self._quote
+
+
+@pytest.fixture
+def two_disagreeing_sources(monkeypatch):
+    saved = dict(iq._PROVIDERS)
+    iq._PROVIDERS.clear()
+    a = _FixedQuote("a", last=10.0, open=10.0, high=10.0, low=10.0, volume_lots=100.0)
+    b = _FixedQuote("b", last=10.0, open=10.0, high=10.0, low=10.0, volume_lots=200.0)
+    iq.register(a)
+    iq.register(b)
+    monkeypatch.setenv("INTRADAY_QUOTE_PROVIDERS", "a,b")
+    yield a, b
+    iq._PROVIDERS.clear()
+    iq._PROVIDERS.update(saved)
+
+
+def test_cross_check_is_off_by_default(two_disagreeing_sources, monkeypatch, caplog):
+    """默认关：正常路径上问到第一个就停，不为诊断多付一次上游请求。"""
+    a, b = two_disagreeing_sources
+    monkeypatch.setattr(iq, "INTRADAY_QUOTE_CROSS_CHECK_PCT", 0.0)
+
+    with caplog.at_level(logging.WARNING, logger="qtf_mcp"):
+        assert iq.resolve("SH600000").source == "a"
+
+    assert b.calls == 0
+    assert "跨源不一致" not in caplog.text
+
+
+def test_cross_check_reports_a_disagreement(two_disagreeing_sources, monkeypatch, caplog):
+    a, b = two_disagreeing_sources
+    monkeypatch.setattr(iq, "INTRADAY_QUOTE_CROSS_CHECK_PCT", 1.0)
+
+    with caplog.at_level(logging.WARNING, logger="qtf_mcp"):
+        quote = iq.resolve("SH600000")
+
+    # 采用的仍然是第一个源，校验只是观察，不改选择。
+    assert quote.source == "a" and quote.volume_lots == 100.0
+    assert b.calls == 1
+    assert "跨源不一致" in caplog.text and "volume_lots" in caplog.text
+
+
+def test_cross_check_stays_quiet_when_sources_agree(monkeypatch, caplog):
+    saved = dict(iq._PROVIDERS)
+    iq._PROVIDERS.clear()
+    for name in ("a", "b"):
+        iq.register(_FixedQuote(name, last=10.0, volume_lots=100.0))
+    monkeypatch.setenv("INTRADAY_QUOTE_PROVIDERS", "a,b")
+    monkeypatch.setattr(iq, "INTRADAY_QUOTE_CROSS_CHECK_PCT", 1.0)
+    try:
+        with caplog.at_level(logging.WARNING, logger="qtf_mcp"):
+            iq.resolve("SH600000")
+        assert "跨源不一致" not in caplog.text
+    finally:
+        iq._PROVIDERS.clear()
+        iq._PROVIDERS.update(saved)
+
+
+def test_a_broken_cross_check_never_takes_down_the_fetch(two_disagreeing_sources, monkeypatch):
+    """校验是观察点，它自己炸了也不能影响取数。"""
+    a, b = two_disagreeing_sources
+    monkeypatch.setattr(iq, "INTRADAY_QUOTE_CROSS_CHECK_PCT", 1.0)
+    monkeypatch.setattr(b, "fetch", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    assert iq.resolve("SH600000").source == "a"

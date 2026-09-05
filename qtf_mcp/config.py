@@ -422,6 +422,20 @@ def resolve_http_mode(
         return "impersonate", "auto:proxy_gateway_missing"
     return "proxy", "auto:proxy_configured"
 
+# 盘中行情跨源交叉校验：拿到第一个可用报价之后，再问剩下的源一遍，超过这个百分比
+# 就打一条 WARNING。置 0 关闭（默认）。
+#
+# 默认关是因为它有明确代价：正常路径上 resolve() 问到第一个就停，开了之后每个标的
+# 要多问一次网络源。2026-09-05 那轮兜底走了 52 次，开着就是 +52 次上游请求。
+#
+# 什么时候值得开：怀疑某个源的口径不对的时候。真实例子——创业板指的成交量东财
+# 20046.25 万手、腾讯 19341.30 万手，差 3.5%，这件事是靠人工三方比对花了几个钟头
+# 才定位的；开着这个开关，日志里当场就有一行。
+INTRADAY_QUOTE_CROSS_CHECK_PCT = max(
+    0.0,
+    float(env("INTRADAY_QUOTE_CROSS_CHECK_PCT", "0")),
+)
+
 # Synchronous AkShare/efinance calls are I/O bound. Keep the executor bounded,
 # while allowing deployments to tune it for their upstream capacity.
 FETCH_MAX_WORKERS = max(1, int(env("FETCH_MAX_WORKERS", "8")))
