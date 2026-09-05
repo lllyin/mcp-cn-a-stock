@@ -106,14 +106,25 @@ FUND_FLOW_PAGE_FALLBACK_ENABLED = _parse_bool(
 # 并发不降获取率——风控没有因为同一出口 IP 并发而加严，所以"不敢并发"这个顾虑
 # 不成立。4 不取：获取率没涨、单次加载反而变慢、内存最贵。
 #
-# 取 2 正好等于 BROWSER_PAGE_CONCURRENCY 的默认值，也就是兜底可以用满浏览器。
-# 原先刻意留成 1 是为了不挤掉没有替代来源的盘中实时路径，那个顾虑仍然成立，但
-# 实时路径有 FUND_FLOW_PAGE_REUSE_SECONDS 的结果复用和页面级单飞兜着，而资金流
-# 缺一段是没法补的。要恢复"给实时路径留一个名额"，把 BROWSER_PAGE_CONCURRENCY
-# 提到 3——代价见那一项的注释。
+# 2026-09-05 部署机实测把它推到 3：那一轮 5 次丢失**全部**是"名额已满"，一次
+# 上游拒绝都没有（29 次页面加载 29 次成功、零被拒零验证码），也就是说剩下的损失
+# 纯粹是容量问题。用日志里的占用区间做离散事件回放：
+#
+#   名额  争用批次里服务到的标的数
+#     2   7/11    ← 与实测吻合
+#     3   9/11    多救回 2 个
+#     4   11/11   多救回 4 个
+#
+# 机制是 可服务数 ≈ 名额 × ⌈等待上限/持有时长⌉，服务器上持有时长 p50 2.32s、
+# 等待上限 3s，所以每个名额大致只够服务两个标的。
+#
+# 取 3 不取 4：4 要把浏览器页面上限也推到 4，多两个并发渲染进程，而 §二 的
+# 500 MiB 判定还没在 Ubuntu 上复测过；3 只多一个，且能把 5 次丢失里的 2 次补回来。
+# 必须和 BROWSER_PAGE_CONCURRENCY 一起提——只提这一个，浏览器信号量会立刻变成
+# 新的瓶颈，收益为零。
 FUND_FLOW_PAGE_FALLBACK_CONCURRENCY = max(
     1,
-    int(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_CONCURRENCY", "2")),
+    int(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_CONCURRENCY", "3")),
 )
 # 单个标的等一个名额的上限。
 #
@@ -312,14 +323,19 @@ FUND_FLOW_PAGE_REUSE_SECONDS = max(
 #        -> 4 页   +85 MiB
 #   全部关闭后回落到 +25.9 MiB,不漏
 #
-# 保持 2 不动。提到 3 可以给盘中实时路径留一个不被兜底占满的名额（见
-# FUND_FLOW_PAGE_FALLBACK_CONCURRENCY 的注释）,但要多付约 130 MiB,而 §二 的
-# 500 MiB 判定还没在 Ubuntu 上按项目既有口径复测过——macOS 的 RSS 会把共享框架页
-# 在每个进程里重复计入,数值偏高,不能拿来下结论。所以先不花这份预算:兜底并发
-# 提到 2 已经拿到了实测的收益（最慢一批 12.6s -> 4.6s）,而峰值页面数与改动前一样。
+# 2026-09-05 随 FUND_FLOW_PAGE_FALLBACK_CONCURRENCY 一起从 2 提到 3。两者必须
+# 一起动：兜底名额和这个上限是串联的两道闸门，只提其中一个，另一个立刻变成新的
+# 瓶颈，收益为零。收益的量化见那一项的注释（争用批次里多服务 2 个标的）。
+#
+# 代价是多一个并发渲染进程，按上表的边际值约 +130 MiB。这个数是 macOS RSS，会把
+# 共享框架页在每个进程里重复计入，偏高；Ubuntu 上的真实峰值仍需按项目口径复测。
+# scripts/verify_release.py 的性能一节现在会打印进程树峰值 RSS，就是为了让这次
+# 上调的代价能在部署机上直接读出来，而不是靠推断。
+#
+# 不再往上提到 4：那要多两个渲染进程，而 §二 的 500 MiB 判定还没清。
 BROWSER_PAGE_CONCURRENCY = max(
     1,
-    int(os.getenv("CN_STOCK_BROWSER_PAGE_CONCURRENCY", "2")),
+    int(os.getenv("CN_STOCK_BROWSER_PAGE_CONCURRENCY", "3")),
 )
 
 # 多久没人用就把浏览器整个拆掉,秒。置 0 关闭空闲回收。
