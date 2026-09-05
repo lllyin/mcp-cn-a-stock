@@ -995,22 +995,60 @@ async def kline_range(
   return report
 
 
+#: 报告脚注的固定格式。两行，各自只回答一个问题：
+#:   口径 —— 这份数是什么、从哪来，读数之前必须知道的
+#:   备注 —— 这份数有什么不对劲，只在真有事时才出现
+#: 之所以定死格式：脚注是唯一能追溯"这个数字凭什么"的地方，每次换个写法就等于
+#: 每次都要重新读一遍。原先写的是"⚠️ 这一份来自降级源"，说了降级但没说是哪天的、
+#: 哪个源、覆盖多少——追溯不了。
+_SECTOR_SCOPE_LINE = "- 口径：{as_of} | {period} | 覆盖 {coverage} | 数据源：{source}"
+_SECTOR_NOTE_LINE = "- 备注：{notes}"
+
+_SECTOR_NAMES = {"industry": "行业", "concept": "概念", "region": "地域"}
+#: 口径的中文名。**不用"今日"**——周末查出来的"今日"配着上一个交易日的数，
+#: 读的人无从判断是哪天。日期由 as_of 单独给，这里只说窗口有多长。
+_SECTOR_PERIODS = {"today": "当日", "5d": "近5日", "10d": "近10日"}
+_LEVEL_NAMES = {1: "一级", 2: "二级", 3: "三级"}
+#: 分类标准的中文名。scheme 存的是机器标识（和 source 一样），报告里要写人话。
+_SCHEME_NAMES = {"shenwan": "申万"}
+
+
 def _render_sector_fund_flow(board, top: int) -> str:
   """把板块资金流渲染成报告。
 
-  返回 Markdown 而不是 JSON，是因为这一维的用途是"今天哪个方向在被买"——调用方
-  拿到之后是要转述的，和 brief/medium/full 同一类。金额在这里折成亿，调用方不用
-  再换算。（要精确数值的场景走 tech 那种 JSON 工具，两类分开。）
+  返回 Markdown 而不是 JSON，是因为这一维的用途是"哪个方向在被买"——调用方拿到
+  之后是要转述的，和 brief/medium/full 同一类。金额在这里折成亿，调用方不用再换算。
+  （要精确数值的场景走 tech 那种 JSON 工具，两类分开。）
+
+  **只排同一层。** 东财的行业板块是一棵树摊平的名单，直接取 Top N 会把父子一起排
+  进来：2026-09-05 实测，电子 -817.95亿 和它的子板块 半导体 -602.46亿 各占一格，
+  十行里没有十个独立的板块。层级由 sector_taxonomy 补，补不到就如实说。
   """
+  from .datasource.sector_taxonomy import TOP_LEVEL
   from .research import format_fund_flow_amount
 
-  names = {"industry": "行业", "concept": "概念", "region": "地域"}
-  periods = {"today": "今日", "5d": "5日", "10d": "10日"}
-  buf = StringIO()
-  print(f"# {names.get(board.sector_type, board.sector_type)}板块资金流"
-        f"（{periods.get(board.period, board.period)}）\n", file=buf)
+  kind = _SECTOR_NAMES.get(board.sector_type, board.sector_type)
+  period = _SECTOR_PERIODS.get(board.period, board.period)
+  as_of = f"{board.as_of:%Y-%m-%d}" if board.as_of else "日期未知"
 
-  ranked = sorted(board.sectors, key=lambda s: (s.main_net is None, -(s.main_net or 0)))
+  buf = StringIO()
+  print(f"# {kind}板块资金流（{as_of} · {period}）\n", file=buf)
+
+  # 排名的范围：分得出层级就只排最粗的那一层，分不出就全排并在备注里说明。
+  notes = []
+  pool = board.at_level(TOP_LEVEL) if board.levels_known else ()
+  if pool:
+    scheme = _SCHEME_NAMES.get(board.level_scheme, board.level_scheme or "未注明")
+    coverage = (f"{len(pool)} 个{scheme}{_LEVEL_NAMES.get(TOP_LEVEL, TOP_LEVEL)}{kind}"
+                f"（源共 {len(board.sectors)} 个，其余为更细的分级）")
+  else:
+    pool = board.sectors
+    coverage = f"{len(board.sectors)} 个{kind}板块"
+    if board.levels_applicable:
+      # 行业本来是有层级的，这次没分出来——榜上可能父子同时在，得说。
+      notes.append("分级表取不到，父子板块可能同时在榜、同一笔钱数两遍")
+
+  ranked = sorted(pool, key=lambda s: (s.main_net is None, -(s.main_net or 0)))
   inflow = [s for s in ranked if (s.main_net or 0) > 0][:top]
   outflow = [s for s in reversed(ranked) if (s.main_net or 0) < 0][:top]
 
@@ -1036,11 +1074,12 @@ def _render_sector_fund_flow(board, top: int) -> str:
         print(f"| {item.name} | {format_fund_flow_amount(item.main_net)} |", file=buf)
     print("", file=buf)
 
-  print(f"- 口径：{periods.get(board.period, board.period)}"
-        f" | 覆盖 {len(board.sectors)} 个{names.get(board.sector_type, '')}板块"
-        f" | 来源：{board.source}", file=buf)
+  print(_SECTOR_SCOPE_LINE.format(
+      as_of=as_of, period=period, coverage=coverage, source=board.source or "未知"), file=buf)
   if board.partial:
-    print("- ⚠️ 这一份来自降级源，只有主力净额；涨跌幅和四档明细取不到。", file=buf)
+    notes.append("降级源，只有主力净额，涨跌幅和四档明细取不到")
+  if notes:
+    print(_SECTOR_NOTE_LINE.format(notes="；".join(notes)), file=buf)
   return buf.getvalue()
 
 
@@ -1083,13 +1122,21 @@ async def sector_fund_flow(
   if board is None:
     logger.warning("板块资金流取数失败 sector_type=%s period=%s status=%s",
                    sector_type, period, status)
-    return (f"暂时取不到{sector_type}板块的资金流数据。"
-            f"上游状态：{status or '无'}")
+    # 状态字典是给日志的，不是给人的。这里翻成一句能照着做的话：全部平台都不支持
+    # 这个组合，就是覆盖缺口（例如 5日/10日 只有主源能给）；其余是上游没给出结果。
+    unsupported = all(key.endswith("_unsupported") for key in status) if status else False
+    reason = ("没有数据源支持这个组合（可换 period=today 再试）" if unsupported
+              else "上游暂时没有给出结果")
+    return f"取不到{_SECTOR_NAMES.get(sector_type, sector_type)}板块的资金流：{reason}。"
   report = _render_sector_fund_flow(board, top)
-  logger.info("Finished sector_fund_flow sector_type=%s period=%s source=%s "
-              "sectors=%s elapsed=%.3fs",
-              sector_type, period, board.source, len(board.sectors),
-              time.perf_counter() - started_at)
+  # 日志和报告脚注对齐：同样先说是哪天的、哪个源、覆盖多少，再说降级与否。
+  # 出问题时报告和日志能直接对上，不用在两套措辞之间做翻译。
+  logger.info(
+      "Finished sector_fund_flow sector_type=%s period=%s as_of=%s source=%s "
+      "sectors=%s ranked=%s partial=%s elapsed=%.3fs",
+      sector_type, period, board.as_of, board.source, len(board.sectors),
+      len(board.at_level(1)) if board.levels_known else "未分级",
+      int(board.partial), time.perf_counter() - started_at)
   return report
 
 

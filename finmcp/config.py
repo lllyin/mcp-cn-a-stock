@@ -443,6 +443,13 @@ TRADING_CALENDAR_TTL_SECONDS = max(
     float(env("TRADING_CALENDAR_TTL_SECONDS", "86400")),
 )
 
+# 板块分级表的进程内缓存时长。行业分类一年动一两次，一天刷一次绰绰有余；
+# 取一次实测 31+131 行、约 2.4s，缓存住之后对每次查询是零成本。
+SECTOR_TAXONOMY_TTL_SECONDS = max(
+    0.0,
+    float(env("SECTOR_TAXONOMY_TTL_SECONDS", "86400")),
+)
+
 # Synchronous AkShare/efinance calls are I/O bound. Keep the executor bounded,
 # while allowing deployments to tune it for their upstream capacity.
 FETCH_MAX_WORKERS = max(1, int(env("FETCH_MAX_WORKERS", "8")))
