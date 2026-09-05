@@ -16,7 +16,6 @@ from qtf_mcp.datasource.cn_stock_source import CNStockDataSource
 from qtf_mcp.datasource.base import DataSource, FetchRequirements, StockData
 from qtf_mcp import datafeed
 
-
 def _sample_kline_frame():
     return pd.DataFrame(
         [
@@ -301,8 +300,8 @@ def test_simple_kline_skips_unadjusted_copy(monkeypatch):
 
 
 def _tencent_kline(code, start_date, end_date, adjust, symbol=None):
-    """直接问腾讯这个 provider 要一段行情，绕开编排层。"""
-    return kline_source.provider("tencent").fetch(
+    """直接问腾讯这个平台要一段行情，绕开编排层。"""
+    return kline_source.provider("tencent").fetch_kline(
         kline_source.KlineRequest(
             code=code, start_date=start_date, end_date=end_date,
             adjust=adjust, symbol=symbol,
@@ -311,8 +310,8 @@ def _tencent_kline(code, start_date, end_date, adjust, symbol=None):
 
 
 def _stub_tencent_provider(monkeypatch, fetch):
-    """把腾讯这个源换成假的。接缝在 provider 上，不在编排层。"""
-    monkeypatch.setattr(kline_source.provider("tencent"), "fetch", fetch)
+    """把腾讯这个平台换成假的。接缝在平台的能力方法上，不在编排层。"""
+    monkeypatch.setattr(kline_source.provider("tencent"), "fetch_kline", fetch)
 
 
 def test_simple_kline_uses_tencent_fallback_after_provider_failure(monkeypatch):
