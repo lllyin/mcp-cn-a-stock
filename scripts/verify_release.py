@@ -660,6 +660,46 @@ class KnownDifference:
     document: str = ".*"
 
 
+@dataclass(frozen=True)
+class PendingDisagreement:
+    """一处已经发现、但还没裁决的跨源分歧。
+
+    和 ``KNOWN_DIFFERENCES`` 分开是有意的：那份是"已核实、可以忽略"，这份是
+    "看见了、还不知道谁对"。混在一起的话，前者会把后者盖掉——一处没查清的分歧
+    被当成已知差异放行，就再也没人回头看它了。
+
+    ``verdict`` 空着表示待裁决；裁决完要么搬进 KNOWN_DIFFERENCES（可忽略），
+    要么改代码（择优），然后从这里删掉。
+    """
+
+    what: str          # 哪个标的的哪个字段
+    values: str        # 各源分别是多少
+    gap: str           # 相对差
+    found: str         # 发现日期
+    verdict: str = ""  # 裁决结论；空 = 待裁决
+
+
+#: 跨源分歧登记处。发现一处记一处，别直接下判断——判据往往不在代码里，
+#: 得拿券商行情或第三方去核对。
+PENDING_DISAGREEMENTS = (
+    PendingDisagreement(
+        what="SZ399006 创业板指 · 成交量/成交额（全部周期）",
+        values="东财/同花顺 200,462,510 手 · 5036.48亿；腾讯/新浪 193,413,042 手 · 4998.09亿",
+        gap="量 3.52%，额 0.76%",
+        found="2026-09-05",
+        verdict="同花顺定案，东财对。指数改走 KLINE_PROVIDERS_INDEX（同花顺优先）",
+    ),
+    PendingDisagreement(
+        what="SZ000333 美的 · MA60/MA120/MA240（前复权）",
+        values="券商(同花顺+平安) 82.23/78.73/76.03；同花顺 82.229/78.734/76.026；"
+               "腾讯/东财 82.242/78.780/76.091",
+        gap="0.015% ~ 0.080%",
+        found="2026-09-05",
+        verdict="准的是同花顺，但量级可忽略；个股这一条按稳定性排，仍让腾讯优先",
+    ),
+)
+
+
 KNOWN_DIFFERENCES = (
     KnownDifference(
         # kline 的文档名是"（正文）"，K线数据那个标题在 key 的段落部分里，所以
@@ -970,6 +1010,7 @@ LOG_SIGNALS: tuple[tuple[str, str, str], ...] = (
     ),
     (r"历史行情字段不完整", "存疑", "兜底源缺字段"),
     (r"盘中行情来源 (\S+) 取数失败", "回退", "盘中行情来源失败，换下一个"),
+    (r"盘中行情跨源不一致", "跨源不一致", "两个源对同一字段给出的值超出容差，见「跨源分歧待裁决」"),
     (r"资金流向页面兜底成功 (\S+) rows=(\d+)", "回退", "资金流走了浏览器页面兜底"),
     (r"资金流向页面兜底跳过", "跳过", "资金流兜底没跑，原因见样例（熔断/名额满/无此页面）"),
     (r"资金流向页面兜底失败", "回退失败", "浏览器兜底也没拿到"),
@@ -1109,6 +1150,73 @@ def _scan_diagnostics(path: Path, since: dt.datetime) -> dict:
             events.append((stamp, "熔断关闭", src.group(1) if src else "", 0.0))
     out["events"] = events
     return out
+
+
+def _env_number(name: str, default: float) -> float:
+    """从环境变量或 .env 读一个数。脚本独立跑，读不到就用默认值。"""
+    raw = os.getenv(name)
+    if raw is None:
+        env_file = PROJECT_ROOT / ".env"
+        if env_file.exists():
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if stripped.startswith(f"{name}="):
+                    raw = stripped.split("=", 1)[1].strip()
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _render_disagreements(scan: "LogScan") -> list[str]:
+    """跨源分歧待裁决。
+
+    两个来源：登记在 ``PENDING_DISAGREEMENTS`` 里的（人工发现、等裁决），以及本次
+    运行日志里的跨源校验告警（``INTRADAY_QUOTE_CROSS_CHECK_PCT`` 打开时才有）。
+
+    这一节**不进可用率**：一处分歧不代表数据缺了，它代表"有两个说法、还没定谁对"。
+    把它算进分数会逼着人为了绿而草率裁决，那正好是反的。
+    """
+    # 从 .env 读而不是 import qtf_mcp：这个脚本是独立跑的，不在包的搜索路径上；
+    # 而且它验的是**服务**的配置，服务读的就是 .env。
+    tolerance = _env_number("INTRADAY_QUOTE_CROSS_CHECK_PCT", 0.0)
+
+    lines = ["## 跨源分歧待裁决", ""]
+    lines.append("> 和「已知差异」分开：那份是已核实、可以忽略的；这份是看见了、"
+                 "还不知道谁对。混在一起的话，一处没查清的分歧会被当成已知差异放行，"
+                 "然后再没人回头看它。裁决完要么搬进 KNOWN_DIFFERENCES，要么改代码，"
+                 "然后从登记处删掉。")
+    lines.append("")
+
+    pending = [d for d in PENDING_DISAGREEMENTS if not d.verdict]
+    settled = [d for d in PENDING_DISAGREEMENTS if d.verdict]
+
+    lines.append("| 状态 | 标的 · 字段 | 各源取值 | 相对差 | 发现 | 裁决 |")
+    lines.append("| --- | --- | --- | ---: | --- | --- |")
+    for item in pending + settled:
+        mark = "⏳ 待裁决" if not item.verdict else "✅ 已裁决"
+        lines.append(f"| {mark} | {item.what} | {item.values} | {item.gap} "
+                     f"| {item.found} | {item.verdict or '—'} |")
+    lines.append("")
+
+    # 本次运行的实时跨源校验
+    hits = []
+    if scan.available:
+        for sample in (scan.signals.get("跨源不一致") or []):
+            hits.append(sample)
+    if tolerance <= 0:
+        lines.append("- 盘中行情的跨源校验**没开**（`INTRADAY_QUOTE_CROSS_CHECK_PCT=0`），"
+                     "所以这一节没有本次运行的新发现——是没在看，不是没有分歧。"
+                     "怀疑某个源口径不对时把它调成 1 再跑一轮。")
+    elif hits:
+        lines.append(f"- 本次运行发现 {len(hits)} 处实时行情跨源不一致：")
+        for sample in hits[:5]:
+            lines.append(f"  - `{sample[:160]}`")
+    else:
+        lines.append(f"- 本次运行开着跨源校验（容差 {tolerance}%），"
+                     "没有超出容差的字段。")
+    lines.append("")
+    return lines
 
 
 def _render_diagnostics(scan: "LogScan") -> list[str]:
@@ -1878,15 +1986,19 @@ def render_report(
         all_calls = [result for result, _, _ in probes]
         all_calls += [r for _, r, _ in regressions if r is not None]
         section = _render_performance(watch, all_calls)
-        # 编号跟着走：性能第六、诊断第七、说明第八。
+        # 编号跟着走：性能第六、分歧第七、诊断第八、说明第九。
         section[0] = "## 六、性能：耗时与内存"
         lines.extend(section)
 
+    disagreements = _render_disagreements(scan)
+    disagreements[0] = f"## {'七' if watch is not None else '五'}、跨源分歧待裁决"
+    lines.extend(disagreements)
+
     diagnostics = _render_diagnostics(scan)
-    diagnostics[0] = "## 七、诊断：时间花在哪、闸门拦了什么"
+    diagnostics[0] = f"## {'八' if watch is not None else '六'}、诊断：时间花在哪、闸门拦了什么"
     lines.extend(diagnostics)
 
-    lines.append("## 八、怎么看这份报告" if watch is not None else "## 六、怎么看这份报告")
+    lines.append("## 九、怎么看这份报告" if watch is not None else "## 七、怎么看这份报告")
     lines.append("")
     lines.append("**一份报告，两个部分**")
     lines.append("")
