@@ -137,17 +137,116 @@ def _with_levels(board: SectorFundFlowBoard) -> SectorFundFlowBoard:
     )
 
 
+# ── 缓存 ────────────────────────────────────────────────────────
+#
+# 缓存的是**上游那份 board**，不是渲染好的报告。理由是 key 空间：``top``(1-50) 和
+# ``level``(1-2) 只影响渲染，按报告缓存就是 3 类 × 3 口径 × 50 × 2 = 900 个 key，
+# 会把 512 条的上限撑爆、连带挤掉个股报告的条目。按 (类型, 口径) 缓存只有 9 个。
+# 渲染是纯计算，每次重做的代价可以忽略。
+#
+# 复用 ReportCache 而不是自己开一个字典，图的是三样现成的东西：市场纪元（非交易日
+# 一个纪元长达 64 小时）、盘中 TTL、以及 ``REPORT_CACHE_ENABLED=0`` 能一起关掉——
+# 少了最后这条，prove_equivalence.py 的"关掉缓存再比对"就又变成假的了。
+
+
+def _payload(board: SectorFundFlowBoard) -> dict:
+    """board → 可 JSON 化的字典（磁盘层要）。"""
+    return {
+        "sectors": [dataclasses.asdict(s) for s in board.sectors],
+        "sector_type": board.sector_type,
+        "period": board.period,
+        "source": board.source,
+        "partial": board.partial,
+        "as_of": board.as_of.isoformat() if board.as_of else None,
+        "level_scheme": board.level_scheme,
+        "levels_applicable": board.levels_applicable,
+    }
+
+
+def _from_payload(payload) -> Optional[SectorFundFlowBoard]:
+    """字典 → board。形状不对就当作没缓存过——旧版本写下的条目不该让这次查询挂掉。"""
+    if not isinstance(payload, dict) or not payload.get("sectors"):
+        return None
+    try:
+        as_of = payload.get("as_of")
+        return SectorFundFlowBoard(
+            sectors=tuple(SectorFlow(**s) for s in payload["sectors"]),
+            sector_type=payload["sector_type"],
+            period=payload["period"],
+            source=payload.get("source", ""),
+            partial=bool(payload.get("partial")),
+            as_of=datetime.date.fromisoformat(as_of) if as_of else None,
+            level_scheme=payload.get("level_scheme", ""),
+            levels_applicable=bool(payload.get("levels_applicable")),
+        )
+    except (TypeError, ValueError, KeyError):
+        logger.debug("板块资金流缓存条目形状不对，忽略", exc_info=True)
+        return None
+
+
+def _cache_key(request: SectorFundFlowRequest):
+    from ..cache import build_key
+
+    return build_key("sector_fund_flow", request.sector_type,
+                     {"period": request.period})
+
+
+# ── 熔断 ────────────────────────────────────────────────────────
+#
+# 主源（push2）挂掉时必须有人拦一下，否则每次调用都要先付一遍它的超时。这一层
+# 尤其需要：降级源的结果按设计**不进缓存**（缓住就是整个纪元只有两列），所以没有
+# 熔断就是每次调用都重试一遍死掉的主源。
+#
+# 只给主源装，降级源不装：装了也只是把"少两列"变成"整层没有"，换不到东西——
+# 和 cn_stock_source 里"K 线装、资金流接口不装"是同一条判据。
+
+_breakers: dict = {}
+
+
+def _breaker_for(name: str):
+    from .cn_stock_source import SourceBreaker
+    from ..config import SOURCE_BREAKER_COOLDOWN_SECONDS, SOURCE_BREAKER_OPEN_AFTER_FAILURES
+
+    if name != "eastmoney":
+        return None
+    breaker = _breakers.get(name)
+    if breaker is None:
+        breaker = _breakers[name] = SourceBreaker(
+            f"{name}_sector_fund_flow",
+            SOURCE_BREAKER_OPEN_AFTER_FAILURES,
+            SOURCE_BREAKER_COOLDOWN_SECONDS,
+        )
+    return breaker
+
+
 def resolve(request: SectorFundFlowRequest, *, order: Optional[tuple] = None,
             status: Optional[dict] = None) -> Optional[SectorFundFlowBoard]:
+    from ..cache import get_report_cache
+
+    cache = get_report_cache()
+    key = _cache_key(request)
+    cached = _from_payload(cache.get(key)) if cache is not None else None
+    if cached is not None:
+        logger.debug("板块资金流命中缓存 sector_type=%s period=%s 纪元=%s",
+                     request.sector_type, request.period, key.epoch)
+        return cached
+
     resolved = pf.resolve(
         CAPABILITY, request,
         order=configured_order() if order is None else order,
         status=status,
+        breaker_for=_breaker_for,
     )
     if resolved is None:
         return None
-    board = dataclasses.replace(resolved.value, as_of=_as_of())
-    return _with_levels(board)
+    board = _with_levels(dataclasses.replace(resolved.value, as_of=_as_of()))
+
+    # 降级源的结果不进缓存。它字段少一半，而非交易日一个纪元长达 64 小时——缓住
+    # 就是整个周末都只有两列，哪怕主源十秒后就恢复了。不缓的代价是下次重试一遍
+    # 主源，正是想要的行为。同 is_cacheable_report 的道理：别把一次瞬时降级腌起来。
+    if cache is not None and not board.partial:
+        cache.put(key, _payload(board))
+    return board
 
 
 __all__ = [

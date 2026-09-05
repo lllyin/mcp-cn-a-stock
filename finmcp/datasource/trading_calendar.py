@@ -110,15 +110,16 @@ def load(*, force: bool = False) -> Optional[Calendar]:
     它挂了不该让报告挂掉。
     """
     global _cached, _cached_at
+    # 取数在锁内：冷进程上并发进来的几个调用只取一份日历，而不是各取一份。
+    # 挡在锁上的那几个反正都在等这同一份数据。
     with _lock:
         if not force and _cached is not None and _now() - _cached_at < TRADING_CALENDAR_TTL_SECONDS:
             return _cached
-    order = pf.configured_order(CAPABILITY, PROVIDER_ORDER_ENV, DEFAULT_PROVIDER_ORDER)
-    resolved = pf.resolve(CAPABILITY, CalendarRequest(), order=order)
-    calendar = resolved.value if resolved is not None else None
-    if calendar is not None and not calendar.days and calendar.source != "weekday":
-        calendar = None
-    with _lock:
+        order = pf.configured_order(CAPABILITY, PROVIDER_ORDER_ENV, DEFAULT_PROVIDER_ORDER)
+        resolved = pf.resolve(CAPABILITY, CalendarRequest(), order=order)
+        calendar = resolved.value if resolved is not None else None
+        if calendar is not None and not calendar.days and calendar.source != "weekday":
+            calendar = None
         _cached, _cached_at = calendar, _now()
     if calendar is not None:
         logger.debug(

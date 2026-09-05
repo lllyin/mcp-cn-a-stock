@@ -213,3 +213,147 @@ def test_the_scope_line_has_a_fixed_shape():
     line = next(l for l in _render_sector_fund_flow(_board(), top=2).splitlines()
                 if l.startswith("- 口径："))
     assert line == "- 口径：2026-09-04 | 当日 | 覆盖 3 个行业板块 | 数据源：eastmoney"
+
+
+# --- 缓存 -------------------------------------------------------------------
+#
+# 缓存的是上游那份 board，不是渲染结果——top/level 只影响渲染，按报告缓存会有
+# 900 个 key，把 512 条的上限撑爆。
+
+
+@pytest.fixture
+def live_cache(monkeypatch):
+    """开一份真缓存。conftest 默认把缓存关掉了，这几条要的正是它开着的行为。"""
+    from finmcp import cache as cache_module
+
+    cache = cache_module.ReportCache(enabled=True, disk_enabled=False, live_ttl_seconds=60)
+    cache_module.set_report_cache(cache)
+    yield cache
+    cache_module.set_report_cache(
+        cache_module.ReportCache(enabled=False, disk_enabled=False))
+
+
+def _stub_platform(monkeypatch, calls, *, partial=False):
+    """记账用的假平台，数一共问了上游几次。"""
+    class Counting(pf.Platform):
+        name = label = "counting"
+        capabilities = frozenset({sff.CAPABILITY})
+
+        def fetch_sector_fund_flow(self, request):
+            calls.append((request.sector_type, request.period))
+            return sff.SectorFundFlowBoard(
+                sectors=(sff.SectorFlow(name="传媒", main_net=1e9),),
+                sector_type=request.sector_type, period=request.period,
+                source=self.name, partial=partial,
+            )
+
+    pf.register(Counting(), replace=True)
+    monkeypatch.setenv("SECTOR_FUND_FLOW_PROVIDERS", "counting")
+    monkeypatch.setenv("SECTOR_TAXONOMY_PROVIDERS", "off")
+    return lambda: pf.unregister("counting")
+
+
+def test_a_repeat_query_does_not_hit_upstream_again(monkeypatch, live_cache):
+    calls: list = []
+    cleanup = _stub_platform(monkeypatch, calls)
+    try:
+        first = sff.resolve(sff.SectorFundFlowRequest())
+        second = sff.resolve(sff.SectorFundFlowRequest())
+        assert len(calls) == 1, "第二次应该命中缓存，不该再问上游"
+        assert second is not None and second.sectors == first.sectors
+        assert second.as_of == first.as_of
+    finally:
+        cleanup()
+
+
+def test_different_periods_do_not_share_an_entry(monkeypatch, live_cache):
+    """口径进 key，否则 5 日会读到当日的数——正是上一个 bug 的形状。"""
+    calls: list = []
+    cleanup = _stub_platform(monkeypatch, calls)
+    try:
+        for period in ("today", "5d", "10d"):
+            sff.resolve(sff.SectorFundFlowRequest(period=period))
+        assert [c[1] for c in calls] == ["today", "5d", "10d"]
+    finally:
+        cleanup()
+
+
+def test_a_degraded_result_is_never_cached(monkeypatch, live_cache):
+    """非交易日一个纪元长达 64 小时，缓住降级源就是整个周末都只有两列。
+
+    不缓的代价是下次重试一遍主源——正是想要的：主源一恢复就能拿到全字段。
+    """
+    calls: list = []
+    cleanup = _stub_platform(monkeypatch, calls, partial=True)
+    try:
+        sff.resolve(sff.SectorFundFlowRequest())
+        sff.resolve(sff.SectorFundFlowRequest())
+        assert len(calls) == 2
+    finally:
+        cleanup()
+
+
+def test_the_cache_switch_turns_this_off_too(monkeypatch):
+    """REPORT_CACHE_ENABLED=0 必须把这一层也关掉，否则等价性证明是假的。"""
+    calls: list = []
+    cleanup = _stub_platform(monkeypatch, calls)
+    try:
+        sff.resolve(sff.SectorFundFlowRequest())
+        sff.resolve(sff.SectorFundFlowRequest())
+        assert len(calls) == 2
+    finally:
+        cleanup()
+
+
+def test_a_corrupt_cache_entry_is_ignored_not_fatal(live_cache):
+    """旧版本写下的条目形状可能不一样，不该让这次查询挂掉。"""
+    assert sff._from_payload({"sectors": [{"没有这个字段": 1}]}) is None
+    assert sff._from_payload({}) is None
+    assert sff._from_payload("不是字典") is None
+
+
+def test_only_the_primary_source_gets_a_breaker():
+    """降级源不装熔断：装了只是把"少两列"变成"整层没有"，换不到东西。"""
+    assert sff._breaker_for("eastmoney") is not None
+    assert sff._breaker_for("eastmoney_dataapi") is None
+
+
+def test_the_breaker_skips_a_dead_primary(monkeypatch):
+    """主源挂了要拦住，否则每次调用都先付一遍它的超时。
+
+    这一层格外需要：降级源的结果按设计不进缓存，没有熔断就是每次都重试死主源。
+    """
+    dead: list = []
+
+    class Dead(pf.Platform):
+        name, label = "eastmoney", "东财"
+        capabilities = frozenset({sff.CAPABILITY})
+
+        def fetch_sector_fund_flow(self, request):
+            dead.append(1)
+            raise ConnectionError("push2 不通")
+
+    class Backup(pf.Platform):
+        name, label = "eastmoney_dataapi", "东财(dataapi)"
+        capabilities = frozenset({sff.CAPABILITY})
+
+        def fetch_sector_fund_flow(self, request):
+            return sff.SectorFundFlowBoard(
+                sectors=(sff.SectorFlow(name="传媒", main_net=1e9),),
+                sector_type=request.sector_type, period=request.period,
+                source=self.name, partial=True)
+
+    real_dead, real_backup = pf.get("eastmoney"), pf.get("eastmoney_dataapi")
+    sff._breakers.clear()
+    pf.register(Dead(), replace=True)
+    pf.register(Backup(), replace=True)
+    monkeypatch.setenv("SECTOR_TAXONOMY_PROVIDERS", "off")
+    try:
+        for _ in range(6):
+            assert sff.resolve(sff.SectorFundFlowRequest()) is not None
+        # 阈值 3 次之后就该跳过，不该 6 次全打
+        assert len(dead) < 6, f"死掉的主源被打了 {len(dead)} 次，熔断没生效"
+    finally:
+        sff._breakers.clear()
+        pf.register(real_dead, replace=True)
+        pf.register(real_backup, replace=True)

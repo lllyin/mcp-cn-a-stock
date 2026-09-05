@@ -101,18 +101,21 @@ def load(sector_type: str = "industry", *, force: bool = False) -> Optional[Sect
     取不到返回 None，调用方按"分不出层级"处理。这一层不抛异常——分级是给排名用的
     辅助信息，它挂了不该让板块资金流整个查不出来。
     """
-    now = time.monotonic()
+    # 取数在锁内。之前放在锁外，冷进程上并发两次调用就取两份申万分类（日志里
+    # 两行"板块分级"）——同一份数据取 N 遍，白付 N 倍上游请求。挡在锁上的那几个
+    # 反正也要等这份数据，等一次比各取一次便宜。
     with _lock:
         entry = _cached.get(sector_type)
-        if not force and entry is not None and now - entry[1] < SECTOR_TAXONOMY_TTL_SECONDS:
+        if not force and entry is not None and \
+                time.monotonic() - entry[1] < SECTOR_TAXONOMY_TTL_SECONDS:
             return entry[0]
 
-    order = pf.configured_order(CAPABILITY, PROVIDER_ORDER_ENV, DEFAULT_PROVIDER_ORDER)
-    resolved = pf.resolve(CAPABILITY, SectorTaxonomyRequest(sector_type=sector_type), order=order)
-    taxonomy = resolved.value if resolved is not None else None
-
-    with _lock:
+        order = pf.configured_order(CAPABILITY, PROVIDER_ORDER_ENV, DEFAULT_PROVIDER_ORDER)
+        resolved = pf.resolve(
+            CAPABILITY, SectorTaxonomyRequest(sector_type=sector_type), order=order)
+        taxonomy = resolved.value if resolved is not None else None
         _cached[sector_type] = (taxonomy, time.monotonic())
+
     if taxonomy is not None:
         logger.debug("板块分级 sector_type=%s 标准=%s 覆盖=%s 个",
                      sector_type, taxonomy.scheme, len(taxonomy.levels))
