@@ -1630,7 +1630,7 @@ def render_report(
 
     lines.append("# 上线数据验证报告")
     lines.append("")
-    lines.append(f"## 结论：{score.verdict}　可用率 **{score.overall:.0f}%**")
+    lines.append(f"## 结论：可用率 **{score.overall:.0f}%**　{score.verdict}")
     lines.append("")
     lines.append("| 指标 | 分数 | 明细 |")
     lines.append("| --- | ---: | --- |")
@@ -1917,7 +1917,9 @@ def render_report(
                  "`verification/baseline/`，文件名不限，脚本按文件里的「命令：」那一行"
                  "反解调用；选基线的规则见该目录下的 README。")
     lines.append("")
-    return "\n".join(lines), failed, score.verdict
+    # 第三个返回值给控制台用，和报告标题同一句式：先分数、再定性。
+    # 控制台常常是唯一被看到的输出，只给"有降级"而不给分数，等于要人去翻文件。
+    return "\n".join(lines), failed, f"可用率 {score.overall:.0f}%　{score.verdict}"
 
 
 # ── 十、入口 ────────────────────────────────────────────────────
