@@ -21,7 +21,7 @@ mcporter 的行为一致；服务端走真实的 efinance / AkShare / Playwright
 
     for c in 2 3 4; do
         python scripts/loadtest_mcp.py --launch --port $((8790 + c)) \\
-            --env CN_STOCK_BATCH_QUERY_CONCURRENCY=$c \\
+            --env BATCH_CONCURRENCY=$c \\
             --steps 15,22,30 --step-seconds 70 --seed 20260903
     done
 
@@ -476,7 +476,7 @@ def launch_instance(
 ) -> subprocess.Popen:
     """起一个隔离实例：独立端口、独立日志、独立报告缓存目录。"""
     env = dict(os.environ)
-    env["CN_STOCK_REPORT_CACHE_DIR"] = str(cache_dir)
+    env["REPORT_CACHE_DIR"] = str(cache_dir)
     for key, value in (overrides or {}).items():
         env[key] = value
     log_handle = log_path.open("w", encoding="utf-8")

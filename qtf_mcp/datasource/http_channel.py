@@ -22,11 +22,11 @@ from urllib.parse import urlsplit
 import requests as std_requests
 
 from ..config import (
-    HTTP_IMPERSONATE_COOLDOWN,
-    HTTP_IMPERSONATE_FAILURE_THRESHOLD,
-    HTTP_IMPERSONATE_PROFILE,
-    HTTP_IMPERSONATE_RETRY,
-    HTTP_IMPERSONATE_TIMEOUT,
+    IMPERSONATE_BROWSER,
+    IMPERSONATE_RETRY,
+    IMPERSONATE_SUSPEND_AFTER_FAILURES,
+    IMPERSONATE_SUSPEND_SECONDS,
+    IMPERSONATE_TIMEOUT_SECONDS,
     HttpModeError,
     resolve_http_mode,
 )
@@ -166,15 +166,15 @@ def _record_impersonation(*, success: bool) -> None:
             # 只会把冷却往后推，并重复打一条读起来像"又失败了一整轮"的 WARNING。
             return
         _breaker["failures"] += 1
-        if _breaker["failures"] < HTTP_IMPERSONATE_FAILURE_THRESHOLD:
+        if _breaker["failures"] < IMPERSONATE_SUSPEND_AFTER_FAILURES:
             return
         _breaker["failures"] = 0
-        _breaker["suspended_until"] = time.monotonic() + HTTP_IMPERSONATE_COOLDOWN
+        _breaker["suspended_until"] = time.monotonic() + IMPERSONATE_SUSPEND_SECONDS
     logger.warning(
         "HTTP channel suspending impersonation for %ss after %s consecutive "
         "failures; falling back to plain requests",
-        HTTP_IMPERSONATE_COOLDOWN,
-        HTTP_IMPERSONATE_FAILURE_THRESHOLD,
+        IMPERSONATE_SUSPEND_SECONDS,
+        IMPERSONATE_SUSPEND_AFTER_FAILURES,
     )
 
 
@@ -211,9 +211,9 @@ def _resolve_verify(session):
 
 
 def _install_impersonate(
-    retry: int = HTTP_IMPERSONATE_RETRY,
-    timeout: float = HTTP_IMPERSONATE_TIMEOUT,
-    impersonate: str = HTTP_IMPERSONATE_PROFILE,
+    retry: int = IMPERSONATE_RETRY,
+    timeout: float = IMPERSONATE_TIMEOUT_SECONDS,
+    impersonate: str = IMPERSONATE_BROWSER,
 ) -> bool:
     """Route impersonated hosts through curl_cffi, leaving everything else alone.
 
@@ -365,9 +365,9 @@ def install_http_channel(
         elif mode == "impersonate":
             if _install_impersonate():
                 _installed_detail.update(
-                    profile=HTTP_IMPERSONATE_PROFILE,
-                    retry=HTTP_IMPERSONATE_RETRY,
-                    timeout=f"{HTTP_IMPERSONATE_TIMEOUT}s",
+                    profile=IMPERSONATE_BROWSER,
+                    retry=IMPERSONATE_RETRY,
+                    timeout=f"{IMPERSONATE_TIMEOUT_SECONDS}s",
                 )
             else:
                 logger.warning(

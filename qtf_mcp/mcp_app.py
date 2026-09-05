@@ -18,7 +18,7 @@ from .datasource import get_datasource
 from .datasource.base import FETCH_FAILURES_KEY, FetchRequirements
 from .datasource.market_breadth import get_market_breadth
 from .datasource.public_events import PublicEventPoolResponse, get_public_market_events
-from .config import BATCH_QUERY_CONCURRENCY
+from .config import BATCH_CONCURRENCY
 from .observability import bind_log_context, http_trace_id_var
 
 logger = logging.getLogger("qtf_mcp")
@@ -55,8 +55,8 @@ class BatchQueryAdmission:
 def _get_batch_query_admission() -> BatchQueryAdmission:
     loop = asyncio.get_running_loop()
     admission = getattr(loop, _BATCH_QUERY_ADMISSION_ATTR, None)
-    if admission is None or admission.limit != BATCH_QUERY_CONCURRENCY:
-        admission = BatchQueryAdmission(BATCH_QUERY_CONCURRENCY)
+    if admission is None or admission.limit != BATCH_CONCURRENCY:
+        admission = BatchQueryAdmission(BATCH_CONCURRENCY)
         setattr(loop, _BATCH_QUERY_ADMISSION_ATTR, admission)
     return admission
 
@@ -232,7 +232,7 @@ async def fetch_batch_reports(
             len(cached_report),
         )
 
-    # 整批全命中的批次不做任何上游工作，让它去排 BATCH_QUERY_CONCURRENCY 的队会把
+    # 整批全命中的批次不做任何上游工作，让它去排 BATCH_CONCURRENCY 的队会把
     # 一次 0 秒的响应压到慢批次后面——回放显示约 39% 的批次是整批全命中。
     # 这一轮探测只用于"能否跳过准入"的判定：命中就地返回，不经历任何等待；
     # 只要有一个标的未命中就整轮丢弃，由 process_item 在拿到准入之后重新探测。

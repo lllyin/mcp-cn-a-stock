@@ -11,6 +11,19 @@ load_dotenv()
 
 _FALSEY = {"0", "false", "no", "off", "disabled", "none", ""}
 
+# 所有配置项统一不带前缀。想和别的程序共存、担心重名时，设 ENV_PREFIX，例如
+#
+#     ENV_PREFIX=CNSTOCK_
+#
+# 之后全部配置就读 CNSTOCK_<NAME>。前缀这件事只发生在下面这一个函数里，声明处
+# 一律写裸名字——原先每一项都顶着 CN_STOCK_ 前缀，读起来吵，改起来还要改几十处。
+ENV_PREFIX = os.getenv("ENV_PREFIX", "")
+
+
+def env(name: str, default=None):
+    """按配置名取值。名字不带前缀写，前缀由 ENV_PREFIX 统一决定。"""
+    return os.getenv(f"{ENV_PREFIX}{name}", default)
+
 
 def _parse_bool(raw, default: bool) -> bool:
     """Parse common operator spellings for an environment switch."""
@@ -22,10 +35,12 @@ def _parse_bool(raw, default: bool) -> bool:
 # AkShare Proxy Patch Configuration
 # 默认关闭：网关是付费的，每次认证都计积分，而 impersonate 通道在同样的东财主机
 # 上已经能独立取到数据。没有显式开启的部署不应该在第一次调用时就开始扣费。
-AKSHARE_PROXY_ENABLED = _parse_bool(os.getenv("AKSHARE_PROXY_ENABLED"), False)
-AKSHARE_PROXY_IP = os.getenv("AKSHARE_PROXY_GATEWAY") or os.getenv("AKSHARE_PROXY_IP")
-AKSHARE_PROXY_PASSWORD = os.getenv("AKSHARE_PROXY_TOKEN") or os.getenv("AKSHARE_PROXY_PASSWORD")
-AKSHARE_PROXY_RETRY = int(os.getenv("AKSHARE_PROXY_RETRY", os.getenv("AKSHARE_PROXY_PORT", "30")))
+# 这一组保留 AKSHARE_PROXY_ 前缀：它们配的是第三方插件 akshare-proxy-patch，
+# 前缀就是插件的身份，去掉之后看不出这几项跟哪个组件走。
+AKSHARE_PROXY_ENABLED = _parse_bool(env("AKSHARE_PROXY_ENABLED"), False)
+AKSHARE_PROXY_IP = env("AKSHARE_PROXY_GATEWAY") or env("AKSHARE_PROXY_IP")
+AKSHARE_PROXY_PASSWORD = env("AKSHARE_PROXY_TOKEN") or env("AKSHARE_PROXY_PASSWORD")
+AKSHARE_PROXY_RETRY = int(env("AKSHARE_PROXY_RETRY", env("AKSHARE_PROXY_PORT", "30")))
 # Backward-compatible alias. Historically this variable was named PORT, but
 # akshare-proxy-patch treats the third argument as retry count.
 AKSHARE_PROXY_PORT = AKSHARE_PROXY_RETRY
@@ -45,24 +60,22 @@ HTTP_MODE_DEFAULT = "auto"
 # Accepted spelling for operators who think of the channel as a feature switch.
 HTTP_MODE_ALIASES = {"off": "direct"}
 # Requests per target host before giving up and replaying through plain requests.
-HTTP_IMPERSONATE_RETRY = max(1, int(os.getenv("CN_STOCK_HTTP_IMPERSONATE_RETRY", "3")))
-HTTP_IMPERSONATE_TIMEOUT = max(
-    1.0,
-    float(os.getenv("CN_STOCK_HTTP_IMPERSONATE_TIMEOUT", "8")),
-)
+IMPERSONATE_RETRY = max(1, int(env("IMPERSONATE_RETRY", "3")))
+IMPERSONATE_TIMEOUT_SECONDS = max(1.0, float(env("IMPERSONATE_TIMEOUT_SECONDS", "8")))
 # curl_cffi browser profile to impersonate. Fixed rather than random so a
 # per-thread session can keep reusing its TLS connection.
-HTTP_IMPERSONATE_PROFILE = os.getenv("CN_STOCK_HTTP_IMPERSONATE_PROFILE") or "chrome"
-# Consecutive fully-failed hosts before the impersonated path goes on cooldown.
-# Without it, an environment where impersonation can never succeed pays the
-# retry budget plus the plain-requests replay on every single call.
-HTTP_IMPERSONATE_FAILURE_THRESHOLD = max(
+IMPERSONATE_BROWSER = env("IMPERSONATE_BROWSER") or "chrome"
+# Consecutive requests that exhausted their retries before the impersonated path
+# goes on cooldown -- counted per request, not per host. Without it, an
+# environment where impersonation can never succeed pays the retry budget plus
+# the plain-requests replay on every single call.
+IMPERSONATE_SUSPEND_AFTER_FAILURES = max(
     1,
-    int(os.getenv("CN_STOCK_HTTP_IMPERSONATE_FAILURE_THRESHOLD", "4")),
+    int(env("IMPERSONATE_SUSPEND_AFTER_FAILURES", "4")),
 )
-HTTP_IMPERSONATE_COOLDOWN = max(
+IMPERSONATE_SUSPEND_SECONDS = max(
     0.0,
-    float(os.getenv("CN_STOCK_HTTP_IMPERSONATE_COOLDOWN_SECONDS", "300")),
+    float(env("IMPERSONATE_SUSPEND_SECONDS", "300")),
 )
 
 
@@ -73,16 +86,16 @@ HTTP_IMPERSONATE_COOLDOWN = max(
 # provider chain -- efinance retries, three impersonated attempts, AkShare
 # retries -- before reaching the Tencent fallback that served it in ~0.2s.
 # Skipping a source that is provably refusing saves 1.5-3.7s per request.
-SOURCE_BREAKER_ENABLED = _parse_bool(os.getenv("CN_STOCK_SOURCE_BREAKER_ENABLED"), True)
+SOURCE_BREAKER_ENABLED = _parse_bool(env("SOURCE_BREAKER_ENABLED"), True)
 # Consecutive failures before a source is skipped. Historical baseline is a
 # scattered ~1.5% failure rate, so three in a row is 0.003% by chance; a real
 # block produced 111 consecutive failures.
-SOURCE_BREAKER_THRESHOLD = max(1, int(os.getenv("CN_STOCK_SOURCE_BREAKER_THRESHOLD", "3")))
+SOURCE_BREAKER_OPEN_AFTER_FAILURES = max(1, int(env("SOURCE_BREAKER_OPEN_AFTER_FAILURES", "3")))
 # Cooldown before one request is allowed through to probe. Half-open probing
 # means this value only bounds recovery latency, not the cost of staying open.
 SOURCE_BREAKER_COOLDOWN_SECONDS = max(
     1.0,
-    float(os.getenv("CN_STOCK_SOURCE_BREAKER_COOLDOWN_SECONDS", "120")),
+    float(env("SOURCE_BREAKER_COOLDOWN_SECONDS", "120")),
 )
 
 
@@ -93,9 +106,7 @@ SOURCE_BREAKER_COOLDOWN_SECONDS = max(
 # must never become the steady state under load: with the endpoint failing for
 # every symbol, an unbounded fallback would put four page loads per request
 # behind a semaphore of two.
-FUND_FLOW_PAGE_FALLBACK_ENABLED = _parse_bool(
-    os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_ENABLED"), True
-)
+FUND_FLOW_PAGE_ENABLED = _parse_bool(env("FUND_FLOW_PAGE_ENABLED"), True)
 # 同时允许几次页面加载。2026-09-04 实测（一批 4 标的 × 3 批，逐次记录）：
 #
 #   名额  获取率    最慢一批   单次加载
@@ -116,16 +127,16 @@ FUND_FLOW_PAGE_FALLBACK_ENABLED = _parse_bool(
 #     4   11/11   多救回 4 个
 #
 # 取 3 不取 4：4 要把浏览器页面上限也推到 4，多两个并发渲染进程，而 §三 的
-# 500 MiB 判定还没在 Ubuntu 上复测过；3 只多一个。必须和 BROWSER_PAGE_CONCURRENCY
+# 500 MiB 判定还没在 Ubuntu 上复测过；3 只多一个。必须和 BROWSER_MAX_PAGES
 # 一起提——只提这一个，浏览器信号量会立刻变成新的瓶颈，收益为零。
 #
 # 2026-09-05 复盘：上面那段回放当时把"名额"当成了主要旋钮，其实不是。名额只决定
 # 「前几个能立刻拿到」，第 N+1 个能不能等到，取决于 W 和 hold 的关系——见下一项。
 # 名额留在 3 是因为它对慢尾巴更稳：批 4 标的、名额 3 时第 4 个只等一个 hold，
 # p90 也在 W 之内；名额 2 时第 4 个要等两个 hold，p90 下就超了。
-FUND_FLOW_PAGE_FALLBACK_CONCURRENCY = max(
+FUND_FLOW_PAGE_CONCURRENCY = max(
     1,
-    int(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_CONCURRENCY", "3")),
+    int(env("FUND_FLOW_PAGE_CONCURRENCY", "3")),
 )
 # 单个标的等一个名额的上限。
 #
@@ -155,9 +166,9 @@ FUND_FLOW_PAGE_FALLBACK_CONCURRENCY = max(
 # 取 8 是为了盖住 p90 的 7.49s，不是盖 p50——盖 p50 只是把必丢变成一半丢。
 # 代价：需要兜底且满批时，尾部多等 3.4s（p90 情形 7.5s）。那一轮全程只有 20 次
 # 页面加载，这条路不热，按第一条"数据完整 > 性能"这个换法是划算的。
-FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS = max(
+FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS = max(
     0.0,
-    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", "8")),
+    float(env("FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS", "8")),
 )
 # 一次请求里所有标的加起来最多为等名额花掉多少秒。
 #
@@ -173,9 +184,9 @@ FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS = max(
 # 15s 的量级：4 个标的、名额 3 个，最坏是第 4 个等一个 p90 hold(7.5s) 再加自己的
 # 加载，落在 15s 内。40 个标的的大批仍然会在 15s 处截断——延迟有界这一点不变。
 # 置 0 关闭请求级预算,退回纯按标的计时。
-FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS = max(
+FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS = max(
     0.0,
-    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS", "15")),
+    float(env("FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS", "15")),
 )
 # Upper bound on waiting for the historical table to fill. It is only a
 # backstop: the wait aborts as soon as a fund-flow request is refused, so a
@@ -184,7 +195,7 @@ FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS = max(
 # fixed budget silently returned an empty table on the first load of a process.
 FUND_FLOW_PAGE_TABLE_WAIT_SECONDS = max(
     0.5,
-    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_TABLE_WAIT_SECONDS", "15")),
+    float(env("FUND_FLOW_PAGE_TABLE_WAIT_SECONDS", "15")),
 )
 # 关掉整层兜底之前允许多少次白付的页面加载。
 #
@@ -201,21 +212,21 @@ FUND_FLOW_PAGE_TABLE_WAIT_SECONDS = max(
 # 所以改成滑动窗口计数:60 秒内累计 4 次失败才开,冷却 60s。窗口计数比连续计数
 # 更贴合"逐次随机被拒"这个已实测的上游行为:连续计数会被一次成功清零,也会被
 # 两次噪声凑满,两头都不准。
-FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD = max(
+FUND_FLOW_PAGE_OPEN_AFTER_FAILURES = max(
     1,
-    int(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD", "4")),
+    int(env("FUND_FLOW_PAGE_OPEN_AFTER_FAILURES", "4")),
 )
 # 失败计数的滑动窗口秒数。置 0 退回原来的"连续失败"语义。
-FUND_FLOW_PAGE_FALLBACK_FAILURE_WINDOW_SECONDS = max(
+FUND_FLOW_PAGE_FAILURE_WINDOW_SECONDS = max(
     0.0,
-    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_FAILURE_WINDOW_SECONDS", "60")),
+    float(env("FUND_FLOW_PAGE_FAILURE_WINDOW_SECONDS", "60")),
 )
 # 冷却从 300s 降到 60s。300s 的原意是"被拒是分钟级的,等久点省页面加载",但那是
 # 在阈值 2 容易误触的前提下;阈值改成窗口计数后误触少了,冷却长反而是纯损失——
 # 实测持续封锁态确实是分钟级,60s 足够避开一轮,又不会在风控解除后继续空转 4 分钟。
-FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS = max(
+FUND_FLOW_PAGE_COOLDOWN_SECONDS = max(
     1.0,
-    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS", "60")),
+    float(env("FUND_FLOW_PAGE_COOLDOWN_SECONDS", "60")),
 )
 
 # 一次请求内允许的页面加载次数。
@@ -233,8 +244,8 @@ FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS = max(
 # 结论和原来一致但依据换了:2 是对的——第 2 次（同一个 tab 上 reload）确实能救
 # 回标的,第 3 次（开新 tab）在两次实测里都是零收益,而它要多付一次开页面。
 #
-# 改名的原因:这个值原先只在"本进程还没成功取到过数据"时生效,成功过一次之后
-# 预算就塌到 1（只 goto、不 reload）。那个区分站不住:
+# 这一项原先只在"本进程还没成功取到过数据"时生效,成功过一次之后预算就塌到 1
+# （只 goto、不 reload）。那个区分站不住:
 #
 #   - 依据上站不住。它假设"成功过一次说明上游在放行",而项目自己的注释记着被拒
 #     是逐次随机的、8 轮里有 3 轮当场重试就能成功。
@@ -242,18 +253,7 @@ FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS = max(
 #     SH603986 和 SH600030 都只加载了一次就拿着 history=0 放弃了。
 #   - 收益是零。重试只在"这次没拿到想要的数据"时才发生,顺利路径一次都不多花,
 #     所以省不下任何东西。
-#
-# 旧环境变量名继续认,部署里已经配着的不用改。
-FUND_FLOW_PAGE_MAX_LOADS = max(
-    1,
-    int(
-        os.getenv("CN_STOCK_FUND_FLOW_PAGE_MAX_LOADS")
-        or os.getenv("CN_STOCK_FUND_FLOW_PAGE_COLD_ATTEMPTS")
-        or "2"
-    ),
-)
-# 兼容旧名字。
-FUND_FLOW_PAGE_COLD_ATTEMPTS = FUND_FLOW_PAGE_MAX_LOADS
+FUND_FLOW_PAGE_MAX_LOADS = max(1, int(env("FUND_FLOW_PAGE_MAX_LOADS", "2")))
 
 # 把无头浏览器的自报特征改成普通浏览器的样子。默认开。
 #
@@ -266,8 +266,8 @@ FUND_FLOW_PAGE_COLD_ATTEMPTS = FUND_FLOW_PAGE_MAX_LOADS
 #   换完整 Chromium 新无头          : 指纹全对，但 323/401 MiB（+260，超预算）
 #   本方案（CDP 覆盖 + locale）     : 指纹全对，65.7/111 MiB（+2/+16）
 # 所以走本方案。置 0 可一键退回原样，用于对照或伪装反而招致拦截时回滚。
-FUND_FLOW_PAGE_DISGUISE = _parse_bool(
-    os.getenv("CN_STOCK_FUND_FLOW_PAGE_DISGUISE"), True
+BROWSER_DISGUISE = _parse_bool(
+    env("BROWSER_DISGUISE"), True
 )
 
 # 对外声明哪个平台：auto | real | macos | windows。
@@ -277,8 +277,8 @@ FUND_FLOW_PAGE_DISGUISE = _parse_bool(
 # 注意代价：声明 macOS 之后 WebGL renderer 和字体列表仍是 Linux 的样子，若对端
 # 交叉核对到那一层，声明 macOS 反而更可疑。所以要在部署机上用 blocked_captcha
 # 的占比比一比 auto 与 real，别凭感觉定。
-FUND_FLOW_PAGE_CLAIM_PLATFORM = (
-    os.getenv("CN_STOCK_FUND_FLOW_PAGE_CLAIM_PLATFORM") or "auto"
+BROWSER_CLAIM_PLATFORM = (
+    env("BROWSER_CLAIM_PLATFORM") or "auto"
 ).strip().lower()
 
 def _parse_range_ms(raw, default: str) -> tuple[float, float]:
@@ -296,7 +296,7 @@ def _parse_range_ms(raw, default: str) -> tuple[float, float]:
 
 # 同一个 tab 上 reload 之前的随机等待区间，毫秒，写作 "下界,上界"。只作用在重试
 # 路径上：那一次已经没拿到数据、本来就要再付一次页面加载，所以顺利路径一秒都不
-# 多花。睡的次数是每个 tab 的那次 reload 各一次，即 ⌊COLD_ATTEMPTS/2⌋ 次，
+# 多花。睡的次数是每个 tab 的那次 reload 各一次，即 ⌊MAX_LOADS/2⌋ 次，
 # 默认就是每个标的每次请求最多多等一次 350ms。
 #
 # 为什么随机而不是固定：没拿到数据后 0 毫秒就刷新同一个页面，本身是个机器节奏。
@@ -308,17 +308,17 @@ def _parse_range_ms(raw, default: str) -> tuple[float, float]:
 # 可能让"名额已满跳过"更容易触发。重试路径本身少见，所以判断是可以接受；
 # 真在日志里看到跳过变多，把这两个值一起调。置 0 关闭。
 FUND_FLOW_PAGE_RETRY_DELAY_MS = _parse_range_ms(
-    os.getenv("CN_STOCK_FUND_FLOW_PAGE_RETRY_DELAY_MS"), "250,350"
+    env("FUND_FLOW_PAGE_RETRY_DELAY_MS"), "250,350"
 )
 
 # 调试开关，默认关。开启后浏览器有头运行、抓完不关页面，用于人工观察页面到底
 # 渲染成了什么样。两者都会显著抬高内存（每个页面是一个独立渲染进程），只在排查
 # 时开；Linux 上有头模式需要 DISPLAY，start.sh 会拉起 Xvfb。
-FUND_FLOW_PAGE_HEADFUL = _parse_bool(
-    os.getenv("CN_STOCK_FUND_FLOW_PAGE_HEADFUL"), False
+BROWSER_HEADFUL = _parse_bool(
+    env("BROWSER_HEADFUL"), False
 )
-FUND_FLOW_PAGE_KEEP_PAGES = _parse_bool(
-    os.getenv("CN_STOCK_FUND_FLOW_PAGE_KEEP_PAGES"), False
+BROWSER_KEEP_PAGES = _parse_bool(
+    env("BROWSER_KEEP_PAGES"), False
 )
 
 # 解析结果的复用窗口。页面级单飞只能合并并发的加载，而实时预取和资金流兜底在
@@ -327,7 +327,7 @@ FUND_FLOW_PAGE_KEEP_PAGES = _parse_bool(
 # 不引入超出既有约定的陈旧度。置 0 关闭复用。
 FUND_FLOW_PAGE_REUSE_SECONDS = max(
     0.0,
-    float(os.getenv("CN_STOCK_FUND_FLOW_PAGE_REUSE_SECONDS", "30")),
+    float(env("FUND_FLOW_PAGE_REUSE_SECONDS", "30")),
 )
 
 # 整个浏览器同时开着的页面数上限。这也是峰值内存的直接决定项——页面在信号量
@@ -344,7 +344,7 @@ FUND_FLOW_PAGE_REUSE_SECONDS = max(
 #        -> 4 页   +85 MiB
 #   全部关闭后回落到 +25.9 MiB,不漏
 #
-# 2026-09-05 随 FUND_FLOW_PAGE_FALLBACK_CONCURRENCY 一起从 2 提到 3。两者必须
+# 2026-09-05 随 FUND_FLOW_PAGE_CONCURRENCY 一起从 2 提到 3。两者必须
 # 一起动：兜底名额和这个上限是串联的两道闸门，只提其中一个，另一个立刻变成新的
 # 瓶颈，收益为零。收益的量化见那一项的注释（争用批次里多服务 2 个标的）。
 #
@@ -354,9 +354,9 @@ FUND_FLOW_PAGE_REUSE_SECONDS = max(
 # 上调的代价能在部署机上直接读出来，而不是靠推断。
 #
 # 不再往上提到 4：那要多两个渲染进程，而 §三 的 500 MiB 判定还没清。
-BROWSER_PAGE_CONCURRENCY = max(
+BROWSER_MAX_PAGES = max(
     1,
-    int(os.getenv("CN_STOCK_BROWSER_PAGE_CONCURRENCY", "3")),
+    int(env("BROWSER_MAX_PAGES", "3")),
 )
 
 # 多久没人用就把浏览器整个拆掉,秒。置 0 关闭空闲回收。
@@ -379,7 +379,7 @@ BROWSER_PAGE_CONCURRENCY = max(
 # 特性会反过来降低获取率。
 BROWSER_IDLE_TIMEOUT_SECONDS = max(
     0.0,
-    float(os.getenv("CN_STOCK_BROWSER_IDLE_TIMEOUT_SECONDS", "5400")),
+    float(env("BROWSER_IDLE_TIMEOUT_SECONDS", "5400")),
 )
 
 
@@ -398,7 +398,7 @@ def resolve_http_mode(
     that a partial configuration cannot stop the service from starting. Only an
     explicit ``proxy`` request is strict, because there the intent is stated.
     """
-    raw = requested if requested is not None else os.getenv("CN_STOCK_HTTP_MODE")
+    raw = requested if requested is not None else env("HTTP_CHANNEL")
     mode = str(raw or "").strip().lower()
     mode = HTTP_MODE_ALIASES.get(mode, mode)
     if not mode:
@@ -409,7 +409,7 @@ def resolve_http_mode(
     if mode == "proxy":
         if not proxy_gateway:
             raise HttpModeError(
-                "CN_STOCK_HTTP_MODE=proxy requires AKSHARE_PROXY_GATEWAY; "
+                "HTTP_CHANNEL=proxy requires AKSHARE_PROXY_GATEWAY; "
                 "use auto to fall back to impersonate instead."
             )
         return "proxy", "requested"
@@ -424,58 +424,56 @@ def resolve_http_mode(
 
 # Synchronous AkShare/efinance calls are I/O bound. Keep the executor bounded,
 # while allowing deployments to tune it for their upstream capacity.
-DATA_FETCH_MAX_WORKERS = max(1, int(os.getenv("CN_STOCK_DATA_FETCH_MAX_WORKERS", "8")))
+FETCH_MAX_WORKERS = max(1, int(env("FETCH_MAX_WORKERS", "8")))
 # Bound submitted and running work separately from the executor's unbounded
 # internal queue. The default keeps one queued task per worker at saturation.
-DATA_FETCH_MAX_IN_FLIGHT = max(
+FETCH_MAX_IN_FLIGHT = max(
     1,
-    int(os.getenv("CN_STOCK_DATA_FETCH_MAX_IN_FLIGHT", "16")),
+    int(env("FETCH_MAX_IN_FLIGHT", "16")),
 )
 
 # Bound concurrent report batches before they fan out into data and browser work.
-BATCH_QUERY_CONCURRENCY = max(
+BATCH_CONCURRENCY = max(
     1,
-    int(os.getenv("CN_STOCK_BATCH_QUERY_CONCURRENCY", "2")),
+    int(env("BATCH_CONCURRENCY", "2")),
 )
 
 # Financial abstracts normally change only after periodic reports are published.
 # Cache successful results to keep recurring batch scans off the upstream API.
 FINANCE_CACHE_TTL_SECONDS = max(
     0.0,
-    float(os.getenv("CN_STOCK_FINANCE_CACHE_TTL_SECONDS", "21600")),
+    float(env("FINANCE_CACHE_TTL_SECONDS", "21600")),
 )
 FINANCE_CACHE_MAX_ENTRIES = max(
     1,
-    int(os.getenv("CN_STOCK_FINANCE_CACHE_MAX_ENTRIES", "512")),
+    int(env("FINANCE_CACHE_MAX_ENTRIES", "512")),
 )
 
 # --- Report cache (qtf_mcp/cache.py) ---
 # A rendered report is reusable only inside the market epoch that produced it,
 # so the cache never changes what a tool would return. Disabling the master
 # switch removes the cache from the call path entirely.
-REPORT_CACHE_ENABLED = _parse_bool(os.getenv("CN_STOCK_REPORT_CACHE_ENABLED"), True)
+REPORT_CACHE_ENABLED = _parse_bool(env("REPORT_CACHE_ENABLED"), True)
 # 盘中数值持续变动，复用受短 TTL 约束，只用于合并突发重复请求。置 0 则盘中绝不复用。
 # 默认 30 秒是陈旧度与积分的折中：基于下游真实捕获比对，60 秒窗口内主力净流入的
 # P90 相对漂移为 21%，30 秒窗口降至 7.7%，而代价只是约 2.8 个百分点的积分降幅。
-REPORT_CACHE_LIVE_TTL_SECONDS = max(
+REPORT_CACHE_INTRADAY_TTL_SECONDS = max(
     0.0,
-    float(os.getenv("CN_STOCK_REPORT_CACHE_LIVE_TTL_SECONDS", "30")),
+    float(env("REPORT_CACHE_INTRADAY_TTL_SECONDS", "30")),
 )
 REPORT_CACHE_MAX_ENTRIES = max(
     1,
-    int(os.getenv("CN_STOCK_REPORT_CACHE_MAX_ENTRIES", "512")),
+    int(env("REPORT_CACHE_MAX_ENTRIES", "512")),
 )
 # Second tier surviving restarts. Closed epochs span 16h (64h over a weekend),
 # so an in-memory-only cache loses most of its value on any redeploy.
-REPORT_CACHE_DISK_ENABLED = _parse_bool(
-    os.getenv("CN_STOCK_REPORT_CACHE_DISK_ENABLED"), True
-)
+REPORT_CACHE_DISK_ENABLED = _parse_bool(env("REPORT_CACHE_DISK_ENABLED"), True)
 # Resolved against the package root, not the daemon's CWD: the sweeper deletes
 # directories under here, so a relative value read from a copied .env must not
 # land somewhere unexpected.
 _PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 REPORT_CACHE_DIR = os.path.normpath(
-    os.path.join(_PROJECT_ROOT, os.getenv("CN_STOCK_REPORT_CACHE_DIR") or ".runtime/report-cache")
+    os.path.join(_PROJECT_ROOT, env("REPORT_CACHE_DIR") or ".runtime/report-cache")
 )
 
 
@@ -495,7 +493,7 @@ def _parse_hhmm(raw, default: datetime.time) -> datetime.time:
 # later, so the default leaves a 30-minute buffer. cache.py clamps this into
 # [15:00, 17:00]; see the note there for why values outside that range are unsafe.
 REPORT_CACHE_SETTLE_TIME = _parse_hhmm(
-    os.getenv("CN_STOCK_REPORT_CACHE_SETTLE_HHMM"), datetime.time(15, 30)
+    env("REPORT_CACHE_SETTLE_TIME"), datetime.time(15, 30)
 )
 
 # --- Market Indices Configuration ---

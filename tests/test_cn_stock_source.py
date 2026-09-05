@@ -92,7 +92,7 @@ async def test_executor_cancellation_holds_slot_until_thread_finishes(monkeypatc
 
 
 def test_executor_limiter_can_be_reused_across_event_loops(monkeypatch):
-    monkeypatch.setattr(source_module, "DATA_FETCH_MAX_IN_FLIGHT", 1)
+    monkeypatch.setattr(source_module, "FETCH_MAX_IN_FLIGHT", 1)
 
     def blocking_call():
         time.sleep(0.005)
@@ -1362,7 +1362,7 @@ async def test_page_fallback_is_skipped_when_the_browser_tier_is_full(monkeypatc
     exhausted = asyncio.Semaphore(1)
     await exhausted.acquire()
     monkeypatch.setattr(source_module, "_get_fund_flow_page_slots", lambda: exhausted)
-    monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS", 0.01)
 
     async def unexpected(symbol):
         raise AssertionError("没有空位时不应加载页面")
@@ -1381,7 +1381,7 @@ async def test_page_fallback_can_be_disabled(monkeypatch):
     datasource = _page_fallback_datasource(
         monkeypatch, source_module._fetch_failure("fund_flow")
     )
-    monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_FALLBACK_ENABLED", False)
+    monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_ENABLED", False)
 
     async def unexpected(symbol):
         raise AssertionError("开关关闭时不应加载页面")
@@ -1474,7 +1474,7 @@ async def test_page_fallback_stops_after_repeated_futile_attempts(monkeypatch):
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", futile)
 
-    threshold = source_module.FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD
+    threshold = source_module.FUND_FLOW_PAGE_OPEN_AFTER_FAILURES
     for _ in range(threshold + 3):
         result = await datasource.fetch_stock_data(
             "SZ300408", "2024-01-01", "2026-09-03"
@@ -1505,7 +1505,7 @@ async def test_page_fallback_ignores_symbols_without_a_page(monkeypatch):
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", unavailable)
 
-    for _ in range(source_module.FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD + 2):
+    for _ in range(source_module.FUND_FLOW_PAGE_OPEN_AFTER_FAILURES + 2):
         await datasource.fetch_stock_data("SH000688", "2024-01-01", "2026-09-03")
 
     assert not source_module._FUND_FLOW_PAGE_BREAKER.is_open
@@ -1662,9 +1662,9 @@ class TestFallbackRequestBudget:
     @pytest.mark.asyncio
     async def test_symbols_of_one_request_share_one_budget(self, monkeypatch):
         monkeypatch.setattr(
-            source_module, "FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS", 8.0
+            source_module, "FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS", 8.0
         )
-        monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", 3.0)
+        monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS", 3.0)
         clock = [1000.0]
         monkeypatch.setattr(source_module.time, "monotonic", lambda: clock[0])
 
@@ -1682,9 +1682,9 @@ class TestFallbackRequestBudget:
     async def test_a_different_request_gets_its_own_budget(self, monkeypatch):
         """一个批次把预算花光，不能连累下一个批次。"""
         monkeypatch.setattr(
-            source_module, "FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS", 8.0
+            source_module, "FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS", 8.0
         )
-        monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", 3.0)
+        monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS", 3.0)
         clock = [2000.0]
         monkeypatch.setattr(source_module.time, "monotonic", lambda: clock[0])
 
@@ -1697,9 +1697,9 @@ class TestFallbackRequestBudget:
     async def test_a_missing_request_id_does_not_share_a_budget(self, monkeypatch):
         """request_id 缺失时每个标的独享，别让互不相关的调用互相扣预算。"""
         monkeypatch.setattr(
-            source_module, "FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS", 8.0
+            source_module, "FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS", 8.0
         )
-        monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", 3.0)
+        monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS", 3.0)
         clock = [3000.0]
         monkeypatch.setattr(source_module.time, "monotonic", lambda: clock[0])
 
@@ -1711,9 +1711,9 @@ class TestFallbackRequestBudget:
     @pytest.mark.asyncio
     async def test_zero_switches_the_request_budget_off(self, monkeypatch):
         monkeypatch.setattr(
-            source_module, "FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS", 0.0
+            source_module, "FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS", 0.0
         )
-        monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", 3.0)
+        monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS", 3.0)
         clock = [4000.0]
         monkeypatch.setattr(source_module.time, "monotonic", lambda: clock[0])
 
@@ -1724,9 +1724,9 @@ class TestFallbackRequestBudget:
     @pytest.mark.asyncio
     async def test_the_budget_table_does_not_grow_without_bound(self, monkeypatch):
         monkeypatch.setattr(
-            source_module, "FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS", 8.0
+            source_module, "FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS", 8.0
         )
-        monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", 3.0)
+        monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS", 3.0)
         loop = asyncio.get_running_loop()
         setattr(loop, source_module._FUND_FLOW_PAGE_BUDGET_ATTR, {})
 
@@ -1771,7 +1771,7 @@ class TestFallbackRequestBudget:
         busy = asyncio.Semaphore(1)
         await busy.acquire()
         monkeypatch.setattr(source_module, "_get_fund_flow_page_slots", lambda: busy)
-        monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS", 3.0)
+        monkeypatch.setattr(source_module, "FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS", 3.0)
 
         async def working(symbol):
             return page

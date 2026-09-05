@@ -5,10 +5,14 @@ pytest 配置和共享 fixture
 import datetime
 import os
 
+# 测试一律按裸配置名跑。开发机上如果设了 ENV_PREFIX，下面这些 setenv 写的裸名字
+# 就没人读，表现是十几个测试莫名其妙地失败，而不是提示"你设了前缀"。
+os.environ.pop("ENV_PREFIX", None)
+
 # 通道安装会全局改写 requests，且发生在 qtf_mcp.datasource 导入期。
 # 测试固定为 direct（原生 requests），保证断言的是业务逻辑而不是某个通道的转发行为；
 # 需要验证通道本身的测试自行调用 install_http_channel。
-os.environ.setdefault("CN_STOCK_HTTP_MODE", "direct")
+os.environ.setdefault("HTTP_CHANNEL", "direct")
 
 import numpy as np
 import pytest

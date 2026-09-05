@@ -37,7 +37,7 @@ def restore_requests():
 @pytest.fixture
 def unset_mode_env(monkeypatch):
     """Drop the pinned test mode so the shipped default is what gets exercised."""
-    monkeypatch.delenv("CN_STOCK_HTTP_MODE", raising=False)
+    monkeypatch.delenv("HTTP_CHANNEL", raising=False)
 
 
 @pytest.mark.parametrize(
@@ -67,7 +67,7 @@ def test_mode_resolution_matrix(
 
 
 def test_environment_overrides_the_default(monkeypatch):
-    monkeypatch.setenv("CN_STOCK_HTTP_MODE", "direct")
+    monkeypatch.setenv("HTTP_CHANNEL", "direct")
     assert resolve_http_mode(None, True, "10.0.0.1") == ("direct", "requested")
 
 
@@ -201,7 +201,7 @@ def test_impersonated_host_uses_curl_cffi(monkeypatch):
 
     assert response.status_code == 200
     assert len(calls) == 1
-    assert calls[0][2]["timeout"] == channel.HTTP_IMPERSONATE_TIMEOUT
+    assert calls[0][2]["timeout"] == channel.IMPERSONATE_TIMEOUT_SECONDS
 
 
 def test_page_assets_on_impersonated_hosts_pass_through(monkeypatch):
@@ -235,7 +235,7 @@ def test_retries_then_replays_through_plain_requests(monkeypatch):
     )
 
     assert result == "plain"
-    assert len(calls) == channel.HTTP_IMPERSONATE_RETRY
+    assert len(calls) == channel.IMPERSONATE_RETRY
     # The replay keeps the caller's kwargs, without curl_cffi-only additions.
     assert replayed == [{"params": {"secid": "1.600000"}}]
 
@@ -287,9 +287,9 @@ def test_startup_line_includes_impersonate_parameters(monkeypatch):
     summary = channel.describe_installed_channel()
 
     assert "mode=impersonate" in summary
-    assert f"profile={channel.HTTP_IMPERSONATE_PROFILE}" in summary
-    assert f"retry={channel.HTTP_IMPERSONATE_RETRY}" in summary
-    assert f"timeout={channel.HTTP_IMPERSONATE_TIMEOUT}s" in summary
+    assert f"profile={channel.IMPERSONATE_BROWSER}" in summary
+    assert f"retry={channel.IMPERSONATE_RETRY}" in summary
+    assert f"timeout={channel.IMPERSONATE_TIMEOUT_SECONDS}s" in summary
 
 
 def test_startup_line_reports_the_degraded_channel(monkeypatch):
@@ -305,7 +305,7 @@ def test_startup_line_reports_the_degraded_channel(monkeypatch):
 
 
 def test_startup_line_reports_auto_resolution(monkeypatch):
-    monkeypatch.delenv("CN_STOCK_HTTP_MODE", raising=False)
+    monkeypatch.delenv("HTTP_CHANNEL", raising=False)
     _install_impersonate_with_fake_cffi(monkeypatch, [])
     channel.uninstall_http_channel()
     monkeypatch.setattr(channel, "_install_impersonate", lambda *a, **k: True)
@@ -356,9 +356,9 @@ def test_no_proxies_key_when_none_configured(monkeypatch):
 
 def test_repeated_failures_suspend_impersonation(monkeypatch):
     """A doomed environment must stop paying the retry budget on every call."""
-    threshold = channel.HTTP_IMPERSONATE_FAILURE_THRESHOLD
+    threshold = channel.IMPERSONATE_SUSPEND_AFTER_FAILURES
     boom = RuntimeError("no route")
-    responses = [boom] * (channel.HTTP_IMPERSONATE_RETRY * (threshold + 1))
+    responses = [boom] * (channel.IMPERSONATE_RETRY * (threshold + 1))
     calls = _install_impersonate_with_fake_cffi(monkeypatch, responses)
     original = getattr(std_requests, "_qtf_original_session")
     monkeypatch.setattr(
@@ -389,12 +389,12 @@ def test_failures_in_flight_at_suspension_do_not_re_arm_it(caplog):
     channel._breaker["suspended_until"] = 0.0
     caplog.set_level(logging.WARNING, logger="qtf_mcp")
 
-    for _ in range(channel.HTTP_IMPERSONATE_FAILURE_THRESHOLD):
+    for _ in range(channel.IMPERSONATE_SUSPEND_AFTER_FAILURES):
         channel._record_impersonation(success=False)
     suspended_until = channel._breaker["suspended_until"]
     assert caplog.text.count("suspending impersonation") == 1
 
-    for _ in range(channel.HTTP_IMPERSONATE_FAILURE_THRESHOLD * 2):
+    for _ in range(channel.IMPERSONATE_SUSPEND_AFTER_FAILURES * 2):
         channel._record_impersonation(success=False)
 
     assert channel._breaker["suspended_until"] == suspended_until
@@ -402,10 +402,10 @@ def test_failures_in_flight_at_suspension_do_not_re_arm_it(caplog):
 
 
 def test_cooldown_expires(monkeypatch):
-    threshold = channel.HTTP_IMPERSONATE_FAILURE_THRESHOLD
+    threshold = channel.IMPERSONATE_SUSPEND_AFTER_FAILURES
     boom = RuntimeError("no route")
     _install_impersonate_with_fake_cffi(
-        monkeypatch, [boom] * (channel.HTTP_IMPERSONATE_RETRY * threshold)
+        monkeypatch, [boom] * (channel.IMPERSONATE_RETRY * threshold)
     )
     original = getattr(std_requests, "_qtf_original_session")
     monkeypatch.setattr(
@@ -424,13 +424,13 @@ def test_cooldown_expires(monkeypatch):
 
 
 def test_a_success_resets_the_failure_streak(monkeypatch):
-    threshold = channel.HTTP_IMPERSONATE_FAILURE_THRESHOLD
+    threshold = channel.IMPERSONATE_SUSPEND_AFTER_FAILURES
     boom = RuntimeError("flaky")
     responses = []
     for _ in range(threshold - 1):
-        responses += [boom] * channel.HTTP_IMPERSONATE_RETRY
+        responses += [boom] * channel.IMPERSONATE_RETRY
     responses.append(200)
-    responses += [boom] * channel.HTTP_IMPERSONATE_RETRY
+    responses += [boom] * channel.IMPERSONATE_RETRY
     _install_impersonate_with_fake_cffi(monkeypatch, responses)
     original = getattr(std_requests, "_qtf_original_session")
     monkeypatch.setattr(
@@ -498,7 +498,7 @@ def test_impersonation_failure_reason_is_logged(monkeypatch, caplog):
     import logging
 
     _install_impersonate_with_fake_cffi(
-        monkeypatch, [RuntimeError("no route")] * channel.HTTP_IMPERSONATE_RETRY
+        monkeypatch, [RuntimeError("no route")] * channel.IMPERSONATE_RETRY
     )
     original = getattr(std_requests, "_qtf_original_session")
     monkeypatch.setattr(original, "request", lambda self, m, u, **k: "plain")

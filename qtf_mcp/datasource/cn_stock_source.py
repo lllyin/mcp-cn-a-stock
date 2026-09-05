@@ -21,21 +21,21 @@ from ..config import (
     AKSHARE_PROXY_IP,
     AKSHARE_PROXY_PASSWORD,
     AKSHARE_PROXY_RETRY,
-    DATA_FETCH_MAX_IN_FLIGHT,
-    DATA_FETCH_MAX_WORKERS,
+    FETCH_MAX_IN_FLIGHT,
+    FETCH_MAX_WORKERS,
     FINANCE_CACHE_MAX_ENTRIES,
     FINANCE_CACHE_TTL_SECONDS,
-    FUND_FLOW_PAGE_FALLBACK_CONCURRENCY,
-    FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS,
-    FUND_FLOW_PAGE_FALLBACK_ENABLED,
-    FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD,
-    FUND_FLOW_PAGE_FALLBACK_FAILURE_WINDOW_SECONDS,
-    FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS,
-    FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS,
+    FUND_FLOW_PAGE_CONCURRENCY,
+    FUND_FLOW_PAGE_COOLDOWN_SECONDS,
+    FUND_FLOW_PAGE_ENABLED,
+    FUND_FLOW_PAGE_FAILURE_WINDOW_SECONDS,
+    FUND_FLOW_PAGE_OPEN_AFTER_FAILURES,
+    FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS,
+    FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS,
+    SH_INDICES,
     SOURCE_BREAKER_COOLDOWN_SECONDS,
     SOURCE_BREAKER_ENABLED,
-    SOURCE_BREAKER_THRESHOLD,
-    SH_INDICES,
+    SOURCE_BREAKER_OPEN_AFTER_FAILURES,
     SZ_INDICES,
 )
 from . import basic_info
@@ -206,7 +206,7 @@ class SourceBreaker:
 # 空转的代价：8 次 K 线调用各 12.9~14.7s，占该窗口 K 线总耗时的 87%。
 _KLINE_BREAKER = SourceBreaker(
     "eastmoney_kline",
-    SOURCE_BREAKER_THRESHOLD,
+    SOURCE_BREAKER_OPEN_AFTER_FAILURES,
     SOURCE_BREAKER_COOLDOWN_SECONDS,
     degraded=impersonated_hosts_degraded,
 )
@@ -222,9 +222,9 @@ _KLINE_BREAKER = SourceBreaker(
 # 停掉，而真的持续半通时又总有一次成功把它清零。
 _FUND_FLOW_PAGE_BREAKER = SourceBreaker(
     "fund_flow_page",
-    FUND_FLOW_PAGE_FALLBACK_FAILURE_THRESHOLD,
-    FUND_FLOW_PAGE_FALLBACK_COOLDOWN_SECONDS,
-    window=FUND_FLOW_PAGE_FALLBACK_FAILURE_WINDOW_SECONDS,
+    FUND_FLOW_PAGE_OPEN_AFTER_FAILURES,
+    FUND_FLOW_PAGE_COOLDOWN_SECONDS,
+    window=FUND_FLOW_PAGE_FAILURE_WINDOW_SECONDS,
 )
 
 
@@ -501,7 +501,7 @@ import efinance as ef
 
 # 线程池用于执行同步的调用
 _executor = ThreadPoolExecutor(
-    max_workers=DATA_FETCH_MAX_WORKERS,
+    max_workers=FETCH_MAX_WORKERS,
     thread_name_prefix="cn-stock-data",
 )
 _DATA_FETCH_SLOTS_ATTR = "_cn_stock_data_fetch_slots"
@@ -523,7 +523,7 @@ def _get_data_fetch_slots() -> asyncio.Semaphore:
     loop = asyncio.get_running_loop()
     slots = getattr(loop, _DATA_FETCH_SLOTS_ATTR, None)
     if slots is None:
-        slots = asyncio.Semaphore(DATA_FETCH_MAX_IN_FLIGHT)
+        slots = asyncio.Semaphore(FETCH_MAX_IN_FLIGHT)
         setattr(loop, _DATA_FETCH_SLOTS_ATTR, slots)
     return slots
 
@@ -533,7 +533,7 @@ def _get_fund_flow_page_slots() -> asyncio.Semaphore:
     loop = asyncio.get_running_loop()
     slots = getattr(loop, _FUND_FLOW_PAGE_SLOTS_ATTR, None)
     if slots is None:
-        slots = asyncio.Semaphore(FUND_FLOW_PAGE_FALLBACK_CONCURRENCY)
+        slots = asyncio.Semaphore(FUND_FLOW_PAGE_CONCURRENCY)
         setattr(loop, _FUND_FLOW_PAGE_SLOTS_ATTR, slots)
     return slots
 
@@ -549,8 +549,8 @@ def _fund_flow_page_wait_budget(request_id: str) -> float:
     返回值已经和单标的上限 ``FALLBACK_WAIT_SECONDS`` 取过小：前者管整批，后者管
     单个，两个都置 0 就退回"不等，直接跳过"的老行为。
     """
-    per_symbol = FUND_FLOW_PAGE_FALLBACK_WAIT_SECONDS
-    if FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS <= 0:
+    per_symbol = FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS
+    if FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS <= 0:
         return per_symbol
 
     loop = asyncio.get_running_loop()
@@ -578,7 +578,7 @@ def _fund_flow_page_wait_budget(request_id: str) -> float:
 
     deadline = budgets.get(request_id)
     if deadline is None:
-        deadline = now + FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS
+        deadline = now + FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS
         budgets[request_id] = deadline
     return min(per_symbol, max(0.0, deadline - now))
 
@@ -1387,7 +1387,7 @@ class CNStockDataSource(DataSource):
         页面加载。返回结构与 _fetch_fund_flow_sync 完全相同，下游的转换和渲染
         一行不用改——今日数值取的是历史表最后一行，与主源同一条路径。
         """
-        if not FUND_FLOW_PAGE_FALLBACK_ENABLED:
+        if not FUND_FLOW_PAGE_ENABLED:
             return None
 
         from . import realtime_ff
@@ -1418,14 +1418,14 @@ class CNStockDataSource(DataSource):
             # 等不到就放弃而不是无限排队：排队会把"缺一段"换成"整批都慢"，而
             # 请求级预算已经表达了"这一批整体愿意为补全等多久"。
             reason = (
-                f"请求预算 {FUND_FLOW_PAGE_FALLBACK_REQUEST_BUDGET_SECONDS:.0f}s 已用尽"
+                f"请求预算 {FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS:.0f}s 已用尽"
                 if wait_budget <= 0
                 else f"等 {wait_budget:.1f}s 未排到"
             )
             logger.info(
                 "资金流向页面兜底跳过 %s: 兜底名额已满(上限 %d)，%s",
                 symbol,
-                FUND_FLOW_PAGE_FALLBACK_CONCURRENCY,
+                FUND_FLOW_PAGE_CONCURRENCY,
                 reason,
             )
             return None

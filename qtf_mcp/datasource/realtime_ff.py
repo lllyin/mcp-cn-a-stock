@@ -11,12 +11,12 @@ from playwright.async_api import async_playwright, Browser, BrowserContext
 
 from ..config import (
     ALL_INDICES,
+    BROWSER_CLAIM_PLATFORM,
+    BROWSER_DISGUISE,
+    BROWSER_HEADFUL,
     BROWSER_IDLE_TIMEOUT_SECONDS,
-    BROWSER_PAGE_CONCURRENCY,
-    FUND_FLOW_PAGE_CLAIM_PLATFORM,
-    FUND_FLOW_PAGE_DISGUISE,
-    FUND_FLOW_PAGE_HEADFUL,
-    FUND_FLOW_PAGE_KEEP_PAGES,
+    BROWSER_KEEP_PAGES,
+    BROWSER_MAX_PAGES,
     FUND_FLOW_PAGE_MAX_LOADS,
     FUND_FLOW_PAGE_RETRY_DELAY_MS,
     FUND_FLOW_PAGE_REUSE_SECONDS,
@@ -51,7 +51,7 @@ _idle_task: asyncio.Task | None = None
 
 # 整个浏览器同时开着的页面数上限。页面在这段区间内创建也在区间内关闭，所以这个
 # 值同时就是"同时几个渲染进程"，是峰值内存的直接决定项。见配置项的实测数据。
-SEMAPHORE = asyncio.Semaphore(BROWSER_PAGE_CONCURRENCY)
+SEMAPHORE = asyncio.Semaphore(BROWSER_MAX_PAGES)
 _inflight: dict[str, asyncio.Task[dict]] = {}
 _inflight_waiters: dict[str, int] = {}
 _inflight_keep_alive: dict[str, bool] = {}
@@ -233,7 +233,7 @@ def _claimed_platform(real: str) -> str:
     字体列表仍然是 Linux 的样子。如果对端交叉核对到那一层，声明 macOS 反而比照实
     报更可疑。所以留了 ``real`` 选项，好在部署机上用 blocked_captcha 的占比做对照。
     """
-    configured = (FUND_FLOW_PAGE_CLAIM_PLATFORM or "auto").strip().lower()
+    configured = (BROWSER_CLAIM_PLATFORM or "auto").strip().lower()
     if configured == "real":
         return real
     if configured in ("macos", "mac"):
@@ -317,7 +317,7 @@ async def disguise_page(page) -> None:
     这条是这批伪装里唯一有明确机制的：``sec-ch-ua`` 在每个请求头里写着
     ``"HeadlessChrome";v="145"``，是自报身份，不是什么细微指纹。
     """
-    if not FUND_FLOW_PAGE_DISGUISE:
+    if not BROWSER_DISGUISE:
         return
     try:
         context = page.context
@@ -338,7 +338,7 @@ async def get_context() -> BrowserContext:
             try:
                 new_playwright = await async_playwright().start()
                 new_browser = await new_playwright.chromium.launch(
-                    headless=not FUND_FLOW_PAGE_HEADFUL,
+                    headless=not BROWSER_HEADFUL,
                     args=[
                         # 不带这一条时 navigator.webdriver 为 true，东财的资金流
                         # 接口对页面发出的 /fflow/ 请求直接空响应。实测同一时间、
@@ -364,7 +364,7 @@ async def get_context() -> BrowserContext:
                     "java_script_enabled": True,
                     "bypass_csp": True,
                 }
-                if FUND_FLOW_PAGE_DISGUISE:
+                if BROWSER_DISGUISE:
                     context_options.update(
                         # 中文财经站的访客不会只带 en-US。locale 同时决定
                         # navigator.language(s) 和 Accept-Language 请求头。
@@ -376,7 +376,7 @@ async def get_context() -> BrowserContext:
                         screen={"width": 1920, "height": 1080},
                     )
                 new_context = await new_browser.new_context(**context_options)
-                if FUND_FLOW_PAGE_DISGUISE:
+                if BROWSER_DISGUISE:
                     await new_context.add_init_script(_HEADLESS_GAPS_SCRIPT)
             except BaseException:
                 await _close_started_browser(new_playwright, new_browser)
@@ -677,7 +677,7 @@ async def load_fund_flow_page(
                 f"{symbol} 页面既无今日数据也无历史表"
             )
         finally:
-            if FUND_FLOW_PAGE_KEEP_PAGES:
+            if BROWSER_KEEP_PAGES:
                 # 调试模式：留着页面供人工观察。每个页面是一个独立渲染进程，实测
                 # 约 120 MiB，会持续占着，只在排查时开。
                 logger.info("调试模式保留页面 symbol=%s url=%s", symbol, url)

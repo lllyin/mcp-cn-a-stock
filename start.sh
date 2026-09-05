@@ -19,6 +19,30 @@ PORT=8686
 # 创建日志目录
 mkdir -p "$LOG_DIR"
 
+# .env 是给 Python 进程读的（入口 load_dotenv(override=True)），但 XVFB_* 是本脚本
+# 自己在用，写进 .env 就成了静默失效的配置。所以这里按 key 单独取一次。
+# 不用 `source .env`：那会把文件里任意一行当命令执行，一行手滑就能改掉 PATH。
+env_file_value() {
+    [ -f "$SCRIPT_DIR/.env" ] || return 0
+    sed -n "s/^[[:space:]]*$1=//p" "$SCRIPT_DIR/.env" \
+        | tail -n 1 \
+        | sed -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+
+# 取一项配置。配置名不带前缀写，前缀由 ENV_PREFIX 决定——和 Python 侧的
+# qtf_mcp.config.env() 同一套规则，两边不能各认各的。
+# .env 优先于 shell 环境变量，也是为了和 Python 侧一致：入口是
+# load_dotenv(override=True)。同一个文件在两处按相反的优先级解释，迟早坑人。
+conf() {
+    local prefix key value
+    prefix="$(env_file_value ENV_PREFIX)"
+    prefix="${prefix:-${ENV_PREFIX:-}}"
+    key="${prefix}$1"
+    value="$(env_file_value "$key")"
+    [ -n "$value" ] || value="${!key:-}"
+    printf '%s' "$value"
+}
+
 # 激活虚拟环境
 if [ -f ".venv/bin/activate" ]; then
     source ".venv/bin/activate"
@@ -80,10 +104,11 @@ start_xvfb_if_needed() {
         return 0
     fi
 
-    local display_number display socket_path xvfb_pid
-    display_number="${CN_STOCK_XVFB_DISPLAY_NUMBER:-99}"
+    local display_number display socket_path xvfb_pid screen
+    display_number="$(conf XVFB_DISPLAY_NUMBER)"
+    display_number="${display_number:-99}"
     if ! [[ "$display_number" =~ ^[0-9]+$ ]]; then
-        echo "警告: CN_STOCK_XVFB_DISPLAY_NUMBER 必须是数字；将使用默认显示号 99。"
+        echo "警告: XVFB_DISPLAY_NUMBER 必须是数字；将使用默认显示号 99。"
         display_number=99
     fi
     while [ "$display_number" -le 109 ]; do
@@ -99,7 +124,8 @@ start_xvfb_if_needed() {
     fi
 
     display=":${display_number}"
-    Xvfb "$display" -screen 0 "${CN_STOCK_XVFB_SCREEN:-1920x1080x24}" -nolisten tcp \
+    screen="$(conf XVFB_SCREEN)"
+    Xvfb "$display" -screen 0 "${screen:-1920x1080x24}" -nolisten tcp \
         > "$XVFB_LOG_FILE" 2>&1 &
     xvfb_pid=$!
     echo "$xvfb_pid $display" > "$XVFB_PID_FILE"

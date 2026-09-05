@@ -550,7 +550,7 @@ WINDOWS_UA = (
 async def test_version_is_kept_whole_and_headless_is_dropped(monkeypatch):
     """版本号要完整保留：报一个比引擎新的版本会被特性检测抓出来。"""
     monkeypatch.setattr(realtime_ff, "_identity", None)
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_CLAIM_PLATFORM", "real")
+    monkeypatch.setattr(realtime_ff, "BROWSER_CLAIM_PLATFORM", "real")
     context = _FakeContext(_FakePage(MAC_UA, "MacIntel", "macOS"))
 
     identity = await realtime_ff._browser_identity(context)
@@ -572,7 +572,7 @@ async def test_linux_claims_macos_by_default(monkeypatch):
     navigator.platform、client hints 的 platform。
     """
     monkeypatch.setattr(realtime_ff, "_identity", None)
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_CLAIM_PLATFORM", "auto")
+    monkeypatch.setattr(realtime_ff, "BROWSER_CLAIM_PLATFORM", "auto")
     context = _FakeContext(_FakePage(LINUX_UA, "Linux x86_64", "Linux"))
 
     identity = await realtime_ff._browser_identity(context)
@@ -596,7 +596,7 @@ async def test_common_desktop_platforms_are_reported_truthfully(
     monkeypatch, ua, nav_platform, ch_platform
 ):
     monkeypatch.setattr(realtime_ff, "_identity", None)
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_CLAIM_PLATFORM", "auto")
+    monkeypatch.setattr(realtime_ff, "BROWSER_CLAIM_PLATFORM", "auto")
     context = _FakeContext(_FakePage(ua, nav_platform, ch_platform))
 
     identity = await realtime_ff._browser_identity(context)
@@ -609,7 +609,7 @@ async def test_common_desktop_platforms_are_reported_truthfully(
 async def test_claim_platform_real_keeps_linux(monkeypatch):
     """留 real 是为了在部署机上做对照，不能被 auto 的规则覆盖掉。"""
     monkeypatch.setattr(realtime_ff, "_identity", None)
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_CLAIM_PLATFORM", "real")
+    monkeypatch.setattr(realtime_ff, "BROWSER_CLAIM_PLATFORM", "real")
     context = _FakeContext(_FakePage(LINUX_UA, "Linux x86_64", "Linux"))
 
     identity = await realtime_ff._browser_identity(context)
@@ -634,7 +634,7 @@ async def test_identity_is_probed_once(monkeypatch):
 @pytest.mark.asyncio
 async def test_disguise_page_sends_the_override(monkeypatch):
     monkeypatch.setattr(realtime_ff, "_identity", None)
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", True)
+    monkeypatch.setattr(realtime_ff, "BROWSER_DISGUISE", True)
     page = _FakePage("HeadlessChrome/145.0.0.0", "MacIntel", "macOS")
     context = _FakeContext(page)
 
@@ -645,7 +645,7 @@ async def test_disguise_page_sends_the_override(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_disguise_is_skipped_when_switched_off(monkeypatch):
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+    monkeypatch.setattr(realtime_ff, "BROWSER_DISGUISE", False)
     page = _FakePage("HeadlessChrome/145.0.0.0", "MacIntel", "macOS")
     context = _FakeContext(page)
 
@@ -657,7 +657,7 @@ async def test_disguise_is_skipped_when_switched_off(monkeypatch):
 @pytest.mark.asyncio
 async def test_disguise_failure_never_breaks_the_fetch(monkeypatch):
     """拿不到数据的代价远大于指纹暴露，伪装失败必须放行。"""
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", True)
+    monkeypatch.setattr(realtime_ff, "BROWSER_DISGUISE", True)
     monkeypatch.setattr(realtime_ff, "_identity", None)
 
     class _Boom:
@@ -738,8 +738,8 @@ async def _no_wait(*_a, **_k):
 async def test_reloads_the_same_tab_before_opening_another(monkeypatch):
     """第一次没数据 -> 同一个 tab reload，不是新开一个。"""
     page = _FakeTabPage([EMPTY_HTML, _full_html()])
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+    monkeypatch.setattr(realtime_ff, "BROWSER_KEEP_PAGES", False)
+    monkeypatch.setattr(realtime_ff, "BROWSER_DISGUISE", False)
     monkeypatch.setattr(realtime_ff, "_wait_for_today", _no_wait)
     monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
     monkeypatch.setattr(realtime_ff, "_sleep_before_retry", lambda: _resolved(0.3))
@@ -776,8 +776,8 @@ async def test_an_unsupported_symbol_still_logs_one_line(monkeypatch, caplog):
 async def test_a_load_that_blows_up_still_logs_one_line(monkeypatch, caplog):
     """goto 超时之类的异常也要留下 outcome=error，否则只剩上游一句笼统的失败。"""
     page = _FakeTabPage([])
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+    monkeypatch.setattr(realtime_ff, "BROWSER_KEEP_PAGES", False)
+    monkeypatch.setattr(realtime_ff, "BROWSER_DISGUISE", False)
 
     async def boom(*_a, **_k):
         raise TimeoutError("goto 超时")
@@ -798,8 +798,8 @@ async def test_a_load_that_blows_up_still_logs_one_line(monkeypatch, caplog):
 async def test_each_load_logs_exactly_one_line(monkeypatch, caplog):
     """goto + reload = 两行，靠 how 区分；不能少记也不能被 finally 重复补记。"""
     page = _FakeTabPage([EMPTY_HTML, _full_html()])
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+    monkeypatch.setattr(realtime_ff, "BROWSER_KEEP_PAGES", False)
+    monkeypatch.setattr(realtime_ff, "BROWSER_DISGUISE", False)
     monkeypatch.setattr(realtime_ff, "_wait_for_today", _no_wait)
     monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
     monkeypatch.setattr(realtime_ff, "_sleep_before_retry", lambda: _resolved(0.0))
@@ -821,8 +821,8 @@ async def test_each_load_logs_exactly_one_line(monkeypatch, caplog):
 async def test_one_load_never_reloads(monkeypatch):
     """预算只有一次时不 reload——会话已经热了就不该多付一次加载。"""
     page = _FakeTabPage([_full_html()])
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+    monkeypatch.setattr(realtime_ff, "BROWSER_KEEP_PAGES", False)
+    monkeypatch.setattr(realtime_ff, "BROWSER_DISGUISE", False)
     monkeypatch.setattr(realtime_ff, "_wait_for_today", _no_wait)
     monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
 
@@ -835,8 +835,8 @@ async def test_one_load_never_reloads(monkeypatch):
 async def test_a_satisfied_first_load_does_not_reload(monkeypatch):
     """第一次就拿到了想要的，不该白刷一次。"""
     page = _FakeTabPage([_full_html()])
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+    monkeypatch.setattr(realtime_ff, "BROWSER_KEEP_PAGES", False)
+    monkeypatch.setattr(realtime_ff, "BROWSER_DISGUISE", False)
     monkeypatch.setattr(realtime_ff, "_wait_for_today", _no_wait)
     monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
 
@@ -852,8 +852,8 @@ async def test_a_satisfied_first_load_does_not_reload(monkeypatch):
 async def test_the_tab_is_closed_even_when_every_load_fails(monkeypatch):
     """两次都没数据也要关掉，否则 tab 会活过信号量区间、上限失效。"""
     page = _FakeTabPage([EMPTY_HTML, EMPTY_HTML])
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+    monkeypatch.setattr(realtime_ff, "BROWSER_KEEP_PAGES", False)
+    monkeypatch.setattr(realtime_ff, "BROWSER_DISGUISE", False)
     monkeypatch.setattr(realtime_ff, "_wait_for_today", _no_wait)
     monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
     monkeypatch.setattr(realtime_ff, "_sleep_before_retry", lambda: _resolved(0.0))
@@ -874,8 +874,8 @@ async def test_the_tab_is_closed_even_when_every_load_fails(monkeypatch):
 async def test_the_semaphore_is_released_after_both_loads(monkeypatch):
     """reload 在同一段持有区间内，结束后必须把名额还回去。"""
     page = _FakeTabPage([EMPTY_HTML, _full_html()])
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
-    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+    monkeypatch.setattr(realtime_ff, "BROWSER_KEEP_PAGES", False)
+    monkeypatch.setattr(realtime_ff, "BROWSER_DISGUISE", False)
     monkeypatch.setattr(realtime_ff, "_wait_for_today", _no_wait)
     monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
     monkeypatch.setattr(realtime_ff, "_sleep_before_retry", lambda: _resolved(0.0))
@@ -973,8 +973,8 @@ class TestLoadBudget:
         页面也算成"取到过数据"，于是本进程后面所有标的都只加载一次。
         """
         page = _FakeTabPage([EMPTY_HTML, _full_html()])
-        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
-        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+        monkeypatch.setattr(realtime_ff, "BROWSER_KEEP_PAGES", False)
+        monkeypatch.setattr(realtime_ff, "BROWSER_DISGUISE", False)
         monkeypatch.setattr(realtime_ff, "_wait_for_today", _no_wait)
         monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
         monkeypatch.setattr(realtime_ff, "_sleep_before_retry", lambda: _resolved(0.0))
@@ -999,8 +999,8 @@ class TestLoadBudget:
         这正是并发 4×4 实测里丢掉 SH603986 和 SH600030 的原因：批 1 有一个标的
         成功之后，它们都只加载了一次就拿着 history=0 放弃了。
         """
-        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
-        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+        monkeypatch.setattr(realtime_ff, "BROWSER_KEEP_PAGES", False)
+        monkeypatch.setattr(realtime_ff, "BROWSER_DISGUISE", False)
         monkeypatch.setattr(realtime_ff, "_wait_for_today", _no_wait)
         monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
         monkeypatch.setattr(realtime_ff, "_sleep_before_retry", lambda: _resolved(0.0))
@@ -1027,8 +1027,8 @@ class TestLoadBudget:
     async def test_the_happy_path_still_costs_one_load(self, monkeypatch):
         """预算是上限不是配额：一次就拿到就不再加载，顺利路径零额外开销。"""
         page = _FakeTabPage([_full_html()])
-        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_KEEP_PAGES", False)
-        monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_DISGUISE", False)
+        monkeypatch.setattr(realtime_ff, "BROWSER_KEEP_PAGES", False)
+        monkeypatch.setattr(realtime_ff, "BROWSER_DISGUISE", False)
         monkeypatch.setattr(realtime_ff, "_wait_for_today", _no_wait)
         monkeypatch.setattr(realtime_ff, "_wait_for_history", _no_wait)
         monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_MAX_LOADS", 2)
@@ -1041,12 +1041,6 @@ class TestLoadBudget:
         await realtime_ff._load_page_shared("300408", require_history=True)
 
         assert page.calls == ["goto"]
-
-    def test_the_old_env_name_is_still_accepted(self):
-        """部署里配着 COLD_ATTEMPTS 的不用改。"""
-        from qtf_mcp import config
-
-        assert config.FUND_FLOW_PAGE_COLD_ATTEMPTS == config.FUND_FLOW_PAGE_MAX_LOADS
 
 
 # --- P4：90 分钟空闲回收 -------------------------------------------------

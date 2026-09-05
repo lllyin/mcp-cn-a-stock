@@ -102,10 +102,10 @@ def test_auth_cache_round_trip_uses_private_permissions(tmp_path):
 
 
 def test_browser_sandbox_is_only_disabled_explicitly(monkeypatch):
-    monkeypatch.delenv("CN_STOCK_CHROME_NO_SANDBOX", raising=False)
+    monkeypatch.delenv("BROWSER_NO_SANDBOX", raising=False)
     assert "--no-sandbox" not in _tonghuashun_browser_args()
 
-    monkeypatch.setenv("CN_STOCK_CHROME_NO_SANDBOX", "1")
+    monkeypatch.setenv("BROWSER_NO_SANDBOX", "1")
     assert "--no-sandbox" in _tonghuashun_browser_args()
 
 

@@ -17,6 +17,8 @@ import pandas as pd
 import requests
 from playwright.async_api import Browser, Playwright, async_playwright
 
+from ..config import env
+
 
 logger = logging.getLogger("qtf_mcp")
 
@@ -90,18 +92,18 @@ def _now_shanghai() -> str:
 
 
 def _env_flag(name: str) -> bool:
-    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+    return env(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _env_float(name: str, default: float) -> float:
     try:
-        return max(0.0, float(os.getenv(name, str(default))))
+        return max(0.0, float(env(name, str(default))))
     except ValueError:
         return default
 
 
 def _default_auth_cache_path() -> Path:
-    configured = os.getenv("CN_STOCK_TONGHUASHUN_AUTH_FILE")
+    configured = env("MARKET_BREADTH_AUTH_FILE")
     if configured:
         return Path(configured).expanduser()
     return Path(__file__).resolve().parents[2] / ".runtime" / "tonghuashun-auth.json"
@@ -211,7 +213,7 @@ def _tonghuashun_browser_args() -> list[str]:
         "--disable-blink-features=AutomationControlled",
         "--window-position=-10000,-10000",
     ]
-    if _env_flag("CN_STOCK_CHROME_NO_SANDBOX"):
+    if _env_flag("BROWSER_NO_SANDBOX"):
         args.append("--no-sandbox")
     return args
 
@@ -232,7 +234,7 @@ class TonghuashunPlaywrightProvider:
         self._session = requests.Session()
         self._session_lock = threading.Lock()
         self._cooldown_seconds = (
-            _env_float("CN_STOCK_TONGHUASHUN_COOLDOWN_SECONDS", 300.0)
+            _env_float("MARKET_BREADTH_COOLDOWN_SECONDS", 300.0)
             if cooldown_seconds is None
             else max(0.0, cooldown_seconds)
         )

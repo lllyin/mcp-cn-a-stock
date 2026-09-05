@@ -125,7 +125,7 @@ def test_live_ttl_default_is_thirty_seconds():
     实测依据：60 秒窗口内主力净流入 P90 相对漂移 21%，30 秒窗口 7.7%；
     代价是约 2.8 个百分点的积分降幅。详见 docs/technical-details.md。
     """
-    assert config.REPORT_CACHE_LIVE_TTL_SECONDS == 30.0
+    assert config.REPORT_CACHE_INTRADAY_TTL_SECONDS == 30.0
 
 
 @pytest.mark.parametrize(
@@ -188,15 +188,15 @@ def test_settle_at_branch_flip_leaves_no_postclose_window(monkeypatch):
     ],
 )
 def test_settle_env_var_is_wired(monkeypatch, env_value, expected):
-    """验证 CN_STOCK_REPORT_CACHE_SETTLE_HHMM 一路贯通到 cache.SETTLE。"""
+    """验证 REPORT_CACHE_SETTLE_TIME 一路贯通到 cache.SETTLE。"""
     original = cache_module.SETTLE
-    monkeypatch.setenv("CN_STOCK_REPORT_CACHE_SETTLE_HHMM", env_value)
+    monkeypatch.setenv("REPORT_CACHE_SETTLE_TIME", env_value)
     try:
         importlib.reload(config)
         importlib.reload(cache_module)
         assert cache_module.SETTLE == expected
     finally:
-        monkeypatch.delenv("CN_STOCK_REPORT_CACHE_SETTLE_HHMM", raising=False)
+        monkeypatch.delenv("REPORT_CACHE_SETTLE_TIME", raising=False)
         importlib.reload(config)
         importlib.reload(cache_module)
         assert cache_module.SETTLE == original

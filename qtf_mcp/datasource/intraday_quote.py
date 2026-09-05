@@ -25,16 +25,16 @@ from __future__ import annotations
 
 import abc
 import logging
-import os
 from dataclasses import dataclass
 from typing import Optional
 
+from ..config import env
 from .fund_flow_page import FundFlowPage, parse_amount, parse_percent, parse_price
 
 logger = logging.getLogger("qtf_mcp")
 
 # 启用哪些 provider、按什么顺序。留空或设为 off 则整层关闭，调用方拿到 None。
-PROVIDER_ORDER_ENV = "CN_STOCK_INTRADAY_QUOTE_PROVIDERS"
+PROVIDER_ORDER_ENV = "INTRADAY_QUOTE_PROVIDERS"
 DEFAULT_PROVIDER_ORDER = ("fund_flow_page", "tencent")
 _DISABLED = {"", "off", "none", "0", "false"}
 
@@ -119,7 +119,7 @@ def registered() -> tuple:
 
 def configured_order() -> tuple:
     """按配置解析启用顺序。未知名字会被忽略并告警，不让服务起不来。"""
-    raw = os.getenv(PROVIDER_ORDER_ENV)
+    raw = env(PROVIDER_ORDER_ENV)
     if raw is None:
         names = DEFAULT_PROVIDER_ORDER
     elif raw.strip().lower() in _DISABLED:

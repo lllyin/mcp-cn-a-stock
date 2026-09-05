@@ -2078,7 +2078,7 @@ _BROWSER_HINTS = ("chrome", "chromium", "headless_shell", "Xvfb")
 def tree_rss(pid: int) -> tuple[float, int, float, int, float]:
     """(整棵树 MiB, 进程数, 其中浏览器 MiB, 浏览器进程数, 累计 CPU 秒)。
 
-    浏览器那部分单列，因为它是峰值的主要来源，也是 BROWSER_PAGE_CONCURRENCY
+    浏览器那部分单列，因为它是峰值的主要来源，也是 BROWSER_MAX_PAGES
     这个旋钮直接作用的地方——两个数放在一起才看得出上调的代价落在哪。
     """
     procs, kids = _process_table()
@@ -2239,7 +2239,7 @@ def _render_performance(watch: "MemoryWatch", calls: list[CallResult]) -> list[s
         lines.append("")
     lines.append("> 口径：`ps` 的 RSS 逐进程相加。共享页会在每个进程里各算一次，所以这个数是"
                  "**偏高的上界**，不能直接拿去和 500 MiB 的预算比对；它的用处是看趋势，以及"
-                 "看 `BROWSER_PAGE_CONCURRENCY` 这类旋钮上调之后代价落在哪。要跟预算硬比，"
+                 "看 `BROWSER_MAX_PAGES` 这类旋钮上调之后代价落在哪。要跟预算硬比，"
                  "得用 PSS（Linux 上读 `/proc/<pid>/smaps_rollup`）。")
     lines.append("")
     lines.append("> 浏览器那一行单列，是因为峰值基本由它决定：页面用完即关，所以峰值只在"

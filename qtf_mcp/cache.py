@@ -56,7 +56,7 @@ from .config import (
     REPORT_CACHE_DIR,
     REPORT_CACHE_DISK_ENABLED,
     REPORT_CACHE_ENABLED,
-    REPORT_CACHE_LIVE_TTL_SECONDS,
+    REPORT_CACHE_INTRADAY_TTL_SECONDS,
     REPORT_CACHE_MAX_ENTRIES,
     REPORT_CACHE_SETTLE_TIME,
 )
@@ -314,7 +314,7 @@ class ReportCache:
         self,
         *,
         enabled: bool = REPORT_CACHE_ENABLED,
-        live_ttl_seconds: float = REPORT_CACHE_LIVE_TTL_SECONDS,
+        live_ttl_seconds: float = REPORT_CACHE_INTRADAY_TTL_SECONDS,
         max_entries: int = REPORT_CACHE_MAX_ENTRIES,
         disk_enabled: bool = REPORT_CACHE_DISK_ENABLED,
         directory: str = REPORT_CACHE_DIR,

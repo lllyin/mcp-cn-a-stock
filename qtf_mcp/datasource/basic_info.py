@@ -65,15 +65,15 @@ from __future__ import annotations
 
 import abc
 import logging
-import os
 from dataclasses import dataclass
 from typing import Optional
 
+from ..config import env
 from .intraday_quote import tencent_code
 
 logger = logging.getLogger("qtf_mcp")
 
-PROVIDER_ORDER_ENV = "CN_STOCK_BASIC_INFO_PROVIDERS"
+PROVIDER_ORDER_ENV = "BASIC_INFO_PROVIDERS"
 DEFAULT_PROVIDER_ORDER = ("eastmoney", "tencent")
 _DISABLED = {"", "off", "none", "0", "false"}
 
@@ -153,7 +153,7 @@ def registered() -> tuple:
 
 def configured_order() -> tuple:
     """按配置解析启用顺序。未知名字忽略并告警，不让服务起不来。"""
-    raw = os.getenv(PROVIDER_ORDER_ENV)
+    raw = env(PROVIDER_ORDER_ENV)
     if raw is None:
         names = DEFAULT_PROVIDER_ORDER
     elif raw.strip().lower() in _DISABLED:

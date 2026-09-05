@@ -331,7 +331,7 @@ async def test_report_modes_share_batch_concurrency_limit(monkeypatch):
     async def fake_build_trading_data(fp, symbol, data, **kwargs):
         print("# trading", file=fp)
 
-    monkeypatch.setattr(app_module, "BATCH_QUERY_CONCURRENCY", 2)
+    monkeypatch.setattr(app_module, "BATCH_CONCURRENCY", 2)
     monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
     monkeypatch.setattr(app_module.research, "build_trading_data", fake_build_trading_data)
 
