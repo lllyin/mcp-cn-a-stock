@@ -39,8 +39,12 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+#: AGENTS.md 第四条：服务及其 Chromium、Xvfb 等子进程的合计峰值上限。
+#: 和 scripts/loadtest_mcp.py 用同一个数，两边报告才可比。
+MEMORY_BUDGET_MIB = 500.0
 DEFAULT_BASELINE_DIR = PROJECT_ROOT / "verification" / "baseline"
 DEFAULT_REPORT_DIR = PROJECT_ROOT / "verification" / "reports"
 DEFAULT_LOG_PATH = PROJECT_ROOT / "logs" / "cn-stock-mcp.log"
@@ -2294,17 +2298,55 @@ def _process_table() -> tuple[dict, dict]:
 _BROWSER_HINTS = ("chrome", "chromium", "headless_shell", "Xvfb")
 
 
-def tree_rss(pid: int) -> tuple[float, int, float, int, float]:
-    """(整棵树 MiB, 进程数, 其中浏览器 MiB, 浏览器进程数, 累计 CPU 秒)。
+def _pss_kib(pid: int) -> float | None:
+    """读 ``/proc/<pid>/smaps_rollup`` 的 Pss，单位 KiB；读不到返回 None。
+
+    为什么非要它：RSS 把共享页在每个进程里各算一次，而 Chromium 是一个主进程加
+    七八个共享同一份代码段和字体缓存的渲染进程——逐进程相加会把同一块内存算七八遍。
+    2026-09-06 部署机上实测 RSS 合计 1482 MiB，而机器级曲线只涨了约 840 MiB，
+    虚高 1.76 倍。PSS 把共享页按共享它的进程数均摊，加起来才等于"这棵树真正占了多少"。
+
+    ``smaps_rollup`` 是内核直接给的汇总（不是 ``smaps`` 那样一段段自己加），代价是
+    一次页表遍历，十几个进程每秒一轮可以忽略。只有 Linux 有；macOS 上没有等价物，
+    所以那里只能退回 RSS，报告里必须说清是哪一种。
+    """
+    try:
+        with open(f"/proc/{pid}/smaps_rollup", "rb") as handle:
+            for line in handle:
+                if line.startswith(b"Pss:"):
+                    return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+class TreeSample(NamedTuple):
+    """一次采样。``pss_mib`` 为 0 表示这个平台或权限下读不到 PSS。"""
+
+    rss_mib: float
+    processes: int
+    browser_rss_mib: float
+    browser_processes: int
+    cpu_seconds: float
+    pss_mib: float = 0.0
+    #: 成功读到 PSS 的进程数。小于 processes 就说明 PSS 那列是不完整的，
+    #: 不能拿去和预算比——宁可不给数，也不给一个偏低的数。
+    pss_processes: int = 0
+
+
+def tree_rss(pid: int) -> TreeSample:
+    """采一次服务进程树。
 
     浏览器那部分单列，因为它是峰值的主要来源，也是 BROWSER_MAX_PAGES
     这个旋钮直接作用的地方——两个数放在一起才看得出上调的代价落在哪。
     """
     procs, kids = _process_table()
     if pid not in procs:
-        return 0.0, 0, 0.0, 0, 0.0
+        return TreeSample(0.0, 0, 0.0, 0, 0.0)
     total = browser = 0
     count = browser_count = 0
+    pss = 0.0
+    pss_count = 0
     cpu = 0.0
     seen: set[int] = set()
     stack = [pid]
@@ -2317,11 +2359,20 @@ def tree_rss(pid: int) -> tuple[float, int, float, int, float]:
         total += rss
         cpu += proc_cpu
         count += 1
+        # 只对树里的进程读 smaps_rollup。_process_table 扫的是全机进程，
+        # 对每一个都读一次页表汇总，代价就不是可以忽略的了。
+        measured = _pss_kib(current)
+        if measured is not None:
+            pss += measured
+            pss_count += 1
         if any(hint.lower() in comm.lower() for hint in _BROWSER_HINTS):
             browser += rss
             browser_count += 1
         stack.extend(kids.get(current, ()))
-    return total / 1024, count, browser / 1024, browser_count, cpu
+    return TreeSample(
+        total / 1024, count, browser / 1024, browser_count, cpu,
+        pss / 1024, pss_count,
+    )
 
 
 @dataclass
@@ -2378,6 +2429,12 @@ class MemoryWatch:
         # 累计 CPU 秒是单调的，首尾之差就是这段窗口里真正烧掉的算力。
         cpu_used = max(0.0, cpus[-1] - cpus[0]) if len(cpus) > 1 else 0.0
         span = max(1e-9, (len(self.samples) - 1) * self.interval)
+
+        # PSS 只在**每一个**进程都读到时才算数。少读一个就是偏低，而偏低的内存数
+        # 比没有内存数更危险——它会让一个超预算的版本看着合格。
+        complete = [s for s in self.samples
+                    if len(s) > 6 and s[6] and s[6] == s[1]]
+        pss = [s[5] for s in complete]
         return {
             "first": totals[0],
             "peak": max(totals),
@@ -2390,6 +2447,10 @@ class MemoryWatch:
             "cpu_seconds": cpu_used,
             "cpu_cores": cpu_used / span,
             "span": span,
+            "pss_peak": max(pss) if pss else None,
+            "pss_mean": (sum(pss) / len(pss)) if pss else None,
+            "pss_last": pss[-1] if pss else None,
+            "pss_samples": len(pss),
         }
 
 
@@ -2440,11 +2501,24 @@ def _render_performance(watch: "MemoryWatch", calls: list[CallResult]) -> list[s
     info = watch.summary()
     lines.append(f"| 指标 | 值 |")
     lines.append(f"| --- | ---: |")
+    has_pss = info["pss_peak"] is not None
     lines.append(f"| 起始 | {info['first']:.0f} MiB |")
-    lines.append(f"| **峰值** | **{info['peak']:.0f} MiB**（{info['peak_processes']} 进程）|")
-    lines.append(f"| 均值 | {info['mean']:.0f} MiB |")
-    lines.append(f"| 结束 | {info['last']:.0f} MiB |")
-    lines.append(f"| 其中浏览器峰值 | {info['browser_peak']:.0f} MiB"
+    if has_pss:
+        # PSS 在前、RSS 在后：能跟预算比的是前者，后者只是上界。
+        budget = MEMORY_BUDGET_MIB
+        verdict = "✅ 在预算内" if info["pss_peak"] <= budget else "❌ 超预算"
+        lines.append(f"| **峰值 PSS** | **{info['pss_peak']:.0f} MiB**"
+                     f"（预算 {budget:.0f} MiB，{verdict}）|")
+        lines.append(f"| 峰值 RSS 合计 | {info['peak']:.0f} MiB"
+                     f"（{info['peak_processes']} 进程，含重复计的共享页）|")
+        lines.append(f"| 均值 PSS | {info['pss_mean']:.0f} MiB |")
+        lines.append(f"| 结束 PSS | {info['pss_last']:.0f} MiB |")
+    else:
+        lines.append(f"| **峰值 RSS 合计** | **{info['peak']:.0f} MiB**"
+                     f"（{info['peak_processes']} 进程）|")
+        lines.append(f"| 均值 | {info['mean']:.0f} MiB |")
+        lines.append(f"| 结束 | {info['last']:.0f} MiB |")
+    lines.append(f"| 其中浏览器峰值 RSS | {info['browser_peak']:.0f} MiB"
                  f"（{info['browser_peak_processes']} 进程）|")
     if info["cpu_seconds"] > 0:
         lines.append(f"| **CPU** | **{info['cpu_seconds']:.0f}s / {info['span']:.0f}s"
@@ -2456,10 +2530,21 @@ def _render_performance(watch: "MemoryWatch", calls: list[CallResult]) -> list[s
                      "接近核数就是算力打满；远低于核数而调用又慢，那是在等网络。"
                      "只统计服务进程树，不含本脚本自己和它拉起的 mcporter。")
         lines.append("")
-    lines.append("> 口径：`ps` 的 RSS 逐进程相加。共享页会在每个进程里各算一次，所以这个数是"
-                 "**偏高的上界**，不能直接拿去和 500 MiB 的预算比对；它的用处是看趋势，以及"
-                 "看 `BROWSER_MAX_PAGES` 这类旋钮上调之后代价落在哪。要跟预算硬比，"
-                 "得用 PSS（Linux 上读 `/proc/<pid>/smaps_rollup`）。")
+    if has_pss:
+        lines.append(f"> 口径：PSS 读自 `/proc/<pid>/smaps_rollup`，共享页按共享它的进程数均摊，"
+                     f"整棵树加起来等于「实际占了多少」，可以直接和预算比。"
+                     f"RSS 那一行是逐进程相加，Chromium 的代码段会被算七八遍——"
+                     f"本次两者相差 {info['peak'] / max(info['pss_peak'], 1e-9):.2f} 倍，"
+                     f"留着它是为了看 `BROWSER_MAX_PAGES` 这类旋钮的代价落在哪。"
+                     f"PSS 采到 {info['pss_samples']}/{info['samples']} 次"
+                     f"（只在整棵树都读到时才计入，缺一个就整次作废，"
+                     f"偏低的内存数比没有更危险）。")
+    else:
+        lines.append("> 口径：`ps` 的 RSS 逐进程相加，共享页在每个进程里各算一次，"
+                     "所以这个数是**偏高的上界**（Chromium 上实测约 1.8 倍），"
+                     f"不能直接拿去和 {MEMORY_BUDGET_MIB:.0f} MiB 的预算比。"
+                     "本次没拿到 PSS——它要读 `/proc/<pid>/smaps_rollup`，"
+                     "只有 Linux 有，且要有权限。要跟预算硬比，得在部署机上跑。")
     lines.append("")
     lines.append("> 浏览器那一行单列，是因为峰值基本由它决定：页面用完即关，所以峰值只在"
                  "页面加载的那两三秒里存在，采样间隔必须比一次加载短才抓得到。")

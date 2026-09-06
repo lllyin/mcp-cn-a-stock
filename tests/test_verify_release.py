@@ -988,3 +988,54 @@ class TestRunCallsPairing:
         assert [i for i, _ in produced] == [0, 1, 2]
         for index, result in produced:
             assert result.spec is specs[index]
+
+
+class TestMemoryAccounting:
+    """RSS 逐进程相加会把 Chromium 的共享代码段算七八遍。
+
+    2026-09-06 部署机上实测：RSS 合计 1482 MiB，而机器级曲线只涨了约 840 MiB，
+    虚高 1.76 倍。拿虚高的数去比 500 MiB 预算，得到的结论是错的。
+    """
+
+    @staticmethod
+    def _sample(rss, procs, pss=0.0, pss_procs=0, cpu=0.0):
+        return verify.TreeSample(rss, procs, 0.0, 0, cpu, pss, pss_procs)
+
+    def test_pss_is_reported_and_compared_against_the_budget(self):
+        watch = verify.MemoryWatch()
+        watch.samples = [self._sample(1482.0, 9, pss=840.0, pss_procs=9)]
+        text = "\n".join(verify._render_performance(
+            watch, [verify.CallResult(verify.CallSpec("brief", {}), 0, "x", "", 1.0)]))
+        assert "峰值 PSS" in text and "840 MiB" in text
+        assert "1482 MiB" in text, "RSS 要留着，用来看旋钮的代价"
+        assert "❌ 超预算" in text
+
+    def test_a_tree_inside_the_budget_says_so(self):
+        watch = verify.MemoryWatch()
+        watch.samples = [self._sample(700.0, 5, pss=420.0, pss_procs=5)]
+        text = "\n".join(verify._render_performance(
+            watch, [verify.CallResult(verify.CallSpec("brief", {}), 0, "x", "", 1.0)]))
+        assert "✅ 在预算内" in text
+
+    def test_a_partial_pss_read_is_discarded_rather_than_reported_low(self):
+        """少读一个进程就偏低，而偏低的内存数会让超预算的版本看着合格。"""
+        watch = verify.MemoryWatch()
+        watch.samples = [self._sample(1482.0, 9, pss=300.0, pss_procs=4)]
+        info = watch.summary()
+        assert info["pss_peak"] is None
+        text = "\n".join(verify._render_performance(
+            watch, [verify.CallResult(verify.CallSpec("brief", {}), 0, "x", "", 1.0)]))
+        assert "300 MiB" not in text
+        assert "偏高的上界" in text, "拿不到 PSS 就必须说清 RSS 只是上界"
+
+    def test_macos_without_pss_still_renders(self):
+        watch = verify.MemoryWatch()
+        watch.samples = [self._sample(900.0, 6)]
+        text = "\n".join(verify._render_performance(
+            watch, [verify.CallResult(verify.CallSpec("brief", {}), 0, "x", "", 1.0)]))
+        assert "峰值 RSS 合计" in text and "900 MiB" in text
+        assert "没拿到 PSS" in text
+
+    def test_the_reader_returns_none_where_smaps_rollup_does_not_exist(self):
+        """macOS 上没有 /proc，读不到要安静地返回 None，不是抛异常。"""
+        assert verify._pss_kib(999999) is None
