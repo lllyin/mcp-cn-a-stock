@@ -5,6 +5,7 @@
 """
 
 import datetime
+import pathlib
 import importlib
 import json
 import os
@@ -139,7 +140,7 @@ def test_live_ttl_default_is_thirty_seconds():
     实测依据：60 秒窗口内主力净流入 P90 相对漂移 21%，30 秒窗口 7.7%；
     代价是约 2.8 个百分点的积分降幅。详见 docs/technical-details.md。
     """
-    assert config.REPORT_CACHE_INTRADAY_TTL_SECONDS == 30.0
+    assert config.CACHE_INTRADAY_TTL_SECONDS == 30.0
 
 
 @pytest.mark.parametrize(
@@ -457,7 +458,7 @@ def test_disk_sweep_retires_expired_epoch_dirs(tmp_path):
     key = build_key("brief", "SH600000", {}, now=at(MONDAY, 18, 0))
     c.put(key, "报告正文")
 
-    epoch_dir = directory / f"{cache_module.EPOCH_DIR_PREFIX}{key.epoch}"
+    epoch_dir = pathlib.Path(c.directory) / f"{cache_module.EPOCH_DIR_PREFIX}{key.epoch}"
     assert epoch_dir.is_dir()
 
     expired = time.time() - cache_module.DISK_RETENTION_SECONDS - 60
@@ -497,9 +498,10 @@ def test_disk_payload_is_readable_json(tmp_path):
     key = build_key("brief", "SH600000", {}, now=at(MONDAY, 18, 0))
     c.put(key, "报告正文")
 
+    # c.directory 比传进去的多一层命名空间子目录：每个域各扫各的，一个域的清扫
+    # 不会顺手带走另一个域的条目。
     path = (
-        tmp_path
-        / "cache"
+        pathlib.Path(c.directory)
         / f"{cache_module.EPOCH_DIR_PREFIX}{key.epoch}"
         / f"{key.digest()}.json"
     )

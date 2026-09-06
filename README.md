@@ -304,21 +304,22 @@ AkShare 和 efinance 的接口是同步网络调用，由一个有界线程池�
 | `MARKET_EPOCH_FINAL_TIME` | 资金流从抓页面切回读接口的时刻，同时是纪元边界 | 四位 HHMM，夹在 `1500`–`2300`（默认 `1600`） |
 | `MARKET_EPOCH_BUFFER_MINUTES` | 午休、傍晚这些边界后留给上游整理的缓冲 | 分钟，`0`–`60`（默认 `5`） |
 
-### 报告缓存
+### 缓存
 
-按标的缓存已渲染的报告，`sector_fund_flow` 则缓存上游那份板块数据。缓存条目绑定“市场纪元”，
-只在重新生成会得到同样字节的窗口内复用，因此命中与否不改变返回内容。
+缓存唯一的正当理由是"这段时间里这份数据不会变"：非交易日数据冻结，一个纪元可以一直
+命中；盘中数据在变，只用短 TTL 合并重复请求。命中与否不改变返回内容。
 
 | 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
-| `REPORT_CACHE_ENABLED` | 关闭后缓存完全不参与调用链，可用于冷热对照压测 | `0`<br>`1`<br>（默认 `1`） |
-| `REPORT_CACHE_INTRADAY_TTL_SECONDS` | 盘中的缓存时间，只用于合并突发重复请求 | 秒，`0` 表示盘中绝不复用（默认 `30`） |
-| `REPORT_CACHE_MAX_ENTRIES` | 内存缓存的最大条目数 | 正整数（默认 `512`） |
-| `REPORT_CACHE_DISK_ENABLED` | 跨重启保留闭市期间的缓存 | `0`<br>`1`<br>（默认 `1`） |
-| `REPORT_CACHE_DIR` | 磁盘缓存目录 | 路径，相对项目根目录（默认 `.runtime/report-cache`） |
+| `CACHE_ENABLED` | 总开关。关掉后所有命名空间既不读也不写，可用于冷热对照压测 | `0`<br>`1`<br>（默认 `1`） |
+| `CACHE_INTRADAY_TTL_SECONDS` | 盘中软过期秒数的默认值，`0` 表示盘中绝不复用。盘中数值持续变动，这个 TTL 只用于合并突发重复请求 | 秒（默认 `30`） |
+| `CACHE_STALE_ON_ERROR` | 软过期后刷新失败，是否继续用旧值。用了一定会在输出里标注；跨纪元的旧值永远不给 | `0`<br>`1`<br>（默认 `1`） |
+| `CACHE_DISK_ENABLED` | 跨重启保留闭市纪元的条目。傍晚纪元长达 16 小时，周末达 64 小时 | `0`<br>`1`<br>（默认 `1`） |
+| `CACHE_DIR` | 磁盘层目录，相对项目根目录。每个命名空间一个子目录 | 路径（默认 `.runtime/cache`） |
+| `CACHE_<命名空间>_MAX_ENTRIES`<br>`CACHE_<命名空间>_TTL_SECONDS` | 单个命名空间的覆盖，命名空间有 `report`、`market_events`、`sector_flow`、`market_breadth`、`finance`、`calendar`、`taxonomy`。例：`CACHE_REPORT_MAX_ENTRIES=512` | 正整数 / 秒 |
 
-盘中命中返回的是一份稍旧的快照，TTL 决定它能有多旧；对资金流精度要求高时设为 `0`。
-取值依据和实测数据见[报告缓存](docs/technical-details.md#10-报告缓存)。
+盘中命中返回的必然是一份稍旧的快照，TTL 决定这份快照能有多旧。对资金流精度要求高时设为 `0`。
+纪元划分、TTL 取值依据和实测数据见[报告缓存](docs/technical-details.md#10-报告缓存)。
 
 ### 市场宽度（同花顺）
 

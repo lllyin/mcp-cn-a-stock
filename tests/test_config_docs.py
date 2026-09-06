@@ -29,6 +29,25 @@ _FOREIGN = {"REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"}
 _LEGACY = {"AKSHARE_PROXY_IP", "AKSHARE_PROXY_PASSWORD", "AKSHARE_PROXY_PORT"}
 
 
+#: 按命名空间派生的配置名：``CACHE_<命名空间>_TTL_SECONDS`` / ``_MAX_ENTRIES``。
+#: 代码里用 f-string 拼名字（config.cache_ttl / cache_max_entries），扫不出来；
+#: 而八个命名空间 × 两项 = 十六行文档，写进 README 也没人会逐行看。所以这一族按
+#: **模式**校验：文档必须写清模式本身（见下面那条测试），具体名字不逐个比对。
+_NAMESPACED_CACHE = re.compile(r"^CACHE_[A-Z0-9]+_(TTL_SECONDS|MAX_ENTRIES)$")
+
+
+def _drop_namespaced(names: dict) -> dict:
+    return {k: v for k, v in names.items() if not _NAMESPACED_CACHE.match(k)}
+
+
+def test_the_namespaced_cache_override_pattern_is_documented():
+    """这一族不逐个比对，那就必须保证模式本身写在文档里，否则等于没写。"""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert "CACHE_<命名空间>_MAX_ENTRIES" in readme
+    assert "CACHE_<命名空间>_TTL_SECONDS" in env_example
+
+
 def _code_configs() -> dict[str, str | None]:
     """扫出代码实际读取的配置名，以及能直接读到的默认值字面量。
 
@@ -95,13 +114,15 @@ def _readme_configs() -> dict[str, str | None]:
 
 
 def test_env_example_covers_exactly_what_the_code_reads():
-    code, doc = set(_code_configs()), set(_env_example())
+    code = set(_drop_namespaced(_code_configs()))
+    doc = set(_drop_namespaced(_env_example()))
     assert not code - doc, f".env.example 缺少代码在读的配置: {sorted(code - doc)}"
     assert not doc - code, f".env.example 写了代码不读的配置: {sorted(doc - code)}"
 
 
 def test_readme_covers_exactly_what_the_code_reads():
-    code, doc = set(_code_configs()), set(_readme_configs())
+    code = set(_drop_namespaced(_code_configs()))
+    doc = set(_drop_namespaced(_readme_configs()))
     assert not code - doc, f"README 缺少代码在读的配置: {sorted(code - doc)}"
     assert not doc - code, f"README 写了代码不读的配置: {sorted(doc - code)}"
 

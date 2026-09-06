@@ -50,17 +50,21 @@ import os
 import re
 import shutil
 import tempfile
+import asyncio
 import threading
 import time
+import dataclasses
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from .config import (
-    REPORT_CACHE_DIR,
-    REPORT_CACHE_DISK_ENABLED,
-    REPORT_CACHE_ENABLED,
-    REPORT_CACHE_INTRADAY_TTL_SECONDS,
-    REPORT_CACHE_MAX_ENTRIES,
+    CACHE_DIR,
+    CACHE_DISK_ENABLED,
+    CACHE_ENABLED,
+    CACHE_INTRADAY_TTL_SECONDS,
+    CACHE_STALE_ON_ERROR,
+    cache_max_entries,
+    cache_ttl,
 )
 from .market_session import (
     PHASE_CLOSED,
@@ -138,6 +142,88 @@ market_phase = phase_and_epoch
 
 
 @dataclass(frozen=True)
+class Namespace:
+    """一个缓存域的全部声明。
+
+    各有各的额度，互不挤占——``market_events`` 一条 1.6 MiB，和个股报告混在同一份
+    512 条额度里会把报告条目全挤掉。
+
+    失效口径只有两种，用 ``epoch_bound`` 区分：
+
+    - **跟市场**（``epoch_bound=True``）：行情、资金流这些，盘中一直在变、收盘冻住。
+      ``ttl_seconds`` 是软过期，**只在盘中纪元生效**；收盘后的纪元里数据已经冻结，
+      再设软过期只会白打上游。
+    - **按时长**（``epoch_bound=False``）：交易日历、行业分级这些，和交易时段无关。
+    """
+
+    name: str
+    max_entries: int
+    epoch_bound: bool = True
+    ttl_seconds: float = 0.0
+    #: 硬过期上限，0 = 只受 epoch 约束。软过期之后还能用多久，由它兜底。
+    max_age_seconds: float = 0.0
+    disk: bool = False
+    #: 值 → 可 JSON 化。None 表示值本身就能 JSON 化（str/dict/list）。
+    encode: Optional[Callable[[Any], Any]] = None
+    decode: Optional[Callable[[Any], Any]] = None
+    #: 哪些结果不该写进去（失败、降级）。签名 ``(value, key) -> bool``。
+    cacheable: Optional[Callable[..., bool]] = None
+
+
+_NAMESPACES: dict[str, Namespace] = {}
+
+
+def register_namespace(namespace: Namespace) -> Namespace:
+    """登记一个缓存域，并让配置能按名字覆盖它的 TTL 和上限。"""
+    resolved = dataclasses.replace(
+        namespace,
+        ttl_seconds=cache_ttl(namespace.name, namespace.ttl_seconds),
+        max_entries=cache_max_entries(namespace.name, namespace.max_entries),
+    )
+    _NAMESPACES[resolved.name] = resolved
+    return resolved
+
+
+def namespace(name: str) -> Optional[Namespace]:
+    return _NAMESPACES.get(name)
+
+
+@dataclass(frozen=True)
+class Entry:
+    """一次取用的结果，外加"它有多新"。
+
+    ``fresh=False`` 表示软过期之后刷新失败、用的是旧值——调用方**必须**在输出里
+    标注。悄悄返回旧数据比少一段数据更糟：少一段看得见，旧一天看不见。
+    """
+
+    value: Any
+    fresh: bool = True
+    age_seconds: float = 0.0
+
+    @property
+    def age_text(self) -> str:
+        seconds = int(self.age_seconds)
+        if seconds < 60:
+            return f"{seconds} 秒"
+        if seconds < 3600:
+            return f"{seconds // 60} 分钟"
+        if seconds < 86400:
+            return f"{seconds // 3600} 小时"
+        return f"{seconds // 86400} 天"
+
+
+#: 报告：唯一缓存**渲染结果**而不是上游数据的命名空间。理由是它的渲染本身要跑
+#: 指标计算，重做不便宜，而参数只有 (symbol, date, fund_flow_limit)，key 空间有界。
+REPORT_NAMESPACE = register_namespace(Namespace(
+    name="report",
+    max_entries=512,
+    epoch_bound=True,
+    ttl_seconds=CACHE_INTRADAY_TTL_SECONDS,
+    disk=True,
+))
+
+
+@dataclass(frozen=True)
 class CacheKey:
     tool: str
     symbol: str
@@ -208,6 +294,31 @@ def build_key(
     )
 
 
+def key_for(
+    ns: str,
+    key: str,
+    *,
+    epoch: Optional[str] = None,
+    now: Optional[datetime.datetime] = None,
+) -> CacheKey:
+    """通用命名空间的 key。
+
+    ``epoch`` 显式传入用于钉过去日期的查询：传 ``date-2026-08-20`` 之后这条永不
+    跨纪元失效，因为那天的数据不会再变。这类条目的 phase 记成 CLOSED——它没有
+    "盘中"可言，不该被盘中 TTL 约束。
+
+    ``key`` 里只放**影响上游请求**的参数。渲染参数（top/level/keywords 这些）一律
+    不进：板块资金流那次的教训，进了就是 900 个 key，不进只有 9 个。
+    """
+    if epoch is not None:
+        return CacheKey(tool=ns, symbol=key, params="", epoch=epoch,
+                        window=epoch, phase=PHASE_CLOSED)
+    moment = _as_shanghai(now)
+    phase, current = market_phase(moment)
+    return CacheKey(tool=ns, symbol=key, params="", epoch=current,
+                    window=moment.date().isoformat(), phase=phase)
+
+
 #: 报告里资金流那一段的标题，形如 ``## 资金流向（2026-09-04）``。日期是这段数据
 #: 真正的日子，由 ``research.fund_flow_date`` 从资金流历史的最后一行取。
 _FUND_FLOW_HEADING = re.compile(r"##\s*资金流向（(\d{4}-\d{2}-\d{2})）")
@@ -269,35 +380,67 @@ def is_cacheable_report(
     return True
 
 
-class ReportCache:
-    """Two-tier epoch-bound cache: bounded memory over an optional disk tier."""
+class Cache:
+    """一个命名空间的两层缓存：有界内存层 + 可选磁盘层。
+
+    内存层存**活对象**，磁盘层存编码后的 JSON——内存命中不付编解码代价。
+    """
 
     def __init__(
         self,
+        ns: Optional[Namespace] = None,
         *,
-        enabled: bool = REPORT_CACHE_ENABLED,
-        live_ttl_seconds: float = REPORT_CACHE_INTRADAY_TTL_SECONDS,
-        max_entries: int = REPORT_CACHE_MAX_ENTRIES,
-        disk_enabled: bool = REPORT_CACHE_DISK_ENABLED,
-        directory: str = REPORT_CACHE_DIR,
+        enabled: bool = CACHE_ENABLED,
+        live_ttl_seconds: Optional[float] = None,
+        max_entries: Optional[int] = None,
+        disk_enabled: bool = CACHE_DISK_ENABLED,
+        directory: str = CACHE_DIR,
+        stale_on_error: bool = CACHE_STALE_ON_ERROR,
     ):
+        self.ns = ns or REPORT_NAMESPACE
         self.enabled = enabled
-        self.live_ttl_seconds = live_ttl_seconds
-        self.max_entries = max_entries
-        self.disk_enabled = disk_enabled
-        self.directory = directory
+        self.live_ttl_seconds = (
+            self.ns.ttl_seconds if live_ttl_seconds is None else live_ttl_seconds
+        )
+        self.max_entries = self.ns.max_entries if max_entries is None else max_entries
+        self.disk_enabled = disk_enabled and self.ns.disk
+        # 每个命名空间一个子目录：清扫器各扫各的，一个域的条目不会被另一个域的
+        # 清扫顺手带走。
+        self.directory = os.path.join(directory, self.ns.name)
+        self.stale_on_error = stale_on_error
         self._entries: dict[str, tuple[float, str, Any]] = {}
         self._lock = threading.Lock()
+        self._inflight: dict[str, threading.Event] = {}
         self._last_sweep_at = 0.0
         self.hits = 0
         self.misses = 0
         self.stores = 0
+        self.stale_serves = 0
 
     # -- policy ----------------------------------------------------------
 
+    def _hard_expired(self, key: CacheKey, created_at: float, created_epoch: str) -> bool:
+        """硬过期：条目作废，任何情况下都不返回。
+
+        纪元变了就是变了——昨天 15:00 的收盘快照到今天 10:30 只旧了 19.5 小时，
+        任何以"天"为量级的时长上限都会放行它，但它描述的是**另一个交易日**，
+        不是"旧"，是答非所问。
+        """
+        if self.ns.epoch_bound and created_epoch != key.epoch:
+            return True
+        if self.ns.max_age_seconds > 0:
+            return (time.time() - created_at) > self.ns.max_age_seconds
+        return False
+
     def _fresh(self, key: CacheKey, created_at: float, created_epoch: str) -> bool:
-        if created_epoch != key.epoch:
+        """软过期：到了就想刷新，但刷不到还能用（见 get_or_load）。"""
+        if self._hard_expired(key, created_at, created_epoch):
             return False
+        if not self.ns.epoch_bound:
+            return self.live_ttl_seconds <= 0 or (
+                time.time() - created_at) <= self.live_ttl_seconds
+        # 跟市场的命名空间：TTL 只在盘中生效。收盘后数据已冻结，再设软过期
+        # 只会白打上游。
         if key.phase != PHASE_LIVE:
             return True
         if self.live_ttl_seconds <= 0:
@@ -343,7 +486,7 @@ class ReportCache:
         except (FileNotFoundError, NotADirectoryError):
             return
         except OSError:
-            logger.debug("Report cache sweep skipped", exc_info=True)
+            logger.debug("Cache sweep skipped ns=%s", self.ns.name, exc_info=True)
             return
 
         for name in names:
@@ -358,7 +501,7 @@ class ReportCache:
             except OSError:
                 continue
             shutil.rmtree(path, ignore_errors=True)
-            logger.debug("Report cache retired epoch directory %s", name)
+            logger.debug("Cache retired epoch directory ns=%s %s", self.ns.name, name)
 
     def _disk_read(self, key: CacheKey) -> Optional[tuple[float, str, Any]]:
         path = os.path.join(self._epoch_dir(key.epoch), f"{key.digest()}.json")
@@ -368,11 +511,21 @@ class ReportCache:
         except (FileNotFoundError, NotADirectoryError, json.JSONDecodeError):
             return None
         except OSError:
-            logger.debug("Report cache disk read failed", exc_info=True)
+            logger.debug("Cache disk read failed ns=%s", self.ns.name, exc_info=True)
             return None
         if payload.get("epoch") != key.epoch:
             return None
-        return float(payload.get("created_at", 0.0)), key.epoch, payload.get("value")
+        value = payload.get("value")
+        if self.ns.decode is not None:
+            try:
+                value = self.ns.decode(value)
+            except Exception:
+                # 旧版本写下的形状对不上，当作没缓存过。一条坏条目不该让这次查询失败。
+                logger.debug("%s 缓存条目解码失败，忽略", self.ns.name, exc_info=True)
+                return None
+            if value is None:
+                return None
+        return float(payload.get("created_at", 0.0)), key.epoch, value
 
     def _disk_write(self, key: CacheKey, created_at: float, value: Any) -> None:
         directory = self._epoch_dir(key.epoch)
@@ -380,6 +533,7 @@ class ReportCache:
         try:
             os.makedirs(directory, exist_ok=True)
             handle_fd, temp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
+            payload = value if self.ns.encode is None else self.ns.encode(value)
             with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
                 json.dump(
                     {
@@ -387,7 +541,7 @@ class ReportCache:
                         "created_at": created_at,
                         "tool": key.tool,
                         "symbol": key.symbol,
-                        "value": value,
+                        "value": payload,
                     },
                     handle,
                     ensure_ascii=False,
@@ -396,7 +550,7 @@ class ReportCache:
             temp_path = None
         except Exception:
             # A cache write must never surface as a tool error.
-            logger.debug("Report cache disk write failed", exc_info=True)
+            logger.debug("Cache disk write failed ns=%s", self.ns.name, exc_info=True)
         finally:
             if temp_path is not None:
                 try:
@@ -416,7 +570,7 @@ class ReportCache:
         try:
             return self._get(key)
         except Exception:
-            logger.warning("Report cache read failed tool=%s symbol=%s",
+            logger.warning("Cache read failed ns=%s key=%s",
                            key.tool, key.symbol, exc_info=True)
             return None
 
@@ -429,7 +583,9 @@ class ReportCache:
             if entry is not None and self._fresh(key, entry[0], entry[1]):
                 self.hits += 1
                 return entry[2]
-            if entry is not None:
+            # 只丢硬过期的。软过期的要留着——上游取不到时它就是兜底那份，
+            # 在这里顺手 pop 掉，get_stale 就永远找不到东西了。
+            if entry is not None and self._hard_expired(key, entry[0], entry[1]):
                 self._entries.pop(digest, None)
 
         if not self.disk_enabled:
@@ -461,13 +617,17 @@ class ReportCache:
         try:
             self._put(key, value)
         except Exception:
-            logger.warning("Report cache write failed tool=%s symbol=%s",
+            logger.warning("Cache write failed ns=%s key=%s",
                            key.tool, key.symbol, exc_info=True)
 
     def _put(self, key: CacheKey, value: Any) -> None:
         if not self.enabled or value is None:
             return
         if key.phase == PHASE_LIVE and self.live_ttl_seconds <= 0:
+            return
+        # 失败和降级的结果不进缓存：一个纪元长达 64 小时，把一次瞬时降级腌进去，
+        # 整个周末就都是那个样子。
+        if self.ns.cacheable is not None and not self.ns.cacheable(value, key):
             return
         digest = key.digest()
         created_at = time.time()
@@ -479,6 +639,40 @@ class ReportCache:
             self._sweep_disk()
             self._disk_write(key, created_at, value)
 
+    # -- 单飞与旧值 --------------------------------------------------------
+
+    def age_of(self, digest: str) -> float:
+        entry = self._entries.get(digest)
+        return 0.0 if entry is None else max(0.0, time.time() - entry[0])
+
+    def claim(self, digest: str) -> Optional[threading.Event]:
+        """占坑。返回 None 表示这一轮由本调用方去取；返回 Event 表示别人在取，等它。"""
+        with self._lock:
+            existing = self._inflight.get(digest)
+            if existing is not None:
+                return existing
+            self._inflight[digest] = threading.Event()
+            return None
+
+    def release(self, digest: str) -> None:
+        with self._lock:
+            event = self._inflight.pop(digest, None)
+        if event is not None:
+            event.set()
+
+    def get_stale(self, key: CacheKey) -> Optional[tuple]:
+        """软过期但没硬过期的旧值，连同它的岁数。
+
+        只在上游取不到时才该调它——**硬过期的一律不给**，那是跨纪元的数据，
+        不是"旧"，是答非所问。
+        """
+        if not self.enabled or not self.stale_on_error:
+            return None
+        entry = self._entries.get(key.digest())
+        if entry is None or self._hard_expired(key, entry[0], entry[1]):
+            return None
+        return entry[2], max(0.0, time.time() - entry[0])
+
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
@@ -486,32 +680,178 @@ class ReportCache:
             self._last_sweep_at = 0.0
 
 
-_cache: Optional[ReportCache] = None
+# ── 命名空间实例 ────────────────────────────────────────────────
+
+_caches: dict[str, Cache] = {}
 _cache_lock = threading.Lock()
 
 
-def get_report_cache() -> ReportCache:
-    global _cache
-    if _cache is None:
-        with _cache_lock:
-            if _cache is None:
-                _cache = ReportCache()
-                logger.info(
-                    "Report cache initialised enabled=%s live_ttl=%.0fs settle=%s "
-                    "max_entries=%s disk=%s dir=%s render=%s",
-                    _cache.enabled,
-                    _cache.live_ttl_seconds,
-                    SETTLE.strftime("%H:%M"),
-                    _cache.max_entries,
-                    _cache.disk_enabled,
-                    _cache.directory,
-                    RENDER_FINGERPRINT,
-                )
-    return _cache
-
-
-def set_report_cache(cache: Optional[ReportCache]) -> None:
-    """Replace the process-wide cache. Tests use this; production does not."""
-    global _cache
+def cache_for(name: str) -> Cache:
+    """取某个命名空间的缓存实例，按需创建。"""
+    existing = _caches.get(name)
+    if existing is not None:
+        return existing
     with _cache_lock:
-        _cache = cache
+        existing = _caches.get(name)
+        if existing is None:
+            ns = _NAMESPACES.get(name)
+            if ns is None:
+                raise KeyError(f"没有登记过的缓存命名空间：{name}")
+            existing = Cache(ns)
+            _caches[name] = existing
+            logger.info(
+                "Cache initialised ns=%s enabled=%s ttl=%.0fs max_entries=%s "
+                "disk=%s epoch_bound=%s render=%s",
+                ns.name, existing.enabled, existing.live_ttl_seconds,
+                existing.max_entries, existing.disk_enabled, ns.epoch_bound,
+                RENDER_FINGERPRINT,
+            )
+    return existing
+
+
+ReportCache = Cache
+
+
+def get_report_cache() -> Cache:
+    """报告命名空间。外部按这个名字调过，保留。"""
+    return cache_for(REPORT_NAMESPACE.name)
+
+
+def set_report_cache(cache: Optional[Cache]) -> None:
+    """替换进程级的报告缓存。测试用，生产不用。"""
+    with _cache_lock:
+        if cache is None:
+            _caches.pop(REPORT_NAMESPACE.name, None)
+        else:
+            _caches[REPORT_NAMESPACE.name] = cache
+
+
+def reset_caches() -> None:
+    """清掉所有命名空间的实例。给测试用。"""
+    with _cache_lock:
+        _caches.clear()
+
+
+def stats() -> dict:
+    """每个命名空间的命中情况。接进 verify_release 的诊断一节。"""
+    return {
+        name: {
+            "hits": c.hits, "misses": c.misses, "stores": c.stores,
+            "stale_serves": c.stale_serves, "entries": len(c._entries),
+        }
+        for name, c in _caches.items()
+    }
+
+
+# ── 取用 API：查—取—存一次完成，内建单飞 ──────────────────────────
+
+
+def get_or_load(
+    ns: str,
+    key: str,
+    loader: Callable[[], Any],
+    *,
+    epoch: Optional[str] = None,
+    now: Optional[datetime.datetime] = None,
+) -> Optional[Entry]:
+    """同步版。给已经跑在线程里的调用方（分级、日历、财务、market_events）。
+
+    **单飞**：同一个 ``(ns, key)`` 并发进来只放一个 loader 出去，其余等结果。
+    没有它就是缓存踩踏——缓存一空，所有在等的请求同时穿透到上游，而那正是最容易
+    触发风控的时刻。实测过：冷进程并发两次调板块资金流，申万分级表被取了两份。
+
+    **软过期后刷新失败继续用旧值**（``CACHE_STALE_ON_ERROR``），返回的 Entry
+    ``fresh=False``，调用方必须在输出里标注。
+
+    返回 None 表示 loader 没给出结果，也没有可用的旧值。
+    """
+    cache = cache_for(ns)
+    cache_key = key_for(ns, key, epoch=epoch, now=now)
+    digest = cache_key.digest()
+
+    hit = cache.get(cache_key)
+    if hit is not None:
+        return Entry(value=hit, fresh=True, age_seconds=cache.age_of(digest))
+
+    waiter = cache.claim(digest)
+    if waiter is not None:
+        # 别人正在取同一份，等它。醒来之后再查一次缓存即可。
+        waiter.wait(timeout=_INFLIGHT_WAIT_SECONDS)
+        hit = cache.get(cache_key)
+        if hit is not None:
+            return Entry(value=hit, fresh=True, age_seconds=cache.age_of(digest))
+
+    try:
+        value = loader()
+    except Exception:
+        logger.warning("%s 取数失败 key=%s", ns, key, exc_info=True)
+        value = None
+    finally:
+        cache.release(digest)
+
+    if value is not None:
+        cache.put(cache_key, value)
+        return Entry(value=value, fresh=True, age_seconds=0.0)
+
+    stale = cache.get_stale(cache_key)
+    if stale is not None:
+        cache.stale_serves += 1
+        logger.info("%s 用了 %.0f 秒前的旧值 key=%s（上游当前不可用）",
+                    ns, stale[1], key)
+        return Entry(value=stale[0], fresh=False, age_seconds=stale[1])
+    return None
+
+
+async def aget_or_load(
+    ns: str,
+    key: str,
+    loader: Callable[[], Awaitable[Any]],
+    *,
+    epoch: Optional[str] = None,
+    now: Optional[datetime.datetime] = None,
+) -> Optional[Entry]:
+    """异步版。给跑在事件循环上的调用方（报告、市场宽度）。
+
+    单飞用 ``asyncio.Task`` 而不是 ``threading.Lock``——把锁带进事件循环会把整个
+    服务堵住。``shield`` 那句是要紧的：一个等待者被取消，不能中断别人需要的加载。
+    """
+    cache = cache_for(ns)
+    cache_key = key_for(ns, key, epoch=epoch, now=now)
+    digest = cache_key.digest()
+
+    hit = cache.get(cache_key)
+    if hit is not None:
+        return Entry(value=hit, fresh=True, age_seconds=cache.age_of(digest))
+
+    tasks = _async_inflight.setdefault(id(asyncio.get_running_loop()), {})
+    task = tasks.get(digest)
+    if task is None or task.done():
+        task = asyncio.ensure_future(loader())
+        tasks[digest] = task
+        task.add_done_callback(lambda done, d=digest: tasks.pop(d, None)
+                               if tasks.get(d) is done else None)
+    try:
+        value = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("%s 取数失败 key=%s", ns, key, exc_info=True)
+        value = None
+
+    if value is not None:
+        cache.put(cache_key, value)
+        return Entry(value=value, fresh=True, age_seconds=0.0)
+
+    stale = cache.get_stale(cache_key)
+    if stale is not None:
+        cache.stale_serves += 1
+        logger.info("%s 用了 %.0f 秒前的旧值 key=%s（上游当前不可用）",
+                    ns, stale[1], key)
+        return Entry(value=stale[0], fresh=False, age_seconds=stale[1])
+    return None
+
+
+#: 单飞等待的上限。等不到就自己去取——宁可多打一次上游，也不能把调用方挂死在
+#: 一个可能永远不会 set 的事件上。
+_INFLIGHT_WAIT_SECONDS = 30.0
+_async_inflight: dict[int, dict] = {}

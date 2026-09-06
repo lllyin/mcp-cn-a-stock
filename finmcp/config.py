@@ -477,32 +477,42 @@ FINANCE_CACHE_MAX_ENTRIES = max(
     int(env("FINANCE_CACHE_MAX_ENTRIES", "512")),
 )
 
-# --- Report cache (finmcp/cache.py) ---
-# A rendered report is reusable only inside the market epoch that produced it,
-# so the cache never changes what a tool would return. Disabling the master
-# switch removes the cache from the call path entirely.
-REPORT_CACHE_ENABLED = _parse_bool(env("REPORT_CACHE_ENABLED"), True)
-# 盘中数值持续变动，复用受短 TTL 约束，只用于合并突发重复请求。置 0 则盘中绝不复用。
-# 默认 30 秒是陈旧度与积分的折中：基于下游真实捕获比对，60 秒窗口内主力净流入的
+# --- 缓存 (finmcp/cache.py) ---
+# 缓存唯一的正当理由是"这段时间里这份数据不会变"。防风控、省积分、变快都是这条
+# 成立之后自然得到的好处，不是判据。设计见 docs/cache-design.md。
+#
+# 总开关关掉之后所有命名空间既不读也不写——prove_equivalence.py 的"关掉缓存再比对"
+# 要的就是这个语义，关不干净那个证明就是假的。
+CACHE_ENABLED = _parse_bool(env("CACHE_ENABLED"), True)
+# 盘中软过期秒数的默认值；设为 0 时盘中绝不复用。
+# 30 秒是陈旧度与积分的折中：基于下游真实捕获比对，60 秒窗口内主力净流入的
 # P90 相对漂移为 21%，30 秒窗口降至 7.7%，而代价只是约 2.8 个百分点的积分降幅。
-REPORT_CACHE_INTRADAY_TTL_SECONDS = max(
+CACHE_INTRADAY_TTL_SECONDS = max(
     0.0,
-    float(env("REPORT_CACHE_INTRADAY_TTL_SECONDS", "30")),
+    float(env("CACHE_INTRADAY_TTL_SECONDS", "30")),
 )
-REPORT_CACHE_MAX_ENTRIES = max(
-    1,
-    int(env("REPORT_CACHE_MAX_ENTRIES", "512")),
-)
-# Second tier surviving restarts. Closed epochs span 16h (64h over a weekend),
-# so an in-memory-only cache loses most of its value on any redeploy.
-REPORT_CACHE_DISK_ENABLED = _parse_bool(env("REPORT_CACHE_DISK_ENABLED"), True)
-# Resolved against the package root, not the daemon's CWD: the sweeper deletes
-# directories under here, so a relative value read from a copied .env must not
-# land somewhere unexpected.
+# 软过期后刷新失败，是否继续用旧值。用了一定会在输出里标注——悄悄返回旧数据比少
+# 一段数据更糟：少一段看得见，旧一天看不见。
+CACHE_STALE_ON_ERROR = _parse_bool(env("CACHE_STALE_ON_ERROR"), True)
+# 第二层，跨重启保留。闭市纪元长达 16 小时（周末 64 小时），只有内存层的话
+# 每次重部署都把它丢光。
+CACHE_DISK_ENABLED = _parse_bool(env("CACHE_DISK_ENABLED"), True)
+# 相对项目根目录解析，不是相对进程 CWD：清扫器会删这底下的目录，一个从别处抄来的
+# .env 里的相对路径不能落到意外的地方。
 _PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
-REPORT_CACHE_DIR = os.path.normpath(
-    os.path.join(_PROJECT_ROOT, env("REPORT_CACHE_DIR") or ".runtime/report-cache")
+CACHE_DIR = os.path.normpath(
+    os.path.join(_PROJECT_ROOT, env("CACHE_DIR") or ".runtime/cache")
 )
+
+
+def cache_ttl(namespace: str, default: float) -> float:
+    """某个命名空间的 TTL 覆盖：``CACHE_<NS>_TTL_SECONDS``。"""
+    return max(0.0, float(env(f"CACHE_{namespace.upper()}_TTL_SECONDS", str(default))))
+
+
+def cache_max_entries(namespace: str, default: int) -> int:
+    """某个命名空间的条数上限覆盖：``CACHE_<NS>_MAX_ENTRIES``。"""
+    return max(1, int(env(f"CACHE_{namespace.upper()}_MAX_ENTRIES", str(default))))
 
 
 def _parse_hhmm(raw, default: datetime.time) -> datetime.time:

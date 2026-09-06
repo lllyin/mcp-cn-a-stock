@@ -448,7 +448,8 @@ async def test_cache_faults_do_not_damage_reports(mode, tmp_path, caplog, determ
     assert broken.errors == {}
     assert broken.reports["SH600000"] == baseline.reports["SH600000"]
     # 证明故障缓存确实被调用过，测试不是空过
-    faults = [r for r in caplog.records if "Report cache" in r.getMessage()]
+    faults = [r for r in caplog.records if "Cache read failed" in r.getMessage()
+              or "Cache write failed" in r.getMessage()]
     assert any("read failed" in r.getMessage() or "lookup failed" in r.getMessage() for r in faults)
     assert any("write failed" in r.getMessage() for r in faults)
 
