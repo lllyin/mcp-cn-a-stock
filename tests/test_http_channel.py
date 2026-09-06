@@ -13,8 +13,25 @@ channel = importlib.import_module("finmcp.datasource.http_channel")
 
 
 @pytest.fixture(autouse=True)
-def restore_requests():
-    """Every test must leave the requests module exactly as it found it."""
+def restore_requests(monkeypatch):
+    """Every test must leave the requests module exactly as it found it.
+
+    进来之前先摘掉别人留在 ``requests`` 上的代理补丁标记。这一整个文件测的是
+    "channel 自己怎么装"，前提是 ``requests`` 干净；标记还在的话
+    ``install_http_channel("impersonate")`` 会按设计降级成 direct，21 个用例
+    集体判 ``requests_already_patched``——那是产品行为对、测试前提被破坏。
+
+    真实来源：``tests_research/test_etf.py`` 顶层的
+    ``akshare_proxy_patch.install_patch(...)`` 在 pytest **收集阶段**就跑了。
+    ``testpaths`` 已经把那个目录挡在默认收集之外，但这里仍然自己兜一层——
+    顺序相关的测试早晚会被下一个人用别的方式再触发一次。
+
+    摘除必须走 ``monkeypatch`` 而不是手写 delattr/setattr：本 fixture 的清理跑在
+    ``monkeypatch.undo()`` **之前**，手写还原会把 degrade 那条用例自己插的标记
+    提前删掉，undo 再去 delattr 就 AttributeError。挂到同一个 monkeypatch 栈上，
+    两次改动按相反顺序退栈，先退用例的、再退这里的，才是对的。
+    """
+    monkeypatch.delattr(std_requests, channel._PROXY_PATCH_MARKER, raising=False)
     before = (
         std_requests.Session,
         std_requests.get,

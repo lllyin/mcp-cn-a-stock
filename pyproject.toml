@@ -38,3 +38,12 @@ py-modules = ["main", "data"]
 # 装成包再起服务才会炸，2026-09-06 在部署机上就是这么炸的。
 [tool.setuptools.packages.find]
 include = ["finmcp*"]
+
+[tool.pytest.ini_options]
+# 只收 tests/。tests_research/ 是调研脚本目录，里面 33 个文件里有 3 个碰巧叫
+# test_*.py，裸跑 pytest 会把它们收进来——而 test_etf.py 顶层就有一行
+# akshare_proxy_patch.install_patch("101.201.173.125", ...)，**收集阶段**就会执行：
+# 既去连那个代理（积分是要充值的），又把 requests 全进程 patch 掉，让
+# tests/test_http_channel.py 的 21 个用例集体判 requests_already_patched。
+# 要跑调研脚本就显式写路径。
+testpaths = ["tests"]
