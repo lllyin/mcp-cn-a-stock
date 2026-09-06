@@ -235,11 +235,27 @@ def run_call(spec: CallSpec, config: Path, timeout_ms: int) -> CallResult:
 
 def run_calls(
     specs: list[CallSpec], config: Path, timeout_ms: int, concurrency: int
-) -> list[CallResult]:
+):
+    """逐个产出探活结果，**谁先完成先产出**。
+
+    这里必须是生成器。原先是 ``list(pool.map(...))``，要等 22 个调用全部结束才返回，
+    调用方一行进度都打不出来——默认每个调用 120 秒上限、并发 2，最坏情况是
+    22/2 × 150s ≈ 27 分钟的纯静默。而"静默 27 分钟"和"卡死了"，从终端上看是一模一样的，
+    没人会等到它自己出来。
+
+    顺序换成完成顺序，调用方拿到全部结果之后按 specs 的原顺序排回去（见 probes 那段）。
+    """
     if concurrency <= 1:
-        return [run_call(spec, config, timeout_ms) for spec in specs]
+        for spec in specs:
+            yield run_call(spec, config, timeout_ms)
+        return
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-        return list(pool.map(lambda spec: run_call(spec, config, timeout_ms), specs))
+        futures = {
+            pool.submit(run_call, spec, config, timeout_ms): index
+            for index, spec in enumerate(specs)
+        }
+        for future in concurrent.futures.as_completed(futures):
+            yield future.result()
 
 
 # ── 三、载荷解析 ────────────────────────────────────────────────
@@ -2444,7 +2460,9 @@ def main() -> int:
     probes: list[tuple[CallResult, Payload, Completeness]] = []
     if not args.skip_probe:
         specs = probe_suite(tools)
-        print(f"[验证] 探活 {len(specs)} 个调用…")
+        print(f"[验证] 探活 {len(specs)} 个调用…"
+              f"（并发 {args.concurrency}，单个上限 {args.timeout_ms / 1000:.0f}s；"
+              f"下面按完成先后逐行打印）", flush=True)
         for result in run_calls(specs, config, args.timeout_ms, args.concurrency):
             payload = parse_payload(result.payload)
             completeness = (
@@ -2457,7 +2475,13 @@ def main() -> int:
                 "" if completeness.graded == 0
                 else f"  维度 {completeness.available}/{completeness.graded}"
             )
-            print(f"  [{flag}] {result.spec.describe()[:66]}  {result.elapsed:.1f}s{rate}")
+            print(f"  [{len(probes)}/{len(specs)}] [{flag}] "
+                  f"{result.spec.describe()[:60]}  {result.elapsed:.1f}s{rate}", flush=True)
+
+        # 产出是完成顺序，报告和归档要的是 specs 的原顺序——不排回去，基线比对
+        # 会因为顺序漂移而失真。
+        order = {spec.describe(): index for index, spec in enumerate(specs)}
+        probes.sort(key=lambda item: order.get(item[0].spec.describe(), 0))
 
         if args.capture:
             hard = [item for _, _, c in probes for item in c.bad]

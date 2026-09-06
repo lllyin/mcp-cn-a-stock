@@ -56,7 +56,7 @@ if [ -f "$PID_FILE" ]; then
     PID=$(cat "$PID_FILE")
     if ps -p "$PID" > /dev/null 2>&1; then
         echo "服务已在运行 (PID: $PID)"
-        echo "访问地址: http://localhost:$PORT/cnstock/mcp"
+        echo "访问地址: http://127.0.0.1:$PORT/cnstock/mcp"
         echo "查看日志: tail -f $LOG_FILE"
         exit 0
     else
@@ -172,7 +172,7 @@ sleep 2
 if ps -p "$PID" > /dev/null 2>&1; then
     echo "✅ 服务启动成功!"
     echo "   PID: $PID"
-    echo "   访问地址: http://localhost:$PORT/cnstock/mcp"
+    echo "   访问地址: http://127.0.0.1:$PORT/cnstock/mcp"
     echo "   查看日志: tail -f $LOG_FILE"
     echo "   停止服务: ./stop.sh"
 else

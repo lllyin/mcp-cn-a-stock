@@ -23,7 +23,7 @@ pytest tests --ignore=tests/test_akshare_source.py
 MCP Inspector 可以直接点着调用每个工具：
 
 ```bash
-npx @modelcontextprotocol/inspector --url http://localhost:8686/cnstock/mcp
+npx @modelcontextprotocol/inspector --url http://127.0.0.1:8686/cnstock/mcp
 ```
 
 查看版本：

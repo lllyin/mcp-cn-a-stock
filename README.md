@@ -64,8 +64,12 @@ cd mcp-cn-a-stock
 默认 MCP 地址：
 
 ```text
-http://localhost:8686/cnstock/mcp
+http://127.0.0.1:8686/cnstock/mcp
 ```
+
+写 `127.0.0.1` 而不是 `localhost`：服务只监听 IPv4 回环，而 macOS 上 `localhost`
+会先解析到 IPv6 的 `::1`，有些客户端在那里被拒之后不会回退到 IPv4，表现是连接
+一直挂着不报错。
 
 查看日志（启动时会打印当前版本）：
 
@@ -94,7 +98,7 @@ cn-stock-mcp --transport sse --port 8686
 ```text
 名称: cn-stock
 类型: streamableHttp
-地址: http://localhost:8686/cnstock/mcp
+地址: http://127.0.0.1:8686/cnstock/mcp
 ```
 
 CherryStudio 中进入“设置 → MCP 设置 → 添加服务器”，选择
