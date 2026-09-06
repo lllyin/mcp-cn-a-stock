@@ -796,6 +796,47 @@ _LIVE_ONLY_KEY = re.compile(r"净流入|标的名称|指定日期查询暂不展
 _LIVE_VALUE_KEY = re.compile(r"总市值|流通市值|市盈率|市净率|净资产收益率|换手")
 
 
+@dataclass(frozen=True)
+class RenamedItem:
+    """一处**纯改名**：条目名换了，值一个字没变。
+
+    差异器按「段落 › 条目名」做键，改个名字就变成"旧键缺失 + 新键新增"两条计分
+    差异——而两边的数值完全相同。2026-09-06 就是这样：`含今日` 改成 `含当日`
+    一个字，8 份基线 × 5 个周期 × 2 条 = 80 行差异，回归一致率从 99% 掉到 48%，
+    没有一个数字变过。
+
+    **只登记纯改名。** 口径变了不能进来——那是真漂移，正是这套比对要抓的东西。
+    登记之后按新名字配对，比的才是数值本身；值真变了照样报出来。
+    """
+
+    old: str        # 旧条目名，正则
+    new: str        # 新条目名，替换式
+    reason: str
+    since: str
+
+
+#: 条目改名登记处。基线是历史账本，不为一次改名重采（重采会把当时的降级状态一起
+#: 固化进去）；差异器认识改名，账本就还能继续用。
+RENAMED_ITEMS = (
+    RenamedItem(
+        old=r"^(- \d+日总换手) \(含今日\)$",
+        new=r"\1 (含当日)",
+        reason="「今日」在非交易日是错的——周末查出来那一栏说的是上一个交易日。"
+               "报告里其余各处一律用「当日」，这里跟着统一",
+        since="2026-09-06",
+    ),
+)
+
+
+def _canonical_key(key: str) -> str:
+    """把旧条目名换成现在的名字，好让改过名的两边配得上。"""
+    for item in RENAMED_ITEMS:
+        renamed = re.sub(item.old, item.new, key)
+        if renamed != key:
+            return renamed
+    return key
+
+
 def _index_by_section(lines: list[str]) -> dict[str, list[str]]:
     """行的身份要带上所属段落，否则同名行会被并成一条。
 
@@ -809,7 +850,8 @@ def _index_by_section(lines: list[str]) -> dict[str, list[str]]:
         stripped = line.strip()
         if stripped.startswith("#"):
             section = stripped.lstrip("# ")
-        key = f"{section} › {_line_key(line)}" if section else _line_key(line)
+        item = _canonical_key(_line_key(line))
+        key = f"{section} › {item}" if section else item
         indexed.setdefault(key, []).append(_line_value(line))
     return indexed
 
