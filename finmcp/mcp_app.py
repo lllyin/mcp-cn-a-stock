@@ -379,7 +379,10 @@ async def fetch_batch_reports(
                 if (
                     cache_key is not None
                     and not fetch_failures
-                    and is_cacheable_report(output["reports"][symbol])
+                    and is_cacheable_report(
+                        output["reports"][symbol],
+                        phase=cache_key.phase, epoch=cache_key.epoch,
+                    )
                 ):
                     report_cache.put(cache_key, output["reports"][symbol])
                 elif fetch_failures:

@@ -492,3 +492,61 @@ def test_disk_payload_is_readable_json(tmp_path):
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["value"] == "报告正文"
     assert payload["epoch"] == key.epoch
+
+
+# --- 守卫：当日资金流还在路上时，不进 CLOSED 纪元 ------------------------------
+#
+# CLOSED 纪元长达 16–64 小时，而 AkShare 的当日资金流行要到收盘后一段时间才落地。
+# MARKET_EPOCH_FINAL_TIME 配早了这一段就会缺，然后被冻一整晚。守卫把"配早了"的代价
+# 从数据缺失降到少命中几次缓存。
+
+
+def _report(data_date: str, flow_date: str | None) -> str:
+    body = f"# 基本数据\n- 股票代码: SH600000\n- 数据日期: {data_date}\n"
+    if flow_date:
+        body += f"\n## 资金流向（{flow_date}）\n- 主力净流入: 1.22亿\n"
+    return body
+
+
+def test_a_lagging_fund_flow_is_kept_out_of_the_closed_epoch():
+    """K 线有当日、资金流没有 —— 上游在路上，等一会儿就有，别把这一版冻进去。"""
+    text = _report("2026-09-04", "2026-09-03")
+    assert is_cacheable_report(text, phase="closed", epoch="closed-2026-09-04") is False
+
+
+def test_a_settled_fund_flow_is_cacheable():
+    text = _report("2026-09-04", "2026-09-04")
+    assert is_cacheable_report(text, phase="closed", epoch="closed-2026-09-04") is True
+
+
+def test_a_lagging_fund_flow_is_fine_before_the_epoch_closes():
+    """盘中和盘后本来就走短 TTL，不用拦——拦了只是白白少命中几次。"""
+    text = _report("2026-09-04", "2026-09-03")
+    assert is_cacheable_report(text, phase="postclose", epoch="postclose-2026-09-04") is True
+    assert is_cacheable_report(text, phase="live", epoch="live-2026-09-04") is True
+
+
+def test_a_suspended_symbol_is_not_blocked_forever():
+    """K 线也停在那天 —— 没有什么可等的。
+
+    少了这层区分，停牌股会被永久挡在缓存外：白白的性能损失，换不来任何数据完整性。
+    """
+    text = _report("2026-06-30", "2026-06-30")
+    assert is_cacheable_report(text, phase="closed", epoch="closed-2026-09-04") is True
+
+
+def test_a_pinned_past_query_is_not_blocked():
+    """钉了过去日期，两个日期都比纪元旧，属于"没什么可等的"那一类。"""
+    text = _report("2026-06-05", "2026-06-04")
+    assert is_cacheable_report(text, phase="closed", epoch="closed-2026-09-04") is True
+
+
+def test_a_report_without_a_fund_flow_section_is_not_blocked():
+    """科创50 这类标的本来就没有资金流页面，钉日期的查询也不展示。"""
+    assert is_cacheable_report(_report("2026-09-04", None),
+                               phase="closed", epoch="closed-2026-09-04") is True
+
+
+def test_the_guard_is_off_when_the_phase_is_unknown():
+    """不传 phase 就是老调用方，行为和以前一致。"""
+    assert is_cacheable_report(_report("2026-09-04", "2026-09-03")) is True
