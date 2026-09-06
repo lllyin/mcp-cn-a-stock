@@ -50,6 +50,16 @@ python scripts/verify_release.py
 它会实调每个工具、按维度契约逐项检查、把结果和 `verification/baseline/` 里的历史归档
 重放比对，最后给一个可用率。≥99% 才发。
 
+容量单独量，用闭环压测起一个隔离实例，固定并发 1 / 5 / 10 批、完成一个补一个：
+
+```bash
+python scripts/loadtest_mcp.py --launch --port 8790 --closed-loop --steps 1,5,10 --step-seconds 120
+```
+
+并发 5 那一档的 P95 就是写给下游的 SLA。开环模式（不加 `--closed-loop`，按每分钟 N 次阶梯加压）
+用来找上游限流的拐点，两种模式量的不是一回事，不要互相替代。上线前的完整清单见
+[2.0.0 变更说明与上线清单](release-notes-2.0.0.md)。
+
 重构取数层时还要证明行为没变：
 
 ```bash
@@ -60,5 +70,5 @@ python scripts/prove_equivalence.py capture after
 python scripts/prove_equivalence.py diff before after
 ```
 
-比对前记得把 `REPORT_CACHE_ENABLED` 设成 0——不然「改完」那次读的是「改之前」写的
+比对前记得把 `CACHE_ENABLED` 设成 0——不然「改完」那次读的是「改之前」写的
 字节，等价性是假的（脚本会检查，没关会拒绝跑）。
