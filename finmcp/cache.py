@@ -269,7 +269,13 @@ def _encode_fund_flow(value: dict) -> dict:
             {key: _jsonable(cell) for key, cell in row.items()}
             for row in frame.to_dict(orient="records")
         ]
-    return {"rows": rows, "is_market": bool(value.get("is_market", False))}
+    return {
+        "rows": rows,
+        "is_market": bool(value.get("is_market", False)),
+        # 这份是不是该源能给的全部历史（eastmoney_delay 只给当日一行时为 False）。
+        # 老条目没有这个键，按 True 读——它们都是主源或页面给的全份。
+        "complete": bool(value.get("complete", True)),
+    }
 
 
 def _decode_fund_flow(raw: dict) -> dict:
@@ -278,6 +284,7 @@ def _decode_fund_flow(raw: dict) -> dict:
     return {
         "fund_flow": pd.DataFrame(raw.get("rows") or []),
         "is_market": bool(raw.get("is_market", False)),
+        "complete": bool(raw.get("complete", True)),
     }
 
 

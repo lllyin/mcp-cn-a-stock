@@ -1,10 +1,22 @@
 """东方财富。
 
-这个文件目前只放板块资金流。个股那几维（K 线、基本数据、资金流）还散在
-cn_stock_source 里走 efinance/AkShare，迁过来是后面的阶段——**先接新能力、
-再迁老能力**，这样每一步都能单独验证。
+这个文件放板块资金流和个股/指数资金流。K 线和基本数据还散在 cn_stock_source 里走
+efinance/AkShare，迁过来是后面的阶段——**先接新能力、再迁老能力**，这样每一步都能
+单独验证。
 
-## 两个端点，一主一备
+## 个股/指数资金流：两台主机，一主一备
+
+主：``push2his.eastmoney.com/api/qt/stock/fflow/daykline/get``（经 AkShare 封装），
+``lmt=0`` 给全部历史。走伪装通道，被拒时整维没有。
+
+备：``push2delay.eastmoney.com`` 上同一个接口。**只回最近一天**，``lmt`` 给多少都一样；
+但它不在伪装通道的接管名单里，push2his 拒绝出口 IP 的同一时刻它仍应答（2026-09-06
+本机实测，1.000688 / 1.600519 / 0.399006 的当日行和 push2his 逐字节相同）。它存在的
+理由是覆盖浏览器页面兜底够不到的标的——科创 50 这类指数没有资金流向页面，主源一次
+``RemoteDisconnected`` 就整维缺失（部署机 09-06 14:35 那轮的 3 项缺失全在它身上）。
+只有一行，所以 ``complete=False``：有页面的标的编排层还会去页面把 120 行历史补回来。
+
+## 板块资金流：两个端点，一主一备
 
 主：``push2.eastmoney.com/api/qt/clist/get?fs=m:90+t:{1,2,3}``（经 AkShare 封装），
 字段全——涨跌幅、主力净额和净占比、超大/大/中/小四档、领涨股。走本项目的伪装通道。
@@ -20,6 +32,7 @@ import logging
 from typing import Optional
 
 from .. import platform as pf
+from ..fund_flow_source import FundFlowHistory
 from ..sector_fund_flow import SectorFlow, SectorFundFlowBoard
 
 logger = logging.getLogger("finmcp")
@@ -45,9 +58,49 @@ def _f(row, key):
         return None
 
 
+#: 个股资金流接口 ``fields2`` 的 15 个字段，按位置对应的列名。和 AkShare 的
+#: ``stock_individual_fund_flow`` 一字不差——归一到同一套列名是两台主机能互为
+#: 备份的前提。最后两位是接口保留位，AkShare 也丢掉。
+_FUND_FLOW_RAW_COLUMNS = [
+    "日期",
+    "主力净流入-净额", "小单净流入-净额", "中单净流入-净额", "大单净流入-净额", "超大单净流入-净额",
+    "主力净流入-净占比", "小单净流入-净占比", "中单净流入-净占比", "大单净流入-净占比", "超大单净流入-净占比",
+    "收盘价", "涨跌幅", "-", "-",
+]
+_FUND_FLOW_COLUMNS = [
+    "日期", "收盘价", "涨跌幅",
+    "主力净流入-净额", "主力净流入-净占比",
+    "超大单净流入-净额", "超大单净流入-净占比",
+    "大单净流入-净额", "大单净流入-净占比",
+    "中单净流入-净额", "中单净流入-净占比",
+    "小单净流入-净额", "小单净流入-净占比",
+]
+_FUND_FLOW_FIELDS = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
+_DELAY_FUND_FLOW_URL = "https://push2delay.eastmoney.com/api/qt/stock/fflow/daykline/get"
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/81.0.4044.138 Safari/537.36")
+
+
+def _fund_flow_frame(klines: list):
+    """``fflow/daykline`` 的 ``klines`` 字符串 → AkShare 列名的表。
+
+    每一步照 ``ak.stock_individual_fund_flow`` 做（拆逗号、按位置命名、选 13 列、
+    日期转 date、其余 ``to_numeric``），两台主机给的表才会逐字相同。
+    """
+    import pandas as pd
+
+    frame = pd.DataFrame([item.split(",") for item in klines])
+    frame.columns = _FUND_FLOW_RAW_COLUMNS
+    frame = frame[_FUND_FLOW_COLUMNS]
+    frame["日期"] = pd.to_datetime(frame["日期"], errors="coerce").dt.date
+    for column in _FUND_FLOW_COLUMNS[1:]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame
+
+
 class EastmoneyPlatform(pf.Platform):
     name, label = "eastmoney", "东财"
-    capabilities = frozenset({"sector_fund_flow"})
+    capabilities = frozenset({"sector_fund_flow", "fund_flow"})
 
     def degraded(self) -> bool:
         # 伪装通道一进冷却，push2 的请求就退回原生 requests，而它被接管的理由正是
@@ -55,6 +108,15 @@ class EastmoneyPlatform(pf.Platform):
         from ..http_channel import impersonated_hosts_degraded
 
         return impersonated_hosts_degraded()
+
+    def fetch_fund_flow(self, request) -> Optional[FundFlowHistory]:
+        """push2his 的全部历史，经 AkShare。入参写法和迁移前那次调用完全一样。"""
+        import akshare as ak
+
+        frame = ak.stock_individual_fund_flow(stock=request.code, market=request.exchange)
+        if frame is None or frame.empty:
+            return None
+        return FundFlowHistory(frame=frame, complete=True)
 
     def fetch_sector_fund_flow(self, request) -> Optional[SectorFundFlowBoard]:
         import akshare as ak
@@ -142,5 +204,43 @@ class EastmoneyDataApiPlatform(pf.Platform):
         )
 
 
+class EastmoneyDelayPlatform(pf.Platform):
+    """push2delay 主机上的个股资金流接口。只有最近一天，但主源被拒时它还通。
+
+    不在伪装通道的接管名单里，所以 ``degraded()`` 保持默认的 False——伪装通道冷却
+    与它无关。``complete=False`` 让编排层知道这只是当日一行。
+    """
+
+    name, label = "eastmoney_delay", "东财(delay)"
+    capabilities = frozenset({"fund_flow"})
+
+    @staticmethod
+    def _get(secid: str) -> dict:
+        """发一次请求。单拎出来是为了测试能不联网注入响应。"""
+        import time
+
+        import requests
+
+        response = requests.get(
+            _DELAY_FUND_FLOW_URL,
+            params={
+                "lmt": "0", "klt": "101", "secid": secid,
+                "fields1": "f1,f2,f3,f7", "fields2": _FUND_FLOW_FIELDS,
+                "ut": "b2884a393a59ad64002292a3e90d46a5", "_": int(time.time() * 1000),
+            },
+            headers={"User-Agent": _UA},
+            timeout=15,
+        )
+        return response.json()
+
+    def fetch_fund_flow(self, request) -> Optional[FundFlowHistory]:
+        payload = self._get(request.secid)
+        klines = ((payload or {}).get("data") or {}).get("klines") or []
+        if not klines:
+            return None
+        return FundFlowHistory(frame=_fund_flow_frame(klines), complete=False)
+
+
 pf.register(EastmoneyPlatform())
 pf.register(EastmoneyDataApiPlatform())
+pf.register(EastmoneyDelayPlatform())

@@ -232,7 +232,7 @@ _FUND_FLOW_PAGE_BREAKER = SourceBreaker(
 
 # 兜底 K 线的帧归一逻辑搬到了 kline_frame，好让 provider 直接用而不产生循环依赖。
 # 这些名字仍从本模块可见：外部按 cn_stock_source.<name> 取的地方不用改。
-from . import kline_source
+from . import fund_flow_source, kline_source
 from .kline_frame import (  # noqa: F401
     FALLBACK_FRAME_COLUMNS,
     _FALLBACK_REQUIRED,
@@ -469,8 +469,24 @@ async def _run_in_executor(func, *args):
 
 
 def _fund_flow_rows(value) -> int:
-    frame = (value or {}).get("fund_flow")
+    if not isinstance(value, dict) or _is_fetch_failure(value):
+        return 0
+    frame = value.get("fund_flow")
     return 0 if frame is None else len(frame)
+
+
+def _fund_flow_needs_page(value) -> bool:
+    """HTTP 那一层的结果还要不要去页面补。
+
+    失败要补；只拿到 delay 那一行（``complete`` 为 False）也要补——页面有 120 行历史。
+    主源给的全份（哪怕新股只有几行）不补：那已经是这个标的全部的历史，页面上也不会更多。
+    ``None`` 是"这次没要资金流"，不是失败。
+    """
+    if value is None:
+        return False
+    if _is_fetch_failure(value):
+        return True
+    return not bool(value.get("complete", True))
 
 
 def _truncate_fund_flow(value: Optional[Dict], keep: int) -> Optional[Dict]:
@@ -1073,29 +1089,41 @@ class CNStockDataSource(DataSource):
         return {"finance": result["finance"].copy(deep=True)}
     
     def _fetch_fund_flow_sync(self, code: str, symbol: str = None) -> Optional[Dict]:
-        """同步获取资金流向数据"""
+        """同步获取资金流向数据。
+
+        源在平台层：``FUND_FLOW_PROVIDERS`` 决定问谁、按什么顺序（默认 eastmoney →
+        eastmoney_delay），见 fund_flow_source.py。返回结构和以前一字不差，多一个
+        ``complete``——这份是不是该源能给的全部历史。编排层靠它决定还要不要付一次
+        页面加载：主源给的是全部，不用补；delay 只有当日一行，有页面的标的还该去页面
+        把 120 行历史取回来。
+
+        "获取资金流向数据失败 <code>:" 这行的措辞不能改：verify_release 和 loadtest
+        都按它数主源失败的次数。主源没给、只拿到 delay 那一行时同样打这一行——
+        对"主源失败了几次"这个问题它仍然是失败。
+        """
         from ..symbols import get_symbol_name
         symbol_name = get_symbol_name(symbol) if symbol else ""
         is_index = check_is_index(symbol, symbol_name)
-        
+        request = fund_flow_source.FundFlowRequest(code=code, symbol=symbol, is_index=is_index)
+        status: dict = {}
         try:
-            import akshare as ak
-            df = None
-            is_market = False
-            if is_index:
-                exchange = "sh" if symbol.startswith("SH") else "sz"
-                df = ak.stock_individual_fund_flow(stock=code, market=exchange)
-            else:
-                # 个股
-                exchange = "sh" if code.startswith("6") else "sz"
-                df = ak.stock_individual_fund_flow(stock=code, market=exchange)
-            
-            if df is None or df.empty:
-                return _fetch_failure("fund_flow")
-            return {"fund_flow": df, "is_market": is_market}
+            result = fund_flow_source.resolve(request, status=status)
         except Exception as e:
             logger.warning(f"获取资金流向数据失败 {code}: {e}")
             return _fetch_failure("fund_flow")
+        if result is None:
+            logger.warning(
+                "获取资金流向数据失败 %s: 全部来源无结果 %s",
+                code, ",".join(sorted(status)) or "-",
+            )
+            return _fetch_failure("fund_flow")
+        if not result.complete:
+            logger.warning(
+                "获取资金流向数据失败 %s: 主源无完整历史，%s 只给了当日一行",
+                code, result.provider,
+            )
+        # is_market 从不为 True：页面兜底和缓存编解码都按这个约定。
+        return {"fund_flow": result.frame, "is_market": False, "complete": result.complete}
 
     def _fetch_fund_flow_cached(
         self, code: str, symbol: str, rows_needed: int
@@ -1423,16 +1451,28 @@ class CNStockDataSource(DataSource):
         task_results = await asyncio.gather(*(future for _, future in task_specs))
         fetched = dict(zip((name for name, _ in task_specs), task_results))
 
-        if requirements.fund_flow and _is_fetch_failure(fetched.get("fund_flow")):
-            # 页面兜底挂在 gather 之后：只有主源真的失败才付这一次页面加载，正常
-            # 情况下这条路一次都不会走。必须在下面统计 fetch_failures 之前替换，
-            # 否则兜底成功了报告依然被判定为不完整而整体不进缓存。
+        if requirements.fund_flow and _fund_flow_needs_page(fetched.get("fund_flow")):
+            # 页面兜底挂在 gather 之后：只有主源真的失败、或只拿到 delay 那一行时才付
+            # 这一次页面加载，正常情况下这条路一次都不会走。必须在下面统计
+            # fetch_failures 之前替换，否则兜底成功了报告依然被判定为不完整而整体不进缓存。
             page_result = await self._fetch_fund_flow_from_page(canonical_symbol)
-            if page_result is not None:
+            if page_result is not None and (
+                _fund_flow_rows(page_result) > _fund_flow_rows(fetched.get("fund_flow"))
+            ):
+                # 页面给 120 行，只在它比手上的多时才换——手上那一行是 delay 给的当日，
+                # 页面失败或更少时留着它，别把有变成没有。
                 fetched["fund_flow"] = page_result
                 # 写回缓存：兜底不走 get_or_load（它挂在 gather 之后，包进去会改
                 # 触发时机），不显式写回的话下一次同标的又是一次 6.4 秒的页面加载。
                 store_fund_flow(canonical_symbol, page_result)
+        # 页面也没补上、手里仍是 delay 那一行：报告照常渲染，但它是降级结果，不能进
+        # 跨请求缓存——下一次页面可能就成功了，缓存住等于把一行历史冻进整个纪元
+        # （cache-design §七 不变量 4）。用 fetch_failures 表达，它唯一的用途就是拦缓存。
+        fund_flow_partial = (
+            requirements.fund_flow
+            and not _is_fetch_failure(fetched.get("fund_flow"))
+            and _fund_flow_needs_page(fetched.get("fund_flow"))
+        )
 
         kline_data = fetched.get("kline")
         finance_data = fetched.get("finance")
@@ -1445,7 +1485,9 @@ class CNStockDataSource(DataSource):
             for result in fetched.values()
             if _is_fetch_failure(result)
         ]
-        
+        if fund_flow_partial:
+            stock_data.fetch_failures.append("fund_flow:partial")
+
         if realtime_data and "info" in realtime_data:
             info = realtime_data["info"]
             stock_data.name = info.get("股票简称", "")

@@ -344,7 +344,9 @@ register(XueqiuPlatform())
 | 2 | K 线迁到平台层 | ✅ | `prove_equivalence.py` 前后逐字比对，54 份文档 0 差异 |
 | 3 | 同花顺平台、板块资金流 | ✅ | 预期**不等价**——看的是"差异只出现在指数、且往权威值靠" |
 | 4 | 基本数据 + 盘中行情迁过来 | 待做 | `prove_equivalence.py` |
-| 5 | 东财个股那几维从 `cn_stock_source` 迁出 | 待做 | 同上 |
+| 5a | 个股/指数资金流迁出：`fund_flow_source` + `eastmoney` / `eastmoney_delay` | ✅ | `prove_equivalence.py`；主源通时逐字相同，主源拒绝时科创 50 多出当日一行（净增益） |
+| 5b | 腾讯日 K 自己发请求，不经 AkShare 的按年循环 | ✅ | `prove_equivalence.py` 62 份可判定文档 0 差异；每标的 8 个请求降到 2 个 |
+| 5c | K 线主路径、基本数据从 `cn_stock_source` 迁出 | 待做 | 同上 |
 
 先做交易日历是有意的：它是全新维度，用它验证抽象，比拿一个有等价性要求的维度去
 试错便宜得多。而且它的兜底路径恰好检验了一个设计点——"取不到日历就退回

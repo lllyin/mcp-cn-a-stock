@@ -254,6 +254,7 @@ mcporter call cn-stock market_events \
 | `INTRADAY_QUOTE_PROVIDERS` | 盘中实时行情的尝试顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`fund_flow_page` 复用已解析的资金流页面，不发请求但没有开高低<br>`tencent` 六项俱全 | `fund_flow_page`<br>`tencent`<br>`off`<br>（默认 `fund_flow_page,tencent`） |
 | `INTRADAY_QUOTE_CROSS_CHECK_PCT` | 拿到第一个可用报价后再问剩下的源一遍，字段相差超过这个值就打 WARNING。每个标的多一次上游请求，只在怀疑某个源口径不对时开 | 百分比，`0` 关闭（默认 `0`） |
 | `TRADING_CALENDAR_PROVIDERS` | 判「今天开不开市」的日历来源：<br>`sina` 上交所公布的交易日名单<br>`weekday` 兜底，周一到周五算交易日 | `sina`<br>`weekday`<br>`off`<br>（默认 `sina,weekday`） |
+| `FUND_FLOW_PROVIDERS` | 个股/指数资金流 HTTP 层的取数顺序（浏览器页面兜底另算，挂在这一层之后）：<br>`eastmoney` 给全部历史，走伪装通道<br>`eastmoney_delay` 同一接口的 push2delay 主机，只回当日一行，但主源拒绝出口 IP 时它还通；补的是没有资金流向页面的标的（科创 50 这类指数） | `eastmoney`<br>`eastmoney_delay`<br>`off`<br>（默认 `eastmoney,eastmoney_delay`） |
 | `SECTOR_FUND_FLOW_PROVIDERS` | 板块资金流的取数顺序：<br>`eastmoney` 字段全<br>`eastmoney_dataapi` 只有主力净额，但主源连不上时它还通；报告备注里会标出是降级源 | `eastmoney`<br>`eastmoney_dataapi`<br>`off`<br>（默认 `eastmoney,eastmoney_dataapi`） |
 | `SECTOR_TAXONOMY_PROVIDERS` | 板块分级表的来源，用来只排同一层——东财的行业板块名单是一棵树摊平的（496 个），不分级会让父子板块同时上榜、同一笔钱数两遍。默认排申万二级，和东财官网那张榜逐位一致：<br>`shenwan` 申万宏源的行业分类<br>`off` 退回全部板块一起排，报告里会标出来 | `shenwan`<br>`off`<br>（默认 `shenwan`） |
 | `KLINE_PROVIDERS_INDEX` | **指数**用的兜底顺序，和下一项分开配：指数的成交量各源口径差得多（创业板指相差 3.52%），同花顺与东财一致 | 同上（默认 `tonghuashun,tencent,sina`） |
@@ -353,6 +354,7 @@ AkShare 和 efinance 的接口是同步网络调用，由一个有界线程池�
 
 ## 更多文档
 
+- [2.0.0 变更说明与上线清单](docs/release-notes-2.0.0.md)：输出文本和配置名改了什么、下游怎么改、服务器上怎么验
 - [开发与维护](docs/development.md)：跑测试、调试、发布前验证、重构时怎么证明行为没变
 - [项目架构](docs/architecture.md)：分层、每层负责什么、加工具/加数据源该动哪里
 - [技术实现说明](docs/technical-details.md)：数据链路与回退、输出契约、报告缓存、调优边界

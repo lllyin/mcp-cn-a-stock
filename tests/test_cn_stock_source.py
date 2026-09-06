@@ -12,6 +12,7 @@ import pytest
 
 from finmcp.datasource import cn_stock_source as source_module
 from finmcp.datasource import kline_source
+from finmcp.datasource.platforms import tencent as tencent_module
 from finmcp.datasource.cn_stock_source import CNStockDataSource
 from finmcp.datasource.base import DataSource, FetchRequirements, StockData
 from finmcp import datafeed
@@ -309,6 +310,16 @@ def test_simple_kline_skips_unadjusted_copy(monkeypatch):
 
 
 
+
+#: akshare.stock_individual_fund_flow 真实返回的 13 列里，下面几个假表没写的那 8 列。
+#: 平台层按全部 13 列校验契约，假表得和真表一样齐。
+_REST_OF_FUND_FLOW_COLUMNS = {
+    "超大单净流入-净额": 0.0, "超大单净流入-净占比": 0.0,
+    "大单净流入-净额": 0.0, "大单净流入-净占比": 0.0,
+    "中单净流入-净额": 0.0, "中单净流入-净占比": 0.0,
+    "小单净流入-净额": 0.0, "小单净流入-净占比": 0.0,
+}
+
 def _tencent_kline(code, start_date, end_date, adjust, symbol=None):
     """直接问腾讯这个平台要一段行情，绕开编排层。"""
     return kline_source.provider("tencent").fetch_kline(
@@ -342,12 +353,10 @@ def test_simple_kline_uses_tencent_fallback_after_provider_failure(monkeypatch):
 
 def test_tencent_kline_fallback_normalizes_columns(monkeypatch):
     datasource = CNStockDataSource()
-    import akshare as ak
-
     monkeypatch.setattr(
-        ak,
-        "stock_zh_a_hist_tx",
-        lambda **kwargs: pd.DataFrame([
+        tencent_module,
+        "_history_frame",
+        lambda *args, **kwargs: pd.DataFrame([
             {
                 "date": "2026-06-15", "open": 10.0, "close": 10.0,
                 "high": 10.2, "low": 9.8, "volume": 1000,
@@ -388,6 +397,7 @@ def test_etf_fund_flow_uses_stock_individual_fund_flow(monkeypatch):
                     "涨跌幅": 3.59,
                     "主力净流入-净额": 186277584.0,
                     "主力净流入-净占比": 11.80,
+                    **_REST_OF_FUND_FLOW_COLUMNS,
                 }
             ]
         )
@@ -478,6 +488,7 @@ def test_small_index_fund_flow_is_enabled(monkeypatch):
                     "涨跌幅": 3.82,
                     "主力净流入-净额": 2929126656.0,
                     "主力净流入-净占比": 4.76,
+                    **_REST_OF_FUND_FLOW_COLUMNS,
                 }
             ]
         )
@@ -877,7 +888,7 @@ def _fake_tx_frame():
 
 
 def _patch_tx(monkeypatch, frame=None, seen=None):
-    import akshare
+    """腾讯平台自己发请求了，接缝在它的 _history_frame（和 AkShare 同一套入参写法）。"""
 
     def fake_tx(symbol, start_date, end_date, adjust="", **kwargs):
         if seen is not None:
@@ -889,7 +900,7 @@ def _patch_tx(monkeypatch, frame=None, seen=None):
         upper = datetime.datetime.strptime(end_date, "%Y%m%d").date()
         return source[(source["date"] >= lower) & (source["date"] <= upper)]
 
-    monkeypatch.setattr(akshare, "stock_zh_a_hist_tx", fake_tx)
+    monkeypatch.setattr(tencent_module, "_history_frame", fake_tx)
 
 
 def test_tencent_fallback_widens_the_fetch_window(monkeypatch):
@@ -1160,7 +1171,7 @@ def test_sina_fallback_serves_symbols_tencent_rejects(monkeypatch):
     import akshare
 
     monkeypatch.setattr(
-        akshare, "stock_zh_a_hist_tx", lambda **k: (_ for _ in ()).throw(KeyError("day"))
+        tencent_module, "_history_frame", lambda *a, **k: (_ for _ in ()).throw(KeyError("day"))
     )
     monkeypatch.setattr(akshare, "stock_zh_a_daily", lambda **k: _sina_frame())
 
@@ -1178,7 +1189,7 @@ def test_sina_volume_is_normalised_to_lots(monkeypatch):
     import akshare
 
     monkeypatch.setattr(
-        akshare, "stock_zh_a_hist_tx", lambda **k: (_ for _ in ()).throw(KeyError("day"))
+        tencent_module, "_history_frame", lambda *a, **k: (_ for _ in ()).throw(KeyError("day"))
     )
     monkeypatch.setattr(akshare, "stock_zh_a_daily", lambda **k: _sina_frame())
 
@@ -1196,7 +1207,7 @@ def test_unsupported_only_when_every_fallback_rejects(monkeypatch):
     import akshare
 
     monkeypatch.setattr(
-        akshare, "stock_zh_a_hist_tx", lambda **k: (_ for _ in ()).throw(IndexError("oob"))
+        tencent_module, "_history_frame", lambda *a, **k: (_ for _ in ()).throw(IndexError("oob"))
     )
     monkeypatch.setattr(
         akshare, "stock_zh_a_daily", lambda **k: (_ for _ in ()).throw(KeyError("date"))
@@ -1214,7 +1225,7 @@ def test_empty_window_is_not_reported_as_unsupported(monkeypatch):
     import akshare
 
     empty = pd.DataFrame()
-    monkeypatch.setattr(akshare, "stock_zh_a_hist_tx", lambda **k: empty)
+    monkeypatch.setattr(tencent_module, "_history_frame", lambda *a, **k: empty)
     monkeypatch.setattr(akshare, "stock_zh_a_daily", lambda **k: empty)
 
     status = {}
@@ -1230,7 +1241,7 @@ def test_simple_kline_reports_unsupported_distinctly(monkeypatch):
     monkeypatch.setattr(source_module.ef.stock, "get_quote_history", lambda *a, **k: None)
     monkeypatch.setattr(akshare, "stock_zh_a_hist", lambda **k: pd.DataFrame())
     monkeypatch.setattr(
-        akshare, "stock_zh_a_hist_tx", lambda **k: (_ for _ in ()).throw(KeyError("day"))
+        tencent_module, "_history_frame", lambda *a, **k: (_ for _ in ()).throw(KeyError("day"))
     )
     monkeypatch.setattr(
         akshare, "stock_zh_a_daily", lambda **k: (_ for _ in ()).throw(KeyError("date"))
@@ -1250,7 +1261,7 @@ def test_simple_kline_returns_none_for_a_quiet_window(monkeypatch):
 
     monkeypatch.setattr(source_module.ef.stock, "get_quote_history", lambda *a, **k: None)
     monkeypatch.setattr(akshare, "stock_zh_a_hist", lambda **k: pd.DataFrame())
-    monkeypatch.setattr(akshare, "stock_zh_a_hist_tx", lambda **k: pd.DataFrame())
+    monkeypatch.setattr(tencent_module, "_history_frame", lambda *a, **k: pd.DataFrame())
     monkeypatch.setattr(akshare, "stock_zh_a_daily", lambda **k: pd.DataFrame())
 
     assert CNStockDataSource().fetch_kline_simple_sync(
@@ -1342,6 +1353,103 @@ async def test_page_fallback_supplies_history_and_clears_the_failure(monkeypatch
     assert result.fund_main_amount[-1] == pytest.approx(1.59e8)
     assert result.fund_main_ratio[-1] == pytest.approx(0.0337)
     assert result.is_market is False
+
+
+# --- HTTP 层只拿到 delay 的当日一行（complete=False）时 ---------------------------
+
+
+def _partial_fund_flow_result():
+    """eastmoney_delay 给的那一行：push2delay 2026-09-06 对 0.399006 的原样返回。"""
+    from finmcp.datasource.platforms import eastmoney
+
+    frame = eastmoney._fund_flow_frame([
+        "2026-09-04,-7200599040.0,8721076224.0,-1520476160.0,-3684253696.0,-3516345344.0,"
+        "-1.43,1.73,-0.30,-0.73,-0.70,3286.55,-0.78,0.00,0.00"
+    ])
+    return {"fund_flow": frame, "is_market": False, "complete": False}
+
+
+@pytest.mark.asyncio
+async def test_partial_fund_flow_still_goes_to_the_page_and_takes_its_history(monkeypatch):
+    """delay 只有一行，有页面的标的仍去页面把 120 行补回来。"""
+    from finmcp.datasource import realtime_ff as realtime_ff_module
+
+    datasource = _page_fallback_datasource(monkeypatch, _partial_fund_flow_result())
+    page = _captured_page()
+    loaded = []
+
+    async def fake_page(symbol):
+        loaded.append(symbol)
+        return page
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+
+    result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
+
+    assert loaded == ["SZ300408"]
+    assert len(result.fund_flow_history["DATE"]) == 121
+    assert result.fetch_failures == []           # 页面补齐了，报告可以进缓存
+
+
+@pytest.mark.asyncio
+async def test_partial_fund_flow_survives_a_failed_page_but_blocks_the_cache(monkeypatch):
+    """页面没补上：当日那一行留着（有比没有强），但报告不能进跨请求缓存。"""
+    from finmcp.datasource import realtime_ff as realtime_ff_module
+
+    datasource = _page_fallback_datasource(monkeypatch, _partial_fund_flow_result())
+
+    async def failing_page(symbol):
+        raise RuntimeError("风控滑块")
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", failing_page)
+
+    result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
+
+    assert len(result.fund_flow_history["DATE"]) == 1
+    assert result.fund_main_amount[-1] == pytest.approx(-7200599040.0)
+    assert result.fetch_failures == ["fund_flow:partial"]
+
+
+@pytest.mark.asyncio
+async def test_partial_fund_flow_for_a_symbol_without_a_page_skips_the_browser(monkeypatch):
+    """科创 50 没有资金流向页面：不开浏览器，直接用 delay 那一行，同样不进缓存。"""
+    from finmcp.datasource import realtime_ff as realtime_ff_module
+
+    datasource = _page_fallback_datasource(monkeypatch, _partial_fund_flow_result())
+    loaded = []
+
+    async def fake_page(symbol):
+        loaded.append(symbol)
+        return _captured_page()
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+
+    result = await datasource.fetch_stock_data("SH000688", "2024-01-01", "2026-09-03")
+
+    assert loaded == []
+    assert len(result.fund_flow_history["DATE"]) == 1
+    assert result.fetch_failures == ["fund_flow:partial"]
+
+
+@pytest.mark.asyncio
+async def test_a_complete_fund_flow_never_pays_for_a_page(monkeypatch):
+    """主源给的全份——哪怕只有几行——不再去页面，行为和迁移前一样。"""
+    from finmcp.datasource import realtime_ff as realtime_ff_module
+
+    complete = dict(_partial_fund_flow_result(), complete=True)
+    datasource = _page_fallback_datasource(monkeypatch, complete)
+    loaded = []
+
+    async def fake_page(symbol):
+        loaded.append(symbol)
+        return _captured_page()
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+
+    result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
+
+    assert loaded == []
+    assert result.fetch_failures == []
 
 
 @pytest.mark.asyncio
