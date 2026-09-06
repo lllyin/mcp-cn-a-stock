@@ -115,7 +115,7 @@ JSON 外壳没有变。
 超预算的部分全部是浏览器活跃窗口。浏览器空闲回收现在按市场时段分档：盘中 90 分钟，盘外 5 分钟。
 要把峰值也压进预算，唯一的杠杆是让浏览器兜底不再是稳态，也就是开网关。
 
-### 09-06 晚间两处取数层改动
+### 09-06 晚间三处取数层改动
 
 - **K 线兜底每标的 8 个请求降到 2 个。** 腾讯日 K 不再经 AkShare 的按年循环，一页 640 根直接取。
   归一和"认不认这个代码"都照抄 AkShare，`prove_equivalence.py` 62 份可判定文档 0 差异。
@@ -123,6 +123,11 @@ JSON 外壳没有变。
 - **科创50 的资金流有了第二条路。** `FUND_FLOW_PROVIDERS=eastmoney,eastmoney_delay`：主源拒绝时
   `push2delay` 主机给当日一行。等价性比对里唯一的差异就是 `SH000688` 从"暂无资金流向数据"
   变成有当日五行，其余文档逐字相同。
+- **板块分级表有了第二个源。** `SECTOR_TAXONOMY_PROVIDERS=shenwan,swsresearch`。部署机 21:04 第一次调
+  `sector_fund_flow` 就是 `ranked=未分级`：乐咕乐股对机房 IP 回 302 跳人机验证页，申万两级分类全挂，
+  496 个板块只能混排、父子同榜。申万宏源研究所官网的 JSON 接口是同一套标准，一级 31/31、二级 124 个
+  同名（比乐咕少 7 个小板块），乐咕缺的级由它补，乐咕给全时不发请求。**服务器 `.env` 里若写死了
+  `SECTOR_TAXONOMY_PROVIDERS=shenwan`，新默认不会生效，要改成两项或删掉这一行。**
 
 ### 已知限制
 
@@ -142,6 +147,7 @@ cd /root/.openclaw/workspace-finance/repos/mcp-cn-a-stock
 git fetch origin
 ./switch.sh feat/v2.0.0          # 拉取、卸旧、重装、自检包能否读到参考数据
 grep -c '^CN_STOCK_' .env        # 应为 0；不为 0 按第二节改名
+grep '^SECTOR_TAXONOMY_PROVIDERS' .env   # 若只有 shenwan，改成 shenwan,swsresearch 或删掉用默认
 ./stop.sh && ./start.sh
 head -5 logs/cn-stock-mcp.log    # 看 HTTP channel mode= 这一行，确认是预期的通道
 ```
@@ -164,6 +170,9 @@ python3 scripts/verify_release.py
 
 # 3. 复核缓存去重生效：同一轮里每个标的的页面加载应只有 1 次
 grep -o '资金流向页面兜底成功 \S*' logs/cn-stock-mcp.log | sort | uniq -c | sort -rn | head
+
+# 4. 板块分级在部署机上到底有没有：调一次 sector_fund_flow 之后 ranked= 应是个数字（二级约 120），不是 未分级
+grep -o 'sector_fund_flow .*ranked=[^ ]*' logs/cn-stock-mcp.log | tail -3
 ```
 
 判据：

@@ -256,7 +256,7 @@ mcporter call cn-stock market_events \
 | `TRADING_CALENDAR_PROVIDERS` | 判「今天开不开市」的日历来源：<br>`sina` 上交所公布的交易日名单<br>`weekday` 兜底，周一到周五算交易日 | `sina`<br>`weekday`<br>`off`<br>（默认 `sina,weekday`） |
 | `FUND_FLOW_PROVIDERS` | 个股/指数资金流 HTTP 层的取数顺序（浏览器页面兜底另算，挂在这一层之后）：<br>`eastmoney` 给全部历史，走伪装通道<br>`eastmoney_delay` 同一接口的 push2delay 主机，只回当日一行，但主源拒绝出口 IP 时它还通；补的是没有资金流向页面的标的（科创 50 这类指数） | `eastmoney`<br>`eastmoney_delay`<br>`off`<br>（默认 `eastmoney,eastmoney_delay`） |
 | `SECTOR_FUND_FLOW_PROVIDERS` | 板块资金流的取数顺序：<br>`eastmoney` 字段全<br>`eastmoney_dataapi` 只有主力净额，但主源连不上时它还通；报告备注里会标出是降级源 | `eastmoney`<br>`eastmoney_dataapi`<br>`off`<br>（默认 `eastmoney,eastmoney_dataapi`） |
-| `SECTOR_TAXONOMY_PROVIDERS` | 板块分级表的来源，用来只排同一层——东财的行业板块名单是一棵树摊平的（496 个），不分级会让父子板块同时上榜、同一笔钱数两遍。默认排申万二级，和东财官网那张榜逐位一致：<br>`shenwan` 申万宏源的行业分类<br>`off` 退回全部板块一起排，报告里会标出来 | `shenwan`<br>`off`<br>（默认 `shenwan`） |
+| `SECTOR_TAXONOMY_PROVIDERS` | 板块分级表的来源，用来只排同一层——东财的行业板块名单是一棵树摊平的（496 个），不分级会让父子板块同时上榜、同一笔钱数两遍。默认排申万二级，和东财官网那张榜逐位一致：<br>`shenwan` 申万宏源的行业分类，经 AkShare 抓乐咕乐股页面<br>`swsresearch` 申万宏源研究所官网的接口，同一套分类的第二个源，乐咕乐股对机房 IP 回人机验证页时靠它补<br>同一套标准的源会合并：前一个缺的级由后一个补<br>`off` 退回全部板块一起排，报告里会标出来 | `shenwan,swsresearch`<br>`shenwan`<br>`off`<br>（默认 `shenwan,swsresearch`） |
 | `KLINE_PROVIDERS_INDEX` | **指数**用的兜底顺序，和下一项分开配：指数的成交量各源口径差得多（创业板指相差 3.52%），同花顺与东财一致 | 同上（默认 `tonghuashun,tencent,sina`） |
 | `KLINE_PROVIDERS` | 东财那一级取不到时，**个股/ETF** 的兜底顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`tonghuashun` 不覆盖北交所<br>`tencent` 个股/ETF/指数都覆盖，北交所大半不认<br>`sina` 覆盖腾讯不认的北交所代码，但不认 ETF 和创业板指<br>三家各补各的洞 | `tonghuashun`<br>`tencent`<br>`sina`<br>`off`<br>（默认 `tencent,sina`） |
 | `FUND_FLOW_PAGE_ENABLED` | 东财资金流接口不可用时，是否回退到资金流向页面 | `0`<br>`1`<br>（默认 `1`） |

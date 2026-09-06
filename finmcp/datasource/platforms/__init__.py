@@ -7,6 +7,6 @@ import 的顺序无所谓——注册是幂等的，能力的启用顺序由各�
 环境变量决定，不由这里的顺序决定。
 """
 
-from . import eastmoney, shenwan, sina, tencent, tonghuashun, weekday  # noqa: F401  仅为触发注册
+from . import eastmoney, shenwan, sina, swsresearch, tencent, tonghuashun, weekday  # noqa: F401  仅为触发注册
 
-__all__ = ["eastmoney", "shenwan", "sina", "tencent", "tonghuashun", "weekday"]
+__all__ = ["eastmoney", "shenwan", "sina", "swsresearch", "tencent", "tonghuashun", "weekday"]

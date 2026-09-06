@@ -28,6 +28,18 @@
 - ``sw_index_third_info`` 三级是 HTML 抓取，实测 4 次成 2 次——**不接它**。
   排名只需要一个干净的层，一级已经够，为它引入一个一半会失败的依赖不划算。
 
+## 为什么有第二个源
+
+``sw_index_*_info`` 抓的是乐咕乐股的页面，它前面的阿里云 WAF 对机房 IP 回 302 跳到
+人机验证页：部署机 2026-09-06 两级全挂（``'NoneType' object has no attribute 'find_all'``），
+本机同一时刻 200。同一段代码一台机器有分级一台没有，榜就对不上东财官网。第二个源
+``swsresearch`` 直接调申万宏源研究所官网的 JSON 接口，同一套标准：一级 31/31 同名，
+二级 124 个全部同名、比乐咕少 7 个小板块（细节见 platforms/swsresearch.py）。
+
+两个源同一套标准，所以**合并**而不是二选一（``_merge``）：前一个缺的级由后一个补——
+乐咕是 HTML 抓取，两级各自成败，一级到了二级没到的情形真实存在；同名冲突信先配置的。
+``_enough`` 要求能排的每一级都有名字，乐咕给全时官网一个请求都不发。
+
 分类一年动一两次，所以缓存 24 小时，对每次查询是零成本。
 """
 
@@ -45,7 +57,7 @@ logger = logging.getLogger("finmcp")
 
 CAPABILITY = "sector_taxonomy"
 PROVIDER_ORDER_ENV = "SECTOR_TAXONOMY_PROVIDERS"
-DEFAULT_PROVIDER_ORDER = ("shenwan",)
+DEFAULT_PROVIDER_ORDER = ("shenwan", "swsresearch")
 
 #: 排名默认排哪一级。**二级**——判据是东财官网自己就这么排：
 #: data.eastmoney.com/bkzj/hy.html 的"行业板块资金流向排行"共 3 页 × 50 行，
@@ -111,10 +123,34 @@ cache.register_namespace(cache.Namespace(
 ))
 
 
+def _merge(base: Optional[SectorTaxonomy], extra: SectorTaxonomy) -> SectorTaxonomy:
+    """把后一个源的层级合进前一个。
+
+    解的是"A 缺二级、B 有二级"。同一个名字两个源给的层级不同，信先配置的那个——
+    那是仲裁，归顺序管，不归合并管。分类标准不同的表不合：申万的二级和别家的二级
+    不是一回事，合了就是错的，这时只留前面那份。
+    """
+    if base is None:
+        return extra
+    if extra.scheme != base.scheme:
+        return base
+    levels = dict(extra.levels)
+    levels.update(base.levels)
+    return SectorTaxonomy(levels=levels, scheme=base.scheme,
+                          source=f"{base.source}+{extra.source}")
+
+
+def _enough(taxonomy: SectorTaxonomy) -> bool:
+    """能排的每一级都有名字才算够；差一级就继续问下一个源。"""
+    present = set(taxonomy.levels.values())
+    return all(level in present for level in RANK_LEVELS)
+
+
 def _fetch(sector_type: str) -> Optional[SectorTaxonomy]:
     order = pf.configured_order(CAPABILITY, PROVIDER_ORDER_ENV, DEFAULT_PROVIDER_ORDER)
     resolved = pf.resolve(
-        CAPABILITY, SectorTaxonomyRequest(sector_type=sector_type), order=order)
+        CAPABILITY, SectorTaxonomyRequest(sector_type=sector_type), order=order,
+        merge=_merge, enough=_enough)
     return resolved.value if resolved is not None else None
 
 
@@ -130,8 +166,9 @@ def load(sector_type: str = "industry", *, force: bool = False) -> Optional[Sect
         CACHE_NAMESPACE, sector_type, lambda: _fetch(sector_type))
     taxonomy = None if entry is None else entry.value
     if taxonomy is not None:
-        logger.debug("板块分级 sector_type=%s 标准=%s 覆盖=%s 个 新鲜=%s",
-                     sector_type, taxonomy.scheme, len(taxonomy.levels), entry.fresh)
+        logger.debug("板块分级 sector_type=%s 标准=%s 来源=%s 覆盖=%s 个 新鲜=%s",
+                     sector_type, taxonomy.scheme, taxonomy.source,
+                     len(taxonomy.levels), entry.fresh)
     return taxonomy
 
 
