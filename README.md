@@ -339,7 +339,8 @@ AkShare 和 efinance 的接口是同步网络调用，由一个有界线程池�
 | 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
 | `BROWSER_MAX_PAGES` | 整个浏览器同时开着的页面数上限。这同时就是同时有几个渲染进程，是峰值内存的直接决定项：每多一个并发页约 +130 MiB | 正整数（默认 `3`） |
-| `BROWSER_IDLE_TIMEOUT_SECONDS` | 多久没人调用就关掉浏览器。默认 90 分钟盖住午休，关早了下一批调用要重新等冷启动 | 秒，`0` 关闭空闲回收（默认 `5400`） |
+| `BROWSER_IDLE_TIMEOUT_SECONDS` | **盘中**多久没人调用就关掉浏览器。默认 90 分钟盖住午休，关早了下一批调用要重新等冷启动（+2.19s） | 秒，`0` 整层关闭回收（总开关，不看时段）（默认 `5400`） |
+| `BROWSER_IDLE_TIMEOUT_CLOSED_SECONDS` | **盘外**（收盘后、非交易日）的空闲回收超时。盘外没有午休要盖，而浏览器进程树占 378 MiB（热空闲共 621 MiB，拆掉后 243 MiB） | 秒，`0` 盘外不回收、盘中照旧（默认 `300`） |
 | `BROWSER_DISGUISE` | 把无头浏览器的自报特征改成普通浏览器的样子，避免被上游风控挑出来 | `0`<br>`1`<br>（默认 `1`） |
 | `BROWSER_CLAIM_PLATFORM` | 对外声明哪个平台。`auto` 下 Windows/macOS 照实报，Linux 报 macOS | `auto`<br>`real`<br>`macos`<br>`windows`<br>（默认 `auto`） |
 | `BROWSER_NO_SANDBOX` | 为 Chromium 添加 `--no-sandbox`。会降低隔离，仅在 sandbox 确实不可用时启用 | `0`<br>`1`<br>（默认 `0`） |

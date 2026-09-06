@@ -1181,3 +1181,78 @@ class TestIdleTeardown:
         async with realtime_ff.browser_lease():
             assert armed.cancelled()
             assert realtime_ff._idle_timer is None
+
+
+class TestIdleTimeoutBySession:
+    """空闲回收超时按市场时段分档。
+
+    90 分钟那个值的唯一依据是"盖住午休 11:30-13:00"，而午休只在盘中存在。
+    收盘后到次日开盘有 18 小时、周末更长，让浏览器那 378 MiB 空转 90 分钟纯属
+    白占（2026-09-06 部署机实测：热空闲 621 MiB，拆掉浏览器后 243 MiB）。
+    """
+
+    @pytest.mark.parametrize(
+        "moment,expected,why",
+        [
+            ("2026-09-04 10:00", "intraday", "盘中"),
+            ("2026-09-04 12:00", "intraday", "午休——正是长超时要盖住的那段"),
+            ("2026-09-04 14:30", "intraday", "盘中"),
+            ("2026-09-04 17:00", "closed", "收盘后"),
+            ("2026-09-04 03:00", "closed", "凌晨"),
+            ("2026-09-05 11:00", "closed", "非交易日，没有午休可盖"),
+            ("2026-09-06 12:00", "closed", "周末的同一时刻，也不该按盘中留"),
+        ],
+    )
+    def test_the_timeout_follows_the_market_session(
+        self, monkeypatch, moment, expected, why
+    ):
+        import datetime
+
+        monkeypatch.setattr(realtime_ff, "BROWSER_IDLE_TIMEOUT_SECONDS", 5400.0)
+        monkeypatch.setattr(realtime_ff, "BROWSER_IDLE_TIMEOUT_CLOSED_SECONDS", 300.0)
+        now = datetime.datetime.strptime(moment, "%Y-%m-%d %H:%M")
+
+        got = realtime_ff.idle_timeout_seconds(now)
+        want = 5400.0 if expected == "intraday" else 300.0
+        assert got == want, f"{moment}（{why}）应当用{expected}口径"
+
+    def test_the_intraday_knob_is_the_master_switch(self, monkeypatch):
+        """置 0 关闭回收是分档之前就写在文档里的语义，不能因为多了一档而失效。"""
+        import datetime
+
+        monkeypatch.setattr(realtime_ff, "BROWSER_IDLE_TIMEOUT_SECONDS", 0.0)
+        monkeypatch.setattr(realtime_ff, "BROWSER_IDLE_TIMEOUT_CLOSED_SECONDS", 300.0)
+        for moment in (datetime.datetime(2026, 9, 4, 10, 0),    # 盘中
+                       datetime.datetime(2026, 9, 4, 17, 0)):   # 盘外
+            assert realtime_ff.idle_timeout_seconds(moment) == 0.0
+
+    def test_closed_zero_keeps_the_browser_only_outside_the_session(self, monkeypatch):
+        """只想盘外不回收：把盘外那个设 0，盘中照旧。"""
+        import datetime
+
+        monkeypatch.setattr(realtime_ff, "BROWSER_IDLE_TIMEOUT_SECONDS", 5400.0)
+        monkeypatch.setattr(realtime_ff, "BROWSER_IDLE_TIMEOUT_CLOSED_SECONDS", 0.0)
+        assert realtime_ff.idle_timeout_seconds(
+            datetime.datetime(2026, 9, 4, 17, 0)) == 0.0
+        assert realtime_ff.idle_timeout_seconds(
+            datetime.datetime(2026, 9, 4, 10, 0)) == 5400.0
+
+    @pytest.mark.asyncio
+    async def test_arming_outside_the_session_uses_the_short_value(
+        self, monkeypatch, idle_browser
+    ):
+        """真的排一次定时器，确认取的是盘外那个值。"""
+        monkeypatch.setattr(realtime_ff, "idle_timeout_seconds", lambda now=None: 300.0)
+
+        async def fake_get_context():
+            return realtime_ff._context
+
+        monkeypatch.setattr(realtime_ff, "get_context", fake_get_context)
+        async with realtime_ff.browser_lease():
+            pass
+
+        timer = realtime_ff._idle_timer
+        assert timer is not None
+        loop = asyncio.get_running_loop()
+        # call_later 的 when() 是单调时钟上的绝对时刻，减去当下就是它排了多久
+        assert timer.when() - loop.time() == pytest.approx(300.0, abs=1.0)

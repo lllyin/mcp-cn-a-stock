@@ -14,6 +14,7 @@ from ..config import (
     BROWSER_CLAIM_PLATFORM,
     BROWSER_DISGUISE,
     BROWSER_HEADFUL,
+    BROWSER_IDLE_TIMEOUT_CLOSED_SECONDS,
     BROWSER_IDLE_TIMEOUT_SECONDS,
     BROWSER_KEEP_PAGES,
     BROWSER_MAX_PAGES,
@@ -422,22 +423,52 @@ def _cancel_idle_timer() -> None:
         _idle_timer = None
 
 
+def idle_timeout_seconds(now=None) -> float:
+    """当下该用哪个空闲回收超时。
+
+    盘中（含午休）用长的，因为那 90 分钟的唯一依据就是"盖住午休 11:30-13:00"；
+    盘外用短的，因为收盘后到次日开盘的 18 小时里没有午休要盖，让 378 MiB 的浏览器
+    进程树空转 90 分钟纯属白占。两个值的收益与代价见 config.py 里的注释。
+
+    时段判定走 ``market_session``——它是全项目时段边界的唯一定义处，缓存纪元也读它。
+    这里再造一套"几点算收盘"必然和它漂移。
+
+    ``BROWSER_IDLE_TIMEOUT_SECONDS=0`` 是**总开关**，置 0 就整个关掉回收，不看时段。
+    分档之前它的语义就是"置 0 关闭空闲回收"，不保住的话，有人照着文档把它设成 0
+    之后浏览器仍会在盘外被拆——一个已经写在文档里的开关静默失效，比多一个旋钮糟。
+    只想在盘外不回收，把 ``BROWSER_IDLE_TIMEOUT_CLOSED_SECONDS`` 设 0。
+    """
+    from ..market_session import PHASE_LIVE, PHASE_LUNCH, phase_and_epoch
+
+    if BROWSER_IDLE_TIMEOUT_SECONDS <= 0:
+        return 0.0
+    phase, _ = phase_and_epoch(now)
+    if phase in (PHASE_LIVE, PHASE_LUNCH):
+        return BROWSER_IDLE_TIMEOUT_SECONDS
+    return BROWSER_IDLE_TIMEOUT_CLOSED_SECONDS
+
+
 def _arm_idle_timer() -> None:
     """最后一个借用者离开时排一个回收定时器。调用方必须已持有 ``_lock``。
 
     用 ``call_later`` 而不是轮询循环：到点即拆，空闲期一次也不唤醒。全仓现有的
     ``create_task`` 全是请求内的，这是唯一一个常驻定时器，所以刻意做成"没有借用
     者时才存在"——有人在用的时候它是被撤掉的状态。
+
+    超时值在**排定时器的这一刻**定下，不随时段变化重排。15:59 排下的定时器因此会
+    按盘中口径留到 17:29，每天最多多留一个窗口；要跟着时段走就得周期性唤醒重算，
+    那会毁掉上面那条"空闲期一次也不唤醒"。
     """
     global _idle_timer
     _cancel_idle_timer()
-    if BROWSER_IDLE_TIMEOUT_SECONDS <= 0 or _browser is None:
+    timeout = idle_timeout_seconds()
+    if timeout <= 0 or _browser is None:
         return
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    _idle_timer = loop.call_later(BROWSER_IDLE_TIMEOUT_SECONDS, _on_idle_timeout)
+    _idle_timer = loop.call_later(timeout, _on_idle_timeout)
 
 
 def _on_idle_timeout() -> None:
