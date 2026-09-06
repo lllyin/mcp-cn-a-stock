@@ -6,7 +6,10 @@ import datetime
 from io import StringIO
 
 import numpy as np
+import pathlib
 import pytest
+
+from finmcp import research
 
 from finmcp.research import (
     build_basic_data,
@@ -599,3 +602,46 @@ class TestEmptyRealtimeFundFlowIsNotZero:
         assert "标的名称: 三环集团(300408)" in output
         assert "1.0477亿" in output
         assert "3.37%" in output
+
+
+# --- 资金流日期和数据日期不一致时要说出来 --------------------------------------
+#
+# 报告只写一个「数据日期」，资金流那段没有自己的日期。东财的资金流历史偶尔比 K 线
+# 晚一个交易日，不说出来读者无从察觉——所以走 warnings。
+
+
+def _data(kline_day: str, flow_day: str | None):
+    def ns(day):
+        return int(datetime.datetime.strptime(day, "%Y-%m-%d").timestamp() * 1e9)
+
+    out = {"DATE": np.array([ns(kline_day)], dtype=np.int64)}
+    if flow_day:
+        out["_DS_FUND_FLOW"] = {"DATE": np.array([ns(flow_day)], dtype=np.int64)}
+    return out
+
+
+def test_no_lag_when_the_two_dates_agree():
+    assert research.fund_flow_lag(_data("2026-09-04", "2026-09-04")) is None
+
+
+def test_a_lag_is_reported_with_both_dates():
+    lag = research.fund_flow_lag(_data("2026-09-04", "2026-09-03"))
+    assert lag == (datetime.date(2026, 9, 3), datetime.date(2026, 9, 4))
+
+
+def test_no_lag_without_fund_flow_history():
+    """科创50 这类标的本来就没有资金流，别报成滞后。"""
+    assert research.fund_flow_lag(_data("2026-09-04", None)) is None
+
+
+def test_no_lag_intraday(monkeypatch):
+    """盘中资金流走实时抓取，本来就是当天的，不该判成滞后。"""
+    monkeypatch.setattr(research, "is_realtime_fund_flow_window", lambda now=None: True)
+    assert research.fund_flow_lag(_data("2026-09-04", "2026-09-03")) is None
+
+
+def test_the_heading_carries_no_date():
+    """日期只在报告开头写一次。两处写同一个日期是冗余，不一致时靠 warning 提示。"""
+    src = (pathlib.Path(research.__file__)).read_text(encoding="utf-8")
+    assert 'print("## 资金流向", file=fp)' in src
+    assert "## 资金流向（" not in src

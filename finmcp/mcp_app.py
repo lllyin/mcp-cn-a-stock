@@ -376,12 +376,22 @@ async def fetch_batch_reports(
 
                 output["reports"][symbol] = buf.getvalue()
                 fetch_failures = tuple(raw_data.get(FETCH_FAILURES_KEY, ()))
+                # 资金流那一段没有自己的日期，读者只看得到开头那个"数据日期"。
+                # 真不一致时（东财的资金流历史偶尔比 K 线晚一个交易日）不说出来，
+                # 就没人会察觉——所以走 warnings，而不是让读者自己比对。
+                lag = research.fund_flow_lag(raw_data)
+                if lag is not None:
+                    flow_day, kline_day = lag
+                    output["warnings"].append(
+                        f"{symbol}: 资金流向数据止于 {flow_day}，比报告的数据日期 "
+                        f"{kline_day} 晚一步——上游的当日资金流还没落地"
+                    )
                 if (
                     cache_key is not None
                     and not fetch_failures
                     and is_cacheable_report(
                         output["reports"][symbol],
-                        phase=cache_key.phase, epoch=cache_key.epoch,
+                        phase=cache_key.phase, fund_flow_lagging=lag is not None,
                     )
                 ):
                     report_cache.put(cache_key, output["reports"][symbol])

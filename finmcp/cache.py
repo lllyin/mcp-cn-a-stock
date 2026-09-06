@@ -330,42 +330,11 @@ def key_for(
                     window=moment.date().isoformat(), phase=phase)
 
 
-#: 报告里资金流那一段的标题，形如 ``## 资金流向（2026-09-04）``。日期是这段数据
-#: 真正的日子，由 ``research.fund_flow_date`` 从资金流历史的最后一行取。
-_FUND_FLOW_HEADING = re.compile(r"##\s*资金流向（(\d{4}-\d{2}-\d{2})）")
-#: 报告顶部的 ``- 数据日期: 2026-09-04``，来自 K 线最后一根，是"这份报告说的是哪天"。
-_DATA_DATE = re.compile(r"-\s*数据日期:\s*(\d{4}-\d{2}-\d{2})")
-#: 纪元 token 形如 ``closed-2026-09-04``，尾巴上那个日期是刚结束的那个交易日。
-_EPOCH_DAY = re.compile(r"-(\d{4}-\d{2}-\d{2})$")
-
-
-def _fund_flow_is_lagging(text: str, epoch: str) -> bool:
-    """当日资金流是不是"还没落地"。
-
-    判据不看时钟，看数据：报告里两个日期一比就知道。
-
-    - **K 线有当日、资金流没有** → 上游正在路上，等一会儿就有 → 这就是要拦的。
-    - **K 线也没有当日**（停牌、退市、没有当日 bar 的指数）→ 没有什么可等的，
-      这个标的的资金流本来就停在那天，拦下来只会让它永远进不了缓存。
-
-    两种都返回"资金流比纪元旧"，但只有第一种该拦。少了这一层区分，停牌股会被
-    永久挡在缓存外——白白的性能损失，换不来任何数据完整性。
-
-    取不到日期就当作不滞后。这道守卫只拦一种明确的情况，不是通用闸门：钉日期的
-    历史查询不展示实时资金流、科创50 这类标的本来就没有资金流页面，两者都没有
-    这个标题，不该被它拦下。
-    """
-    day = _EPOCH_DAY.search(epoch or "")
-    heading = _FUND_FLOW_HEADING.search(text)
-    data_date = _DATA_DATE.search(text)
-    if day is None or heading is None or data_date is None:
-        return False
-    epoch_day = day.group(1)
-    return data_date.group(1) >= epoch_day > heading.group(1)
-
-
 def is_cacheable_report(
-    text: str, *, phase: Optional[str] = None, epoch: Optional[str] = None
+    text: str,
+    *,
+    phase: Optional[str] = None,
+    fund_flow_lagging: bool = False,
 ) -> bool:
     """这份渲染结果能不能写进缓存。
 
@@ -374,19 +343,22 @@ def is_cacheable_report(
     1. **瞬时失败不进缓存。** 一个纪元长达 64 小时，把一次上游抖动腌进去，
        整个周末就都是那个样子。
 
-    2. **当日资金流还在路上时，不进 CLOSED 纪元。** CLOSED 纪元长达 16–64 小时，
+    2. **当日资金流还在路上时，不进 CLOSED 纪元。** CLOSED 纪元长达 16-64 小时，
        而 AkShare 的当日资金流行要到收盘后一段时间才落地——``MARKET_EPOCH_FINAL_TIME``
-       配早了，这一段就会缺，然后被冻一整晚。措辞不会错（标题如实写着上一个交易日），
-       但"缺一段"被冻这么久仍然是 AGENTS §一 要拦的。
+       配早了，这一段就会缺，然后被冻一整晚。
 
        有了这道守卫，``final`` 配早的代价从**数据缺失**降到**少命中几次缓存**——
        没落地就继续留在 POSTCLOSE 的短 TTL 里，落地了自然进。
+
+    ``fund_flow_lagging`` 由调用方算好传进来（``research.fund_flow_lag``），
+    不在这里从渲染结果里正则抠日期：抠出来的东西依赖标题措辞，措辞一改守卫就
+    悄悄失效了，而失效是看不出来的。
     """
     if not text or not text.strip():
         return False
     if any(marker in text for marker in TRANSIENT_MARKERS):
         return False
-    if phase == PHASE_CLOSED and _fund_flow_is_lagging(text, epoch or ""):
+    if phase == PHASE_CLOSED and fund_flow_lagging:
         return False
     return True
 
