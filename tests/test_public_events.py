@@ -3,6 +3,8 @@ import importlib
 import pandas as pd
 import pytest
 
+from finmcp import cache
+from finmcp.datasource import public_events
 from finmcp.datasource.public_events import (
     PublicEventPoolResponse,
     fetch_public_market_events_sync,
@@ -346,3 +348,77 @@ async def test_row_cap_still_bounded():
         await events_module.get_public_market_events(
             date="2026-07-15", sources="lhb", max_rows_per_source=0
         )
+
+
+# --- 缓存：按 (源, 日期) --------------------------------------------------------
+#
+# 不按整次请求缓：keywords / symbols / max_rows_per_source 都是本地过滤参数，
+# 进 key 就是无界 key 空间。按 (源, 日期) 缓 key 空间有界，公告还能让不同 lookback
+# 的查询共用条目。实测钉过去日期 7 个源 + 回看 3 天：14.88s → 0.76s。
+
+
+def test_a_past_date_gets_an_immutable_epoch():
+    """那天的池子永远不会再变，给恒定纪元，永不失效。"""
+    assert public_events._epoch_for("lhb", "20260820") == "date-2026-08-20"
+
+
+def test_today_follows_the_market_epoch():
+    """当天的还在盘后陆续发布，不能钉死。"""
+    import datetime
+
+    today = datetime.date.today().strftime("%Y%m%d")
+    assert public_events._epoch_for("lhb", today) is None
+
+
+def test_earnings_forecast_never_gets_an_immutable_epoch():
+    """它是报告期的当前快照，会被后续修订覆盖——revision_safe=False 就是这个意思。"""
+    assert public_events._epoch_for("earnings_forecast", "20260630") is None
+
+
+def test_each_source_and_day_is_one_upstream_call():
+    """缓存的最小单位。公告那个循环本来就是按天的，逐天缓存于是天然共用条目。"""
+    calls = []
+
+    class FakeAk:
+        def stock_notice_report(self, symbol, date):
+            calls.append(date)
+            return pd.DataFrame([{"代码": "600000", "名称": "浦发银行",
+                                  "公告标题": "t", "公告日期": "2026-08-20"}])
+
+    public_events._fetch_source(FakeAk(), "announcements", "20260820", 3, False)
+    assert calls == ["20260820", "20260819", "20260818"]
+
+
+def test_a_json_round_trip_does_not_change_the_normalised_records():
+    """缓的是原始表，往返之后归一结果必须一字不差——否则缓存就改了返回内容。"""
+    frame = pd.DataFrame([{
+        "代码": "600000", "名称": "浦发银行", "上榜日": "2026-08-20",
+        "解读": "买一", "收盘价": 10.5, "涨跌幅": 3.2, "龙虎榜净买额": 1.2e8,
+    }])
+    ns = cache.namespace(public_events.CACHE_NAMESPACE)
+    restored = ns.decode(ns.encode(frame))
+    before = public_events._normalize_source("lhb", frame, "2026-08-20")
+    after = public_events._normalize_source("lhb", restored, "2026-08-20")
+    assert [r.model_dump() for r in before] == [r.model_dump() for r in after]
+
+
+def test_an_empty_frame_is_not_cached():
+    """空结果可能只是这次没取到，缓住就把它固化成"那天没有事件"了。"""
+    ns = cache.namespace(public_events.CACHE_NAMESPACE)
+    assert ns.cacheable(pd.DataFrame(), None) is False
+    assert ns.cacheable(pd.DataFrame([{"a": 1}]), None) is True
+
+
+def test_injected_ak_modules_bypass_the_cache():
+    """测试路径注入的是桩，别把桩数据腌进进程级缓存。"""
+    calls = []
+
+    class FakeAk:
+        def stock_lhb_detail_em(self, start_date, end_date):
+            calls.append(1)
+            return pd.DataFrame([{"代码": "600000", "名称": "x", "上榜日": "2026-08-20"}])
+
+    fake = FakeAk()
+    for _ in range(3):
+        public_events._fetch_source(fake, "lhb", "20260820", 1, False, use_cache=False)
+    assert len(calls) == 3

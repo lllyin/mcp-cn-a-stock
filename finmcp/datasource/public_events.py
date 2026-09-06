@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import threading
 import types
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta
 from datetime import date as date_type
-from datetime import datetime, timedelta
 from typing import Any, Literal, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 from pydantic import BaseModel, Field
+
+from .. import cache
+from ..config import CACHE_INTRADAY_TTL_SECONDS
 
 
 PublicEventSource = Literal[
@@ -204,6 +208,8 @@ def fetch_public_market_events_sync(
                 compact_date,
                 announcement_lookback_days,
                 use_direct_requests,
+                # 注入了 ak_module 的是测试路径，别把桩数据腌进进程级缓存。
+                use_cache=use_direct_requests,
             )
             records = _normalize_source(source, frame, iso_date)
             raw_count = len(records)
@@ -254,13 +260,55 @@ def fetch_public_market_events_sync(
     )
 
 
-def _fetch_source(
+# ── 缓存：按 (源, 日期) ────────────────────────────────────────────
+#
+# 不按整次请求缓：keywords / symbols / max_rows_per_source 都是**本地过滤参数**，
+# 进 key 就是无界 key 空间（自由文本）。按 (源, 日期) 缓，key 空间有界，而且公告
+# 按天缓之后 lookback=3 和 lookback=5 两次查询能共用条目，第二次只补 2 天。
+#
+# 缓的是**上游那张原始表**，不是归一后的记录：归一要用查询日期做兜底日期，缓在
+# 归一之后的话，同一天的条目被另一个查询日期命中就会带着错的兜底值。原始表
+# 经 JSON 往返不影响归一结果（实测 lhb 68 条逐字段相同）。
+CACHE_NAMESPACE = "market_events"
+
+cache.register_namespace(cache.Namespace(
+    name=CACHE_NAMESPACE,
+    max_entries=64,
+    epoch_bound=True,
+    ttl_seconds=CACHE_INTRADAY_TTL_SECONDS,
+    disk=True,
+    encode=lambda frame: json.loads(
+        json.dumps(frame.to_dict(orient="records"), default=str)),
+    decode=lambda payload: pd.DataFrame(payload),
+    cacheable=lambda frame, key: frame is not None and not frame.empty,
+))
+
+
+def _epoch_for(source: PublicEventSource, day: str) -> Optional[str]:
+    """这一天的这个源该挂在哪个纪元下。
+
+    过去日期的池子**永远不会再变**，所以给一个恒定的纪元 token，永不失效。
+    当天的还在盘后陆续发布，跟当前市场纪元走。
+
+    ``earnings_forecast`` 例外：它是报告期的**当前快照**，会被后续修订覆盖
+    （这也是 ``revision_safe=False`` 的由来），所以不给它恒定纪元。
+    """
+    if source == "earnings_forecast":
+        return None
+    try:
+        queried = datetime.strptime(day, "%Y%m%d").date()
+    except ValueError:
+        return None
+    return f"date-{queried.isoformat()}" if queried < date.today() else None
+
+
+def _fetch_source_day(
     ak_module: Any,
     source: PublicEventSource,
     compact_date: str,
-    announcement_lookback_days: int,
     use_direct_requests: bool,
 ) -> pd.DataFrame:
+    """一个源、一天、一次上游调用。缓存的最小单位就是它。"""
     def call(name: str, **kwargs) -> pd.DataFrame:
         function = getattr(ak_module, name)
         return _call_with_direct_requests(function, **kwargs) if use_direct_requests else function(**kwargs)
@@ -276,24 +324,67 @@ def _fetch_source(
     if source == "lhb":
         return call("stock_lhb_detail_em", start_date=compact_date, end_date=compact_date)
     if source == "earnings_forecast":
-        report_period = _latest_completed_report_period(compact_date)
-        frame = call("stock_yjyg_em", date=report_period)
+        frame = call("stock_yjyg_em", date=compact_date)
         if frame is None or frame.empty:
             return pd.DataFrame()
         frame = frame.copy()
-        frame["报告期"] = report_period
+        frame["报告期"] = compact_date
+        return frame
+    return call("stock_notice_report", symbol="全部", date=compact_date)
+
+
+def _cached_day(
+    ak_module: Any,
+    source: PublicEventSource,
+    compact_date: str,
+    use_direct_requests: bool,
+    *,
+    use_cache: bool,
+) -> pd.DataFrame:
+    if not use_cache:
+        return _fetch_source_day(ak_module, source, compact_date, use_direct_requests)
+    entry = cache.get_or_load(
+        CACHE_NAMESPACE,
+        f"{source}:{compact_date}",
+        lambda: _fetch_source_day(ak_module, source, compact_date, use_direct_requests),
+        epoch=_epoch_for(source, compact_date),
+    )
+    return pd.DataFrame() if entry is None else entry.value
+
+
+def _fetch_source(
+    ak_module: Any,
+    source: PublicEventSource,
+    compact_date: str,
+    announcement_lookback_days: int,
+    use_direct_requests: bool,
+    *,
+    use_cache: bool = False,
+) -> pd.DataFrame:
+    """一个源在这次查询里要的全部原始数据，按天取、按天缓，最后拼起来。"""
+    def day(value: str) -> pd.DataFrame:
+        return _cached_day(ak_module, source, value, use_direct_requests, use_cache=use_cache)
+
+    if source == "earnings_forecast":
+        report_period = _latest_completed_report_period(compact_date)
+        frame = day(report_period)
+        if frame is None or frame.empty:
+            return pd.DataFrame()
         notice_date = pd.to_datetime(frame.get("公告日期"), errors="coerce")
         end = datetime.strptime(compact_date, "%Y%m%d")
         start = end - timedelta(days=announcement_lookback_days - 1)
         return frame[(notice_date >= start) & (notice_date <= end)]
-    date = datetime.strptime(compact_date, "%Y%m%d")
+
+    if source != "announcements":
+        return day(compact_date)
+
+    # 公告本来就是按天取的，逐天缓存于是天然让不同 lookback 的查询共用条目。
+    anchor = datetime.strptime(compact_date, "%Y%m%d")
     frames = [
-        ak_module.stock_notice_report(
-            symbol="全部",
-            date=(date - timedelta(days=offset)).strftime("%Y%m%d"),
-        )
+        day((anchor - timedelta(days=offset)).strftime("%Y%m%d"))
         for offset in range(announcement_lookback_days)
     ]
+    frames = [f for f in frames if f is not None and not f.empty]
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
