@@ -138,7 +138,7 @@ def _same_value(left: str, right: str) -> bool:
 
 
 @pytest.mark.parametrize("name,expected", sorted(
-    (k, v) for k, v in _code_configs().items() if v is not None
+    (k, v) for k, v in _drop_namespaced(_code_configs()).items() if v is not None
 ))
 def test_env_example_default_matches_the_code(name, expected):
     documented = _env_example()[name]

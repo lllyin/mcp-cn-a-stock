@@ -14,12 +14,45 @@ os.environ.pop("ENV_PREFIX", None)
 # 需要验证通道本身的测试自行调用 install_http_channel。
 os.environ.setdefault("HTTP_CHANNEL", "direct")
 
+# 缓存的磁盘层指到临时目录。不指的话测试会读到 .runtime/cache 下上一次真实调用
+# 落盘的条目——桩掉的上游根本不会被调到，测的就不是这里想测的东西了。
+import tempfile
+
+os.environ.setdefault(
+    "CACHE_DIR", tempfile.mkdtemp(prefix="finmcp-test-cache-"))
+
+# 缓存整层默认关闭。它是个可选层，断言"是否回源"的测试必须在关闭状态下跑；要验缓存
+# 本身的测试自己把对应命名空间打开。必须在任何 Cache 实例构造之前设——enabled 的
+# 默认值是导入期从这个变量读的。
+os.environ.setdefault("CACHE_ENABLED", "0")
+
 import numpy as np
 import pytest
 
 from finmcp import cache as cache_module
 from finmcp import research as research_module
 from finmcp.datasource import realtime_ff as realtime_ff_module
+
+
+@pytest.fixture(autouse=True)
+def _isolated_caches():
+    """每个测试从空缓存、且整层关闭的状态开始。
+
+    命名空间是进程级单例，条目会跨测试泄漏：上一个测试写进去的 board，下一个
+    测试就命中了，于是它的桩一次都没被调到，断言"上游被问了几次"全成 0。
+    """
+    def reset():
+        for cache in list(cache_module._caches.values()):
+            # 只动跟市场走的那些。TTL 型的（交易日历、行业分类）装的是参考数据，
+            # 不是测试可见的状态：清了它下一次判断就得重打上游，853 个测试各清一次
+            # 整套会慢三倍（实测 8s → 23s），而它们的内容和被测代码毫无关系。
+            if not cache.ns.epoch_bound:
+                continue
+            cache.clear()
+            cache.enabled = False
+    reset()
+    yield
+    reset()
 
 
 @pytest.fixture(autouse=True)
@@ -89,13 +122,10 @@ def no_browser_left_behind():
 
 @pytest.fixture(autouse=True)
 def isolate_report_cache():
-    """默认关闭报告缓存，并隔离生产缓存目录。
-
-    缓存是一个可选层，断言"是否回源"的测试必须在关闭状态下运行；
-    需要缓存的测试自行调用 set_report_cache 覆盖。
-    """
+    """报告缓存单独再关一次：它有专门的 set_report_cache 注入点，很多测试在用。"""
     cache_module.set_report_cache(
-        cache_module.ReportCache(enabled=False, disk_enabled=False)
+        cache_module.Cache(cache_module.REPORT_NAMESPACE,
+                           enabled=False, disk_enabled=False)
     )
     yield
     cache_module.set_report_cache(None)

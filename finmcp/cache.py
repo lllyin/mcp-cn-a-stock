@@ -294,6 +294,10 @@ def build_key(
     )
 
 
+#: TTL 型命名空间的纪元占位。它们不跟市场走，所有条目共用一个恒定 token。
+_TTL_EPOCH = "ttl"
+
+
 def key_for(
     ns: str,
     key: str,
@@ -313,6 +317,13 @@ def key_for(
     if epoch is not None:
         return CacheKey(tool=ns, symbol=key, params="", epoch=epoch,
                         window=epoch, phase=PHASE_CLOSED)
+    declared = _NAMESPACES.get(ns)
+    if declared is not None and not declared.epoch_bound:
+        # TTL 型命名空间不看市场时钟——它的新鲜度和交易时段无关。
+        # 这不只是省一次计算：交易日历自己就是一个 TTL 命名空间，而市场纪元要靠
+        # 交易日历才算得出来。让它去问纪元就是无限递归。
+        return CacheKey(tool=ns, symbol=key, params="", epoch=_TTL_EPOCH,
+                        window=_TTL_EPOCH, phase=PHASE_CLOSED)
     moment = _as_shanghai(now)
     phase, current = market_phase(moment)
     return CacheKey(tool=ns, symbol=key, params="", epoch=current,
@@ -398,7 +409,17 @@ class Cache:
         stale_on_error: bool = CACHE_STALE_ON_ERROR,
     ):
         self.ns = ns or REPORT_NAMESPACE
-        self.enabled = enabled
+        # 总开关只管**跟市场走**的命名空间。TTL 型的（交易日历、行业分类）不受它
+        # 影响，理由是它们不是"某次查询的结果"，是加载一次的参考数据：
+        #
+        #   - 关掉它不改变任何输出——同一份名单，读缓存和重新取得到的完全一样，
+        #     所以对 prove_equivalence 的等价性证明没有任何贡献。
+        #   - 关掉它的代价是灾难性的：交易日历决定市场纪元，而纪元每次算 phase
+        #     都要用——实测 CACHE_ENABLED=0 时三次 is_trading_day 就打了三次上游，
+        #     0.51s。生产里等于每个请求都多付几次网络往返。
+        #
+        # 想强制重取用 clear()，那是"重置"该做的事，不是总开关。
+        self.enabled = enabled or not self.ns.epoch_bound
         self.live_ttl_seconds = (
             self.ns.ttl_seconds if live_ttl_seconds is None else live_ttl_seconds
         )
@@ -674,10 +695,26 @@ class Cache:
         return entry[2], max(0.0, time.time() - entry[0])
 
     def clear(self) -> None:
+        """清空这个命名空间，内存和磁盘都清。
+
+        磁盘也要清，否则 ``clear()`` 之后下一次读还会把旧条目从盘上捞回来——
+        "重置"就不是重置了，``load(force=True)`` 也不会真的重取。
+        """
         with self._lock:
             self._entries.clear()
-            self.hits = self.misses = self.stores = 0
+            self._inflight.clear()
+            self.hits = self.misses = self.stores = self.stale_serves = 0
             self._last_sweep_at = 0.0
+        if not self.ns.disk:
+            return
+        try:
+            for name in os.listdir(self.directory):
+                if name.startswith(EPOCH_DIR_PREFIX):
+                    shutil.rmtree(os.path.join(self.directory, name), ignore_errors=True)
+        except (FileNotFoundError, NotADirectoryError):
+            pass
+        except OSError:
+            logger.debug("Cache clear skipped disk ns=%s", self.ns.name, exc_info=True)
 
 
 # ── 命名空间实例 ────────────────────────────────────────────────

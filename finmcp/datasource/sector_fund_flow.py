@@ -15,6 +15,8 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
+from .. import cache
+from ..config import CACHE_INTRADAY_TTL_SECONDS
 from . import platform as pf
 from . import sector_taxonomy, trading_calendar
 
@@ -184,11 +186,22 @@ def _from_payload(payload) -> Optional[SectorFundFlowBoard]:
         return None
 
 
-def _cache_key(request: SectorFundFlowRequest):
-    from ..cache import build_key
+CACHE_NAMESPACE = "sector_flow"
 
-    return build_key("sector_fund_flow", request.sector_type,
-                     {"period": request.period})
+cache.register_namespace(cache.Namespace(
+    name=CACHE_NAMESPACE,
+    # 3 类 × 3 口径 = 9 个 key，留点余量。
+    max_entries=16,
+    epoch_bound=True,
+    ttl_seconds=CACHE_INTRADAY_TTL_SECONDS,
+    disk=True,
+    encode=_payload,
+    decode=_from_payload,
+    # 降级源的结果不进缓存。它字段少一半，而非交易日一个纪元长达 64 小时——缓住
+    # 就是整个周末都只有两列，哪怕主源十秒后就恢复了。不缓的代价是下次重试一遍
+    # 主源，正是想要的行为。
+    cacheable=lambda board, key: not board.partial,
+))
 
 
 # ── 熔断 ────────────────────────────────────────────────────────
@@ -219,18 +232,7 @@ def _breaker_for(name: str):
     return breaker
 
 
-def resolve(request: SectorFundFlowRequest, *, order: Optional[tuple] = None,
-            status: Optional[dict] = None) -> Optional[SectorFundFlowBoard]:
-    from ..cache import get_report_cache
-
-    cache = get_report_cache()
-    key = _cache_key(request)
-    cached = _from_payload(cache.get(key)) if cache is not None else None
-    if cached is not None:
-        logger.debug("板块资金流命中缓存 sector_type=%s period=%s 纪元=%s",
-                     request.sector_type, request.period, key.epoch)
-        return cached
-
+def _fetch(request: SectorFundFlowRequest, order, status) -> Optional[SectorFundFlowBoard]:
     resolved = pf.resolve(
         CAPABILITY, request,
         order=configured_order() if order is None else order,
@@ -239,14 +241,22 @@ def resolve(request: SectorFundFlowRequest, *, order: Optional[tuple] = None,
     )
     if resolved is None:
         return None
-    board = _with_levels(dataclasses.replace(resolved.value, as_of=_as_of()))
+    return _with_levels(dataclasses.replace(resolved.value, as_of=_as_of()))
 
-    # 降级源的结果不进缓存。它字段少一半，而非交易日一个纪元长达 64 小时——缓住
-    # 就是整个周末都只有两列，哪怕主源十秒后就恢复了。不缓的代价是下次重试一遍
-    # 主源，正是想要的行为。同 is_cacheable_report 的道理：别把一次瞬时降级腌起来。
-    if cache is not None and not board.partial:
-        cache.put(key, _payload(board))
-    return board
+
+def resolve(request: SectorFundFlowRequest, *, order: Optional[tuple] = None,
+            status: Optional[dict] = None) -> Optional[SectorFundFlowBoard]:
+    """按 (板块类型, 口径) 缓存**上游那份 board**，不缓渲染结果。
+
+    ``top`` 和 ``level`` 只影响渲染：按报告缓存就是 3 类 × 3 口径 × 50 × 2 = 900 个
+    key，按上游数据缓只有 9 个。渲染是纯计算，重做不要钱。
+    """
+    entry = cache.get_or_load(
+        CACHE_NAMESPACE,
+        f"{request.sector_type}:{request.period}",
+        lambda: _fetch(request, order, status),
+    )
+    return None if entry is None else entry.value
 
 
 __all__ = [

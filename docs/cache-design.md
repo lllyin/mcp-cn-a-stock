@@ -235,6 +235,19 @@ if not entry.fresh:
     warnings.append(f"财务摘要来自 {entry.age_text} 前的缓存，上游当前不可用")
 ```
 
+### 4.6 总开关不管 TTL 型命名空间
+
+`CACHE_ENABLED=0` 只关**跟市场走**的那些（报告、板块资金流、事件池、市场宽度）。
+交易日历和行业分类不受它影响，两条理由：
+
+- **关掉它不改变任何输出。** 同一份名单，读缓存和重新取得到的完全一样，
+  对等价性证明没有任何贡献。它们不是"某次查询的结果"，是加载一次的参考数据。
+- **关掉它的代价是灾难性的。** 交易日历决定市场纪元，而纪元每算一次 phase 就要用
+  一次——实测 `CACHE_ENABLED=0` 时三次 `is_trading_day` 打了三次上游、0.51 秒。
+  生产里等于每个请求都多付几次网络往返。
+
+想强制重取用 `clear()`，那是"重置"该做的事，不是总开关。
+
 ### 4.4 取用 API
 
 ```python
@@ -329,7 +342,7 @@ async def aget_or_load(ns: str, key: str, loader: Callable[[], Awaitable[Any]], 
 
 | 配置名 | 作用 | 默认 |
 |---|---|---|
-| `CACHE_ENABLED` | 总开关。关掉后所有命名空间既不读也不写（单飞仍生效——它不改变返回内容） | `1` |
+| `CACHE_ENABLED` | 总开关，作用于**跟市场走**的命名空间。TTL 型的（交易日历、行业分类）不受它影响，理由见 §4.6 | `1` |
 | `CACHE_DISK_ENABLED` | 磁盘层开关 | `1` |
 | `CACHE_DIR` | 磁盘层目录 | `.runtime/cache` |
 | `CACHE_INTRADAY_TTL_SECONDS` | 盘中软过期时长的默认值，`0` = 盘中不复用 | `30` |
@@ -364,7 +377,7 @@ SECTOR_TAXONOMY_TTL_SECONDS       → CACHE_TAXONOMY_TTL_SECONDS
 |---|---|---|
 | 1 | 一个纪元内绝不跨越 `warmup` / `final` | 同一纪元里出现两种形状的报告 |
 | 2 | 命中与否不改变返回内容（除 stale 标注） | 缓存从优化变成数据源 |
-| 3 | `CACHE_ENABLED=0` 时所有命名空间都不读不写 | `prove_equivalence.py` 的比对是假的 |
+| 3 | `CACHE_ENABLED=0` 时**跟市场走**的命名空间都不读不写 | `prove_equivalence.py` 的比对是假的 |
 | 4 | 失败结果、降级结果永不写入 | 一次瞬时故障被冻 64 小时 |
 | 5 | 当日资金流未落地时，报告不进 CLOSED 纪元 | 缺一段的报告被冻 17 小时（§2.5） |
 | 6 | 硬过期的条目在任何情况下都不被返回 | 跨交易日的旧数据被当成当天的 |

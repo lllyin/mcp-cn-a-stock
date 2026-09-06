@@ -222,15 +222,16 @@ def test_the_scope_line_has_a_fixed_shape():
 
 
 @pytest.fixture
-def live_cache(monkeypatch):
-    """开一份真缓存。conftest 默认把缓存关掉了，这几条要的正是它开着的行为。"""
+def live_cache():
+    """把板块资金流这个命名空间打开。conftest 默认整层关闭，这几条要的正是开着的行为。"""
     from finmcp import cache as cache_module
 
-    cache = cache_module.ReportCache(enabled=True, disk_enabled=False, live_ttl_seconds=60)
-    cache_module.set_report_cache(cache)
+    cache = cache_module.cache_for(sff.CACHE_NAMESPACE)
+    cache.clear()
+    cache.enabled, cache.disk_enabled = True, False
     yield cache
-    cache_module.set_report_cache(
-        cache_module.ReportCache(enabled=False, disk_enabled=False))
+    cache.clear()
+    cache.enabled = False
 
 
 def _stub_platform(monkeypatch, calls, *, partial=False):

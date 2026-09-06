@@ -32,11 +32,11 @@ from __future__ import annotations
 
 import datetime
 import logging
-import threading
 from dataclasses import dataclass
 from typing import Optional
 
-from ..config import TRADING_CALENDAR_TTL_SECONDS
+from .. import cache
+from ..config import CACHE_CALENDAR_TTL_SECONDS
 from . import platform as pf
 
 logger = logging.getLogger("finmcp")
@@ -92,48 +92,66 @@ pf.define_capability(CAPABILITY, Calendar)
 
 # ── 取数与缓存 ──────────────────────────────────────────────────
 
-_lock = threading.Lock()
-_cached: Optional[Calendar] = None
-_cached_at: float = 0.0
+# 缓存这一维：TTL 型（和交易时段无关，日历一年才发布一次），落盘。
+# 落盘的理由和分级表一样：有效期以天计，而进程重启是分钟级的事——不落盘等于
+# 每次重启都重付一次上游。
+CACHE_NAMESPACE = "calendar"
+
+cache.register_namespace(cache.Namespace(
+    name=CACHE_NAMESPACE,
+    max_entries=1,
+    epoch_bound=False,
+    ttl_seconds=CACHE_CALENDAR_TTL_SECONDS,
+    # 日历提前一年公布，取不到时旧的照样准。30 天是"这份名单还没过期到不能用"
+    # 的宽松上限；真超了就退回按星期判断，也就是接入日历之前的行为。
+    max_age_seconds=30 * 86400,
+    disk=True,
+    encode=lambda cal: {
+        "days": sorted(d.isoformat() for d in cal.days),
+        "covers_through": cal.covers_through.isoformat(),
+        "source": cal.source,
+    },
+    decode=lambda payload: Calendar(
+        days=frozenset(datetime.date.fromisoformat(d) for d in payload["days"]),
+        covers_through=datetime.date.fromisoformat(payload["covers_through"]),
+        source=payload.get("source", ""),
+    ),
+))
 
 
-def _now() -> float:
-    import time
-
-    return time.monotonic()
+def _fetch() -> Optional[Calendar]:
+    order = pf.configured_order(CAPABILITY, PROVIDER_ORDER_ENV, DEFAULT_PROVIDER_ORDER)
+    resolved = pf.resolve(CAPABILITY, CalendarRequest(), order=order)
+    calendar = resolved.value if resolved is not None else None
+    # 空名单只有 weekday 兜底平台才是合法的（它的空集就是"我不知道，按星期算"）；
+    # 别的源给空名单是没取到，不能当成"这一年没有交易日"。
+    if calendar is not None and not calendar.days and calendar.source != "weekday":
+        return None
+    return calendar
 
 
 def load(*, force: bool = False) -> Optional[Calendar]:
-    """取一份日历，进程内缓存 ``TRADING_CALENDAR_TTL_SECONDS``。
+    """取一份日历。取不到就返回 None，调用方退回按星期判断。
 
-    取不到就返回 None，调用方退回按星期判断。这一层不抛异常——日历是个优化，
-    它挂了不该让报告挂掉。
+    这一层不抛异常——日历是个优化，它挂了不该让报告挂掉。单飞和旧值兜底由
+    缓存层内建：并发只取一份，上游挂了用 30 天内的旧名单（日历提前一年公布，
+    旧的照样准）。
     """
-    global _cached, _cached_at
-    # 取数在锁内：冷进程上并发进来的几个调用只取一份日历，而不是各取一份。
-    # 挡在锁上的那几个反正都在等这同一份数据。
-    with _lock:
-        if not force and _cached is not None and _now() - _cached_at < TRADING_CALENDAR_TTL_SECONDS:
-            return _cached
-        order = pf.configured_order(CAPABILITY, PROVIDER_ORDER_ENV, DEFAULT_PROVIDER_ORDER)
-        resolved = pf.resolve(CAPABILITY, CalendarRequest(), order=order)
-        calendar = resolved.value if resolved is not None else None
-        if calendar is not None and not calendar.days and calendar.source != "weekday":
-            calendar = None
-        _cached, _cached_at = calendar, _now()
+    if force:
+        cache.cache_for(CACHE_NAMESPACE).clear()
+    entry = cache.get_or_load(CACHE_NAMESPACE, "cn", _fetch)
+    calendar = None if entry is None else entry.value
     if calendar is not None:
         logger.debug(
-            "交易日历来源=%s 覆盖至=%s 天数=%s",
-            calendar.source, calendar.covers_through, len(calendar.days),
+            "交易日历来源=%s 覆盖至=%s 天数=%s 新鲜=%s",
+            calendar.source, calendar.covers_through, len(calendar.days), entry.fresh,
         )
     return calendar
 
 
 def reset_cache() -> None:
-    """清掉进程内缓存。给测试和排查用。"""
-    global _cached, _cached_at
-    with _lock:
-        _cached, _cached_at = None, 0.0
+    """清掉缓存。给测试和排查用。"""
+    cache.cache_for(CACHE_NAMESPACE).clear()
 
 
 # ── 对外的判断函数 ──────────────────────────────────────────────

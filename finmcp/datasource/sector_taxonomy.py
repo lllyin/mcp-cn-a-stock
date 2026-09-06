@@ -34,12 +34,11 @@
 from __future__ import annotations
 
 import logging
-import threading
-import time
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
-from ..config import SECTOR_TAXONOMY_TTL_SECONDS
+from .. import cache
+from ..config import CACHE_TAXONOMY_TTL_SECONDS
 from . import platform as pf
 
 logger = logging.getLogger("finmcp")
@@ -90,35 +89,49 @@ pf.define_capability(CAPABILITY, SectorTaxonomy)
 
 
 # ── 缓存 ────────────────────────────────────────────────────────
+#
+# TTL 型：行业分类和交易时段无关，一年才动一两次。落盘的理由是有效期以天计，
+# 而进程重启是分钟级的事——不落盘等于每次重启都重付一次上游（31+131 行，约 2.4s）。
 
-_lock = threading.Lock()
-_cached: dict = {}
+CACHE_NAMESPACE = "taxonomy"
+
+cache.register_namespace(cache.Namespace(
+    name=CACHE_NAMESPACE,
+    max_entries=4,
+    epoch_bound=False,
+    ttl_seconds=CACHE_TAXONOMY_TTL_SECONDS,
+    # 一年才动一两次，旧一个月和新的一模一样。
+    max_age_seconds=30 * 86400,
+    disk=True,
+    encode=lambda tax: {"levels": dict(tax.levels), "scheme": tax.scheme,
+                        "source": tax.source},
+    decode=lambda payload: SectorTaxonomy(
+        levels={k: int(v) for k, v in payload["levels"].items()},
+        scheme=payload.get("scheme", ""), source=payload.get("source", "")),
+))
+
+
+def _fetch(sector_type: str) -> Optional[SectorTaxonomy]:
+    order = pf.configured_order(CAPABILITY, PROVIDER_ORDER_ENV, DEFAULT_PROVIDER_ORDER)
+    resolved = pf.resolve(
+        CAPABILITY, SectorTaxonomyRequest(sector_type=sector_type), order=order)
+    return resolved.value if resolved is not None else None
 
 
 def load(sector_type: str = "industry", *, force: bool = False) -> Optional[SectorTaxonomy]:
-    """取一份分级表，进程内按 ``sector_type`` 缓存。
+    """取一份分级表。
 
     取不到返回 None，调用方按"分不出层级"处理。这一层不抛异常——分级是给排名用的
-    辅助信息，它挂了不该让板块资金流整个查不出来。
+    辅助信息，它挂了不该让板块资金流整个查不出来。单飞和旧值兜底由缓存层内建。
     """
-    # 取数在锁内。之前放在锁外，冷进程上并发两次调用就取两份申万分类（日志里
-    # 两行"板块分级"）——同一份数据取 N 遍，白付 N 倍上游请求。挡在锁上的那几个
-    # 反正也要等这份数据，等一次比各取一次便宜。
-    with _lock:
-        entry = _cached.get(sector_type)
-        if not force and entry is not None and \
-                time.monotonic() - entry[1] < SECTOR_TAXONOMY_TTL_SECONDS:
-            return entry[0]
-
-        order = pf.configured_order(CAPABILITY, PROVIDER_ORDER_ENV, DEFAULT_PROVIDER_ORDER)
-        resolved = pf.resolve(
-            CAPABILITY, SectorTaxonomyRequest(sector_type=sector_type), order=order)
-        taxonomy = resolved.value if resolved is not None else None
-        _cached[sector_type] = (taxonomy, time.monotonic())
-
+    if force:
+        cache.cache_for(CACHE_NAMESPACE).clear()
+    entry = cache.get_or_load(
+        CACHE_NAMESPACE, sector_type, lambda: _fetch(sector_type))
+    taxonomy = None if entry is None else entry.value
     if taxonomy is not None:
-        logger.debug("板块分级 sector_type=%s 标准=%s 覆盖=%s 个",
-                     sector_type, taxonomy.scheme, len(taxonomy.levels))
+        logger.debug("板块分级 sector_type=%s 标准=%s 覆盖=%s 个 新鲜=%s",
+                     sector_type, taxonomy.scheme, len(taxonomy.levels), entry.fresh)
     return taxonomy
 
 
@@ -138,9 +151,8 @@ def applies_to(sector_type: str) -> bool:
 
 
 def reset_cache() -> None:
-    """清掉进程内缓存。给测试和排查用。"""
-    with _lock:
-        _cached.clear()
+    """清掉缓存。给测试和排查用。"""
+    cache.cache_for(CACHE_NAMESPACE).clear()
 
 
 __all__ = [

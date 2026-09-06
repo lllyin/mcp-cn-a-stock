@@ -36,7 +36,7 @@ def ns(tmp_path, request):
     """一个用完即弃的命名空间，避免各测试互相污染。"""
     name = f"t{abs(hash(request.node.name)) % 100000}"
     namespace = register_namespace(Namespace(name=name, max_entries=4, ttl_seconds=60))
-    cache = Cache(namespace, directory=str(tmp_path))
+    cache = Cache(namespace, directory=str(tmp_path), enabled=True)
     cache_module._caches[name] = cache
     yield name
     cache_module._caches.pop(name, None)
@@ -49,9 +49,9 @@ def ns(tmp_path, request):
 def test_namespaces_do_not_evict_each_other(tmp_path):
     """market_events 一条 1.6 MiB，和个股报告挤同一份额度会把报告条目全挤掉。"""
     small = Cache(register_namespace(Namespace(name="nsA", max_entries=1)),
-                  directory=str(tmp_path))
+                  directory=str(tmp_path), enabled=True)
     big = Cache(register_namespace(Namespace(name="nsB", max_entries=8)),
-                directory=str(tmp_path))
+                directory=str(tmp_path), enabled=True)
     try:
         for i in range(5):
             small.put(key_for("nsA", f"k{i}", now=at(18)), f"v{i}")
@@ -65,7 +65,7 @@ def test_namespaces_do_not_evict_each_other(tmp_path):
 
 def test_each_namespace_gets_its_own_disk_directory(tmp_path):
     cache = Cache(register_namespace(Namespace(name="nsC", max_entries=2, disk=True)),
-                  directory=str(tmp_path))
+                  directory=str(tmp_path), enabled=True)
     try:
         assert cache.directory.endswith("nsC")
     finally:
@@ -78,7 +78,7 @@ def test_each_namespace_gets_its_own_disk_directory(tmp_path):
 def test_a_hard_expired_entry_is_never_returned(tmp_path):
     """跨纪元的旧值不是"旧"，是另一个交易日的数据——任何情况下都不给。"""
     cache = Cache(register_namespace(Namespace(name="nsD", max_entries=4)),
-                  directory=str(tmp_path))
+                  directory=str(tmp_path), enabled=True)
     try:
         cache.put(key_for("nsD", "k", now=at(18)), "周一收盘那份")
         tuesday = datetime.datetime.combine(
@@ -94,7 +94,7 @@ def test_max_age_hard_expires_a_ttl_namespace(tmp_path):
     cache = Cache(
         register_namespace(Namespace(name="nsE", max_entries=4, epoch_bound=False,
                                      ttl_seconds=1, max_age_seconds=2)),
-        directory=str(tmp_path))
+        directory=str(tmp_path), enabled=True)
     try:
         key = key_for("nsE", "k", now=at(18))
         cache.put(key, "值")
@@ -108,7 +108,7 @@ def test_max_age_hard_expires_a_ttl_namespace(tmp_path):
 def test_intraday_ttl_only_applies_to_live_epochs(tmp_path):
     """收盘后数据已冻结，再设软过期只会白打上游。"""
     cache = Cache(register_namespace(Namespace(name="nsF", max_entries=4, ttl_seconds=1)),
-                  directory=str(tmp_path))
+                  directory=str(tmp_path), enabled=True)
     try:
         closed = key_for("nsF", "k", now=at(18))
         cache.put(closed, "收盘那份")
@@ -278,7 +278,7 @@ def test_a_namespace_can_refuse_to_cache_some_values(tmp_path):
         register_namespace(Namespace(
             name="nsG", max_entries=4,
             cacheable=lambda value, key: not getattr(value, "partial", False))),
-        directory=str(tmp_path))
+        directory=str(tmp_path), enabled=True)
     try:
         class Board:
             def __init__(self, partial):

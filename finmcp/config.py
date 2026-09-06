@@ -438,16 +438,16 @@ INTRADAY_QUOTE_CROSS_CHECK_PCT = max(
 
 # 交易日历的进程内缓存时长。交易日历是提前一年公布的，一天刷一次绰绰有余；
 # 取一次实测 0.18s / 8797 行 / 69 KiB，缓存住之后对每次判断是零成本。
-TRADING_CALENDAR_TTL_SECONDS = max(
+CACHE_CALENDAR_TTL_SECONDS = max(
     0.0,
-    float(env("TRADING_CALENDAR_TTL_SECONDS", "86400")),
+    float(env("CACHE_CALENDAR_TTL_SECONDS", "86400")),
 )
 
 # 板块分级表的进程内缓存时长。行业分类一年动一两次，一天刷一次绰绰有余；
 # 取一次实测 31+131 行、约 2.4s，缓存住之后对每次查询是零成本。
-SECTOR_TAXONOMY_TTL_SECONDS = max(
+CACHE_TAXONOMY_TTL_SECONDS = max(
     0.0,
-    float(env("SECTOR_TAXONOMY_TTL_SECONDS", "86400")),
+    float(env("CACHE_TAXONOMY_TTL_SECONDS", "86400")),
 )
 
 # Synchronous AkShare/efinance calls are I/O bound. Keep the executor bounded,
