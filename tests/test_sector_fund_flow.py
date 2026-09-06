@@ -295,7 +295,7 @@ def test_a_degraded_result_is_never_cached(monkeypatch, live_cache):
 
 
 def test_the_cache_switch_turns_this_off_too(monkeypatch):
-    """REPORT_CACHE_ENABLED=0 必须把这一层也关掉，否则等价性证明是假的。"""
+    """CACHE_ENABLED=0 必须把这一层也关掉，否则等价性证明是假的。"""
     calls: list = []
     cleanup = _stub_platform(monkeypatch, calls)
     try:

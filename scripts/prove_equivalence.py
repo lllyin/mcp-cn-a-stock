@@ -20,7 +20,7 @@
 两个坑，踩过：
 
   - **报告缓存必须关掉。** 不关的话"改完"那次直接读"改之前"写的字节，等价性
-    是假的。脚本会检查服务是不是以 REPORT_CACHE_ENABLED=0 起的，不是就拒绝跑。
+    是假的。脚本会检查服务是不是以 CACHE_ENABLED=0 起的（2.0.0 起管全部缓存命名空间），不是就拒绝跑。
   - **一次 capture 要跑两遍。** 只跑一遍分不清"这个字段变了是因为我改了代码"
     还是"它本来每次就不一样"。跑两遍能把后者标出来，diff 时自动排除。
 """
@@ -147,12 +147,12 @@ def _refuse_if_cache_is_on() -> None:
     raw = ""
     if env_file.exists():
         for line in env_file.read_text(encoding="utf-8").splitlines():
-            if line.strip().startswith("REPORT_CACHE_ENABLED="):
+            if line.strip().startswith("CACHE_ENABLED="):
                 raw = line.split("=", 1)[1].strip()
     if raw.lower() not in {"0", "false", "no", "off"}:
         sys.exit(
-            "拒绝执行：.env 里 REPORT_CACHE_ENABLED 不是 0。\n"
-            "先写 REPORT_CACHE_ENABLED=0 再 ./stop.sh && ./start.sh，比完记得改回来。"
+            "拒绝执行：.env 里 CACHE_ENABLED 不是 0。\n"
+            "先写 CACHE_ENABLED=0 再 ./stop.sh && ./start.sh，比完记得改回来。"
         )
 
 
