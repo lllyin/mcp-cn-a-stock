@@ -93,5 +93,23 @@ else
 fi
 
 echo
+echo "=== 自检 ==="
+# 装完必须验一次"跑起来的那份代码能不能读到自己的参考数据"。装成包之后服务跑的
+# 是 site-packages 里的副本，本地 `python main.py` 永远照不出差别——2026-09-06
+# 部署机上 confs/ 没跟着装过去，指数名单空掉，上证指数报成了平安银行，一路跑到
+# 验证报告才被人工比对发现。这一步就是为了让它当场失败。
+PKG="$(ls -d finmcp qtf_mcp 2>/dev/null | head -n 1)"
+if [ -n "$PKG" ] && [ -f "scripts/postinstall_check.py" ]; then
+    # 脚本文件形式，不要改成 python -c：那样 sys.path[0] 是 CWD，仓库里的包会把
+    # site-packages 的副本盖住，自检就成了假的。
+    if .venv/bin/python scripts/postinstall_check.py "$PKG"; then
+        echo "✅ 自检通过"
+    else
+        echo "❌ 自检失败，**先别启动服务**——它会返回错数据而不是报错。"
+        exit 1
+    fi
+fi
+
+echo
 echo "安装完成。启动服务："
 echo "  ./start.sh"
