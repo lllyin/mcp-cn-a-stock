@@ -516,12 +516,23 @@ def _parse_hhmm(raw, default: datetime.time) -> datetime.time:
         return default
 
 
-# When the post-close settle buffer ends and full-epoch reuse begins. The market
-# closes at 15:00, but the Eastmoney fund-flow page finalises a few minutes
-# later, so the default leaves a 30-minute buffer. cache.py clamps this into
-# [15:00, 17:00]; see the note there for why values outside that range are unsafe.
-REPORT_CACHE_SETTLE_TIME = _parse_hhmm(
-    env("REPORT_CACHE_SETTLE_TIME"), datetime.time(15, 30)
+# --- 市场纪元边界 (finmcp/market_session.py) ---
+# 交易所的时刻表是死的（09:30/11:30/13:00/15:00，那些是常量），但**上游不在这些
+# 时刻定稿**：盘前上游已经在更新当日数据，盘后东财的资金流页面还在整理。提前多少、
+# 延后多少取决于上游当时的行为，会变，所以这四项是配置。
+# 越界会夹回合法区间并打 WARNING，约束和理由见 market_session._resolve_boundaries。
+MARKET_EPOCH_WARMUP_TIME = _parse_hhmm(
+    env("MARKET_EPOCH_WARMUP_TIME"), datetime.time(9, 15)
+)
+MARKET_EPOCH_SETTLE_TIME = _parse_hhmm(
+    env("MARKET_EPOCH_SETTLE_TIME"), datetime.time(15, 30)
+)
+MARKET_EPOCH_FINAL_TIME = _parse_hhmm(
+    env("MARKET_EPOCH_FINAL_TIME"), datetime.time(17, 0)
+)
+MARKET_EPOCH_BUFFER_MINUTES = max(
+    0,
+    int(env("MARKET_EPOCH_BUFFER_MINUTES", "5")),
 )
 
 # --- Market Indices Configuration ---

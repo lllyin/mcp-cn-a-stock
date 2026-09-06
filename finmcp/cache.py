@@ -27,12 +27,15 @@ Wall-clock dependencies in the render path, and how each is covered:
   midnight.
 - ``research.today_volume_est_ratio`` is constant inside every epoch except
   LIVE, which is why LIVE reuse is TTL-bounded.
-- ``research.is_realtime_fund_flow_window`` flips at 09:15 and 17:00; both are
-  epoch boundaries, so an epoch never mixes the Playwright and AkShare
-  renderings.
-- ``research.build_fund_flow`` prints the newest fund-flow row as 今日 with no
-  date check, and that row lands some minutes after the 17:00 flip. Covered by
-  the evening buffer window.
+- ``market_session.is_realtime_fund_flow_window`` flips at ``WARMUP_TIME`` and
+  ``FINAL_TIME``; both are epoch boundaries, so an epoch never mixes the
+  Playwright and AkShare renderings.
+- ``research.build_fund_flow`` prints the newest fund-flow row, and that row
+  lands some minutes after the ``FINAL_TIME`` flip. Covered by the evening
+  buffer window.
+
+时段边界本身不在这里，在 ``market_session``——它是全项目唯一的定义处，
+``research`` 也读同一份。
 - ``research.has_today_fund_flow_from_api`` compares against today's date but is
   only reachable from LIVE/LUNCH/POSTCLOSE, which never span midnight.
 """
@@ -50,7 +53,6 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
-from zoneinfo import ZoneInfo
 
 from .config import (
     REPORT_CACHE_DIR,
@@ -58,36 +60,18 @@ from .config import (
     REPORT_CACHE_ENABLED,
     REPORT_CACHE_INTRADAY_TTL_SECONDS,
     REPORT_CACHE_MAX_ENTRIES,
-    REPORT_CACHE_SETTLE_TIME,
+)
+from .market_session import (
+    PHASE_CLOSED,
+    PHASE_LIVE,
+    PHASE_LUNCH,
+    PHASE_POSTCLOSE,
+    now_shanghai as _as_shanghai,
+    phase_and_epoch,
 )
 from .version import __version__
 
 logger = logging.getLogger("finmcp")
-
-SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
-
-# Market phase boundaries in Asia/Shanghai wall clock. PRE_OPEN and BRANCH_FLIP
-# must stay aligned with research.is_realtime_fund_flow_window.
-PRE_OPEN = datetime.time(9, 15)
-LUNCH_START = datetime.time(11, 30)
-LUNCH_END = datetime.time(13, 0)
-BRANCH_FLIP = datetime.time(17, 0)
-# Continuous trading ends here, and research.today_volume_est_ratio drops to a
-# constant 1 from this moment, so no epoch may start before it.
-MARKET_CLOSE = datetime.time(15, 0)
-
-# Upstream feeds do not finalise at the instant a session boundary passes: the
-# Eastmoney fund-flow page keeps settling for a few minutes after the morning
-# session, and the AkShare daily fund-flow row lands some minutes after 17:00.
-# Each boundary therefore gets a short TTL-bounded buffer before full reuse
-# begins. The post-close buffer is the operator-facing one and is configured
-# separately through REPORT_CACHE_SETTLE_TIME.
-BOUNDARY_BUFFER = datetime.timedelta(minutes=5)
-
-PHASE_LIVE = "live"
-PHASE_LUNCH = "lunch"
-PHASE_POSTCLOSE = "postclose"
-PHASE_CLOSED = "closed"
 
 # A report carrying one of these markers recorded a transient upstream failure.
 # Caching it would pin the failure for the rest of the epoch.
@@ -107,55 +91,6 @@ DISK_RETENTION_SECONDS = 5 * 24 * 3600
 DISK_SWEEP_INTERVAL_SECONDS = 3600
 
 
-def _add(clock: datetime.time, delta: datetime.timedelta) -> datetime.time:
-    return (datetime.datetime.combine(datetime.date(2000, 1, 1), clock) + delta).time()
-
-
-def _as_shanghai(now: Optional[datetime.datetime] = None) -> datetime.datetime:
-    """Normalize cache clock inputs to Asia/Shanghai.
-
-    Naive datetimes are the existing test/API convention and are interpreted as
-    Shanghai wall time; aware datetimes are converted explicitly so an Ubuntu
-    host configured for UTC cannot move market boundaries by eight hours.
-    """
-    current = datetime.datetime.now(SHANGHAI_TZ) if now is None else now
-    if current.tzinfo is None:
-        return current.replace(tzinfo=SHANGHAI_TZ)
-    return current.astimezone(SHANGHAI_TZ)
-
-
-def _clamp_settle(value: datetime.time) -> datetime.time:
-    """Keep the settle boundary inside the range where an epoch stays coherent.
-
-    Earlier than 15:00 would fold part of the continuous session into a
-    fully-reusable epoch while today_volume_est_ratio is still moving. Later
-    than 17:00 would let one epoch straddle the point where
-    research.is_realtime_fund_flow_window flips the report between the
-    Playwright and AkShare renderings.
-    """
-    if value < MARKET_CLOSE:
-        logger.warning(
-            "Report cache settle time %s is before the 15:00 close; using %s",
-            value.strftime("%H:%M"),
-            MARKET_CLOSE.strftime("%H:%M"),
-        )
-        return MARKET_CLOSE
-    if value > BRANCH_FLIP:
-        logger.warning(
-            "Report cache settle time %s is after the %s fund-flow branch flip; using %s",
-            value.strftime("%H:%M"),
-            BRANCH_FLIP.strftime("%H:%M"),
-            BRANCH_FLIP.strftime("%H:%M"),
-        )
-        return BRANCH_FLIP
-    return value
-
-
-SETTLE = _clamp_settle(REPORT_CACHE_SETTLE_TIME)
-LUNCH_SETTLE = _add(LUNCH_START, BOUNDARY_BUFFER)
-EVENING_SETTLE = _add(BRANCH_FLIP, BOUNDARY_BUFFER)
-
-
 def _render_fingerprint() -> str:
     """Identify the rendering inputs, so a deploy cannot serve pre-deploy output.
 
@@ -167,6 +102,9 @@ def _render_fingerprint() -> str:
     ``config.ALL_INDICES``, whether a symbol renders down the index branch or
     the stock branch (``research.get_realtime_fund_flow_target``). Editing it is
     a rendering change even though no ``.py`` file moved.
+
+    ``market_session.py`` is in the list because the session boundaries decide
+    which fund-flow branch a report takes — moving one is a rendering change.
     """
     parts = [__version__]
     here = os.path.dirname(os.path.abspath(__file__))
@@ -175,7 +113,8 @@ def _render_fingerprint() -> str:
     # must hash to a stable marker, or the fingerprint would change every boot.
     sources = [
         (os.path.join(here, name), True)
-        for name in ("research.py", "mcp_app.py", "cache.py", "config.py")
+        for name in ("research.py", "mcp_app.py", "cache.py", "config.py",
+                     "market_session.py")
     ]
     sources.append((os.path.join(here, os.pardir, "confs", "indices.json"), False))
     for path, required in sources:
@@ -193,58 +132,8 @@ def _render_fingerprint() -> str:
 RENDER_FINGERPRINT = _render_fingerprint()
 
 
-def _is_trading_day(day: datetime.date) -> bool:
-    """这天开不开市。取不到日历时退回按星期判断，也就是接入日历之前的行为。
-
-    延迟 import：本模块被 mcp_app 先于 datasource 导入，模块级 import 会把
-    datasource 的导入副作用（安装出站 HTTP 通道）提前，那是另一件事，不该由缓存
-    层顺手改掉。
-    """
-    from .datasource import trading_calendar
-
-    return trading_calendar.is_trading_day(day)
-
-
-def _previous_trading_day(day: datetime.date) -> datetime.date:
-    """上一个交易日。
-
-    原来是"上一个工作日"，长假里这个锚点天天在变——国庆八天里纪元 token 每天换
-    一次，磁盘缓存跟着每天作废，而那几天数据其实是冻住的。
-    """
-    from .datasource import trading_calendar
-
-    return trading_calendar.previous_trading_day(day)
-
-
-def market_phase(now: Optional[datetime.datetime] = None) -> tuple[str, str]:
-    """Return ``(phase, epoch)`` for a moment in time.
-
-    The closed epoch is anchored on the trading day whose session just ended, so
-    Friday evening through Monday 09:15 is one continuous epoch. Buffer windows
-    carry their own token so an entry written while a feed was still settling can
-    never be served once the feed has settled.
-    """
-    local_now = _as_shanghai(now)
-    day = local_now.date()
-    clock = local_now.replace(tzinfo=None).time()
-
-    if not _is_trading_day(day) or clock < PRE_OPEN:
-        # 非交易日整天都是 CLOSED。修之前用的是 weekday()>=5，于是国庆
-        # 10-01~10-08 被判成盘中，报告缓存退化成 30 秒 TTL，八天等于没有缓存。
-        return PHASE_CLOSED, f"closed-{_previous_trading_day(day)}"
-    if clock < LUNCH_START:
-        return PHASE_LIVE, f"live-{day}"
-    if clock < LUNCH_SETTLE:
-        return PHASE_LIVE, f"lunch-open-{day}"
-    if clock < LUNCH_END:
-        return PHASE_LUNCH, f"lunch-{day}"
-    if clock < SETTLE:
-        return PHASE_LIVE, f"live-{day}"
-    if clock < BRANCH_FLIP:
-        return PHASE_POSTCLOSE, f"postclose-{day}"
-    if clock < EVENING_SETTLE:
-        return PHASE_LIVE, f"evening-open-{day}"
-    return PHASE_CLOSED, f"closed-{day}"
+#: 兼容旧名字：外部按 cache.market_phase 调过；定义在 market_session。
+market_phase = phase_and_epoch
 
 
 @dataclass(frozen=True)

@@ -144,64 +144,6 @@ def test_settle_hhmm_parsing(raw, expected):
     assert config._parse_hhmm(raw, datetime.time(15, 30)) == expected
 
 
-@pytest.mark.parametrize(
-    "configured,expected",
-    [
-        (datetime.time(15, 30), datetime.time(15, 30)),
-        (datetime.time(16, 0), datetime.time(16, 0)),
-        (datetime.time(17, 0), datetime.time(17, 0)),
-        (datetime.time(9, 30), datetime.time(15, 0)),   # 早于收盘 -> 夹到 15:00
-        (datetime.time(14, 59), datetime.time(15, 0)),
-        (datetime.time(17, 30), datetime.time(17, 0)),  # 晚于分支翻转 -> 夹到 17:00
-        (datetime.time(23, 0), datetime.time(17, 0)),
-    ],
-)
-def test_settle_is_clamped_to_safe_range(configured, expected):
-    """早于 15:00 会把仍在变动的盘中折进完全复用纪元；
-    晚于 17:00 会让一个纪元横跨资金流渲染分支翻转点。"""
-    assert cache_module._clamp_settle(configured) == expected
-
-
-def test_configured_settle_moves_the_postclose_boundary(monkeypatch):
-    monkeypatch.setattr(cache_module, "SETTLE", datetime.time(16, 0))
-    assert market_phase(at(MONDAY, 15, 45))[0] == PHASE_LIVE
-    assert market_phase(at(MONDAY, 16, 0))[0] == PHASE_POSTCLOSE
-    # 17:00 的分支翻转边界不受影响
-    assert market_phase(at(MONDAY, 17, 5))[0] == PHASE_CLOSED
-
-
-def test_settle_at_branch_flip_leaves_no_postclose_window(monkeypatch):
-    """SETTLE=17:00 是合法的极端值：postclose 窗口为空，全部走 live TTL。"""
-    monkeypatch.setattr(cache_module, "SETTLE", datetime.time(17, 0))
-    assert market_phase(at(MONDAY, 16, 59))[0] == PHASE_LIVE
-    assert market_phase(at(MONDAY, 17, 5))[0] == PHASE_CLOSED
-
-
-@pytest.mark.parametrize(
-    "env_value,expected",
-    [
-        ("1600", datetime.time(16, 0)),
-        ("1500", datetime.time(15, 0)),
-        ("0930", datetime.time(15, 0)),     # 夹到收盘
-        ("1730", datetime.time(17, 0)),     # 夹到分支翻转
-        ("garbage", datetime.time(15, 30)),  # 回退默认
-    ],
-)
-def test_settle_env_var_is_wired(monkeypatch, env_value, expected):
-    """验证 REPORT_CACHE_SETTLE_TIME 一路贯通到 cache.SETTLE。"""
-    original = cache_module.SETTLE
-    monkeypatch.setenv("REPORT_CACHE_SETTLE_TIME", env_value)
-    try:
-        importlib.reload(config)
-        importlib.reload(cache_module)
-        assert cache_module.SETTLE == expected
-    finally:
-        monkeypatch.delenv("REPORT_CACHE_SETTLE_TIME", raising=False)
-        importlib.reload(config)
-        importlib.reload(cache_module)
-        assert cache_module.SETTLE == original
-
-
 def test_postclose_and_evening_are_different_epochs():
     """17:00 前后渲染分支不同，绝不能落在同一个纪元。"""
     _, postclose = market_phase(at(MONDAY, 16, 0))
