@@ -7,7 +7,7 @@ import re
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable, Optional, Protocol, Sequence
@@ -17,6 +17,7 @@ import pandas as pd
 import requests
 from playwright.async_api import Browser, Playwright, async_playwright
 
+from .. import cache
 from ..config import env
 
 
@@ -506,30 +507,41 @@ DEFAULT_MARKET_BREADTH_PROVIDERS: tuple[MarketBreadthProvider, ...] = (
     EfinanceMarketBreadthProvider(),
 )
 
-_market_breadth_cache: tuple[float, MarketBreadthData] | None = None
-_market_breadth_fetch_lock = asyncio.Lock()
+# ── 缓存 ────────────────────────────────────────────────────────
+#
+# 跟市场纪元走，不是平 TTL。原先非交易日也是 300 秒一刷，而那几天数据根本不动——
+# 一个周末的纪元长达 64 小时，按纪元走就只打一次上游，按平 TTL 是 768 次。
+#
+# 不落盘：这一维的上游是全项目最脆的一条链（同花顺 + 浏览器 + 验证码），而它只有
+# 一条记录、重取代价可控；落盘换来的那点跨重启复用，不值得多一份反序列化的形状风险。
+
+CACHE_NAMESPACE = "market_breadth"
 
 
-def _market_breadth_cache_ttl(now: datetime | None = None) -> float:
-    """盘中 15 秒、其余 300 秒。
-
-    非交易日走 300 秒那一支：原来判的是 weekday()<5，节假日会按盘中对待，
-    上游请求多 20 倍，而那几天数据根本不动。
-    """
-    from . import trading_calendar
-
-    current = now or _shanghai_now()
-    hhmm = current.hour * 100 + current.minute
-    if trading_calendar.is_trading_day(current.date()) and 915 <= hhmm <= 1510:
-        return 15.0
-    return 300.0
+def _encode(data: MarketBreadthData) -> dict:
+    payload = asdict(data)
+    payload["distribution"] = [asdict(b) for b in data.distribution]
+    return payload
 
 
-def _get_cached_market_breadth() -> MarketBreadthData | None:
-    if _market_breadth_cache is None:
-        return None
-    expires_at, data = _market_breadth_cache
-    return data if time.monotonic() < expires_at else None
+def _decode(payload: dict) -> MarketBreadthData:
+    buckets = tuple(MarketBreadthBucket(**b) for b in payload.pop("distribution", []))
+    warnings = tuple(payload.pop("warnings", ()))
+    return MarketBreadthData(distribution=buckets, warnings=warnings, **payload)
+
+
+cache.register_namespace(cache.Namespace(
+    name=CACHE_NAMESPACE,
+    # get_market_breadth() 不带参数，全市场只有一个快照。
+    max_entries=1,
+    epoch_bound=True,
+    # 盘中 15 秒。比报告缓存的 30 秒短一半：涨跌家数是全市场的即时快照，
+    # 用它的人要的就是「现在」，陈旧一点的价值下降得比个股报告快。
+    ttl_seconds=15.0,
+    disk=False,
+    encode=_encode,
+    decode=_decode,
+))
 
 
 async def _fetch_from_providers(
@@ -550,22 +562,21 @@ async def _fetch_from_providers(
 async def get_market_breadth(
     providers: Optional[Sequence[MarketBreadthProvider]] = None,
 ) -> MarketBreadthData:
-    """Fetch market breadth from the first available provider."""
-    global _market_breadth_cache
+    """Fetch market breadth from the first available provider.
+
+    显式传 providers 的是测试和探活路径，直接回源、不碰缓存。
+    """
     if providers is not None:
         return await _fetch_from_providers(providers)
 
-    cached = _get_cached_market_breadth()
-    if cached is not None:
-        return cached
-
-    async with _market_breadth_fetch_lock:
-        cached = _get_cached_market_breadth()
-        if cached is not None:
-            return cached
-        result = await _fetch_from_providers(DEFAULT_MARKET_BREADTH_PROVIDERS)
-        _market_breadth_cache = (time.monotonic() + _market_breadth_cache_ttl(), result)
-        return result
+    entry = await cache.aget_or_load(
+        CACHE_NAMESPACE, "all",
+        lambda: _fetch_from_providers(DEFAULT_MARKET_BREADTH_PROVIDERS),
+    )
+    if entry is None:
+        # 缓存层把异常吞成 None，但调用方要的是原来那个异常语义。
+        return await _fetch_from_providers(DEFAULT_MARKET_BREADTH_PROVIDERS)
+    return entry.value
 
 
 def close_market_breadth_resources() -> None:

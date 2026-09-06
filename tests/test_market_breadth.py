@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+from finmcp import cache as cache_module
 from finmcp.datasource.market_breadth import (
     MARKET_BREADTH_RANGES,
     MarketBreadthBucket,
@@ -37,6 +38,14 @@ TONGHUASHUN_PAYLOAD = {
         "dnum": 3635,
     },
 }
+
+
+def _live_breadth_cache():
+    """把市场宽度这个命名空间打开并清空。conftest 默认整层关闭。"""
+    cache = cache_module.cache_for(market_module.CACHE_NAMESPACE)
+    cache.clear()
+    cache.enabled = True
+    return cache
 
 
 def make_data(source: str = "test") -> MarketBreadthData:
@@ -472,7 +481,7 @@ async def test_default_market_breadth_calls_share_result_cache(monkeypatch):
 
     provider = CountingProvider()
     monkeypatch.setattr(market_module, "DEFAULT_MARKET_BREADTH_PROVIDERS", (provider,))
-    monkeypatch.setattr(market_module, "_market_breadth_cache", None)
+    _live_breadth_cache()
 
     first, second = await asyncio.gather(get_market_breadth(), get_market_breadth())
 
@@ -493,11 +502,9 @@ async def test_injected_providers_bypass_result_cache(monkeypatch):
             return make_data("counting")
 
     provider = CountingProvider()
-    monkeypatch.setattr(
-        market_module,
-        "_market_breadth_cache",
-        (float("inf"), make_data("cached")),
-    )
+    cache = _live_breadth_cache()
+    cache.put(cache_module.key_for(market_module.CACHE_NAMESPACE, "all"),
+              make_data("cached"))
 
     first = await get_market_breadth([provider])
     second = await get_market_breadth([provider])

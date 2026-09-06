@@ -1005,6 +1005,9 @@ LOG_SIGNALS: tuple[tuple[str, str, str], ...] = (
     (r"Source breaker opened source=(\S+)", "熔断", "上游源熔断打开"),
     (r"Source breaker closed source=(\S+)", "恢复", "上游源熔断关闭"),
     (r"incomplete_sources=(\S+)", "缺源", "报告不完整，未进缓存"),
+    (r"Cache initialised ns=(\S+)", "缓存", "某个缓存命名空间起来了"),
+    (r"(\S+) 用了 [\d.]+ 秒前的旧值", "旧值兜底",
+     "上游取不到，用了缓存里的旧值——输出里会标注，但连续出现说明上游有问题"),
     # 没有网关的部署上这条会一直出现，是正常的兜底而不是故障：东财的 base_info
     # 需要网关，市值那一组由腾讯补。它消失了才说明网关回来了。
     (

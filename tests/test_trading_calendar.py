@@ -170,11 +170,16 @@ def test_a_trading_day_still_reports_live(monkeypatch):
     assert phase == cache.PHASE_LIVE
 
 
-def test_market_breadth_ttl_is_long_on_a_non_trading_day(monkeypatch):
+def test_market_breadth_rides_the_epoch_not_a_flat_ttl():
+    """节假日整段是一个纪元，只打一次上游。
+
+    原先是平 TTL：非交易日也 300 秒一刷，而那几天数据根本不动——一个周末的纪元
+    长达 64 小时，按纪元走打 1 次，按平 TTL 打 768 次。
+    """
+    from finmcp import cache as cache_module
     from finmcp.datasource import market_breadth
 
-    monkeypatch.setattr(tc, "load", lambda: FAKE)
-    holiday = datetime.datetime(2026, 10, 1, 10, 0)
-    trading = datetime.datetime(2026, 9, 4, 10, 0)
-    assert market_breadth._market_breadth_cache_ttl(holiday) == 300.0
-    assert market_breadth._market_breadth_cache_ttl(trading) == 15.0
+    ns = cache_module.namespace(market_breadth.CACHE_NAMESPACE)
+    assert ns.epoch_bound is True
+    assert ns.ttl_seconds == 15.0     # 盘中才受它约束
+    assert ns.disk is False           # 只有一条记录，不值得多一份反序列化风险
