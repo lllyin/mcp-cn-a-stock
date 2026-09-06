@@ -144,6 +144,14 @@ start_xvfb_if_needed
 
 # 启动服务
 echo "正在启动 $APP_NAME 服务..."
+
+# 上一轮的日志留一份。下面的 nohup 用 > 重定向，会把日志截断成空——上一次是怎么
+# 挂的、挂之前打了什么，全没了，而那正是重启之后最想看的东西。只留一代：同名直接
+# 覆盖，日志目录不会随重启次数无限长。
+if [ -s "$LOG_FILE" ]; then
+    mv -f "$LOG_FILE" "$LOG_FILE.bak"
+    echo "上一轮日志: $LOG_FILE.bak"
+fi
 echo "日志文件: $LOG_FILE"
 
 # 如果未通过 pip install -e . 安装，则直接使用 python main.py
