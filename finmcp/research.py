@@ -422,10 +422,14 @@ def build_fund_flow(field: tuple[str, str], data: Dict[str, ndarray]) -> str:
     else:
         amount_str = f"{raw_amount / 1e4:.2f}万"
     
-    # 前缀只标"是谁的钱"（沪深两市 / 这只标的）。**不标时间**——哪一天的写在
-    # 报告开头那个"数据日期"上，一处即可。原先每行都写"今日"，周末查出来
-    # 就是"今日主力净流入"配着 09-04 的数，读的人无从知道是哪天。
-    prefix = "沪深两市" if data.get("IS_MARKET", False) else ""
+    # 前缀沿用原来的结构：要么"沪深两市"（大盘口径），要么标时间。时间那个从
+    # "今日"改成"当日"——"今日"在非交易日是假话，周末查出来是"今日主力净流入"
+    # 配着 09-04 的数；"当日"指的是报告开头那个"数据日期"，和价格、涨跌幅、
+    # 成交量那几段用的是同一个词。
+    #
+    # 只换词不删前缀是有意的：删了行的形状就变了（`- 今日X净流入` → `- X净流入`），
+    # 下游按标签正则取数的得改结构；换词的话一次 今日→当日 替换就全覆盖。
+    prefix = "沪深两市" if data.get("IS_MARKET", False) else "当日"
     return f"{prefix}{kind}净流入: {amount_str}  {kind}净占比: {ratio:.2%}"
 
 
@@ -636,11 +640,12 @@ def get_realtime_fund_flow_target(symbol: str, data: Dict[str, ndarray]) -> Opti
 def get_realtime_fund_flow_prefix(target_code: str, data: Dict[str, ndarray]) -> str:
     """Return the display prefix for realtime fund-flow rows.
 
-    只标"是谁的钱"，不标时间——日期写在段标题上，见 ``build_fund_flow``。
+    和 ``build_fund_flow`` 同一套前缀：大盘口径写"沪深两市"，其余写"当日"。
+    两条路径必须一致，否则同一份报告里盘中和盘后的措辞会不一样。
     """
     if data.get("IS_MARKET", False) and target_code == "dpzjlx":
         return "沪深两市"
-    return ""
+    return "当日"
 
 
 def resolve_realtime_fund_flow_target(symbol: str) -> Optional[str]:
