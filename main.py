@@ -43,12 +43,24 @@ logger.setLevel(logging.DEBUG)
 import click
 
 from finmcp import __version__, mcp_app
+from finmcp.config import legacy_env_names
 from finmcp.datasource.http_channel import describe_installed_channel
 from finmcp.symbols import load_symbols
 
 
 def log_application_version() -> None:
     logger.info("cn-stock-mcp version=%s", __version__)
+
+
+def log_legacy_env_names() -> None:
+    """1.x 前缀的配置名 2.0.0 不再读取；残留的 .env 会静默退回默认值，只有这里能看见。"""
+    names = legacy_env_names()
+    if names:
+        logger.warning(
+            "忽略 %d 个 1.x 配置名（2.0.0 起不带 CN_STOCK_ 前缀，见 docs/release-notes-2.0.0.md）: %s",
+            len(names),
+            ", ".join(names),
+        )
 
 
 def log_http_channel() -> None:
@@ -83,6 +95,7 @@ def main(port: int, transport: str) -> int:
     log_application_version()
     log_market_data_versions()
     log_http_channel()
+    log_legacy_env_names()
     load_symbols()
     if transport == "http":
         transport = "streamable-http"

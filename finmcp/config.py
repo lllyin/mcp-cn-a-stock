@@ -25,6 +25,23 @@ def env(name: str, default=None):
     return os.getenv(f"{ENV_PREFIX}{name}", default)
 
 
+# 1.x 的配置项全部顶着这个前缀；2.0.0 去掉之后旧名字不再被读，也不会报错——
+# 写着旧名的 .env 会静默退回默认值，线程池、缓存目录这些改了也不知道。
+_LEGACY_PREFIX = "CN_STOCK_"
+
+
+def legacy_env_names(environ=None, prefix: str | None = None) -> list[str]:
+    """环境里还顶着 1.x 前缀、现在不会被读到的配置名，给启动日志报出来。
+
+    ENV_PREFIX 恰好设成旧前缀时这些名字是有效的，不报。参数只为测试可注入。
+    """
+    environ = os.environ if environ is None else environ
+    prefix = ENV_PREFIX if prefix is None else prefix
+    if prefix == _LEGACY_PREFIX:
+        return []
+    return sorted(name for name in environ if name.startswith(_LEGACY_PREFIX))
+
+
 def _parse_bool(raw, default: bool) -> bool:
     """Parse common operator spellings for an environment switch."""
     if raw is None:
