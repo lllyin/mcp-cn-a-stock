@@ -63,6 +63,7 @@ from .config import (
     CACHE_ENABLED,
     CACHE_INTRADAY_TTL_SECONDS,
     CACHE_STALE_ON_ERROR,
+    cache_enabled,
     cache_max_entries,
     cache_ttl,
     conf_path,
@@ -226,6 +227,113 @@ REPORT_NAMESPACE = register_namespace(Namespace(
 ))
 
 
+def _jsonable(value):
+    """numpy 标量 → Python 原生；日期 → ISO 字符串。其余原样。
+
+    日期这一条是实跑才暴露的：AkShare 的资金流表里 ``日期`` 是 ``datetime.date``，
+    没有 ``.item()``，``json.dump`` 也不认，于是整条写盘失败。构造测试用的字符串
+    日期照不出来——这就是为什么下面那条测试用 ``datetime.date`` 而不是 str。
+    """
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        return value.isoformat()
+    item = getattr(value, "item", None)
+    if callable(item):
+        value = item()
+        # numpy 的 datetime64 转出来还是 datetime，再过一次
+        if isinstance(value, (datetime.datetime, datetime.date)):
+            return value.isoformat()
+    return value
+
+
+def _encode_fund_flow(value: dict) -> dict:
+    """DataFrame → 纯 Python 的 records。
+
+    两件事都是踩出来的，别简化掉：
+
+    1. **不能直接 ``to_dict(orient="records")`` 就写盘。** 那留下的是 numpy 标量，
+       而磁盘层的 ``json.dump`` 没有 ``default=``，遇到就抛 TypeError，然后被
+       ``_disk_write`` 的 ``except Exception`` 静默吞掉——现象是内存层正常、磁盘
+       目录空着、重启后白重取。2026-09-06 落地时 realtime 落了 4 条、fund_flow
+       一条都没有，就是这个。
+
+    2. **也不能用 ``to_json``。** 它把负零的符号丢了，而报告里 ``-0.00%`` 和
+       ``0.00%`` 是两个不同的字符串（小单占比经常落在这个量级）。丢了符号就等于
+       磁盘命中和实取渲染出不同的字节，破坏"命中不改变返回内容"这条不变量。
+       Python 自己的 ``json`` 是保号的，所以逐个转 numpy 标量、其余交给 json。
+    """
+    frame = value.get("fund_flow")
+    if frame is None or frame.empty:
+        rows = []
+    else:
+        rows = [
+            {key: _jsonable(cell) for key, cell in row.items()}
+            for row in frame.to_dict(orient="records")
+        ]
+    return {"rows": rows, "is_market": bool(value.get("is_market", False))}
+
+
+def _decode_fund_flow(raw: dict) -> dict:
+    import pandas as pd
+
+    return {
+        "fund_flow": pd.DataFrame(raw.get("rows") or []),
+        "is_market": bool(raw.get("is_market", False)),
+    }
+
+
+def _fund_flow_cacheable(value, key) -> bool:
+    """失败和空表不进。一个纪元长达 64 小时，腌一次瞬时失败就是整个周末没有资金流。"""
+    if not isinstance(value, dict):
+        return False
+    frame = value.get("fund_flow")
+    return frame is not None and not frame.empty
+
+
+#: 单标的资金流历史。收编的理由是**重复取数**：`brief`/`medium`/`full` 是三个不同的
+#: 报告缓存键，底下却用同一份资金流。2026-09-06 部署机实测 56 次取数只涉及 23 个标的
+#: （2.4×），而其中 44 次走了浏览器兜底、只涉及 22 个标的——一半的页面加载是重复的，
+#: 每次 P50 6.4s。
+#:
+#: 条数给 128 而不是 512：单条比别的命名空间大一个量级（120 行实测 18.3 KiB，
+#: 截断上限 250 行 38.0 KiB），512 条就不是可忽略的内存了。
+FUND_FLOW_NAMESPACE = register_namespace(Namespace(
+    name="fund_flow",
+    max_entries=128,
+    epoch_bound=True,
+    ttl_seconds=CACHE_INTRADAY_TTL_SECONDS,
+    disk=True,
+    encode=_encode_fund_flow,
+    decode=_decode_fund_flow,
+    cacheable=_fund_flow_cacheable,
+))
+
+
+def _realtime_cacheable(value, key) -> bool:
+    """沿用取数侧既有的失败判据：名字和最新价全没有才算失败。
+
+    ``市净率=无`` **不算降级**，照常缓——那是 basic_info.py 里记录在案的正常状态
+    （东财 f167 拿不到时渲染层退回"现价/每股净资产"，两个口径都有效）。
+    缓存反而消掉了它的抖动：一个纪元内只取一次，同一批报告里这一行必然自洽。
+    """
+    if not isinstance(value, dict):
+        return False
+    info = value.get("info") or {}
+    return bool(info.get("股票简称")) or bool(info.get("最新价"))
+
+
+#: 单标的基本数据的合成结果（`basic_info.resolve` 之后的那一份）。
+#: 实测 68 次取数 / 24 个标的 = 2.8×，纯粹是跨工具重复。条目只有 7 个标量（938 字节），
+#: 512 条约 0.5 MiB。
+REALTIME_NAMESPACE = register_namespace(Namespace(
+    name="realtime",
+    max_entries=512,
+    epoch_bound=True,
+    ttl_seconds=CACHE_INTRADAY_TTL_SECONDS,
+    disk=True,
+    cacheable=_realtime_cacheable,
+))
+
+
 @dataclass(frozen=True)
 class CacheKey:
     tool: str
@@ -376,7 +484,7 @@ class Cache:
         self,
         ns: Optional[Namespace] = None,
         *,
-        enabled: bool = CACHE_ENABLED,
+        enabled: Optional[bool] = None,   # None = 查配置；显式传参压过配置
         live_ttl_seconds: Optional[float] = None,
         max_entries: Optional[int] = None,
         disk_enabled: bool = CACHE_DISK_ENABLED,
@@ -394,7 +502,11 @@ class Cache:
         #     0.51s。生产里等于每个请求都多付几次网络往返。
         #
         # 想强制重取用 clear()，那是"重置"该做的事，不是总开关。
-        self.enabled = enabled or not self.ns.epoch_bound
+        # enabled 没传就查配置：CACHE_<NS>_ENABLED 优先，缺省跟随 CACHE_ENABLED。
+        # 显式传 True/False 的调用方（测试、A/B 脚本）必须压过配置——否则
+        # `Cache(ns, enabled=True)` 会在 CACHE_ENABLED=0 的环境里静默变成关闭。
+        resolved = cache_enabled(self.ns.name) if enabled is None else enabled
+        self.enabled = resolved or not self.ns.epoch_bound
         self.live_ttl_seconds = (
             self.ns.ttl_seconds if live_ttl_seconds is None else live_ttl_seconds
         )
@@ -765,6 +877,7 @@ def get_or_load(
     *,
     epoch: Optional[str] = None,
     now: Optional[datetime.datetime] = None,
+    usable: Optional[Callable[[Any], bool]] = None,
 ) -> Optional[Entry]:
     """同步版。给已经跑在线程里的调用方（分级、日历、财务、market_events）。
 
@@ -775,14 +888,23 @@ def get_or_load(
     **软过期后刷新失败继续用旧值**（``CACHE_STALE_ON_ERROR``），返回的 Entry
     ``fresh=False``，调用方必须在输出里标注。
 
+    **``usable``** 是读侧的谓词：命中的值还要满足它才算数，否则当未命中重新取。
+    和命名空间上写侧的 ``cacheable`` 对称，但它必须按调用传——同一份值对这次请求
+    够用、对下次不一定。资金流靠它守住行数：页面兜底只给 120 行，主源给全部历史，
+    缓存了少的那份之后不能让要得多的请求命中它，否则缓存让数据变少了（AGENTS §一）。
+    不满足时走 loader 重取，结果覆盖旧值——和没有缓存时的行为一致。
+
     返回 None 表示 loader 没给出结果，也没有可用的旧值。
     """
     cache = cache_for(ns)
     cache_key = key_for(ns, key, epoch=epoch, now=now)
     digest = cache_key.digest()
 
+    def _accepts(value: Any) -> bool:
+        return usable is None or usable(value)
+
     hit = cache.get(cache_key)
-    if hit is not None:
+    if hit is not None and _accepts(hit):
         return Entry(value=hit, fresh=True, age_seconds=cache.age_of(digest))
 
     waiter = cache.claim(digest)
@@ -790,7 +912,7 @@ def get_or_load(
         # 别人正在取同一份，等它。醒来之后再查一次缓存即可。
         waiter.wait(timeout=_INFLIGHT_WAIT_SECONDS)
         hit = cache.get(cache_key)
-        if hit is not None:
+        if hit is not None and _accepts(hit):
             return Entry(value=hit, fresh=True, age_seconds=cache.age_of(digest))
 
     try:
@@ -806,12 +928,30 @@ def get_or_load(
         return Entry(value=value, fresh=True, age_seconds=0.0)
 
     stale = cache.get_stale(cache_key)
-    if stale is not None:
+    if stale is not None and _accepts(stale[0]):
         cache.stale_serves += 1
         logger.info("%s 用了 %.0f 秒前的旧值 key=%s（上游当前不可用）",
                     ns, stale[1], key)
         return Entry(value=stale[0], fresh=False, age_seconds=stale[1])
     return None
+
+
+def put_value(
+    ns: str,
+    key: str,
+    value: Any,
+    *,
+    epoch: Optional[str] = None,
+    now: Optional[datetime.datetime] = None,
+) -> None:
+    """直接写一条，不经过 loader。
+
+    给"值是从别的路径拿到的"这种情形：资金流的页面兜底挂在 gather 之后，不走
+    ``get_or_load``（包进去会改它的触发时机，而那个时机牵着 fetch_failures 的统计
+    和请求级等待预算的计时起点），所以由调用方在成功之后显式写回。
+    """
+    cache = cache_for(ns)
+    cache.put(key_for(ns, key, epoch=epoch, now=now), value)
 
 
 async def aget_or_load(

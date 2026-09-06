@@ -530,6 +530,27 @@ def cache_ttl(namespace: str, default: float) -> float:
     return max(0.0, float(env(f"CACHE_{namespace.upper()}_TTL_SECONDS", str(default))))
 
 
+# 资金流历史一条最多存多少行。主源 lmt=0 给全部历史,老标的数千行、一条 182 KiB
+# （1200 行实测）,条数上限再乘上去就不是可忽略的内存了。截断到 250 行之后一条
+# 38 KiB,而实测用到的最大 fund_flow_limit 是 60,页面兜底本来也只给 120 行。
+# 请求要的行数超过存下来的,命中判定会失败、照常打上游——见 docs/cache-design.md §4.7。
+CACHE_FUND_FLOW_MAX_ROWS = max(
+    1,
+    int(env("CACHE_FUND_FLOW_MAX_ROWS", "250")),
+)
+
+
+def cache_enabled(namespace: str) -> bool:
+    """某个命名空间的单独开关：``CACHE_<NS>_ENABLED``，缺省跟随总开关。
+
+    存在的理由是 A/B：要量"这一层缓存值多少"，就得只关掉它、别的照旧。
+    只有总开关时，关掉它连报告缓存一起没了，测出来的是两层加起来的收益，
+    没法归因到某一层。``CACHE_<NS>_MAX_ENTRIES=0`` 不能当开关用——那一项会被
+    夹到至少 1，留一条的缓存在同一批标的里照样命中。
+    """
+    return _parse_bool(env(f"CACHE_{namespace.upper()}_ENABLED"), CACHE_ENABLED)
+
+
 def cache_max_entries(namespace: str, default: int) -> int:
     """某个命名空间的条数上限覆盖：``CACHE_<NS>_MAX_ENTRIES``。"""
     return max(1, int(env(f"CACHE_{namespace.upper()}_MAX_ENTRIES", str(default))))

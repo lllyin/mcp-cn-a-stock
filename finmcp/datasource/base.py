@@ -22,6 +22,10 @@ class FetchRequirements:
     fund_flow: bool = True
     realtime: bool = True
     unadjusted_kline: bool = True
+    #: 这次渲染要用多少行资金流历史。只服务于缓存的行数守卫：页面兜底只给 120 行、
+    #: 主源给全部历史，缓存了少的那份之后不能让要得多的请求命中它，否则缓存让数据
+    #: 变少了。取数本身不看它——上游请求跟行数无关。见 docs/cache-design.md §4.7。
+    fund_flow_rows: int = 15
 
     @classmethod
     def technical(cls) -> "FetchRequirements":

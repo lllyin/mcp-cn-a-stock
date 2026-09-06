@@ -190,7 +190,7 @@ async def fetch_batch_reports(
     symbols_label = ",".join(raw_symbols)
     start_time = time.time()
     date_label = f", date={date}" if date else ""
-    requirements = FetchRequirements()
+    requirements = FetchRequirements(fund_flow_rows=max(1, int(fund_flow_limit or 15)))
     report_cache = get_report_cache()
 
     def _probe_cache(symbol: str):

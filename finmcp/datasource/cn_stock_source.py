@@ -31,6 +31,7 @@ from ..config import (
     FUND_FLOW_PAGE_FAILURE_WINDOW_SECONDS,
     FUND_FLOW_PAGE_OPEN_AFTER_FAILURES,
     FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS,
+    CACHE_FUND_FLOW_MAX_ROWS,
     FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS,
     SH_INDICES,
     SOURCE_BREAKER_COOLDOWN_SECONDS,
@@ -38,6 +39,7 @@ from ..config import (
     SOURCE_BREAKER_OPEN_AFTER_FAILURES,
     SZ_INDICES,
 )
+from .. import cache
 from . import basic_info
 from .base import DataSource, FetchRequirements, StockData
 from .http_channel import (
@@ -460,6 +462,98 @@ async def _run_in_executor(func, *args):
         lambda completed: _release_data_fetch_slot(slots, completed)
     )
     return await asyncio.shield(future)
+
+
+# ── 资金流 / 基本数据的缓存包装 ──────────────────────────────────────────────
+# 放模块级而不是方法里，是为了让测试能不建数据源实例就单独验行数守卫。
+
+
+def _fund_flow_rows(value) -> int:
+    frame = (value or {}).get("fund_flow")
+    return 0 if frame is None else len(frame)
+
+
+def _truncate_fund_flow(value: Optional[Dict], keep: int) -> Optional[Dict]:
+    """只留最新 ``keep`` 行。
+
+    主源 lmt=0 给全部历史，老标的数千行、一条 182 KiB（1200 行实测），条数上限
+    乘上去就不是可忽略的内存了。
+
+    ``keep`` 取 ``max(CACHE_FUND_FLOW_MAX_ROWS, 本次要渲染的行数)``,不是死的 250。
+    因为截断的是**返回值本身**（``get_or_load`` 存的就是 loader 给的那份），
+    砍到固定 250 会让 ``fund_flow_limit=300`` 的请求永远只拿到 250 行——那是缓存
+    把数据变少了,正是 AGENTS §一 禁止的。抬高上限之后内存仍然有界:界由调用方
+    自己要渲染多少行决定,要得多就存得多,不多存一行。
+    """
+    if value is None or _is_fetch_failure(value):
+        return value
+    frame = value.get("fund_flow")
+    if frame is None or len(frame) <= keep:
+        return value
+    trimmed = dict(value)
+    trimmed["fund_flow"] = frame.tail(keep).reset_index(drop=True)
+    return trimmed
+
+
+def _fund_flow_from_cache(symbol: str, rows_needed: int, loader) -> Optional[Dict]:
+    """查缓存，未命中就 loader 取数并按行数上限截断后写回。"""
+    needed = max(1, rows_needed)
+    keep = max(CACHE_FUND_FLOW_MAX_ROWS, needed)
+
+    def load():
+        # loader 只在真要打上游时才跑，所以这一行就是"这一维取了几次"的计数。
+        # 包装之后 `Data task` 那行报的是包装函数名，原来的口径不再能数上游次数。
+        _log_datasource_miss("fund_flow", symbol)
+        return _truncate_fund_flow(loader(), keep)
+
+    entry = cache.get_or_load(
+        cache.FUND_FLOW_NAMESPACE.name,
+        symbol.upper(),
+        load,
+        usable=lambda value: _fund_flow_rows(value) >= needed,
+    )
+    return None if entry is None else entry.value
+
+
+def store_fund_flow(symbol: str, value: Optional[Dict]) -> None:
+    """把页面兜底拿到的结果写回缓存。
+
+    兜底不走 get_or_load（它挂在 gather 之后，包进去会改触发时机），所以由调用方
+    显式写回；不写回的话下一次同标的的兜底又是一次 6.4 秒的页面加载。
+    """
+    if value is None or _is_fetch_failure(value):
+        return
+    cache.put_value(
+        cache.FUND_FLOW_NAMESPACE.name,
+        symbol.upper(),
+        _truncate_fund_flow(value, CACHE_FUND_FLOW_MAX_ROWS),
+    )
+
+
+def _log_datasource_miss(ns: str, symbol: str) -> None:
+    """数据源层缓存未命中、即将打上游。
+
+    设计文档 §九 记着"六个命名空间只有报告缓存有命中数"。这一行是这两维的补丁：
+    它只在 loader 真跑的时候打，所以 `grep -c` 出来就是上游被问了几次——
+    验收"重复取数降了多少"要的正是这个数。
+    """
+    request_id, tool, _ = log_context()
+    logger.debug(
+        "Datasource cache miss ns=%s request_id=%s tool=%s symbol=%s",
+        ns, request_id, tool, symbol,
+    )
+
+
+def _fetch_realtime_from_cache(symbol: str, loader) -> Optional[Dict]:
+    def load():
+        _log_datasource_miss("realtime", symbol)
+        return loader()
+
+    entry = cache.get_or_load(
+        cache.REALTIME_NAMESPACE.name, symbol.upper(), load
+    )
+    return None if entry is None else entry.value
+
 
 
 class CNStockDataSource(DataSource):
@@ -1003,6 +1097,31 @@ class CNStockDataSource(DataSource):
             logger.warning(f"获取资金流向数据失败 {code}: {e}")
             return _fetch_failure("fund_flow")
 
+    def _fetch_fund_flow_cached(
+        self, code: str, symbol: str, rows_needed: int
+    ) -> Optional[Dict]:
+        """带缓存的资金流取数。同步，仍然跑在线程池里。
+
+        收编的理由是重复取数：``brief`` / ``medium`` / ``full`` 是三个不同的报告缓存键，
+        底下却用同一份资金流。2026-09-06 部署机实测 56 次取数只涉及 23 个标的（2.4×），
+        其中 44 次走了浏览器兜底、只涉及 22 个标的——**一半的页面加载是重复的**，
+        每次 P50 6.4s。
+
+        只包主源这一段，不包页面兜底：兜底挂在 gather 之后是有原因的（见调用处的注释，
+        涉及 fetch_failures 的统计时机和请求级等待预算的计时起点），包进来就改了它的
+        触发时机。兜底那条路自己已经有单飞（``fetch_page_shared`` 保证同一标的只加载
+        一次），成功之后由调用方写回这一层。
+
+        ``usable`` 守的是行数：页面兜底只给 120 行，主源给全部历史。缓存了少的那份之后
+        不能让要得多的请求命中它，否则缓存让数据变少了（AGENTS §一）。不满足就当未命中
+        照常打上游——和没有缓存时的行为逐字一致。
+        """
+        return _fund_flow_from_cache(
+            symbol,
+            rows_needed,
+            lambda: self._fetch_fund_flow_sync(code, symbol),
+        )
+
     def _build_fund_flow_history(self, df, symbol: str, is_market: bool) -> Optional[Dict[str, np.ndarray]]:
         """Convert AkShare fund-flow rows to the internal report dataset."""
         if df is None or df.empty or "日期" not in df.columns:
@@ -1279,11 +1398,26 @@ class CNStockDataSource(DataSource):
             )
         if requirements.fund_flow:
             task_specs.append(
-                ("fund_flow", _run_in_executor(self._fetch_fund_flow_sync, code, canonical_symbol))
+                (
+                    "fund_flow",
+                    _run_in_executor(
+                        self._fetch_fund_flow_cached,
+                        code,
+                        canonical_symbol,
+                        requirements.fund_flow_rows,
+                    ),
+                )
             )
         if requirements.realtime:
             task_specs.append(
-                ("realtime", _run_in_executor(self._fetch_realtime_sync, code, canonical_symbol))
+                (
+                    "realtime",
+                    _run_in_executor(
+                        _fetch_realtime_from_cache,
+                        canonical_symbol,
+                        lambda: self._fetch_realtime_sync(code, canonical_symbol),
+                    ),
+                )
             )
 
         task_results = await asyncio.gather(*(future for _, future in task_specs))
@@ -1296,6 +1430,9 @@ class CNStockDataSource(DataSource):
             page_result = await self._fetch_fund_flow_from_page(canonical_symbol)
             if page_result is not None:
                 fetched["fund_flow"] = page_result
+                # 写回缓存：兜底不走 get_or_load（它挂在 gather 之后，包进去会改
+                # 触发时机），不显式写回的话下一次同标的又是一次 6.4 秒的页面加载。
+                store_fund_flow(canonical_symbol, page_result)
 
         kline_data = fetched.get("kline")
         finance_data = fetched.get("finance")

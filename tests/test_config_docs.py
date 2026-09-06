@@ -33,11 +33,25 @@ _LEGACY = {"AKSHARE_PROXY_IP", "AKSHARE_PROXY_PASSWORD", "AKSHARE_PROXY_PORT"}
 #: 代码里用 f-string 拼名字（config.cache_ttl / cache_max_entries），扫不出来；
 #: 而八个命名空间 × 两项 = 十六行文档，写进 README 也没人会逐行看。所以这一族按
 #: **模式**校验：文档必须写清模式本身（见下面那条测试），具体名字不逐个比对。
-_NAMESPACED_CACHE = re.compile(r"^CACHE_[A-Z0-9]+_(TTL_SECONDS|MAX_ENTRIES)$")
+_NAMESPACED_CACHE = re.compile(r"^CACHE_[A-Z0-9]+_(TTL_SECONDS|MAX_ENTRIES|ENABLED)$")
+
+#: 名字长得像派生名、其实是全局项的那几个。不列出来的话 CACHE_DISK_ENABLED
+#: （= CACHE_ + DISK + _ENABLED）会被当成某个命名空间的开关而逃掉文档校验。
+_CACHE_GLOBALS = {
+    "CACHE_ENABLED",
+    "CACHE_DISK_ENABLED",
+    "CACHE_DIR",
+    "CACHE_STALE_ON_ERROR",
+    "CACHE_INTRADAY_TTL_SECONDS",
+    "CACHE_FUND_FLOW_MAX_ROWS",
+}
 
 
 def _drop_namespaced(names: dict) -> dict:
-    return {k: v for k, v in names.items() if not _NAMESPACED_CACHE.match(k)}
+    return {
+        k: v for k, v in names.items()
+        if k in _CACHE_GLOBALS or not _NAMESPACED_CACHE.match(k)
+    }
 
 
 def test_the_namespaced_cache_override_pattern_is_documented():
@@ -46,6 +60,8 @@ def test_the_namespaced_cache_override_pattern_is_documented():
     env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
     assert "CACHE_<命名空间>_MAX_ENTRIES" in readme
     assert "CACHE_<命名空间>_TTL_SECONDS" in env_example
+    assert "CACHE_<命名空间>_ENABLED" in readme
+    assert "CACHE_<命名空间>_ENABLED" in env_example
 
 
 def _code_configs() -> dict[str, str | None]:

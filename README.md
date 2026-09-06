@@ -320,6 +320,8 @@ AkShare 和 efinance 的接口是同步网络调用，由一个有界线程池�
 | `CACHE_DIR` | 磁盘层目录，相对项目根目录。每个命名空间一个子目录 | 路径（默认 `.runtime/cache`） |
 | `CACHE_<命名空间>_MAX_ENTRIES`<br>`CACHE_<命名空间>_TTL_SECONDS` | 单个命名空间的覆盖，命名空间有 `report`、`market_events`、`sector_flow`、`market_breadth`、`finance`、`calendar`、`taxonomy`。例：`CACHE_REPORT_MAX_ENTRIES=512` | 正整数 / 秒 |
 
+| `CACHE_<命名空间>_ENABLED` | 单独关掉某一层缓存，缺省跟随 `CACHE_ENABLED`。用于 A/B——只有总开关时无法把收益归因到某一层 | `0`/`1`（默认跟随总开关） |
+| `CACHE_FUND_FLOW_MAX_ROWS` | 资金流历史一条最多缓存多少行。主源给全部历史（老标的数千行），截断可控内存；请求要的行数超过存下来的会判未命中、照常打上游，所以不会让数据变少 | 正整数（默认 `250`） |
 | `CONF_DIR` | 参考数据目录（指数名单、代码表、板块表）。默认随包发布，正常不用配；指到别处可临时替换而不重装，只放要改的那个文件即可，其余仍从包内读 | 路径（默认包内 `finmcp/confs`） |
 
 盘中命中返回的必然是一份稍旧的快照，TTL 决定这份快照能有多旧。对资金流精度要求高时设为 `0`。
