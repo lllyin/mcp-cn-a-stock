@@ -236,18 +236,22 @@ def run_call(spec: CallSpec, config: Path, timeout_ms: int) -> CallResult:
 def run_calls(
     specs: list[CallSpec], config: Path, timeout_ms: int, concurrency: int
 ):
-    """逐个产出探活结果，**谁先完成先产出**。
+    """逐个产出 ``(下标, 结果)``，**谁先完成先产出**。
 
     这里必须是生成器。原先是 ``list(pool.map(...))``，要等 22 个调用全部结束才返回，
     调用方一行进度都打不出来——默认每个调用 120 秒上限、并发 2，最坏情况是
     22/2 × 150s ≈ 27 分钟的纯静默。而"静默 27 分钟"和"卡死了"，从终端上看是一模一样的，
     没人会等到它自己出来。
 
-    顺序换成完成顺序，调用方拿到全部结果之后按 specs 的原顺序排回去（见 probes 那段）。
+    但产出顺序换成完成顺序之后，"第 n 个结果对应第 n 个 spec"就不成立了，而基线重放
+    正是按位置把结果配回 baseline 的。配错的后果不是报错而是**静默失真**：拿 A 的基线
+    去比 B 的新输出，每份文档都成了"整段新增 + 整段缺失"，一致率崩到 17%，却一条
+    值变化都没有——看着像上游全挂了，实际只是配对错位。所以下标必须跟着结果一起走，
+    由调用方按它排回去，不能靠约定。
     """
     if concurrency <= 1:
-        for spec in specs:
-            yield run_call(spec, config, timeout_ms)
+        for index, spec in enumerate(specs):
+            yield index, run_call(spec, config, timeout_ms)
         return
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = {
@@ -255,7 +259,7 @@ def run_calls(
             for index, spec in enumerate(specs)
         }
         for future in concurrent.futures.as_completed(futures):
-            yield future.result()
+            yield futures[future], future.result()
 
 
 # ── 三、载荷解析 ────────────────────────────────────────────────
@@ -2511,25 +2515,25 @@ def main() -> int:
         print(f"[验证] 探活 {len(specs)} 个调用…"
               f"（并发 {args.concurrency}，单个上限 {args.timeout_ms / 1000:.0f}s；"
               f"下面按完成先后逐行打印）", flush=True)
-        for result in run_calls(specs, config, args.timeout_ms, args.concurrency):
+        ordered: list[tuple[int, CallResult, Payload, Completeness]] = []
+        for index, result in run_calls(specs, config, args.timeout_ms, args.concurrency):
             payload = parse_payload(result.payload)
             completeness = (
                 check_completeness(result.spec.tool, payload) if result.ok
                 else Completeness()
             )
-            probes.append((result, payload, completeness))
+            ordered.append((index, result, payload, completeness))
             flag = "OK " if result.ok else "FAIL"
             rate = (
                 "" if completeness.graded == 0
                 else f"  维度 {completeness.available}/{completeness.graded}"
             )
-            print(f"  [{len(probes)}/{len(specs)}] [{flag}] "
+            print(f"  [{len(ordered)}/{len(specs)}] [{flag}] "
                   f"{result.spec.describe()[:60]}  {result.elapsed:.1f}s{rate}", flush=True)
 
-        # 产出是完成顺序，报告和归档要的是 specs 的原顺序——不排回去，基线比对
-        # 会因为顺序漂移而失真。
-        order = {spec.describe(): index for index, spec in enumerate(specs)}
-        probes.sort(key=lambda item: order.get(item[0].spec.describe(), 0))
+        # 产出是完成顺序，报告和归档要的是 specs 的原顺序——按下标排回去。
+        ordered.sort(key=lambda item: item[0])
+        probes = [(result, payload, c) for _, result, payload, c in ordered]
 
         if args.capture:
             hard = [item for _, _, c in probes for item in c.bad]
@@ -2559,10 +2563,13 @@ def main() -> int:
                 continue
             pending.append(baseline)
 
-        results = run_calls(
+        # 按下标取回对应的 baseline。这里绝不能 zip(pending, results)：results 是
+        # 完成顺序，zip 会把先跑完的结果配给排在前面的基线。
+        replays = run_calls(
             [b.replay_spec for b in pending], config, args.timeout_ms, args.concurrency
         )
-        for baseline, result in zip(pending, results):
+        for index, result in replays:
+            baseline = pending[index]
             if not result.ok:
                 print(f"  [FAIL] {baseline.path.name} 重放失败 exit={result.exit_code}")
                 regressions.append((baseline, result, []))
@@ -2590,6 +2597,10 @@ def main() -> int:
             note += "" if not summary else f"（另 {summary}）"
             print(f"  [{'OK ' if not bad else 'DIFF'}] {baseline.path.name}{note}")
             regressions.append((baseline, result, diffs))
+
+        # 追加顺序是完成顺序，报告要的是文件名顺序——否则同一组基线两次跑出来的
+        # 报告行序不一样，diff 两份报告会全是噪声。
+        regressions.sort(key=lambda item: item[0].path.name)
 
     watch.stop()
     scan = scan_log(args.log, started)

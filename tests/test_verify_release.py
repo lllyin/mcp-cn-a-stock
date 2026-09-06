@@ -942,3 +942,49 @@ class TestMatrixAgreesWithFindings:
         for _, dim in flagged:
             row = next(l for l in text.splitlines() if l.startswith(f"| {dim} "))
             assert "✅" not in row, f"{dim} 在缺失明细里，矩阵却是 ✅：{row}"
+
+
+class TestRunCallsPairing:
+    """``run_calls`` 按完成顺序产出，下标必须跟着结果一起回来。
+
+    这里出错不会抛异常，只会让基线配错对象——拿 A 的基线比 B 的新输出，报告上
+    每份文档都是"整段新增 + 整段缺失"、一条值变化都没有，看着像上游全挂了。
+    真出过一次：一致率 17%，实际一个数都没漂。
+    """
+
+    @staticmethod
+    def _specs(n: int) -> list:
+        return [verify.CallSpec(tool="brief", args={"symbol": f"SH60000{i}"})
+                for i in range(n)]
+
+    def test_index_identifies_the_spec_even_when_slow_calls_finish_last(self, monkeypatch):
+        import time
+
+        specs = self._specs(4)
+        # 让第 0 个最慢、第 3 个最快，完成顺序必然和 specs 顺序相反。
+        delays = {0: 0.20, 1: 0.10, 2: 0.05, 3: 0.0}
+
+        def fake_run_call(spec, config, timeout_ms):
+            time.sleep(delays[int(spec.args["symbol"][-1])])
+            return verify.CallResult(spec=spec, exit_code=0, payload="x",
+                                     stderr="", elapsed=0.0)
+
+        monkeypatch.setattr(verify, "run_call", fake_run_call)
+        produced = list(verify.run_calls(specs, Path("cfg.json"), 1000, 4))
+
+        assert [i for i, _ in produced] != list(range(len(specs))), \
+            "完成顺序应当和 specs 顺序不同，否则这个测试什么也没验到"
+        for index, result in produced:
+            assert result.spec is specs[index]
+
+    def test_serial_mode_yields_indexes_too(self, monkeypatch):
+        specs = self._specs(3)
+        monkeypatch.setattr(
+            verify, "run_call",
+            lambda spec, config, timeout_ms: verify.CallResult(
+                spec=spec, exit_code=0, payload="x", stderr="", elapsed=0.0),
+        )
+        produced = list(verify.run_calls(specs, Path("cfg.json"), 1000, 1))
+        assert [i for i, _ in produced] == [0, 1, 2]
+        for index, result in produced:
+            assert result.spec is specs[index]
