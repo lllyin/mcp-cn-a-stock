@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from finmcp import cache as cache_module
+from finmcp import market_session as ms
 from finmcp import config
 from finmcp.cache import (
     PHASE_CLOSED,
@@ -35,6 +36,19 @@ SATURDAY = datetime.date(2026, 8, 22)
 
 def at(day: datetime.date, hour: int, minute: int = 0) -> datetime.datetime:
     return datetime.datetime.combine(day, datetime.time(hour, minute))
+
+
+def moment(clock, day=MONDAY):
+    """边界本身的那一刻。不写死时刻——写死就会在下次调边界时又漂一遍。"""
+    return datetime.datetime.combine(day, clock)
+
+
+def before(clock, minutes=1, day=MONDAY):
+    return moment(clock, day) - datetime.timedelta(minutes=minutes)
+
+
+def after(clock, minutes=1, day=MONDAY):
+    return moment(clock, day) + datetime.timedelta(minutes=minutes)
 
 
 def make_cache(tmp_path, **kwargs) -> ReportCache:
@@ -63,8 +77,8 @@ def make_cache(tmp_path, **kwargs) -> ReportCache:
         (at(MONDAY, 13, 0), PHASE_LIVE),
         (at(MONDAY, 15, 29), PHASE_LIVE),
         (at(MONDAY, 15, 30), PHASE_POSTCLOSE),
-        (at(MONDAY, 16, 59), PHASE_POSTCLOSE),
-        (at(MONDAY, 17, 5), PHASE_CLOSED),   # 资金流分支翻转 + 缓冲
+        (before(ms.FINAL_TIME), PHASE_POSTCLOSE),
+        (after(ms.EVENING_SETTLE), PHASE_CLOSED),   # 资金流分支翻转 + 缓冲
         (at(SATURDAY, 11, 0), PHASE_CLOSED),
     ],
 )
@@ -146,7 +160,7 @@ def test_settle_hhmm_parsing(raw, expected):
 
 def test_postclose_and_evening_are_different_epochs():
     """17:00 前后渲染分支不同，绝不能落在同一个纪元。"""
-    _, postclose = market_phase(at(MONDAY, 16, 0))
+    _, postclose = market_phase(before(ms.FINAL_TIME))
     _, evening = market_phase(at(MONDAY, 18, 0))
     assert postclose != evening
 
@@ -231,9 +245,9 @@ def test_today_dated_query_stays_epoch_bound():
         (at(MONDAY, 11, 30), PHASE_LIVE),    # 午休刚开始，东财页面尚未定稿
         (at(MONDAY, 11, 34), PHASE_LIVE),
         (at(MONDAY, 11, 35), PHASE_LUNCH),   # 缓冲结束，进入完全复用
-        (at(MONDAY, 17, 0), PHASE_LIVE),     # 分支刚翻转，资金流当日行未必已落
-        (at(MONDAY, 17, 4), PHASE_LIVE),
-        (at(MONDAY, 17, 5), PHASE_CLOSED),
+        (moment(ms.FINAL_TIME), PHASE_LIVE),   # 分支刚翻转，资金流当日行未必已落
+        (before(ms.EVENING_SETTLE), PHASE_LIVE),
+        (moment(ms.EVENING_SETTLE), PHASE_CLOSED),
     ],
 )
 def test_boundary_buffers_delay_full_reuse(moment, expected_phase):
@@ -245,7 +259,7 @@ def test_buffer_windows_have_their_own_epoch_tokens():
     _, morning_live = market_phase(at(MONDAY, 10, 0))
     _, lunch_buffer = market_phase(at(MONDAY, 11, 31))
     _, lunch_full = market_phase(at(MONDAY, 12, 0))
-    _, evening_buffer = market_phase(at(MONDAY, 17, 1))
+    _, evening_buffer = market_phase(after(ms.FINAL_TIME))
     _, evening_full = market_phase(at(MONDAY, 18, 0))
     tokens = [morning_live, lunch_buffer, lunch_full, evening_buffer, evening_full]
     assert len(set(tokens)) == len(tokens)
@@ -254,9 +268,9 @@ def test_buffer_windows_have_their_own_epoch_tokens():
 def test_evening_buffer_entry_never_leaks_into_closed_epoch(tmp_path):
     """17:00-17:05 生成的报告（资金流可能还是昨日行）不得流入傍晚纪元。"""
     c = make_cache(tmp_path)
-    buffer_key = build_key("brief", "SH600000", {}, now=at(MONDAY, 17, 1))
+    buffer_key = build_key("brief", "SH600000", {}, now=after(ms.FINAL_TIME))
     c.put(buffer_key, "可能含昨日资金流")
-    closed_key = build_key("brief", "SH600000", {}, now=at(MONDAY, 17, 30))
+    closed_key = build_key("brief", "SH600000", {}, now=after(ms.EVENING_SETTLE, 25))
     assert c.get(closed_key) is None
 
 

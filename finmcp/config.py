@@ -527,8 +527,14 @@ MARKET_EPOCH_WARMUP_TIME = _parse_hhmm(
 MARKET_EPOCH_SETTLE_TIME = _parse_hhmm(
     env("MARKET_EPOCH_SETTLE_TIME"), datetime.time(15, 30)
 )
+# 16:00：资金流从"抓页面"切回"读接口"，同时是纪元边界。曾经是 17:00，依据是
+# "AkShare 的当日资金流行在 17:00 之后几分钟才落地"。提前到 16:00 本身有风险——
+# 那一行要是还没落地，一份缺当日资金流的报告会被冻进 16-64 小时的 CLOSED 纪元。
+# 兜住这个的是 cache._fund_flow_is_lagging：没落地就不进 CLOSED，留在 POSTCLOSE
+# 的短 TTL 里等。所以配早了只是少命中几次缓存，不会掉数据。
+# 真正合适的值等交易日实测当日资金流行的落地时刻再定。
 MARKET_EPOCH_FINAL_TIME = _parse_hhmm(
-    env("MARKET_EPOCH_FINAL_TIME"), datetime.time(17, 0)
+    env("MARKET_EPOCH_FINAL_TIME"), datetime.time(16, 0)
 )
 MARKET_EPOCH_BUFFER_MINUTES = max(
     0,

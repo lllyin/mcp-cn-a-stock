@@ -133,9 +133,11 @@ def test_the_buffer_is_wired_and_bounded(monkeypatch):
 
 
 def test_moving_settle_moves_the_postclose_boundary(monkeypatch):
-    monkeypatch.setattr(ms, "SETTLE_TIME", datetime.time(16, 0))
-    assert ms.phase_and_epoch(at(datetime.time(15, 45)))[0] == ms.PHASE_LIVE
-    assert ms.phase_and_epoch(at(datetime.time(16, 0)))[0] == ms.PHASE_POSTCLOSE
+    """settle 往后挪，postclose 的起点跟着挪；final 不受影响。"""
+    moved = datetime.time(15, 45)
+    monkeypatch.setattr(ms, "SETTLE_TIME", moved)
+    assert ms.phase_and_epoch(at(moved, minus_minutes=1))[0] == ms.PHASE_LIVE
+    assert ms.phase_and_epoch(at(moved))[0] == ms.PHASE_POSTCLOSE
 
 
 def test_settle_equal_to_final_leaves_no_postclose_window(monkeypatch):
