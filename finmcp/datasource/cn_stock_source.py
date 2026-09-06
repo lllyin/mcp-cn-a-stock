@@ -513,7 +513,7 @@ class CNStockDataSource(DataSource):
         elif code.startswith(("00", "20", "30")):
             # 对 000 段位进行细分：个股 vs 指数
             if symbol.upper().startswith("SH") and code.startswith("000"):
-                # 检查是否在沪市核心指数名单中 (从 confs/indices.json 加载)
+                # 检查是否在沪市核心指数名单中 (从 finmcp/confs/indices.json 加载)
                 if code in SH_INDICES:
                     market = "sh"
                 else:

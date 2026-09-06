@@ -39,6 +39,11 @@ py-modules = ["main", "data"]
 [tool.setuptools.packages.find]
 include = ["finmcp*"]
 
+# confs/*.json 是参考数据（代码表、指数名单、板块表），不打进包的话装成包就读不到：
+# indices.json 缺失会让 SH_INDICES 空掉，沪市指数被判成深市个股，返回另一只证券。
+[tool.setuptools.package-data]
+finmcp = ["confs/*.json"]
+
 [tool.pytest.ini_options]
 # 只收 tests/。tests_research/ 是调研脚本目录，里面 33 个文件里有 3 个碰巧叫
 # test_*.py，裸跑 pytest 会把它们收进来——而 test_etf.py 顶层就有一行

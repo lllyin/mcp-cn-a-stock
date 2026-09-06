@@ -11,13 +11,15 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
+from .config import conf_path
 from .datasource import get_datasource
 from .datasource.base import FetchRequirements
 
 logger = logging.getLogger("finmcp")
 
-# 股票板块数据配置文件路径
-stock_sector_data = "confs/stock_sector.json"
+# 股票板块数据配置文件路径。走 conf_path 而不是 CWD 相对路径：装成包之后进程的
+# CWD 不一定是仓库，"confs/stock_sector.json" 会静默读不到。
+stock_sector_data = conf_path("stock_sector.json")
 
 STOCK_SECTOR: Dict[str, List[str]] | None = None
 

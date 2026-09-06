@@ -551,24 +551,72 @@ MARKET_EPOCH_BUFFER_MINUTES = max(
     int(env("MARKET_EPOCH_BUFFER_MINUTES", "5")),
 )
 
+# --- 参考数据文件的定位 ---
+# confs/*.json 是随包发布的参考数据（代码表、指数名单、板块表），不是用户配置——
+# 用户配置在 .env 里。所以它们住在包内，`pip install` 一定带得走。
+#
+# 曾经它们在仓库根目录，而定位方式有三种：config.py 用 `__file__/../confs`，
+# symbols.py 和 datafeed.py 用 CWD 相对的 "confs/xxx.json"。装成包之后
+# `__file__/../` 指到 site-packages，那里没有 confs——2026-09-06 部署机上
+# SH_INDICES 因此为空，SH000001 被"纠正"成 SZ000001，上证指数报成了平安银行。
+# 本地开发跑 `python main.py`，包就在仓库里，三种找法都命中，照不出这个洞。
+#
+# 现在只有这一个入口，四处调用点（config / symbols / datafeed / cache 指纹）共用。
+# CONF_DIR 可以指到别处，用于运维临时替换名单而不重装。
+_PACKAGED_CONF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "confs")
+
+
+def conf_path(name: str) -> str:
+    """返回参考数据文件的绝对路径。CONF_DIR 覆盖优先，否则用包内那份。
+
+    覆盖目录里缺哪个文件就只回退哪个文件，不是整个目录一起回退——运维只想换
+    indices.json 时，不该被迫把 markets.json 也复制一份过去。
+    """
+    override = env("CONF_DIR", "")
+    if override:
+        candidate = os.path.join(os.path.expanduser(override), name)
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.join(_PACKAGED_CONF_DIR, name)
+
+
 # --- Market Indices Configuration ---
 import json
-_CONF_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "confs"))
-_INDICES_FILE = os.path.join(_CONF_DIR, "indices.json")
+import logging as _logging
 
-SH_INDICES: set[str] = set()
-SZ_INDICES: set[str] = set()
-ALL_INDICES: set[str] = set()
+_INDICES_FILE = conf_path("indices.json")
 
-try:
-    if os.path.exists(_INDICES_FILE):
-        with open(_INDICES_FILE, "r", encoding="utf-8") as f:
-            _conf = json.load(f)
-            SH_INDICES = set(_conf.get("sh_indices", []))
-            SZ_INDICES = set(_conf.get("sz_indices", []))
-            ALL_INDICES = SH_INDICES | SZ_INDICES
-except Exception:
-    # 基础兜底名单
-    SH_INDICES = {"000001", "000300", "000016", "000905", "000688", "000852"}
-    SZ_INDICES = {"399001", "399006", "399005", "399300", "399007"}
-    ALL_INDICES = SH_INDICES | SZ_INDICES
+# 内置兜底名单。过去它写在 except 里，而"文件不存在"不抛异常——于是文件缺失时
+# 兜底永远不执行，三个集合保持空集，_symbol_to_akshare 把每一个 SH000xxx 都判成
+# 深市。静默返回另一只证券比整段缺数据危险得多，所以现在先给默认值再尝试覆盖。
+_FALLBACK_SH_INDICES = frozenset({"000001", "000300", "000016", "000905", "000688", "000852"})
+_FALLBACK_SZ_INDICES = frozenset({"399001", "399006", "399005", "399300", "399007"})
+
+
+def _load_indices(path: str) -> tuple[set[str], set[str]]:
+    """读指数名单。读不到就回落到内置名单，并且必须在日志里说出来。
+
+    空名单和"没读到"一律当失败：空集会让沪市指数被判成深市个股，那是错数据，
+    不是缺数据——宁可用一份不全但正确的内置名单。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            conf = json.load(handle)
+        sh = set(conf.get("sh_indices", []))
+        sz = set(conf.get("sz_indices", []))
+        if not sh or not sz:
+            raise ValueError(f"名单为空 sh={len(sh)} sz={len(sz)}")
+        return sh, sz
+    except Exception as exc:
+        _logging.getLogger("finmcp").warning(
+            "指数名单读取失败，改用内置兜底名单 file=%s %s: %s"
+            "（SH000xxx 的沪深归属靠它判定，名单不全会把沪市指数当成深市个股）",
+            path,
+            type(exc).__name__,
+            exc,
+        )
+        return set(_FALLBACK_SH_INDICES), set(_FALLBACK_SZ_INDICES)
+
+
+SH_INDICES, SZ_INDICES = _load_indices(_INDICES_FILE)
+ALL_INDICES: set[str] = SH_INDICES | SZ_INDICES

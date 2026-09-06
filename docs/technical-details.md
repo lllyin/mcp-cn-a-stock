@@ -388,8 +388,8 @@ CDP 方案只 +2/+16 MiB。
 `渲染指纹 | 工具 | 标的 | 参数 | 纪元 | 取数窗口日期`
 
 - **渲染指纹**是版本号与 `research.py`/`mcp_app.py`/`cache.py`/`config.py` 以及
-  `confs/indices.json` 内容的哈希。闭市纪元最长 64 小时且磁盘层跨重启存活，没有它则
-  傍晚上线的渲染修复要到次日开盘才可见。`confs/indices.json` 之所以计入，是因为
+  `finmcp/confs/indices.json` 内容的哈希。闭市纪元最长 64 小时且磁盘层跨重启存活，没有它则
+  傍晚上线的渲染修复要到次日开盘才可见。`finmcp/confs/indices.json` 之所以计入，是因为
   `ALL_INDICES` 决定标的走指数分支还是个股分支（`research.get_realtime_fund_flow_target`），
   改它是一次渲染变更，尽管没有任何 `.py` 文件变动。
 - **取数窗口日期**覆盖 `research.load_raw_data` 用 `now() + 1 天` 推导取数区间的行为，

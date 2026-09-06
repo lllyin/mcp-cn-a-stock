@@ -65,6 +65,7 @@ from .config import (
     CACHE_STALE_ON_ERROR,
     cache_max_entries,
     cache_ttl,
+    conf_path,
 )
 from .market_session import (
     PHASE_CLOSED,
@@ -103,7 +104,7 @@ def _render_fingerprint() -> str:
     without this a rendering fix shipped in the evening would stay invisible
     until the next session opened.
 
-    ``confs/indices.json`` is covered because it decides, through
+    ``finmcp/confs/indices.json`` is covered because it decides, through
     ``config.ALL_INDICES``, whether a symbol renders down the index branch or
     the stock branch (``research.get_realtime_fund_flow_target``). Editing it is
     a rendering change even though no ``.py`` file moved.
@@ -121,7 +122,9 @@ def _render_fingerprint() -> str:
         for name in ("research.py", "mcp_app.py", "cache.py", "config.py",
                      "market_session.py")
     ]
-    sources.append((os.path.join(here, os.pardir, "confs", "indices.json"), False))
+    # 走 conf_path，否则装成包时这里指到 site-packages/confs（不存在），指纹会
+    # 稳定地哈希成 "absent"，改名单再也不会让缓存失效。
+    sources.append((conf_path("indices.json"), False))
     for path, required in sources:
         name = os.path.basename(path)
         try:

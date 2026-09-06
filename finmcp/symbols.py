@@ -19,9 +19,11 @@ def load_markets(fname: str):
 
 def load_symbols():
   """
-  load symbols from confs/markets.json
+  load symbols from the packaged finmcp/confs/markets.json
   """
-  load_markets("confs/markets.json")
+  from .config import conf_path
+
+  load_markets(conf_path("markets.json"))
 
 
 def symbol_with_name(symbols: Iterable[str]) -> Iterable[Tuple[str, str]]:
