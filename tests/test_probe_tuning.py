@@ -362,3 +362,53 @@ def test_prefixed_environment_moves_dotenv_behind_the_prefix(tmp_path):
 def test_prefixed_environment_refuses_a_dotenv_that_sets_its_own_prefix(tmp_path):
     with pytest.raises(SystemExit):
         probe.prefixed_environment({}, {"ENV_PREFIX": "X_"}, {}, "PROBE_", tmp_path)
+
+
+# ── 依赖守卫 ───────────────────────────────────────────────────
+
+
+class TestVenvGuard:
+    """用系统 python3 跑会缺依赖，要在开头拦住而不是跑到第三层再崩。
+
+    2026-09-07 部署环境实测：`python3 scripts/probe_tuning.py all` 在
+    `[facts] 机器…` 打出来之后才报 `ModuleNotFoundError: No module named 'dotenv'`
+    ——看起来像「跑起来了又坏了」。而脚本自己的用法段落当时写的就是 `python`。
+    """
+
+    def test_it_stops_early_and_says_which_command_to_use(self, monkeypatch, capsys):
+        import importlib.util
+
+        real = importlib.util.find_spec
+        monkeypatch.setattr(
+            importlib.util, "find_spec",
+            lambda name, *a, **k: None if name == "dotenv" else real(name, *a, **k))
+        monkeypatch.setattr(probe.sys, "argv", ["scripts/probe_tuning.py", "all"])
+        with pytest.raises(SystemExit) as exc:
+            probe._require_venv()
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "dotenv" in err
+        assert ".venv/bin/python" in err, "得给出能直接复制的命令"
+        assert "scripts/probe_tuning.py all" in err, "得带上原来的子命令"
+
+    def test_it_is_silent_when_everything_is_installed(self):
+        probe._require_venv()          # 不抛就是通过
+
+    def test_every_guarded_name_is_an_import_name(self):
+        """写 pip 包名会让守卫永远误报——python-dotenv 的模块名是 dotenv。"""
+        import importlib.util
+
+        for name in probe._VENV_ONLY_IMPORTS:
+            assert "-" not in name, f"{name} 看着像 pip 包名，不是 import 名"
+            assert importlib.util.find_spec(name) is not None, \
+                f"{name} 在本环境里都找不到，守卫会永远拦住"
+
+    def test_the_usage_block_does_not_invite_system_python(self):
+        """用法段落必须写 .venv/bin/python，否则下一个人照抄又踩一次。"""
+        import inspect
+        import re
+
+        doc = inspect.getdoc(probe) or ""
+        for line in doc.splitlines():
+            if "scripts/probe_tuning.py" in line:
+                assert re.search(r"\.venv/bin/python scripts/probe_tuning\.py", line), line

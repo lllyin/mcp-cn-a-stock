@@ -67,8 +67,8 @@ python scripts/loadtest_mcp.py --launch --port 8790 --closed-loop --steps 1,5,10
 内存余量都随机器变，一台机器上量出来的结论搬到另一台可能正相反：
 
 ```bash
-python scripts/probe_tuning.py all            # facts → browser → recommend，约 6-10 分钟
-python scripts/probe_tuning.py verify --env-file .runtime/probe-tuning/<时间戳>/.env.recommended
+.venv/bin/python scripts/probe_tuning.py all            # facts → browser → recommend，约 6-10 分钟
+.venv/bin/python scripts/probe_tuning.py verify --env-file .runtime/probe-tuning/<时间戳>/.env.recommended
 ```
 
 `facts` 探各源各通道的可达性和线上服务的内存基数；`browser` 用线上同一套身份定义起自己的

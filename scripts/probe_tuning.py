@@ -47,11 +47,11 @@
 
 用法
 ----
-    python scripts/probe_tuning.py all                          # facts → browser → recommend
-    python scripts/probe_tuning.py facts
-    python scripts/probe_tuning.py browser [--identities legacy,disguise] [--batches 6] [--max-tabs 3] [--force]
-    python scripts/probe_tuning.py recommend [--env .env] [--service-base-mib 243]
-    python scripts/probe_tuning.py verify --env-file <dir>/.env.recommended [--only brief,medium,full]
+    .venv/bin/python scripts/probe_tuning.py all                          # facts → browser → recommend
+    .venv/bin/python scripts/probe_tuning.py facts
+    .venv/bin/python scripts/probe_tuning.py browser [--identities legacy,disguise] [--batches 6] [--max-tabs 3] [--force]
+    .venv/bin/python scripts/probe_tuning.py recommend [--env .env] [--service-base-mib 243]
+    .venv/bin/python scripts/probe_tuning.py verify --env-file <dir>/.env.recommended [--only brief,medium,full]
 
 结果目录缺省 .runtime/probe-tuning/<时间戳>/，--out-dir 指定或复用（recommend 读它、verify 写进它）。
 """
@@ -1447,8 +1447,42 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+#: 这个脚本要用的、只装在项目虚拟环境里的包。名字 → 提示里显示的用途。
+#: 全部按 `import x` 的写法写，别写 pip 包名（python-dotenv 的模块名是 dotenv）。
+_VENV_ONLY_IMPORTS = {
+    "dotenv": "读 .env",
+    "requests": "可达性探测",
+    "playwright": "浏览器探测",
+}
+
+
+def _require_venv() -> None:
+    """缺依赖就在开头拦住，并告诉怎么跑。
+
+    默认用法写的是 `python scripts/probe_tuning.py`，而系统 python3 里没有这几个包，
+    于是会跑到第三层函数才 ModuleNotFoundError——那时候 `[facts] 机器…` 已经打出来了，
+    看起来像"跑起来了又坏了"。开头拦住，错误信息里直接给能用的命令。
+    """
+    import importlib.util
+
+    missing = [name for name in _VENV_ONLY_IMPORTS
+               if importlib.util.find_spec(name) is None]
+    if not missing:
+        return
+    venv_python = PROJECT_ROOT / ".venv" / "bin" / "python"
+    detail = "、".join(f"{n}（{_VENV_ONLY_IMPORTS[n]}）" for n in missing)
+    hint = (f"{venv_python} {' '.join(sys.argv[1:] and ['scripts/probe_tuning.py'] + sys.argv[1:] or ['scripts/probe_tuning.py'])}"
+            if venv_python.exists()
+            else "先跑 ./install.sh 建虚拟环境")
+    print(f"缺少依赖：{detail}\n"
+          f"这个脚本要用项目虚拟环境里的包，系统 python3 里没有。请改成：\n"
+          f"    {hint}", file=sys.stderr)
+    raise SystemExit(2)
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
+    _require_venv()
     handlers = {"facts": run_facts, "browser": run_browser, "recommend": run_recommend,
                 "verify": run_verify, "all": run_all}
     return handlers[args.command](args)
