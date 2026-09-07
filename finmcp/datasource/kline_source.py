@@ -53,8 +53,16 @@ PROVIDER_ORDER_ENV = "KLINE_PROVIDERS"
 #     注意别把这段读成"腾讯更准"——之前确实这么写过，依据是"腾讯和东财逐位一致"，
 #     而券商核对证明东财自己在长周期上就是偏的。判据是稳定性，不是准确度。
 #
+#     **同花顺排第三，但必须在**。"按稳定性排"说的是它不该排第一，不是它不该出现——
+#     2026-09-07 18:36 部署环境上 verify_release 那轮，SH512480（ETF）的 full 整份报
+#     `未找到证券代码 SH512480 的相关行情数据`：ETF 走的是这条顺序，而**新浪不认 ETF**
+#     （`JSONDecodeError: No value to decode`），东财在那台机器上常态被拒，于是整条链
+#     实际只剩腾讯一个源，它一次瞬时失败就让这个标的**全维度归零**（不是缺一段，是
+#     load_raw_data 返回空、报告只剩一行 Error）。而同一时刻同花顺对它是好的，实测
+#     241 根。排在最后零成本——resolve() 拿到非空结果就停，腾讯正常时它一次请求都不发。
+#
 # 这是按**类别**分，不是按标的——同一类里不再有例外，加一只新股票不用改任何东西。
-DEFAULT_PROVIDER_ORDER = ("tencent", "sina")
+DEFAULT_PROVIDER_ORDER = ("tencent", "sina", "tonghuashun")
 INDEX_PROVIDER_ORDER = ("tonghuashun", "tencent", "sina")
 INDEX_PROVIDER_ORDER_ENV = "KLINE_PROVIDERS_INDEX"
 

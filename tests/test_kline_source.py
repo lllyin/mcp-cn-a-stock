@@ -110,10 +110,13 @@ def test_indices_and_the_rest_use_different_orders():
     指数：创业板指成交量东财/同花顺一致，腾讯/新浪低 3.52%。
     个股：美的 120 日均价东财/腾讯一致，同花顺 -0.059%（前复权基准不同）。
     """
-    assert kline_source.DEFAULT_PROVIDER_ORDER == ("tencent", "sina")
-    assert kline_source.INDEX_PROVIDER_ORDER == ("tonghuashun", "tencent", "sina")
     assert kline_source.configured_order(_request("SZ399006"))[0] == "tonghuashun"
     assert kline_source.configured_order(_request("SH600519"))[0] == "tencent"
+    # **三家都必须在两条顺序里**，只是次序不同。少一家就会出现单点：SH512480 这类
+    # ETF 走非指数那条，而新浪不认 ETF、东财常态被拒的环境里就只剩腾讯一个源，
+    # 它一次瞬时失败会让整个标的全维度归零（2026-09-07 18:36 实际发生过）。
+    for order in (kline_source.DEFAULT_PROVIDER_ORDER, kline_source.INDEX_PROVIDER_ORDER):
+        assert set(order) == {"tencent", "sina", "tonghuashun"}, order
 
 
 @pytest.mark.parametrize("symbol,expected", [
