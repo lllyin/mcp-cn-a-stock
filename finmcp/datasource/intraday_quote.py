@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import abc
+import json
 import logging
 from dataclasses import dataclass
 from typing import Optional
@@ -35,7 +36,7 @@ logger = logging.getLogger("finmcp")
 
 # 启用哪些 provider、按什么顺序。留空或设为 off 则整层关闭，调用方拿到 None。
 PROVIDER_ORDER_ENV = "INTRADAY_QUOTE_PROVIDERS"
-DEFAULT_PROVIDER_ORDER = ("fund_flow_page", "tencent")
+DEFAULT_PROVIDER_ORDER = ("fund_flow_page", "tencent", "tonghuashun")
 _DISABLED = {"", "off", "none", "0", "false"}
 
 
@@ -83,6 +84,62 @@ class QuoteContext:
     """
 
     fund_flow_page: Optional[FundFlowPage] = None
+
+
+def to_lots(raw, *, amount_yuan, last, symbol: str, source: str):
+    """把上游给的成交量归一成**手**。归一不了就返回 None，不要蒙一个。
+
+    ``volume_lots`` 这个契约字段的单位是手，而**上游的单位不统一，同一个端点内部
+    都不统一**：腾讯 qt.gtimg.cn 的 ``[6]`` 对沪深主板、创业板是手，对**科创板
+    （688xxx）是股**；同花顺 realhead 的 ``[13]`` 一律是股。实测（2026-09-07 收盘后，
+    用 成交额/收盘 反算股数判定）：
+
+        标的                腾讯[6]        判定    同花顺[13]        判定
+        贵州茅台 600519       25,250        手     2,524,962        股
+        宁德时代 300750      246,788        手    24,678,820        股
+        中芯国际 688981   31,314,788      **股**  31,314,788        股
+        金山办公 688111    4,856,986      **股**   4,856,986        股
+        澜起科技 688008   38,159,931      **股**  38,159,931        股
+
+    不归一的后果是**整整 100 倍**，而且两个数都"看着像成交量"：修之前报告里
+    SH688981 的当日成交量是 3131.48 万手，真实 31.2 万手，同一份报告的成交额
+    38.74亿 对不上（3131万手 × 124元 = 3887亿）。
+
+    判定用数据而不是用代码前缀名单——名单会漏，而在这件事上漏一个就是 100 倍。
+    判据和历史行情那条一样（``kline_frame._normalize_volume_to_lots``，那条在 1497
+    个东财口径的交易日上验过）：``成交额/收盘`` 是股数，它和手数相差两个数量级，
+    0.1 是对数中点。
+
+    **指数走不了这条推断**：指数的"收盘"是点位不是股价，``成交额/点位`` 算不出任何
+    股数。实测指数上腾讯是手、同花顺是股，所以指数由 provider 自己按端点的固定
+    口径给，不进这个函数。
+    """
+    if raw is None or raw <= 0:
+        return raw
+    if not amount_yuan or not last or last <= 0:
+        # 缺了反算的材料。宁可不给这一维，也不要把 100 倍的数写进报告。
+        logger.warning(
+            "%s %s 成交量无法定单位（成交额=%s 收盘=%s），丢弃该字段",
+            source, symbol, amount_yuan, last,
+        )
+        return None
+    implied_shares = amount_yuan / last
+    if implied_shares <= 0:
+        return None
+    ratio = raw / implied_shares
+    in_shares = ratio > 0.1
+    scaled = ratio if in_shares else ratio * 100
+    if not 0.5 <= scaled <= 2.0:
+        logger.warning(
+            "%s %s 盘中成交量量级异常 ratio=%.4g，按%s处理",
+            source, symbol, ratio, "股" if in_shares else "手",
+        )
+    else:
+        logger.debug(
+            "%s %s 盘中成交量单位=%s ratio=%.4g",
+            source, symbol, "股" if in_shares else "手", ratio,
+        )
+    return raw / 100 if in_shares else raw
 
 
 class QuoteProvider(abc.ABC):
@@ -329,6 +386,16 @@ class TencentQuoteProvider(QuoteProvider):
         if last is None:
             return None
         amount_wan = number("amount_wan")
+        amount_yuan = None if amount_wan is None else amount_wan * 1e4
+        raw_volume = number("volume_lots")
+        # ``[6]`` 的单位在这个端点内部就不统一：主板/创业板给手，科创板给股。
+        # 指数不进推断（点位算不出股数），实测那里是手，原样用。
+        from .kline_frame import _is_index_code
+
+        volume_lots = raw_volume if _is_index_code(code) else to_lots(
+            raw_volume, amount_yuan=amount_yuan, last=last,
+            symbol=symbol, source=self.name,
+        )
         return IntradayQuote(
             symbol=symbol,
             source=self.name,
@@ -337,8 +404,8 @@ class TencentQuoteProvider(QuoteProvider):
             open=number("open"),
             high=number("high"),
             low=number("low"),
-            volume_lots=number("volume_lots"),
-            amount_yuan=None if amount_wan is None else amount_wan * 1e4,
+            volume_lots=volume_lots,
+            amount_yuan=amount_yuan,
             turnover_pct=number("turnover_pct"),
             as_of=parts[TENCENT_FIELDS["as_of"]].strip() or None,
         )
@@ -363,5 +430,117 @@ def tencent_code(symbol: str) -> Optional[str]:
     return "sz" + digits
 
 
+#: 同花顺 realhead 的字段号 → 语义。全部用已知值反查确认过（2026-09-07 收盘后，
+#: 上证指数 最新 3932.70 / 昨收 3930.12 / 开 3942.51 / 高 3948.42 / 低 3916.49）。
+#:
+#: 两个坑写在这里，别再踩：
+#:   - ``13`` 是**股**，不是手，而且指数也是股（上证 47,737,526,000 股 = 4.77亿手，
+#:     与交易所定稿值一致）。腾讯那个端点相反——它的 ``[6]`` 主板给手、科创板给股。
+#:   - ``1771976`` **不是换手率**。实测它和腾讯的换手率完全不符（茅台 0.906 vs
+#:     0.20、50ETF 1.299 vs 8.14），语义未知，所以这个源不提供换手率。
+#:     这正是它排在腾讯之后的原因：排前面会让所有个股的当日 bar 丢掉换手率。
+#: ``time`` 是服务器时刻，``updateTime`` 才是数据时刻，取后者。
+TONGHUASHUN_QUOTE_FIELDS = {
+    "last": "10", "prev_close": "6", "open": "7", "high": "8", "low": "9",
+    "volume_shares": "13", "amount_yuan": "19", "change_pct": "199112",
+    "code": "5", "as_of": "updateTime",
+}
+TONGHUASHUN_QUOTE_URL = "https://d.10jqka.com.cn/v6/realhead/hs_{code}/last.js"
+
+
+class TonghuashunQuoteProvider(QuoteProvider):
+    """同花顺 realhead。当日那一根的第二个来源。
+
+    为什么需要第二个：``upsert_intraday_bar`` 之后，**当天那一根完全依赖这一层**
+    （日线端点给的当天行一律不作准），于是腾讯成了单点——它一失败，当天那一根就
+    拼不出来。这个源和腾讯不同域、不同厂，实测收盘价 12/12 逐位一致。
+
+    它还是那 3.89% 的唯一对照：创业板指的成交量腾讯比它低 3.89%（而它与东财一致），
+    开 ``INTRADAY_QUOTE_CROSS_CHECK_PCT`` 就能在日志里看到这个差，不必再人工三方比对。
+
+    裸 GET，必须带 Referer 和 Accept，缺了返回 0 字节——和历史行情那个端点同一规矩。
+    """
+
+    name = "tonghuashun"
+
+    def __init__(self, timeout: float = 5.0):
+        self.timeout = timeout
+
+    def fetch(self, symbol: str, context: QuoteContext) -> Optional[IntradayQuote]:
+        from .platforms.tonghuashun import _HEADERS, tonghuashun_code
+
+        code = tonghuashun_code(tencent_code(symbol) or "")
+        if code is None:
+            return None
+
+        import requests
+
+        response = requests.get(TONGHUASHUN_QUOTE_URL.format(code=code),
+                                headers=_HEADERS, timeout=self.timeout)
+        body = response.text
+        if response.status_code != 200 or "(" not in body:
+            return None
+        try:
+            payload = json.loads(body[body.index("(") + 1: body.rindex(")")])
+        except (ValueError, json.JSONDecodeError):
+            return None
+        items = payload.get("items") or payload
+        if not isinstance(items, dict):
+            return None
+        # 代码对不上说明拿回的不是这只票。踩过：hs_000001 返回的是平安银行。
+        if str(items.get(TONGHUASHUN_QUOTE_FIELDS["code"], "")).upper() != code.upper():
+            logger.warning("同花顺行情返回的标的不符 请求=%s 返回=%s",
+                           code, items.get(TONGHUASHUN_QUOTE_FIELDS["code"]))
+            return None
+
+        def number(key: str):
+            return parse_price(str(items.get(TONGHUASHUN_QUOTE_FIELDS[key], "")))
+
+        last = number("last")
+        if last is None:
+            return None
+        amount_yuan = number("amount_yuan")
+        raw_shares = number("volume_shares")
+        prefixed = tencent_code(symbol) or ""
+        from .kline_frame import _is_index_code
+
+        if raw_shares is None:
+            volume_lots = None
+        elif _is_index_code(prefixed):
+            # 指数也是股，但点位算不出股数，推断不了——按这个端点的固定口径换算。
+            volume_lots = raw_shares / 100
+        else:
+            volume_lots = to_lots(raw_shares, amount_yuan=amount_yuan, last=last,
+                                  symbol=symbol, source=self.name)
+        return IntradayQuote(
+            symbol=symbol,
+            source=self.name,
+            last=last,
+            prev_close=number("prev_close"),
+            open=number("open"),
+            high=number("high"),
+            low=number("low"),
+            volume_lots=volume_lots,
+            amount_yuan=amount_yuan,
+            # 换手率这个源给不了，见 TONGHUASHUN_QUOTE_FIELDS 的注释。留 None 而不是 0：
+            # upsert_intraday_bar 会保留源里原有的换手率，写 0 会把它抹掉。
+            turnover_pct=None,
+            as_of=_compact_timestamp(items.get(TONGHUASHUN_QUOTE_FIELDS["as_of"])),
+        )
+
+
+def _compact_timestamp(raw) -> Optional[str]:
+    """``2026-09-07 15:00`` → ``20260907150000``。
+
+    契约要求 ``as_of`` 的前 8 位能按 ``%Y%m%d`` 解析（``upsert_intraday_bar`` 靠它
+    判断这根 bar 是哪天的），所以分隔符必须去掉。
+    """
+    text = "".join(ch for ch in str(raw or "") if ch.isdigit())
+    if len(text) < 8:
+        return None
+    return (text + "000000")[:14]
+
+
 register(FundFlowPageQuoteProvider())
 register(TencentQuoteProvider())
+register(TonghuashunQuoteProvider())

@@ -566,3 +566,172 @@ class TestTodaysBarOverridesTheDailyEndpoint:
         with caplog.at_level(logging.INFO, logger="finmcp"):
             upsert_intraday_bar(self._frame(rows), self._quote(), today=self.TODAY)
         assert not [r for r in caplog.records if r.levelno >= logging.INFO]
+
+
+class TestVolumeUnitNormalisation:
+    """``volume_lots`` 的单位是手，而上游的单位**在同一个端点内部都不统一**。
+
+    2026-09-07 定位：腾讯 qt.gtimg.cn 的 ``[6]`` 对主板/创业板是手，对科创板
+    （688xxx）是股，而 provider 直接把它当手用——报告里 SH688981 的当日成交量是
+    3131.48 万手，真实 31.2 万手，整整 100 倍，而且和同一份报告的成交额 38.74亿
+    自相矛盾（3131万手 × 124元 = 3887亿）。
+
+    判定用 ``成交额/收盘`` 反算股数，不用代码前缀名单——名单会漏，漏一个就是 100 倍。
+    """
+
+    def test_a_star_market_stock_reported_in_shares_is_converted(self):
+        """SH688981 实测：raw 31,314,788 是股，成交额反算 31,212,053 股。"""
+        got = iq.to_lots(31_314_788, amount_yuan=3.874040e9, last=124.12,
+                         symbol="SH688981", source="tencent")
+        assert got == pytest.approx(313_147.88)
+
+    def test_a_main_board_stock_reported_in_lots_is_left_alone(self):
+        """SH600519 实测：raw 25,250 已经是手。"""
+        got = iq.to_lots(25_250, amount_yuan=3.336030e9, last=1316.01,
+                         symbol="SH600519", source="tencent")
+        assert got == 25_250
+
+    def test_the_tonghuashun_caliber_is_always_shares(self):
+        """同花顺 realhead 的 [13] 一律是股，同一条推断也能判对。"""
+        got = iq.to_lots(2_524_962, amount_yuan=3.336030e9, last=1316.01,
+                         symbol="SH600519", source="tonghuashun")
+        assert got == pytest.approx(25_249.62)
+
+    def test_it_gives_up_rather_than_guess(self, caplog):
+        """没有成交额就定不了单位。宁可这一维缺，也不要把 100 倍的数写进报告。"""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="finmcp"):
+            assert iq.to_lots(12345, amount_yuan=None, last=10.0,
+                              symbol="SZ000001", source="tencent") is None
+        assert any("无法定单位" in r.getMessage() for r in caplog.records)
+
+    def test_zero_volume_is_not_a_unit_problem(self):
+        """停牌日成交量是 0，别把它当成定不了单位。"""
+        assert iq.to_lots(0, amount_yuan=0, last=10.0,
+                          symbol="SZ000001", source="tencent") == 0
+
+    def test_an_odd_magnitude_still_returns_a_value_but_shouts(self, caplog):
+        """判据落在两簇之间时要留告警——这一维承载全部兜底成交量，不能静默。"""
+        import logging
+
+        # implied_shares = 1e8/10 = 1e7；raw 取 5e5 → ratio 0.05，正好落在
+        # "手"（0.01）和"股"（1.0）两簇之间，既判不准也不能静默。
+        with caplog.at_level(logging.WARNING, logger="finmcp"):
+            iq.to_lots(500_000, amount_yuan=1.0e8, last=10.0,
+                       symbol="SZ000001", source="tencent")
+        assert any("量级异常" in r.getMessage() for r in caplog.records)
+
+    def test_the_tencent_provider_normalises_a_star_market_stock(self, monkeypatch):
+        """整条链：科创板标的过一遍 provider，出来必须是手。"""
+        import requests
+
+        parts = ["v_sh688981", "中芯国际", "688981", "124.12", "121.14", "122.50",
+                 "31314788"] + [""] * 23 + ["20260907153000"] + [""] * 6 + \
+                ["387404.0", "1.57"] + [""] * 2 + ["125.30", "122.22"] + [""] * 20
+
+        class FakeResponse:
+            text = "~".join(parts)
+            encoding = "gbk"
+
+        monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse())
+        quote = iq.TencentQuoteProvider().fetch("SH688981", iq.QuoteContext())
+        assert quote.volume_lots == pytest.approx(313_147.88), \
+            "科创板的 [6] 是股，必须换成手，否则报告里是 100 倍"
+
+    def test_an_index_skips_the_inference(self, monkeypatch):
+        """指数的"收盘"是点位，成交额/点位 算不出股数，只能按端点口径原样用。"""
+        import requests
+
+        parts = ["v_sh000001", "上证指数", "000001", "3932.70", "3930.12", "3942.51",
+                 "477375261"] + [""] * 23 + ["20260907161402"] + [""] * 6 + \
+                ["89790401", "0.98"] + [""] * 2 + ["3948.42", "3916.49"] + [""] * 20
+
+        class FakeResponse:
+            text = "~".join(parts)
+            encoding = "gbk"
+
+        monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse())
+        quote = iq.TencentQuoteProvider().fetch("SH000001", iq.QuoteContext())
+        assert quote.volume_lots == 477_375_261, "指数原样用，别去除 100"
+
+
+class TestTonghuashunQuoteProvider:
+    """当日那一根的第二个来源。
+
+    ``upsert_intraday_bar`` 之后当天那一根完全依赖这一层，腾讯就成了单点——它一
+    失败当天那根就拼不出来。这个源不同域不同厂，实测收盘价与腾讯 12/12 逐位一致。
+    """
+
+    #: 字段号取自实测（上证指数 2026-09-07 收盘）：10 最新 6 昨收 7 开 8 高 9 低
+    #: 13 成交量(股) 19 成交额 5 代码 updateTime 数据时刻。
+    PAYLOAD = (
+        'quotebridge_v6_realhead_hs_1A0001_last({"items":{'
+        '"10":"3932.70","6":"3930.12","7":"3942.51","8":"3948.42","9":"3916.49",'
+        '"13":"47737526000.00","19":"897904010000.00","199112":"0.07",'
+        '"1771976":"0.884","5":"1A0001","name":"上证指数",'
+        '"time":"2026-09-07 17:33:38 北京时间","updateTime":"2026-09-07 15:00"}})'
+    )
+
+    def _fetch(self, monkeypatch, symbol="SH000001", payload=None, status=200):
+        import requests
+
+        body = self.PAYLOAD if payload is None else payload
+
+        class FakeResponse:
+            status_code = status
+            text = body
+
+        monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse())
+        return iq.TonghuashunQuoteProvider().fetch(symbol, iq.QuoteContext())
+
+    def test_it_parses_the_numeric_fields(self, monkeypatch):
+        quote = self._fetch(monkeypatch)
+        assert quote.source == "tonghuashun"
+        assert quote.last == pytest.approx(3932.70)
+        assert quote.prev_close == pytest.approx(3930.12)
+        assert quote.open == pytest.approx(3942.51)
+        assert quote.high == pytest.approx(3948.42)
+        assert quote.low == pytest.approx(3916.49)
+        assert quote.amount_yuan == pytest.approx(8.9790401e11)
+        assert quote.has_ohlc is True
+
+    def test_the_volume_is_shares_even_for_an_index(self, monkeypatch):
+        """[13] 一律是股，指数也是：47,737,526,000 股 = 4.77亿手，与交易所定稿一致。"""
+        quote = self._fetch(monkeypatch)
+        assert quote.volume_lots == pytest.approx(477_375_260)
+
+    def test_it_does_not_pretend_to_know_turnover(self, monkeypatch):
+        """1771976 不是换手率（实测茅台 0.906 vs 腾讯 0.20），所以这个源不给。
+
+        留 None 而不是 0：upsert_intraday_bar 会保留源里原有的换手率，写 0 会抹掉它。
+        """
+        assert self._fetch(monkeypatch).turnover_pct is None
+
+    def test_the_data_timestamp_is_compacted(self, monkeypatch):
+        """契约要求 as_of 的前 8 位能按 %Y%m%d 解析，分隔符必须去掉。
+
+        而且取的是 updateTime（数据时刻）不是 time（服务器时刻）。
+        """
+        assert self._fetch(monkeypatch).as_of == "20260907150000"
+
+    def test_a_mismatched_code_is_refused(self, monkeypatch):
+        """踩过：hs_000001 返回的是平安银行。拿回来不是这只票就得判失败。"""
+        payload = self.PAYLOAD.replace('"5":"1A0001"', '"5":"000001"')
+        assert self._fetch(monkeypatch, payload=payload) is None
+
+    def test_a_non_200_is_a_failure(self, monkeypatch):
+        assert self._fetch(monkeypatch, status=502) is None
+
+    def test_a_body_that_is_not_jsonp_is_a_failure(self, monkeypatch):
+        assert self._fetch(monkeypatch, payload="<html>maintenance</html>") is None
+
+    def test_an_unmappable_symbol_is_skipped_without_a_request(self):
+        """沪市 000 开头不在内部码表里时不发请求——问了会拿回同名深市个股。"""
+        assert iq.TonghuashunQuoteProvider().fetch("SH000998", iq.QuoteContext()) is None
+
+    def test_it_is_registered_after_tencent(self):
+        """排在腾讯之后：排前面会让所有个股的当日 bar 丢掉换手率。"""
+        order = iq.DEFAULT_PROVIDER_ORDER
+        assert "tonghuashun" in iq.registered()
+        assert order.index("tencent") < order.index("tonghuashun")

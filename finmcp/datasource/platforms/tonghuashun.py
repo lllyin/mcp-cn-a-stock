@@ -83,6 +83,23 @@ _SSE_INDEX_CODES = {
 _YEAR_URL = "{base}/hs_{code}/{segment}/{year}.js"
 
 
+def tonghuashun_code(prefixed: str) -> Optional[str]:
+    """带市场前缀的码（``sh600519``/``sz399006``/``bj920021``）→ 同花顺认的代码。
+
+    历史行情和盘中行情两个端点用同一套代码规则，所以这一份只该有一处——照
+    ``intraday_quote.tencent_code`` 的先例。认不出返回 None，调用方跳过这个源。
+    """
+    normalized = (prefixed or "").lower()
+    market, digits = normalized[:2], normalized[2:]
+    if market == "sh" and digits in _SSE_INDEX_CODES:
+        return _SSE_INDEX_CODES[digits]
+    if market == "sh" and digits.startswith("000"):
+        # 沪市 000 开头一定是指数，但不在表里——宁可不给，也不要去问
+        # hs_000xxx 拿回一只同名深市个股的数据。
+        return None
+    return digits or None
+
+
 class TonghuashunPlatform(pf.Platform):
     name, label = "tonghuashun", "同花顺"
     capabilities = frozenset({"kline"})
@@ -91,16 +108,7 @@ class TonghuashunPlatform(pf.Platform):
     _ADJUST = {"qfq": "01", "hfq": "02", "none": "00"}
 
     def _code(self, request) -> Optional[str]:
-        """本项目的 symbol → 同花顺认的代码。认不出就返回 None。"""
-        prefixed = request.prefixed          # sh600519 / sz399006 / bj920021
-        market, digits = prefixed[:2], prefixed[2:]
-        if market == "sh" and digits in _SSE_INDEX_CODES:
-            return _SSE_INDEX_CODES[digits]
-        if market == "sh" and digits.startswith("000"):
-            # 沪市 000 开头一定是指数，但不在表里——宁可不给，也不要去问
-            # hs_000xxx 拿回一只同名深市个股的数据。
-            return None
-        return digits
+        return tonghuashun_code(request.prefixed)
 
     def supports(self, capability: str, request) -> bool:
         return self._code(request) is not None
