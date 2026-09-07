@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 在东财能通的机器（部署服务器）上采一份同刻数据，用来确定备用源的口径。
 #
-# 为什么必须在服务器上采：本机的东财 push2 `f=` 端点被封，ef.stock.get_base_info
+# 为什么要在能通东财的机器上采：push2 的 `f=` 端点会拒绝部分出口 IP，ef.stock.get_base_info
 # 全程 JSONDecodeError，所以总市值/流通市值/市净率/市盈率(动) 这一组根本取不到，
 # 没法和腾讯并排。而口径对不上是换源最大的风险——数字会在两次查询之间跳变。
 #
@@ -21,7 +21,7 @@ STAMP=$(date +%Y%m%d_%H%M%S)
 OUT="/tmp/cn-stock-caliber-$STAMP"
 mkdir -p "$OUT"
 
-export MCPORTER_CONFIG="${MCPORTER_CONFIG:-/root/.openclaw/workspace/config/mcporter.json}"
+export MCPORTER_CONFIG="${MCPORTER_CONFIG:-$HOME/.openclaw/workspace/config/mcporter.json}"
 [ -f "$MCPORTER_CONFIG" ] || export MCPORTER_CONFIG="$HOME/.openclaw/workspace/config/mcporter.json"
 
 PY=".venv/bin/python"

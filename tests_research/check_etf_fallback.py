@@ -3,7 +3,7 @@
 测试自动 fallback 到 AkShare 的 fund_etf_hist_em 接口的方案可行性。
 
 运行方式:
-    cd /Users/desongan/3l-workspace/mcp-cn-a-stock
+    cd /path/to/mcp-cn-a-stock
     .venv/bin/python3 tests_research/check_etf_fallback.py
 """
 

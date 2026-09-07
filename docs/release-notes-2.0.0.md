@@ -1,7 +1,7 @@
 # 2.0.0 变更说明与上线清单
 
 给两类人看：**接报告的下游**看第一、二节，改完正则和配置就够了；**负责部署的人**看第三、四节。
-数字全部来自 2026-09-06 部署机（Ubuntu 2 核 4G）和本机的验证记录，口径写在每张表下面。
+数字全部来自 2026-09-06 云主机（Ubuntu 2 核 4G）和开发机的验证记录，口径写在每张表下面。
 
 ## 一、下游必须改的
 
@@ -77,13 +77,13 @@ JSON 外壳没有变。
 
 ## 三、服务水平：取决于网关开不开
 
-2.0.0 的验证有一条前提：部署机上网关是关的（`HTTP channel mode=impersonate reason=auto:proxy_disabled`），
+2.0.0 的验证有一条前提：云主机上网关是关的（`HTTP channel mode=impersonate reason=auto:proxy_disabled`），
 东财直连的 impersonate 通道失败率 20% 到 30%，资金流基本全走浏览器兜底。**下面的数字是这个形态的数字。**
 开网关后的表现一次都没量过，不能套用。
 
 ### 数据正确性（两种形态都成立）
 
-| 指标 | 部署机 09-06 14:35 | 本机 09-06 16:10 |
+| 指标 | 云主机 09-06 14:35 | 开发机 09-06 16:10 |
 | --- | ---: | ---: |
 | 工具可用率 | 100% (22/22) | 100% (22/22) |
 | 维度完整率 | 99% (527/530) | 100% (528/530) |
@@ -101,15 +101,15 @@ JSON 外壳没有变。
   加大页面并发是反向的：更多 Chromium 抢同样两个核。
 - 调用超时 120s。并发 10 的 P95 已经贴到 102s，上游再抖一点就是超时。**不开网关，请把下游并发限制在 5 以内。**
 - 这组并发数字量的是一次突发（顶到在途上限就停发）。稳态只会更差，正式的容量上限用第四节的闭环压测重量。
-- 这两组数字还没有包含 09-06 下午落地的 fund_flow / realtime 数据源层缓存。本机验证显示同一轮里
-  浏览器加载从 44 次降到 22 次、基本数据上游请求从 57 次降到 30 次；部署机上的效果待重跑。
+- 这两组数字还没有包含 09-06 下午落地的 fund_flow / realtime 数据源层缓存。开发机验证显示同一轮里
+  浏览器加载从 44 次降到 22 次、基本数据上游请求从 57 次降到 30 次；云主机上的效果待重跑。
 
 ### 内存
 
 | 状态 | 数值 | 口径 |
 | --- | ---: | --- |
 | 空闲（浏览器已回收） | 243 MiB | 只剩 Python 进程，其中约 134 MiB 是 pandas / akshare / mcp 的导入地板，90 分钟纹丝不动，无泄漏 |
-| 压测峰值 | 约 840 MiB | 部署机监控折算的机器级增量；脚本按 RSS 相加报 1482 MiB 是重复计了 Chromium 的共享页 |
+| 压测峰值 | 约 840 MiB | 云主机监控折算的机器级增量；脚本按 RSS 相加报 1482 MiB 是重复计了 Chromium 的共享页 |
 | 预算 | 500 MiB | AGENTS.md 第四条 |
 
 超预算的部分全部是浏览器活跃窗口。浏览器空闲回收现在按市场时段分档：盘中 90 分钟，盘外 5 分钟。
@@ -119,11 +119,11 @@ JSON 外壳没有变。
 
 - **K 线兜底每标的 8 个请求降到 2 个。** 腾讯日 K 不再经 AkShare 的按年循环，一页 640 根直接取。
   归一和"认不认这个代码"都照抄 AkShare，`prove_equivalence.py` 62 份可判定文档 0 差异。
-  部署机上 K 线占上游耗时 79%、每请求约 1.9s，预期 K 线 task 从约 12s 降到 4s，待部署后复测。
+  云主机上 K 线占上游耗时 79%、每请求约 1.9s，预期 K 线 task 从约 12s 降到 4s，待部署后复测。
 - **科创50 的资金流有了第二条路。** `FUND_FLOW_PROVIDERS=eastmoney,eastmoney_delay`：主源拒绝时
   `push2delay` 主机给当日一行。等价性比对里唯一的差异就是 `SH000688` 从"暂无资金流向数据"
   变成有当日五行，其余文档逐字相同。
-- **板块分级表有了第二个源。** `SECTOR_TAXONOMY_PROVIDERS=shenwan,swsresearch`。部署机 21:04 第一次调
+- **板块分级表有了第二个源。** `SECTOR_TAXONOMY_PROVIDERS=shenwan,swsresearch`。云主机 21:04 第一次调
   `sector_fund_flow` 就是 `ranked=未分级`：乐咕乐股对机房 IP 回 302 跳人机验证页，申万两级分类全挂，
   496 个板块只能混排、父子同榜。申万宏源研究所官网的 JSON 接口是同一套标准，一级 31/31、二级 124 个
   同名（比乐咕少 7 个小板块），乐咕缺的级由它补，乐咕给全时不发请求。**服务器 `.env` 里若写死了
@@ -132,20 +132,20 @@ JSON 外壳没有变。
 ### 09-07 首个交易日的修正（收盘后部署）
 
 - **浏览器身份回到 main 分支的原样。** 2.0.0 给资金流向页面加的伪装（`--disable-blink-features=AutomationControlled`、
-  CDP 覆盖 UA 与 client hints、注入脚本、zh-CN 上下文）在部署机上适得其反：盘外两次交错 A/B，每种身份 36 次加载，
+  CDP 覆盖 UA 与 client hints、注入脚本、zh-CN 上下文）在云主机上适得其反：盘外两次交错 A/B，每种身份 36 次加载，
   main 原样 36/36 拿到今日块，只加那个参数 26/36，完整伪装 23/36。上午 brief 的实时资金流命中率因此从
   main 时期的 92 到 95 掉到 54。伪装改为 `BROWSER_DISGUISE=1` 才启用，默认关。
 - **被拒不再 reload，直接换 tab；接口断连后给页面 6 秒自己重发；缺的那块是接口拒的就不再加载。**
-  部署机数据：首加载被拒后靠新 tab 救回 7 次、reload 3 次；12 次在首次断连后 1.9 到 3.7 秒内由页面自己重发拿到。
+  云主机数据：首加载被拒后靠新 tab 救回 7 次、reload 3 次；12 次在首次断连后 1.9 到 3.7 秒内由页面自己重发拿到。
 - **实时那条路接上熔断器**（`fund_flow_browser`，与历史兜底共用阈值、窗口、冷却），只有"要今日却被拒"计失败。
 - **brief 与 medium 不再为历史表去打页面**（`FetchRequirements.fund_flow_page`），只有 full 渲染历史表。
 - 部署方要同时把 .env 里的 `FUND_FLOW_PAGE_MAX_LOADS` 回到 `2`、`FUND_FLOW_PAGE_COOLDOWN_SECONDS` 回到 `60`：
-  09-07 上午部署机是 5 和 20，一个标的一次调用最多 10 次加载压在十几秒内，是滑块成批出现的放大器。
+  09-07 上午云主机是 5 和 20，一个标的一次调用最多 10 次加载压在十几秒内，是滑块成批出现的放大器。
 - **科创50 这类无页面标的盘中有实时资金流了。** 新能力 `realtime_fund_flow`，`eastmoney_delay` 取 push2delay 分钟线
   最后一行（当日累计五档净流入），净占比按当日成交额折算；`REALTIME_FUND_FLOW_PROVIDERS` 接线，默认开。
   报告形状与页面路径一致：一行标的名称加五行 `当日X净流入 … X净占比`。
 - **同花顺日 K 两处修正。** 年份文件 5xx 或非 JSONP 现在抛出让链路落到腾讯，不再当"没上市"静默跳过
-  （本机曾因此少了 240 日五行）；404 才是没上市。盘中当天的占位行（开高低为空）跳过，不再让整个源报错。
+  （开发机曾因此少了 240 日五行）；404 才是没上市。盘中当天的占位行（开高低为空）跳过，不再让整个源报错。
 
 ### 已知限制
 
@@ -157,11 +157,11 @@ JSON 外壳没有变。
 
 ## 四、上线清单（服务器上执行）
 
-前提：本地 `feat/v2.0.0` 已推送。部署机之前跑的是 `f96d261`，缺 PSS 内存统计、空闲回收分档、
+前提：本地 `feat/v2.0.0` 已推送。云主机之前跑的是 `f96d261`，缺 PSS 内存统计、空闲回收分档、
 fund_flow / realtime 缓存三个提交。
 
 ```bash
-cd /root/.openclaw/workspace-finance/repos/mcp-cn-a-stock
+cd /path/to/mcp-cn-a-stock          # 换成你的仓库路径
 git fetch origin
 ./switch.sh feat/v2.0.0          # 拉取、卸旧、重装、自检包能否读到参考数据
 grep -c '^CN_STOCK_' .env        # 应为 0；不为 0 按第二节改名
@@ -173,7 +173,7 @@ head -5 logs/cn-stock-mcp.log    # 看 HTTP channel mode= 这一行，确认是�
 三项验证，缺一项不发：
 
 ```bash
-export MCPORTER_CONFIG=/root/.openclaw/workspace/config/mcporter.json
+export MCPORTER_CONFIG="$HOME/.openclaw/workspace/config/mcporter.json"
 
 # 1. 数据：可用率、维度矩阵、基线回归；Linux 上内存一节自动按 PSS 统计
 python3 scripts/verify_release.py
@@ -189,7 +189,7 @@ python3 scripts/verify_release.py
 # 3. 复核缓存去重生效：同一轮里每个标的的页面加载应只有 1 次
 grep -o '资金流向页面兜底成功 \S*' logs/cn-stock-mcp.log | sort | uniq -c | sort -rn | head
 
-# 4. 板块分级在部署机上到底有没有：调一次 sector_fund_flow 之后 ranked= 应是个数字（二级约 120），不是 未分级
+# 4. 板块分级在云主机上到底有没有：调一次 sector_fund_flow 之后 ranked= 应是个数字（二级约 120），不是 未分级
 grep -o 'sector_fund_flow .*ranked=[^ ]*' logs/cn-stock-mcp.log | tail -3
 ```
 

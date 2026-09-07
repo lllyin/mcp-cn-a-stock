@@ -713,7 +713,7 @@ class TestIndexFlowVerdict:
                                        "## 资金流向\n- 暂无实时资金流向\n" if tool != "full" else self.FULL_688)
             for tool in ("brief", "medium", "full")
         }
-        # 科创50 在本机的兜底源上确实没取到，就如实报没取到——它不是"本来
+        # 科创50 在当时的兜底源上确实没取到，就如实报没取到——它不是"本来
         # 就没有"。三个工具口径一致这件事不变。
         assert verdicts == {"❌ 实时资金流没取到（主源被拒且页面兜底也没成）"}
 
@@ -838,7 +838,7 @@ class TestDiagnostics:
 
 
 # --- /proc 解析（只在 Linux 上跑，所以更要测）------------------------------
-# 开发机是 macOS，这条路本地一次都走不到，而部署机全靠它。
+# /proc 是 Linux 独有的：macOS 上这条路一次都走不到，而 Linux 部署全靠它。
 
 
 class TestProcStatParsing:
@@ -993,7 +993,7 @@ class TestRunCallsPairing:
 class TestMemoryAccounting:
     """RSS 逐进程相加会把 Chromium 的共享代码段算七八遍。
 
-    2026-09-06 部署机上实测：RSS 合计 1482 MiB，而机器级曲线只涨了约 840 MiB，
+    2026-09-06 实测：RSS 合计 1482 MiB，而机器级曲线只涨了约 840 MiB，
     虚高 1.76 倍。拿虚高的数去比 500 MiB 预算，得到的结论是错的。
     """
 

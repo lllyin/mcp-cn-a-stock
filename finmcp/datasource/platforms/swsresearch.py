@@ -5,7 +5,8 @@
 ``www.swsresearch.com/institute-sw/api/index_publish/current/``。
 
 它存在的理由：乐咕乐股前面是阿里云 WAF，对机房 IP 回 302 跳到 ``/human-challenge``
-人机验证页（部署机 2026-09-06 实测，本机同一时刻是 200）。AkShare 跟着跳转拿到验证页、
+人机验证页（2026-09-06 实测：**同一时刻**机房 IP 拿到验证页、家用宽带拿到 200，
+所以这一维的可达性取决于出口 IP 的类型，不是时间）。AkShare 跟着跳转拿到验证页、
 找不到分类表，报 ``'NoneType' object has no attribute 'find_all'``，两级全挂，板块资金流
 只能整棵树混排、父子同榜。同一段代码一台机器有分级一台没有，所以要第二个源。
 

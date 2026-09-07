@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""单核参考基准：把压测机的吞吐折算到部署机。
+"""单核参考基准：把压测机的吞吐折算到目标机。
 
-压测跑在开发机上，部署机是 2 核 4G 的 Ubuntu，核数和单核速度都不同，所以
-压测出来的"次/分钟"不能直接搬。可搬的是压测报告里的 cpu_seconds_per_call：
+压测一般跑在开发机上，而目标机往往核数更少、单核更慢（常见的一档是 2 核 4G），
+所以压测出来的"次/分钟"不能直接搬。可搬的是压测报告里的 cpu_seconds_per_call：
 
     该机型吞吐上限(次/分钟) = 核数 x 60 / (cpu_seconds_per_call x 单核降级系数)
 
-单核降级系数 = 部署机本脚本耗时 / 压测机本脚本耗时。在两台机器上分别跑
+单核降级系数 = 目标机本脚本耗时 / 压测机本脚本耗时。在两台机器上分别跑
 
     python scripts/cpu_ref.py
 
@@ -86,7 +86,7 @@ def main() -> int:
         print(f"{label:<12}: {value * 1000:8.2f} ms")
     print(f"{'total':<12}: {total * 1000:8.2f} ms")
     print()
-    print("降级系数 = 部署机 total / 压测机 total")
+    print("降级系数 = 目标机 total / 压测机 total")
     return 0
 
 

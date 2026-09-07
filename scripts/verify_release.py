@@ -48,9 +48,11 @@ MEMORY_BUDGET_MIB = 500.0
 DEFAULT_BASELINE_DIR = PROJECT_ROOT / "verification" / "baseline"
 DEFAULT_REPORT_DIR = PROJECT_ROOT / "verification" / "reports"
 DEFAULT_LOG_PATH = PROJECT_ROOT / "logs" / "cn-stock-mcp.log"
+#: 找 mcporter 配置的顺序：MCPORTER_CONFIG 环境变量 > --config > 下面这个惯例位置。
+#: 不要在这里写死某台机器的绝对路径——以 root 跑时 ``Path.home()`` 就是 ``/root``，
+#: 再列一条 ``/root/...`` 是冗余的。别的部署形态请用环境变量或 --config。
 DEFAULT_CONFIG_CANDIDATES = (
     Path.home() / ".openclaw" / "workspace" / "config" / "mcporter.json",
-    Path("/root/.openclaw/workspace/config/mcporter.json"),
 )
 
 ALL_TOOLS = (
@@ -2243,8 +2245,8 @@ def _parse_proc_stat(raw: str):
 def _process_table() -> tuple[dict, dict]:
     """(pid -> (ppid, rss_kib, comm, cpu_seconds), ppid -> [pid])。
 
-    Linux 上直读 /proc，不起子进程：``ps`` 每次要 fork+exec，实测本机 32.5ms CPU，
-    1Hz 下就是单核的 3.25%——在 2 核部署机上，测量工具自己吃掉这么多是不合适的,
+    Linux 上直读 /proc，不起子进程：``ps`` 每次要 fork+exec，实测 32.5ms CPU，
+    1Hz 下就是单核的 3.25%——在 2 核这一档的机器上，测量工具自己吃掉这么多是不合适的,
     而且它测的正是"这台机器忙不忙"。读 /proc 是纯文件读，成本低两个数量级。
     macOS 没有 /proc，退回 ``ps``（那里只有开发机在跑，成本无所谓）。
 
@@ -2303,7 +2305,7 @@ def _pss_kib(pid: int) -> float | None:
 
     为什么非要它：RSS 把共享页在每个进程里各算一次，而 Chromium 是一个主进程加
     七八个共享同一份代码段和字体缓存的渲染进程——逐进程相加会把同一块内存算七八遍。
-    2026-09-06 部署机上实测 RSS 合计 1482 MiB，而机器级曲线只涨了约 840 MiB，
+    2026-09-06 实测 RSS 合计 1482 MiB，而机器级曲线只涨了约 840 MiB，
     虚高 1.76 倍。PSS 把共享页按共享它的进程数均摊，加起来才等于"这棵树真正占了多少"。
 
     ``smaps_rollup`` 是内核直接给的汇总（不是 ``smaps`` 那样一段段自己加），代价是
@@ -2544,7 +2546,7 @@ def _render_performance(watch: "MemoryWatch", calls: list[CallResult]) -> list[s
                      "所以这个数是**偏高的上界**（Chromium 上实测约 1.8 倍），"
                      f"不能直接拿去和 {MEMORY_BUDGET_MIB:.0f} MiB 的预算比。"
                      "本次没拿到 PSS——它要读 `/proc/<pid>/smaps_rollup`，"
-                     "只有 Linux 有，且要有权限。要跟预算硬比，得在部署机上跑。")
+                     "只有 Linux 有，且要有权限。要跟预算硬比，得在目标部署环境上跑。")
     lines.append("")
     lines.append("> 浏览器那一行单列，是因为峰值基本由它决定：页面用完即关，所以峰值只在"
                  "页面加载的那两三秒里存在，采样间隔必须比一次加载短才抓得到。")

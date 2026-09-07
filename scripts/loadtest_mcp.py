@@ -37,10 +37,10 @@ mcporter 的行为一致；服务端走真实的 efinance / AkShare / Playwright
 
 各档用同一个 --seed 才可比：标的序列和发起节奏都由它决定。
 
-报告里的"次/分钟"只对压测机成立。要折算到部署机（2 核 4G Ubuntu），用
+报告里的"次/分钟"只对跑压测的这台机器成立。要折算到目标机，用
 cpu_seconds_per_call 配合 scripts/cpu_ref.py 量出的单核降级系数：
 
-    部署机上限(次/分钟) = 核数 x 60 x 可用率 / (cpu_seconds_per_call x 降级系数)
+    目标机上限(次/分钟) = 核数 x 60 x 可用率 / (cpu_seconds_per_call x 降级系数)
 
 cores_busy_avg 是同一件事的直读值：它在 8 核机上是小数，在 2 核机上乘以 4
 就是实际利用率。
@@ -74,7 +74,7 @@ QUEUE_TOLERANCE_S = 1.0
 # 明确的限流状态码，出现即判定被限。
 HARD_REFUSAL_PATTERNS = ("status_429", "status_403")
 # 这条链路本来就会零星出现的形态：空响应体导致 json 解析失败、连接被关闭。
-# 它们不能单独作为限流依据——本机在空载时就有基线，必须和基线比。
+# 它们不能单独作为限流依据——空载时本身就有基线，必须和基线比。
 SOFT_REFUSAL_PATTERNS = (
     "Expecting value: line 1 column 1",
     "RemoteDisconnected",
@@ -165,7 +165,7 @@ def _pss_kib(pid: int) -> float | None:
     """读 ``/proc/<pid>/smaps_rollup`` 的 Pss（KiB）；读不到返回 None。
 
     和 verify_release 同口径：RSS 把 Chromium 各渲染进程共享的代码段算七八遍，
-    部署机实测比机器级增量虚高 1.76~1.82 倍；PSS 把共享页按共享它的进程数均摊，
+    实测 RSS 合计比机器级增量虚高 1.76~1.82 倍；PSS 把共享页按共享它的进程数均摊，
     加起来才是这棵树真正占了多少，可以直接和预算比。只有 Linux 有。
     """
     try:
@@ -614,7 +614,7 @@ def should_abort(
     基线，才是加压把上游推过阈值，而不是环境本来就在抖。
 
     ``memory_budget`` 为 0 时不因内存中止：浏览器兜底是稳态的部署形态下，并发 1 的
-    峰值 PSS 就已经超预算（部署机 2026-09-06 实测 949 MiB），一中止容量曲线就量不
+    峰值 PSS 就已经超预算（2026-09-06 在 2 核 4G 云主机上实测 949 MiB），一中止容量曲线就量不
     出来了。预算这道闸门由 verify_release 判，这里照样把超预算写进报告。
     """
     server = report["server"]
@@ -804,7 +804,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 level, results, window, peak, symbols_per_call, cpu_used
             )
             report["saturated"] = saturated
-            # 平均占核数是折算到部署机的关键：8 核机上 15 次/分只有 12% 利用率，
+            # 平均占核数是折算到目标机的关键：8 核机上 15 次/分只有 12% 利用率，
             # 同样的负载在 2 核机上已经吃掉半台机器。
             # 开环按档位时长算，和历史结果同口径；闭环在途的跑完才收尾，按实际时长算。
             step_seconds = (finished - started) if closed_loop else args.step_seconds

@@ -3,10 +3,10 @@
 源在 ``platforms/eastmoney.py``：``eastmoney`` 是 push2his 的 ``fflow/daykline``（经
 AkShare 封装，给全部历史），``eastmoney_delay`` 是同一个接口在 push2delay 主机上的
 副本——**只回最近一天**，但它不在伪装通道的接管名单里，push2his 拒绝出口 IP 的同一
-时刻它仍应答（2026-09-06 本机实测，三个标的当日行逐字节相同）。
+时刻它仍应答（2026-09-06 实测，三个标的当日行逐字节相同）。
 
 为什么要第二条 HTTP 路：浏览器页面兜底覆盖不到没有资金流向页面的标的（科创 50 这类
-指数），主源一次 ``RemoteDisconnected`` 就整维缺失。部署机 2026-09-06 14:35 那轮的
+指数），主源一次 ``RemoteDisconnected`` 就整维缺失。2026-09-06 14:35 那轮的
 3 项缺失全在 ``SH000688`` 身上。
 
 契约是 ``FundFlowHistory``：一张 AkShare 列名的日表，外加 ``complete``——这份是不是

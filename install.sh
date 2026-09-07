@@ -96,7 +96,7 @@ echo
 echo "=== 自检 ==="
 # 装完必须验一次"跑起来的那份代码能不能读到自己的参考数据"。装成包之后服务跑的
 # 是 site-packages 里的副本，本地 `python main.py` 永远照不出差别——2026-09-06
-# 部署机上 confs/ 没跟着装过去，指数名单空掉，上证指数报成了平安银行，一路跑到
+# 曾经 confs/ 没跟着装过去，指数名单空掉，上证指数报成了平安银行，一路跑到
 # 验证报告才被人工比对发现。这一步就是为了让它当场失败。
 PKG="$(ls -d finmcp qtf_mcp 2>/dev/null | head -n 1)"
 if [ -n "$PKG" ] && [ -f "scripts/postinstall_check.py" ]; then

@@ -31,8 +31,8 @@
 ## 为什么有第二个源
 
 ``sw_index_*_info`` 抓的是乐咕乐股的页面，它前面的阿里云 WAF 对机房 IP 回 302 跳到
-人机验证页：部署机 2026-09-06 两级全挂（``'NoneType' object has no attribute 'find_all'``），
-本机同一时刻 200。同一段代码一台机器有分级一台没有，榜就对不上东财官网。第二个源
+人机验证页：2026-09-06 在机房 IP 上两级全挂（``'NoneType' object has no attribute 'find_all'``），
+同一段代码，出口 IP 不同就一边有分级一边没有，榜也就对不上东财官网。第二个源
 ``swsresearch`` 直接调申万宏源研究所官网的 JSON 接口，同一套标准：一级 31/31 同名，
 二级 124 个全部同名、比乐咕少 7 个小板块（细节见 platforms/swsresearch.py）。
 

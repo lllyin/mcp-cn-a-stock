@@ -71,7 +71,7 @@ def _is_fetch_failure(result) -> bool:
 #
 # 带上降级判据：这个源打的是 push2his.eastmoney.com，正是 IMPERSONATED_HOSTS 之一。
 # 伪装通道一进冷却，它的请求就退回原生 requests，而那台主机被列进名单的理由就是
-# 它拒绝原生 requests——冷却期内每次尝试都是已知必败。2026-09-05 部署机实测这段
+# 它拒绝原生 requests——冷却期内每次尝试都是已知必败。2026-09-05 实测这段
 # 空转的代价：8 次 K 线调用各 12.9~14.7s，占该窗口 K 线总耗时的 87%。
 _KLINE_BREAKER = SourceBreaker(
     "eastmoney_kline",
@@ -724,7 +724,7 @@ class CNStockDataSource(DataSource):
         """Build the same result shape from the fallback providers alone.
 
         这里对同一个标的取**两次**（复权 + 不复权），是这条路径最贵的一段。
-        2026-09-05 部署机上兜底变成常态路径之后，_fetch_kline_sync 占了全部取数
+        2026-09-05 兜底变成常态路径之后（东财整层被拒），_fetch_kline_sync 占了全部取数
         时间的 63.8%，所以查过能不能省掉第二次。结论是不能，记在这里免得重查：
 
         - 不复权序列喂 ``close_unadj`` -> ``CLOSE2``，被 research.py 的市盈率(静)
@@ -998,7 +998,7 @@ class CNStockDataSource(DataSource):
         """带缓存的资金流取数。同步，仍然跑在线程池里。
 
         收编的理由是重复取数：``brief`` / ``medium`` / ``full`` 是三个不同的报告缓存键，
-        底下却用同一份资金流。2026-09-06 部署机实测 56 次取数只涉及 23 个标的（2.4×），
+        底下却用同一份资金流。2026-09-06 实测 56 次取数只涉及 23 个标的（2.4×），
         其中 44 次走了浏览器兜底、只涉及 22 个标的——**一半的页面加载是重复的**，
         每次 P50 6.4s。
 
@@ -1081,7 +1081,7 @@ class CNStockDataSource(DataSource):
             # 抢名额之前就能知道，必须在这里判——否则它会白等满一个等待窗口，
             # 而那段等待是从整个请求的预算里扣的，等于替同批的兄弟把预算花掉。
             #
-            # 2026-09-05 部署机日志里就是这样：SH000688 等 3.0s 之后被判"名额已满"，
+            # 2026-09-05 线上日志里就是这样：SH000688 等 3.0s 之后被判"名额已满"，
             # 同一批的 SH601899 / SH000001 / SZ399006 跟着一起没排到。
             logger.debug("资金流向页面兜底跳过 %s: 该标的没有资金流向页面", symbol)
             return None

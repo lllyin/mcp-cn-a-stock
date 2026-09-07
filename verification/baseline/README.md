@@ -64,7 +64,7 @@ kline_daily 和 kline_range 的 4 个标的是拆成 4 份归档的：这两个�
 | tech | 归档库里那两份都被截断了（JSON 没闭合），脚本会跳过并说明 |
 | kline_range 的指数与北交所 | 修复之后（09-03 17:00 起）的窗口里没有指数归档；BJ920021 有一份，但内容是"未找到数据"，等于把一次失败固化成基线 |
 
-都在部署机上补：
+都在能通东财的机器上补：
 
 ```bash
 python scripts/verify_release.py --only medium,tech --capture

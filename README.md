@@ -267,7 +267,7 @@ mcporter call cn-stock market_events \
 | `FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS` | 一次请求里所有标的等名额的总时长上限，必须大于上一项 | 秒，`0` 关闭（默认 `15`） |
 | `FUND_FLOW_PAGE_TABLE_WAIT_SECONDS` | 等历史表渲染完成的上限 | 秒（默认 `15`） |
 | `FUND_FLOW_PAGE_REUSE_SECONDS` | 同一标的页面解析结果的复用窗口，避免一次请求内重复加载同一页面 | 秒，`0` 关闭复用（默认 `30`） |
-| `FUND_FLOW_PAGE_MAX_LOADS` | 单次请求允许的页面加载次数，只在没拿到数据时才会用掉。被拒直接换 tab，不 reload；别调到 5，那是 09-07 上午滑块成批出现的放大器 | 正整数（默认 `2`） |
+| `FUND_FLOW_PAGE_MAX_LOADS` | 单次请求允许的页面加载次数，只在没拿到数据时才会用掉。被拒直接换 tab，不 reload；别调大，被拒后每多开一个 tab 都消耗同一出口的频率额度，会把偶发的拒绝放大成整批滑块，合适的值用 `scripts/probe_tuning.py` 量 | 正整数（默认 `2`） |
 | `FUND_FLOW_PAGE_RETRY_DELAY_MS` | 重试刷新之前的随机等待区间，只作用在重试路径上 | `下界,上界` 毫秒<br>单个数字为固定值<br>`0` 关闭<br>（默认 `250,350`） |
 | `FUND_FLOW_PAGE_OPEN_AFTER_FAILURES` | 多少次徒劳加载后暂停整层兜底 | 正整数（默认 `4`） |
 | `FUND_FLOW_PAGE_FAILURE_WINDOW_SECONDS` | 上一项按这个滑动窗口计数 | 秒，`0` 退回连续计数（默认 `60`） |
@@ -346,7 +346,7 @@ AkShare 和 efinance 的接口是同步网络调用，由一个有界线程池�
 | `BROWSER_MAX_PAGES` | 整个浏览器同时开着的页面数上限。这同时就是同时有几个渲染进程，是峰值内存的直接决定项：每多一个并发页约 +130 MiB | 正整数（默认 `3`） |
 | `BROWSER_IDLE_TIMEOUT_SECONDS` | **盘中**多久没人调用就关掉浏览器。默认 90 分钟盖住午休，关早了下一批调用要重新等冷启动（+2.19s） | 秒，`0` 整层关闭回收（总开关，不看时段）（默认 `5400`） |
 | `BROWSER_IDLE_TIMEOUT_CLOSED_SECONDS` | **盘外**（收盘后、非交易日）的空闲回收超时。盘外没有午休要盖，而浏览器进程树占 378 MiB（热空闲共 621 MiB，拆掉后 243 MiB） | 秒，`0` 盘外不回收、盘中照旧（默认 `300`） |
-| `BROWSER_DISGUISE` | 把无头浏览器的自报特征改成普通浏览器的样子。默认关：部署机实测 main 的原样身份 36/36 拿到今日资金流，伪装后 23/36，东财的数据接口对"伪装过的"拒得更多；置 1 只用于对照 | `0`<br>`1`<br>（默认 `0`） |
+| `BROWSER_DISGUISE` | 把无头浏览器的自报特征改成普通浏览器的样子。默认关：机房出口的机器上实测原样身份全通、伪装后被拒更多，开发机上可能相反；这台机器该用哪种用 `scripts/probe_tuning.py` 量，置 1 启用伪装 | `0`<br>`1`<br>（默认 `0`） |
 | `BROWSER_CLAIM_PLATFORM` | 对外声明哪个平台。`auto` 下 Windows/macOS 照实报，Linux 报 macOS | `auto`<br>`real`<br>`macos`<br>`windows`<br>（默认 `auto`） |
 | `BROWSER_NO_SANDBOX` | 为 Chromium 添加 `--no-sandbox`。会降低隔离，仅在 sandbox 确实不可用时启用 | `0`<br>`1`<br>（默认 `0`） |
 | `XVFB_DISPLAY_NUMBER` | 无 `DISPLAY` 时 `start.sh` 使用的 Xvfb 起始显示号，被占用则依次往后试到 109 | 整数（默认 `99`） |

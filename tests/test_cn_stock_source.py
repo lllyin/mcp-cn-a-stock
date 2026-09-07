@@ -1956,7 +1956,7 @@ async def test_a_symbol_without_a_page_never_waits_for_a_slot(monkeypatch):
     """SH000688 没有资金流向页面，不该占用等待窗口。
 
     它等满一个窗口再被判"名额已满"，那段等待是从整个请求的预算里扣的，等于替
-    同批的兄弟把预算花掉。2026-09-05 部署机日志里就是这样：SH000688 等 3.0s 之后
+    同批的兄弟把预算花掉。2026-09-05 线上日志里就是这样：SH000688 等 3.0s 之后
     被跳过，同批的另外三个也跟着没排到。
     """
     from finmcp.datasource import realtime_ff as realtime_ff_module
@@ -2016,7 +2016,7 @@ async def test_a_symbol_with_a_page_still_goes_through_the_slot(monkeypatch):
 async def test_brief_never_pays_for_the_page_history(monkeypatch):
     """brief 不渲染历史表，资金流历史取不到也不去打浏览器页面。
 
-    09-07 部署机盘中 15 只标的 95 次页面加载，一半以上是 brief 触发的历史兜底重试；这些
+    09-07 盘中实测 15 只标的 95 次页面加载，一半以上是 brief 触发的历史兜底重试；这些
     加载喂出的滑块把同一浏览器上的当日实时一起拒掉。取当日实时那条路不受此项影响。
     """
     from finmcp.datasource import realtime_ff as realtime_ff_module

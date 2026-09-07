@@ -35,7 +35,7 @@ py-modules = ["main", "data"]
 # site-packages/finmcp/ 里只有顶层那几个 .py，datasource/ 整个丢掉，一 import
 # 就是 ModuleNotFoundError: No module named 'finmcp.datasource'。
 # 本地开发跑的是 `python main.py`（从仓库根目录导入），照不出这个洞——只有
-# 装成包再起服务才会炸，2026-09-06 在部署机上就是这么炸的。
+# 装成包再起服务才会炸，2026-09-06 就是这么炸的。
 [tool.setuptools.packages.find]
 include = ["finmcp*"]
 

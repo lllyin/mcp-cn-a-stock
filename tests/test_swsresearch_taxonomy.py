@@ -183,7 +183,7 @@ def test_the_second_source_fills_the_level_the_first_could_not(chain):
 
 
 def test_when_the_first_source_is_blocked_the_second_serves_alone(chain):
-    """部署机的情形：乐咕乐股回人机验证页，两级全挂。"""
+    """机房出口 IP 的情形：乐咕乐股回人机验证页，两级全挂。"""
     chain(lambda request: None,
           lambda request: _tax({"传媒": 1, "证券Ⅱ": 2}, "swsresearch"))
     taxonomy = stx._fetch("industry")
