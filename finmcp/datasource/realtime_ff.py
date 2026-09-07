@@ -58,7 +58,7 @@ _idle_task: asyncio.Task | None = None
 # 值同时就是"同时几个渲染进程"，是峰值内存的直接决定项。见配置项的实测数据。
 SEMAPHORE = asyncio.Semaphore(BROWSER_MAX_PAGES)
 
-#: main 分支的浏览器身份：无头、固定这串 UA、不加任何伪装。2026-09-07 部署机盘外两次交错
+#: main 分支的浏览器身份：无头、固定这串 UA、不加任何伪装。2026-09-07 盘外两次交错
 #: A/B（每种身份 36 次加载、同一批 6 只个股、同一判定）：这套身份今日块 36/36、kline 接口
 #: 断连 0；只加 --disable-blink-features=AutomationControlled 就掉到 26/36、断连 16；再加
 #: CDP 覆盖与注入脚本 23/36。东财 push2 的数据接口对"明显的无头"放行、对"伪装过的"拒绝，
@@ -78,7 +78,7 @@ _LAUNCH_ARGS = [
     "--mute-audio",
 ]
 
-#: 资金流接口第一次断连之后，再给页面这么多秒让它自己重发。2026-09-07 部署机实测 72 次
+#: 资金流接口第一次断连之后，再给页面这么多秒让它自己重发。2026-09-07 实测 72 次
 #: 非 main 身份的加载里有 12 次在首次断连后 1.9 到 3.7 秒内拿到了今日数据，是页面脚本
 #: 自己重发的；第一次断连就判被拒等于把这些数据扔掉。6 秒盖住实测最长的 3.7 秒。
 REFUSAL_GRACE_SECONDS = 6.0
@@ -272,7 +272,7 @@ def _claimed_platform(real: str) -> str:
 
     代价要写明：声明 macOS 之后，WebGL renderer（Linux 上是 SwiftShader/Mesa）和
     字体列表仍然是 Linux 的样子。如果对端交叉核对到那一层，声明 macOS 反而比照实
-    报更可疑。所以留了 ``real`` 选项，好在部署机上用 blocked_captcha 的占比做对照。
+    报更可疑。所以留了 ``real`` 选项，好在目标部署环境上用 blocked_captcha 的占比做对照。
     """
     configured = (BROWSER_CLAIM_PLATFORM or "auto").strip().lower()
     if configured == "real":
@@ -348,7 +348,7 @@ async def _browser_identity(context: BrowserContext) -> dict:
     return _identity
 
 
-async def disguise_page(page) -> None:
+async def disguise_page(page, enabled: bool | None = None) -> None:
     """把 UA 与 client hints 一起改成自洽的非 Headless。
 
     ``Network.setUserAgentOverride`` 是 per-target 的，context 上装一次不会被后建
@@ -357,8 +357,11 @@ async def disguise_page(page) -> None:
 
     这条是这批伪装里唯一有明确机制的：``sec-ch-ua`` 在每个请求头里写着
     ``"HeadlessChrome";v="145"``，是自报身份，不是什么细微指纹。
+
+    ``enabled`` 缺省跟配置走；scripts/probe_tuning.py 要在同一个进程里对照两种身份，
+    显式传。
     """
-    if not BROWSER_DISGUISE:
+    if not (BROWSER_DISGUISE if enabled is None else enabled):
         return
     try:
         context = page.context
@@ -370,6 +373,50 @@ async def disguise_page(page) -> None:
         logger.debug("资金流向页面伪装失败，按原样继续", exc_info=True)
 
 
+def launch_arguments(disguise: bool = BROWSER_DISGUISE) -> list:
+    """Chromium 启动参数。
+
+    伪装身份多一个 AutomationControlled 隐掉 navigator.webdriver。**结论随出口 IP
+    反过来**：一个出口上量到"不带 0/8、带上 7/8"，另一个出口正相反，带上之后
+    kline 接口断连从 0/36 涨到
+    16/36。它只随伪装一起开，默认不带，见 config.BROWSER_DISGUISE。
+
+    单拎成函数是让 scripts/probe_tuning.py 用**同一个定义**起对照浏览器——探测用的
+    身份和线上不是一份，量出来的就不是线上的数。
+    """
+    launch_args = list(_LAUNCH_ARGS)
+    if disguise:
+        launch_args.insert(0, "--disable-blink-features=AutomationControlled")
+    return launch_args
+
+
+def context_options(disguise: bool = BROWSER_DISGUISE) -> dict:
+    """``new_context`` 的参数。
+
+    默认用 main 的身份：固定 UA 字符串 Chrome/120，client hints 照旧写着
+    HeadlessChrome/145，自相矛盾——但这正是那一轮 A/B 里唯一 36/36 通过的身份
+    （见 LEGACY_UA 的注释）。开了伪装才走 disguise_page 那套自洽的覆盖。
+    """
+    options = {
+        "java_script_enabled": True,
+        "bypass_csp": True,
+    }
+    if disguise:
+        options.update(
+            # 中文财经站的访客不会只带 en-US。locale 同时决定
+            # navigator.language(s) 和 Accept-Language 请求头。
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            # 默认 1280x720 是 Playwright 的值，桌面浏览器少见；同时
+            # 让 outerWidth 不再等于 innerWidth。
+            viewport={"width": 1920, "height": 1080},
+            screen={"width": 1920, "height": 1080},
+        )
+    else:
+        options["user_agent"] = LEGACY_UA
+    return options
+
+
 async def get_context() -> BrowserContext:
     global _playwright, _browser, _context
     async with _lock:
@@ -378,37 +425,11 @@ async def get_context() -> BrowserContext:
             new_browser = None
             try:
                 new_playwright = await async_playwright().start()
-                launch_args = list(_LAUNCH_ARGS)
-                if BROWSER_DISGUISE:
-                    # 隐掉 navigator.webdriver。09-04 本机实测不带 0/8、带上 7/8；09-07
-                    # 部署机实测正相反，带上之后 kline 接口断连从 0/36 涨到 16/36。它只随
-                    # 伪装一起开，默认不带，见 config.BROWSER_DISGUISE。
-                    launch_args.insert(0, "--disable-blink-features=AutomationControlled")
                 new_browser = await new_playwright.chromium.launch(
                     headless=not BROWSER_HEADFUL,
-                    args=launch_args,
+                    args=launch_arguments(BROWSER_DISGUISE),
                 )
-                # 默认用 main 的身份：固定 UA 字符串 Chrome/120，client hints 照旧写着
-                # HeadlessChrome/145，自相矛盾——但这正是部署机上唯一 36/36 通过的身份
-                # （见 LEGACY_UA 的注释）。开了伪装才走 disguise_page 那套自洽的覆盖。
-                context_options = {
-                    "java_script_enabled": True,
-                    "bypass_csp": True,
-                }
-                if BROWSER_DISGUISE:
-                    context_options.update(
-                        # 中文财经站的访客不会只带 en-US。locale 同时决定
-                        # navigator.language(s) 和 Accept-Language 请求头。
-                        locale="zh-CN",
-                        timezone_id="Asia/Shanghai",
-                        # 默认 1280x720 是 Playwright 的值，桌面浏览器少见；同时
-                        # 让 outerWidth 不再等于 innerWidth。
-                        viewport={"width": 1920, "height": 1080},
-                        screen={"width": 1920, "height": 1080},
-                    )
-                else:
-                    context_options["user_agent"] = LEGACY_UA
-                new_context = await new_browser.new_context(**context_options)
+                new_context = await new_browser.new_context(**context_options(BROWSER_DISGUISE))
                 if BROWSER_DISGUISE:
                     await new_context.add_init_script(_HEADLESS_GAPS_SCRIPT)
             except BaseException:
@@ -570,7 +591,7 @@ class FundFlowPageRefused(RuntimeError):
       静默 75 秒后 4 次全拒、16 分钟后仍拒。这一种只能等，多试只是白付页面加载。
 
     两者在单次日志里无法区分，所以现在的策略是"最多试两次然后放弃"——对瞬时态
-    足够，对持续态最多浪费一次。要给持续态加长冷却，得先在部署机上采够"进入
+    足够，对持续态最多浪费一次。要给持续态加长冷却，得先在目标环境上采够"进入
     风控 -> 恢复"的时间分布，否则冷却会在风控解除后继续空转。
 
     有头模式加上不关页面之所以"稳定能取到"，是因为人能看见并手动过掉滑块，
@@ -664,7 +685,7 @@ async def load_fund_flow_page(
     完、开盘前）就在同一个 tab 上 reload。实测 reload 便宜一半——同一标的第二次加载
     p50 0.240s，而关掉再开新 tab 是 0.452s。
 
-    **被拒不 reload。** 同一个 tab 刷新带不走滑块，新 tab 才带得走：09-07 部署机
+    **被拒不 reload。** 同一个 tab 刷新带不走滑块，新 tab 才带得走：09-07 线上日志
     首加载被拒后靠重试救回的 10 次里，新 tab 7 次、reload 3 次。被拒直接抛给
     ``_load_page_shared``，由它决定还要不要换 tab。缺的那一块是接口拒的（今日到了、
     历史被拒，或反过来）也不再加载，再来一次只是再被拒一次；拿到的那块交给调用方。

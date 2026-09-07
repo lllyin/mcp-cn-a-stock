@@ -607,7 +607,7 @@ async def test_common_desktop_platforms_are_reported_truthfully(
 
 @pytest.mark.asyncio
 async def test_claim_platform_real_keeps_linux(monkeypatch):
-    """留 real 是为了在部署机上做对照，不能被 auto 的规则覆盖掉。"""
+    """留 real 是为了在目标部署环境上做对照，不能被 auto 的规则覆盖掉。"""
     monkeypatch.setattr(realtime_ff, "_identity", None)
     monkeypatch.setattr(realtime_ff, "BROWSER_CLAIM_PLATFORM", "real")
     context = _FakeContext(_FakePage(LINUX_UA, "Linux x86_64", "Linux"))
@@ -1188,7 +1188,7 @@ class TestIdleTimeoutBySession:
 
     90 分钟那个值的唯一依据是"盖住午休 11:30-13:00"，而午休只在盘中存在。
     收盘后到次日开盘有 18 小时、周末更长，让浏览器那 378 MiB 空转 90 分钟纯属
-    白占（2026-09-06 部署机实测：热空闲 621 MiB，拆掉浏览器后 243 MiB）。
+    白占（2026-09-06 在 2 核 4G 云主机上实测：热空闲 621 MiB，拆掉浏览器后 243 MiB）。
     """
 
     @pytest.mark.parametrize(
