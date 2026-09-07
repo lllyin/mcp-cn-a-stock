@@ -259,6 +259,7 @@ mcporter call cn-stock market_events \
 | `SECTOR_FUND_FLOW_PROVIDERS` | 板块资金流的取数顺序：<br>`eastmoney` 字段全<br>`eastmoney_dataapi` 只有主力净额，但主源连不上时它还通；报告备注里会标出是降级源 | `eastmoney`<br>`eastmoney_dataapi`<br>`off`<br>（默认 `eastmoney,eastmoney_dataapi`） |
 | `SECTOR_TAXONOMY_PROVIDERS` | 板块分级表的来源，用来只排同一层——东财的行业板块名单是一棵树摊平的（496 个），不分级会让父子板块同时上榜、同一笔钱数两遍。默认排申万二级，和东财官网那张榜逐位一致：<br>`shenwan` 申万宏源的行业分类，经 AkShare 抓乐咕乐股页面<br>`swsresearch` 申万宏源研究所官网的接口，同一套分类的第二个源，乐咕乐股对机房 IP 回人机验证页时靠它补<br>同一套标准的源会合并：前一个缺的级由后一个补<br>`off` 退回全部板块一起排，报告里会标出来 | `shenwan,swsresearch`<br>`shenwan`<br>`off`<br>（默认 `shenwan,swsresearch`） |
 | `KLINE_PROVIDERS_INDEX` | **指数**用的兜底顺序，和下一项分开配：指数的成交量各源口径差得多（创业板指相差 3.52%），同花顺与东财一致 | 同上（默认 `tonghuashun,tencent,sina`） |
+| `KLINE_MAX_GAP_TRADING_DAYS` | 相邻两根 K 线之间允许缺多少个**交易日**，超过就判该源失败、让链路回退。防的是「序列断裂」——列是齐的、数值也在合理区间，源「成功」返回，但涨跌幅会跨缺口计算、均线全错。单位是交易日而非自然日，所以长假在结构上就是 0，阈值只用来容忍停牌（10 是 2018 年后重大资产重组停牌的上限）。是偏好不是硬条件：每个源都带同样缺口时（真实长期停牌）会宽松再问一轮并放行，不会让 K 线整段缺失 | 交易日，`0` 关闭（默认 `10`） |
 | `KLINE_PROVIDERS` | 东财那一级取不到时，**个股/ETF** 的兜底顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`tonghuashun` 不覆盖北交所<br>`tencent` 个股/ETF/指数都覆盖，北交所大半不认<br>`sina` 覆盖腾讯不认的北交所代码，但不认 ETF 和创业板指<br>三家各补各的洞 | `tonghuashun`<br>`tencent`<br>`sina`<br>`off`<br>（默认 `tencent,sina`） |
 | `FUND_FLOW_PAGE_ENABLED` | 东财资金流接口不可用时，是否回退到资金流向页面 | `0`<br>`1`<br>（默认 `1`） |
 | `FUND_FLOW_PAGE_CONCURRENCY` | 同时进行的兜底页面加载数。要和 `BROWSER_MAX_PAGES` 一起调，只提一个另一个就成了新瓶颈 | 正整数（默认 `3`） |

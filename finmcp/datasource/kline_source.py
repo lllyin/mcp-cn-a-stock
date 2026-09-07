@@ -10,12 +10,14 @@
 
 from __future__ import annotations
 
+import contextvars
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 
-from . import platform as pf
+from ..config import KLINE_MAX_GAP_TRADING_DAYS
+from . import platform as pf, trading_calendar
 from .kline_frame import FALLBACK_FRAME_COLUMNS, _market_prefixed_symbol
 
 logger = logging.getLogger("finmcp")
@@ -113,8 +115,74 @@ class KlineResult:
     provider: str
 
 
+#: 缺口闸门的两个开关，见 ``_has_no_gap`` 与 ``resolve``。用 ContextVar 而不是模块
+#: 全局：这个服务是多线程并发跑多批标的的，全局变量会让 A 标的的宽松模式漏给 B。
+_ALLOW_GAPS = contextvars.ContextVar("kline_allow_gaps", default=False)
+_GAP_REJECTED = contextvars.ContextVar("kline_gap_rejected", default=False)
+
+
+def _has_no_gap(frame) -> bool:
+    """相邻两根之间不允许缺超过 ``KLINE_MAX_GAP_TRADING_DAYS`` 个**交易日**。
+
+    这一条防的是**序列断裂**，而断裂比缺列危险得多：缺列会让契约当场判失败、
+    链路回退；断裂的序列列是齐的、每个数值也在合理区间，源"成功"返回，
+    没有任何东西会拦它。
+
+    实际发生过：``SH000688 涨跌幅`` 报成 +20.17%（真实 +2.41%）——同花顺某个年份
+    文件取失败被静默跳过，当天前面那一根从 1577.36 变成了
+    1344.07，涨跌幅是跨缺口算的。同一份报告里 240 日均价 1540 → 1148、
+    240 日最高 2255 → 1626（等于当天最高，历史高点整段没了）。
+
+    **为什么查缺口而不是查涨跌幅越界**：越界只拦得住缺口正好落在最后一根之前的
+    情形；缺口在序列中间时当日涨跌幅是对的，而均线仍然全错——今天那份报告两种
+    症状都有。查缺口一次覆盖两者，而且对所有 K 线源生效，不只同花顺。
+
+    **单位是交易日，不是自然日。** 数自然日曾经是这里的写法，而它只是「别把长假
+    当缺口」的代理指标：得坐在最长连休之上、又远低于「丢掉一整年」。实测那个余量
+    很薄——2015 年以来春节最长 11 个自然日，而当时的阈值是 15。问交易日历就没有这个
+    问题：长假之间**缺 0 个交易日**（33 条真实序列实测全为 0），阈值于是只需要回答
+    一个真问题——容忍几天**停牌**。
+
+    默认 10 个交易日：2018 年之后重大资产重组停牌基本以 10 个交易日为上限，所以
+    合规范围内的停牌不会触发额外那一轮回退；而漏掉一个年份文件是 242 个交易日、
+    漏一个季度是 60，都远在阈值之上。日历取不到时退回按星期数，那时候最长的长假
+    会被数成 6，仍在 10 之内（见 ``trading_calendar.missing_trading_days``）。
+
+    **这是偏好不是硬条件**，判死之前先看 ``resolve``：真实的长期停牌（重大资产重组、
+    ST）会让每个源都给出同样带缺口的序列，那时候缺口是真的，硬拦等于把 K 线这一维
+    整个抹掉——比均线偏一点严重得多。所以全都拦下来之后会宽松再问一轮。
+    """
+    if KLINE_MAX_GAP_TRADING_DAYS <= 0 or _ALLOW_GAPS.get():
+        return True
+    if "日期" not in getattr(frame, "columns", ()) or len(frame) < 2:
+        return True
+    import pandas as pd
+
+    parsed = pd.to_datetime(frame["日期"], errors="coerce").dropna()
+    if len(parsed) < 2:
+        return True
+    days = sorted(parsed.dt.date)
+    # 日历只取一次：load() 每次都要过缓存层，240 根逐对去问就是 240 次。
+    calendar = trading_calendar.load()
+    worst, at = 0, None
+    for earlier, later in zip(days, days[1:]):
+        missing = trading_calendar.missing_trading_days(earlier, later, calendar)
+        if missing > worst:
+            worst, at = missing, later
+    if worst <= KLINE_MAX_GAP_TRADING_DAYS:
+        return True
+    _GAP_REJECTED.set(True)
+    logger.warning(
+        "K 线序列缺了 %d 个交易日（上限 %d），判该源失败让链路回退；"
+        "断裂的序列会让涨跌幅跨缺口计算、均线全错 断点≈%s 行数=%d 日历=%s",
+        worst, KLINE_MAX_GAP_TRADING_DAYS, at, len(frame),
+        getattr(calendar, "source", None) or "无（按星期）",
+    )
+    return False
+
+
 def _honours_kline_contract(frame) -> bool:
-    """归一后必须是带标准列的日线表。
+    """归一后必须是带标准列的日线表，且序列不能有缺口。
 
     只判类型说明不了列对不对，而**列不对正是接一个新源最容易出的错**：同花顺的
     原始列序是"开高低收"，别家是"开收高低"，抄错一个位置报告里的最高价就成了收盘价，
@@ -123,7 +191,9 @@ def _honours_kline_contract(frame) -> bool:
     columns = getattr(frame, "columns", None)
     if columns is None:
         return False
-    return set(FALLBACK_FRAME_COLUMNS) <= set(columns)
+    if not set(FALLBACK_FRAME_COLUMNS) <= set(columns):
+        return False
+    return _has_no_gap(frame)
 
 
 pf.define_capability(CAPABILITY, _honours_kline_contract, describe="含标准列的日线表")
@@ -142,13 +212,44 @@ def resolve(
     order: Optional[tuple] = None,
     status: Optional[dict] = None,
 ) -> Optional[KlineResult]:
-    """按配置顺序问每个平台，第一个给出非空结果的赢。"""
-    resolved = pf.resolve(
-        CAPABILITY,
-        request,
-        order=configured_order(request) if order is None else order,
-        status=status,
-    )
+    """按配置顺序问每个平台，第一个给出非空结果的赢。
+
+    比通用的 ``pf.resolve`` 多一件事：缺口闸门（``_has_no_gap``）是**偏好**，所以
+    一轮下来一个源都不剩、且原因是缺口时，宽松再问一轮。
+
+    为什么要这一轮：带缺口的序列有两种成因，而闸门分不开——
+      - 源坏了（同花顺某年文件 404 / 正文被截断）。别的源是好的，第一轮就换到它，
+        这一轮不会发生。
+      - 这只票真的长期停牌（重大资产重组、ST）。缺口在真实数据里，每个源都一样，
+        第一轮会把所有源都拦掉。这时候硬拦的结果是 K 线、均线整段消失，比均线偏
+        一点严重得多（AGENTS.md §一：数据完整 > 功能正确）。
+
+    额外那一轮只在第一轮**确实被缺口拦过**时发生（``_GAP_REJECTED``），所以纯网络
+    失败不会付这个代价——那种情况重问一遍也是全失败。
+    """
+    resolved_order = configured_order(request) if order is None else order
+    local = {} if status is None else status
+
+    token = _GAP_REJECTED.set(False)
+    try:
+        resolved = pf.resolve(CAPABILITY, request, order=resolved_order, status=local)
+        rejected_for_gaps = resolved is None and _GAP_REJECTED.get()
+    finally:
+        _GAP_REJECTED.reset(token)
+
+    if rejected_for_gaps:
+        logger.warning(
+            "%s 每个 K 线源都带缺口，按真实停牌处理、放行带缺口的序列："
+            "长周期均线会偏，但总比这一维整段缺失强 source=%s",
+            request.code, ",".join(resolved_order) or "（空）",
+        )
+        local["kline_gap_tolerated"] = True
+        relaxed = _ALLOW_GAPS.set(True)
+        try:
+            resolved = pf.resolve(CAPABILITY, request, order=resolved_order, status=local)
+        finally:
+            _ALLOW_GAPS.reset(relaxed)
+
     if resolved is None:
         return None
     return KlineResult(frame=resolved.value, provider=resolved.platform)

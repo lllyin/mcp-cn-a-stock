@@ -1,7 +1,7 @@
 """同花顺日 K：年份文件取不到要抛、未上市年份要跳、盘中占位行要跳。
 
-依据是 2026-09-07 的两件事：本机 2024、2025 两年文件返回 502 被当成"没上市"静默跳过，科创50
-只剩 164 根、报告少了 240 日五行；部署机上科创50 2026 年文件盘中多一行
+依据是 2026-09-07 的两件事：2024、2025 两年文件返回 502 被当成"没上市"静默跳过，科创50
+只剩 164 根、报告少了 240 日五行；科创50 2026 年文件盘中多一行
 ``20260907,,,,1577.36,0,,0.000,,,0``，``float('')`` 让整个源报错落到腾讯，当天 6 次。
 """
 
@@ -16,6 +16,10 @@ ROWS_2026 = (
     "20260105,1360.10,1380.20,1350.30,1370.40,753925100,74189842000.00,1.074,,,0;"
     "20260106,1370.40,1390.00,1360.00,1385.50,700000000,70000000000.00,1.000,,,0;"
     "20260107,1385.50,1400.00,1380.00,1395.00,650000000,65000000000.00,0.950,,,0"
+)
+ROWS_2024 = (
+    "20240902,1000.10,1010.20,990.30,1005.40,500000000,50000000000.00,0.700,,,0;"
+    "20240903,1005.40,1015.00,995.00,1010.00,510000000,51000000000.00,0.710,,,0"
 )
 PLACEHOLDER = "20260907,,,,1577.36,0,,0.000,,,0"
 
@@ -71,6 +75,33 @@ def test_a_404_year_is_not_listed_yet_and_is_skipped(monkeypatch):
     frame = tonghuashun.TonghuashunPlatform().fetch_kline(_request())
     assert calls == ["2024", "2025", "2026"]
     assert len(frame) == 3
+
+
+def test_a_404_in_the_middle_is_a_gap_not_a_missing_year(monkeypatch):
+    """同一个 404，判据是「已经取到过行没有」——years 是升序遍历（旧→新）。
+
+    科创50 从 2020 年就有，它的 2025 年 404 只能是取数失败。静默跳过会得到一条断裂的
+    序列而链路不回退（源「成功」了）：2026-09-07 14:56 的 +20.17% 就是这么来的。
+    """
+    calls: list = []
+    _session(monkeypatch, {
+        "2024": _Response(200, _jsonp("2024", ROWS_2024)),
+        "2025": _Response(404, ""),
+        "2026": _Response(200, _jsonp("2026", ROWS_2026)),
+    }, calls)
+    with pytest.raises(RuntimeError, match="2025 年文件 404"):
+        tonghuashun.TonghuashunPlatform().fetch_kline(_request())
+    assert calls == ["2024", "2025"], "抛出去就不该再取后面的年份"
+
+
+def test_the_gap_error_says_it_is_a_gap(monkeypatch):
+    """出错信息要说清是缺口，否则下一个人会照旧当成「未上市」再改回 continue。"""
+    _session(monkeypatch, {
+        "2024": _Response(200, _jsonp("2024", ROWS_2024)),
+        "2025": _Response(404, ""),
+    })
+    with pytest.raises(RuntimeError, match="这是缺口不是未上市"):
+        tonghuashun.TonghuashunPlatform().fetch_kline(_request())
 
 
 def test_a_200_that_is_not_jsonp_is_a_failure(monkeypatch):
