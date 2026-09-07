@@ -168,15 +168,36 @@ def _as_date(value):
         return None
 
 
-def append_intraday_bar(frame, quote, *, adjust: str = "qfq", not_after=None):
-    """把当天这根未完成的 bar 追加到兜底源的日 K 上。
+def upsert_intraday_bar(frame, quote, *, adjust: str = "qfq", not_after=None,
+                        today=None):
+    """**当天**那一根 bar 只认实时行情端点，日线端点给的当天行一律不作准。
 
-    东财的 K 线接口盘中带当天，腾讯和新浪的日 K 不带（实测 2026-09-04 盘中最后
-    一行仍是 09-03）。于是东财一失败，报告的"当日"就退回昨天，而同一份报告里的
-    市值又是今天的——两块数据来自不同日期，报告本身却没有任何提示。
+    兜底源在"当天这一根"上有两种行为，而两种都得靠这一步收拾：
 
-    只在行情自报的日期确实晚于表里最后一行时才追加：不看本地时钟，也就不需要
-    交易日历。休市时行情的日期就是上一个交易日，与最后一行相同，自然不追加。
+    - 腾讯、新浪的日 K **盘中不带当天**（实测 2026-09-04 盘中最后一行仍是 09-03）。
+      东财一失败，报告的"当日"就退回昨天，而同一份报告里的市值又是今天的——两块
+      数据来自不同日期，报告本身却没有任何提示。→ **追加**。
+    - 同花顺的日线年份文件**带当天，但那一行是收盘前的盘中快照，收盘后不回填**。
+      收盘后约两小时按分钟采样：27 个"有当天那行"的样本里**没有一个**等于定稿值。
+      SH000001 停在 3931.85 / 4.20亿手，定稿是 3932.70 / 4.77亿手（量差 12%）；
+      同一份文件的前复权与不复权两个 segment 当天行还互相矛盾（3931.85 vs
+      3931.02），而历史行逐字节一致——复权改不了成交量，所以那一行只能是未定稿。
+      → **覆盖**。
+
+    所以判据不是"源给没给当天"，而是"当天这一根只认实时端点"。实时端点是可信的：
+    12 个标的（指数/个股/ETF/北交所）的收盘价与交易所定稿值 12/12 逐位一致。
+
+    **只换当天那一根，历史一个字不动。** 同花顺的历史成交量是最准的一家（创业板指
+    与东财一致，腾讯低 3.5%），所以这里不是换源，顺序也不动。
+
+    ## 为什么覆盖只限"今天"
+
+    往前的行是**已经定稿**的：同花顺日线 09-04 收 3930.12，与腾讯自报的昨收
+    3930.12 一致。拿实时快照去覆盖一个定稿行只有坏处——周末时会把创业板指那一行
+    正确的成交量换成腾讯低 3.89% 的口径，而且一覆盖就是整个周末。
+
+    ``today`` 只用来回答"这一行是不是今天的"，参数化只为测试可注入。读时钟仅此
+    一处，且读错的后果是退回原来的行为（不覆盖），不会造成错值。
 
     ``not_after`` 是调用方请求的截止日（``research.load_raw_data`` 的 end_date）。
     没有它的话，一次 ``date=2026-08-27`` 的查询会拿到截到 08-27 的序列，再被今天
@@ -203,11 +224,25 @@ def append_intraday_bar(frame, quote, *, adjust: str = "qfq", not_after=None):
     if limit is not None and quote_date > limit:
         return frame
 
-    last_date = frame["日期"].iloc[-1]
-    if quote_date <= last_date:
+    last_date = _as_date(frame["日期"].iloc[-1])
+    if last_date is None or quote_date < last_date:
+        # 表里已经有比行情更新的一天。不该发生，真发生了也不动它。
         return frame
 
-    previous_close = float(frame["收盘"].iloc[-1])
+    replacing = quote_date == last_date
+    if replacing:
+        if today is None:
+            from ..market_session import now_shanghai
+
+            today = now_shanghai().date()
+        if quote_date != today or len(frame) < 2:
+            # 不是今天那一行（已定稿，见上），或者没有前一根算不出涨跌幅。
+            return frame
+        stale = frame.iloc[-1]
+        previous_close = float(frame["收盘"].iloc[-2])
+    else:
+        stale = None
+        previous_close = float(frame["收盘"].iloc[-1])
     if previous_close <= 0:
         return frame
 
@@ -222,19 +257,30 @@ def append_intraday_bar(frame, quote, *, adjust: str = "qfq", not_after=None):
         "振幅": (quote.high - quote.low) / previous_close * 100,
         "涨跌幅": (quote.last / previous_close - 1) * 100,
         "涨跌额": quote.last - previous_close,
-        "换手率": quote.turnover_pct or 0.0,
+        # 行情没给换手率时保留源里那个值，别用 0 把它抹掉。
+        "换手率": quote.turnover_pct if quote.turnover_pct is not None
+        else (float(stale["换手率"]) if stale is not None else 0.0),
     }
-    logger.debug(
-        "补当日盘中 bar 来源=%s 日期=%s 收盘=%s 前收=%s",
-        quote.source,
-        quote_date,
-        quote.last,
-        previous_close,
+    if stale is None:
+        logger.debug("补当日盘中 bar 来源=%s 日期=%s 收盘=%s 前收=%s",
+                     quote.source, quote_date, quote.last, previous_close)
+        return pd.concat([frame, pd.DataFrame([row], columns=FALLBACK_FRAME_COLUMNS)],
+                         ignore_index=True)
+
+    # 覆盖：这条要能在生产日志里看见，它是判断上游当日行有多不靠谱的唯一信号。
+    was, now = float(stale["收盘"]), float(quote.last)
+    drifted = abs(was - now) > max(abs(now), 1.0) * 1e-6
+    logger.log(
+        logging.INFO if drifted else logging.DEBUG,
+        "当日 bar 用实时值覆盖日线端点 日期=%s 来源=%s 收盘 %s→%s 成交量 %s→%s%s",
+        quote_date, quote.source, was, now,
+        f"{float(stale['成交量']):.0f}", f"{quote.volume_lots or 0.0:.0f}",
+        "（日线端点当日行未定稿）" if drifted else "",
     )
-    return pd.concat(
-        [frame, pd.DataFrame([row], columns=FALLBACK_FRAME_COLUMNS)],
-        ignore_index=True,
-    )
+    kept = frame.iloc[:-1]
+    return pd.concat([kept, pd.DataFrame([row], columns=FALLBACK_FRAME_COLUMNS)],
+                     ignore_index=True)
+
 
 
 def _market_prefixed_symbol(code: str, symbol: str = None) -> str:

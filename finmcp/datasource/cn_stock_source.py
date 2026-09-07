@@ -110,7 +110,7 @@ from .kline_frame import (  # noqa: F401
     _is_index_code,
     _market_prefixed_symbol,
     _normalize_volume_to_lots,
-    append_intraday_bar,
+    upsert_intraday_bar,
 )
 
 def check_is_index(symbol: str, name: str) -> bool:
@@ -752,9 +752,9 @@ class CNStockDataSource(DataSource):
         from . import intraday_quote
 
         quote = intraday_quote.resolve(symbol or code, require_ohlc=True)
-        df = append_intraday_bar(df, quote, adjust=adjust, not_after=end_date)
+        df = upsert_intraday_bar(df, quote, adjust=adjust, not_after=end_date)
         if df_unadj is not None and not df_unadj.empty:
-            df_unadj = append_intraday_bar(
+            df_unadj = upsert_intraday_bar(
                 df_unadj, quote, adjust="none", not_after=end_date
             )
         return {

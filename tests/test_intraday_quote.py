@@ -241,9 +241,9 @@ class TestAppendIntradayBar:
     def test_appends_todays_bar(self):
         import datetime
 
-        from finmcp.datasource.cn_stock_source import append_intraday_bar
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
 
-        result = append_intraday_bar(self._frame(), self._quote())
+        result = upsert_intraday_bar(self._frame(), self._quote())
 
         assert len(result) == 2
         row = result.iloc[-1]
@@ -254,9 +254,9 @@ class TestAppendIntradayBar:
 
     def test_derives_change_from_the_previous_bar(self):
         """涨跌以表里最后一根的收盘为前收，保证序列连续。"""
-        from finmcp.datasource.cn_stock_source import append_intraday_bar
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
 
-        row = append_intraday_bar(self._frame(close=110.91), self._quote()).iloc[-1]
+        row = upsert_intraday_bar(self._frame(close=110.91), self._quote()).iloc[-1]
 
         assert row["涨跌额"] == pytest.approx(110.23 - 110.91)
         assert row["涨跌幅"] == pytest.approx((110.23 / 110.91 - 1) * 100)
@@ -264,23 +264,23 @@ class TestAppendIntradayBar:
 
     def test_does_not_append_when_the_quote_is_not_newer(self):
         """休市时行情的日期就是最后一根的日期，不该重复追加。"""
-        from finmcp.datasource.cn_stock_source import append_intraday_bar
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
 
         quote = self._quote(as_of="20260903150000")
-        assert len(append_intraday_bar(self._frame(), quote)) == 1
+        assert len(upsert_intraday_bar(self._frame(), quote)) == 1
 
     def test_requires_a_full_bar(self):
         """页头行情没有开高低，拼不出 bar 就不要拼。"""
-        from finmcp.datasource.cn_stock_source import append_intraday_bar
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
 
         partial = self._quote(open=None, high=None, low=None)
-        assert len(append_intraday_bar(self._frame(), partial)) == 1
+        assert len(upsert_intraday_bar(self._frame(), partial)) == 1
 
     def test_requires_a_timestamp(self):
         """没有自报日期就无法判断新旧，宁可不补——不去猜本地时钟。"""
-        from finmcp.datasource.cn_stock_source import append_intraday_bar
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
 
-        assert len(append_intraday_bar(self._frame(), self._quote(as_of=None))) == 1
+        assert len(upsert_intraday_bar(self._frame(), self._quote(as_of=None))) == 1
 
     def test_does_not_append_past_the_requested_end_date(self):
         """历史查询不能被实时行情污染。
@@ -289,17 +289,17 @@ class TestAppendIntradayBar:
         "数据日期"就变成今天，5/20/60 日窗口也跟着漂——生产归档比对时就是这样
         暴露出来的。
         """
-        from finmcp.datasource.cn_stock_source import append_intraday_bar
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
 
         frame = self._frame(last_date="2026-08-27")
-        assert len(append_intraday_bar(frame, self._quote(), not_after="2026-08-27")) == 1
+        assert len(upsert_intraday_bar(frame, self._quote(), not_after="2026-08-27")) == 1
         # 不指定日期时 load_raw_data 传的是"明天"，当天这根要能通过。
-        assert len(append_intraday_bar(frame, self._quote(), not_after="2026-09-05")) == 2
+        assert len(upsert_intraday_bar(frame, self._quote(), not_after="2026-09-05")) == 2
 
     def test_end_date_accepts_dates_and_datetimes(self):
         import datetime
 
-        from finmcp.datasource.cn_stock_source import append_intraday_bar
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
 
         frame = self._frame()
         for limit in (
@@ -307,22 +307,22 @@ class TestAppendIntradayBar:
             datetime.datetime(2026, 9, 3, 15, 0),
             "2026-09-03",
         ):
-            assert len(append_intraday_bar(frame, self._quote(), not_after=limit)) == 1
+            assert len(upsert_intraday_bar(frame, self._quote(), not_after=limit)) == 1
         # 解析不了的值不该悄悄挡掉当天这根
-        assert len(append_intraday_bar(frame, self._quote(), not_after="不是日期")) == 2
+        assert len(upsert_intraday_bar(frame, self._quote(), not_after="不是日期")) == 2
 
     def test_skips_backward_adjusted_series(self):
         """后复权的最新价被缩放过，接一根原始价上去是错的。"""
-        from finmcp.datasource.cn_stock_source import append_intraday_bar
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
 
-        result = append_intraday_bar(self._frame(), self._quote(), adjust="hfq")
+        result = upsert_intraday_bar(self._frame(), self._quote(), adjust="hfq")
         assert len(result) == 1
 
     def test_no_quote_leaves_the_frame_untouched(self):
-        from finmcp.datasource.cn_stock_source import append_intraday_bar
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
 
         frame = self._frame()
-        assert append_intraday_bar(frame, None) is frame
+        assert upsert_intraday_bar(frame, None) is frame
 
 
 # --- 跨源交叉校验 -------------------------------------------------------------
@@ -405,3 +405,164 @@ def test_a_broken_cross_check_never_takes_down_the_fetch(two_disagreeing_sources
     monkeypatch.setattr(b, "fetch", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
 
     assert iq.resolve("SH600000").source == "a"
+
+
+class TestTodaysBarOverridesTheDailyEndpoint:
+    """当天那一根只认实时端点，日线端点给的当天行一律不作准。
+
+    2026-09-07 定位到的问题：同花顺日线年份文件带当天那一行，但它是收盘前的盘中
+    快照、收盘后不回填。收盘后约两小时按分钟采样，27 个「有当天那行」的样本里
+    没有一个等于定稿值——SH000001 停在 3931.85 / 4.20亿手，定稿是 3932.70 /
+    4.77亿手。而它在指数取数顺序里排第一，于是那个未定稿值直接进了报告的当日
+    收盘、涨跌幅、成交量，以及每一条含当日的均线/均量。
+
+    修法不动取数顺序（同花顺的历史成交量是最准的一家），只换当天那一根。
+    """
+
+    TODAY = __import__("datetime").date(2026, 9, 7)
+
+    def _frame(self, rows):
+        import pandas as pd
+
+        from finmcp.datasource.cn_stock_source import FALLBACK_FRAME_COLUMNS
+
+        base = {"开盘": 3942.51, "最高": 3948.42, "最低": 3916.49,
+                "成交额": 7.998e11, "振幅": 0.81, "涨跌幅": 0.04,
+                "涨跌额": 1.73, "换手率": 0.88}
+        return pd.DataFrame(
+            [{**base, "日期": d, "收盘": c, "成交量": v} for d, c, v in rows],
+            columns=FALLBACK_FRAME_COLUMNS,
+        )
+
+    def _quote(self, **kw):
+        base = dict(symbol="SH000001", source="tencent", last=3932.70,
+                    prev_close=3930.12, open=3942.51, high=3948.42, low=3916.49,
+                    volume_lots=477375261.0, amount_yuan=8.979e11,
+                    turnover_pct=0.88, as_of="20260907161402")
+        base.update(kw)
+        return iq.IntradayQuote(**base)
+
+    def _both_days(self):
+        import datetime
+
+        return [(datetime.date(2026, 9, 4), 3930.12, 537286160.0),
+                (datetime.date(2026, 9, 7), 3931.85, 420313370.0)]   # ← 未定稿
+
+    def test_a_stale_same_day_row_is_replaced_not_kept(self):
+        """核心那一条：源给了当天，但给的是盘中快照，要被实时值顶掉。"""
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
+
+        result = upsert_intraday_bar(self._frame(self._both_days()), self._quote(),
+                                     today=self.TODAY)
+        assert len(result) == 2, "是覆盖，不是又追加一根"
+        row = result.iloc[-1]
+        assert row["收盘"] == 3932.70
+        assert row["成交量"] == 477375261.0
+        assert row["日期"] == self.TODAY
+
+    def test_the_derived_columns_come_off_the_bar_before_today(self):
+        """覆盖时前收盘必须取倒数第二根，取最后一根就是拿今天算今天，涨跌幅恒为 0。"""
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
+
+        row = upsert_intraday_bar(self._frame(self._both_days()), self._quote(),
+                                  today=self.TODAY).iloc[-1]
+        assert row["涨跌幅"] == pytest.approx((3932.70 / 3930.12 - 1) * 100)
+        assert row["涨跌额"] == pytest.approx(3932.70 - 3930.12)
+        assert row["振幅"] == pytest.approx((3948.42 - 3916.49) / 3930.12 * 100)
+
+    def test_history_is_untouched(self):
+        """只换当天那一根——同花顺的历史成交量是最准的一家，不能被顺手改掉。"""
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
+
+        result = upsert_intraday_bar(self._frame(self._both_days()), self._quote(),
+                                     today=self.TODAY)
+        assert result.iloc[0]["收盘"] == 3930.12
+        assert result.iloc[0]["成交量"] == 537286160.0
+
+    def test_a_settled_earlier_day_is_never_replaced(self):
+        """周末查：行情自报的还是周五，而周五那一行**已经定稿**。
+
+        覆盖它只有坏处——会把创业板指那一行正确的成交量换成腾讯低 3.89% 的口径，
+        而且一覆盖就是整个周末。
+        """
+        import datetime
+
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
+
+        friday = [(datetime.date(2026, 9, 3), 3900.0, 5.0e8),
+                  (datetime.date(2026, 9, 4), 3930.12, 537286160.0)]
+        quote = self._quote(last=3930.12, volume_lots=1.0, as_of="20260904150000")
+        result = upsert_intraday_bar(self._frame(friday), quote,
+                                     today=datetime.date(2026, 9, 5))
+        assert result.iloc[-1]["成交量"] == 537286160.0, "定稿行不许被实时快照覆盖"
+        assert len(result) == 2
+
+    def test_a_lone_same_day_row_is_left_alone(self):
+        """只有一行时算不出涨跌幅，宁可不动——kline_daily 只请求一天就是这种。"""
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
+
+        one = [(self.TODAY, 3931.85, 420313370.0)]
+        result = upsert_intraday_bar(self._frame(one), self._quote(), today=self.TODAY)
+        assert result.iloc[-1]["收盘"] == 3931.85
+        assert len(result) == 1
+
+    def test_a_future_row_is_left_alone(self):
+        """表里有比行情更新的一天：不该发生，真发生了也不动它。"""
+        import datetime
+
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
+
+        ahead = [(self.TODAY, 3931.85, 4.2e8),
+                 (datetime.date(2026, 9, 8), 3999.0, 4.0e8)]
+        result = upsert_intraday_bar(self._frame(ahead), self._quote(), today=self.TODAY)
+        assert result.iloc[-1]["收盘"] == 3999.0
+        assert len(result) == 2
+
+    def test_turnover_survives_a_quote_that_does_not_report_it(self):
+        """行情没给换手率时保留源里那个值，别用 0 抹掉它。"""
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
+
+        row = upsert_intraday_bar(self._frame(self._both_days()),
+                                  self._quote(turnover_pct=None),
+                                  today=self.TODAY).iloc[-1]
+        assert row["换手率"] == 0.88
+
+    def test_a_pinned_historical_query_is_still_not_polluted(self):
+        """not_after 那道闸门不能被新逻辑绕过。"""
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
+
+        result = upsert_intraday_bar(self._frame(self._both_days()), self._quote(),
+                                     not_after="2026-09-04", today=self.TODAY)
+        assert result.iloc[-1]["收盘"] == 3931.85, "钉了日期就不该被今天的行情动"
+
+    def test_hfq_is_still_refused(self):
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
+
+        result = upsert_intraday_bar(self._frame(self._both_days()), self._quote(),
+                                     adjust="hfq", today=self.TODAY)
+        assert result.iloc[-1]["收盘"] == 3931.85
+
+    def test_the_override_is_visible_in_the_log(self, caplog):
+        """这条日志是判断上游当日行有多不靠谱的唯一信号，不能只在 DEBUG 里。"""
+        import logging
+
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
+
+        with caplog.at_level(logging.INFO, logger="finmcp"):
+            upsert_intraday_bar(self._frame(self._both_days()), self._quote(),
+                                today=self.TODAY)
+        messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.INFO]
+        assert any("未定稿" in m for m in messages), messages
+        assert any("3931.85" in m and "3932.7" in m for m in messages), messages
+
+    def test_an_already_settled_same_day_row_does_not_shout(self, caplog):
+        """源的当日行已经等于实时值时，覆盖是无害的，但不该刷 INFO 日志。"""
+        import logging
+
+        from finmcp.datasource.cn_stock_source import upsert_intraday_bar
+
+        rows = self._both_days()
+        rows[-1] = (self.TODAY, 3932.70, 477375261.0)
+        with caplog.at_level(logging.INFO, logger="finmcp"):
+            upsert_intraday_bar(self._frame(rows), self._quote(), today=self.TODAY)
+        assert not [r for r in caplog.records if r.levelno >= logging.INFO]
