@@ -1340,8 +1340,20 @@ class CNStockDataSource(DataSource):
         # 页面也没补上、手里仍是 delay 那一行：报告照常渲染，但它是降级结果，不能进
         # 跨请求缓存——下一次页面可能就成功了，缓存住等于把一行历史冻进整个纪元
         # （cache-design §七 不变量 4）。用 fetch_failures 表达，它唯一的用途就是拦缓存。
+        #
+        # **只对真的渲染历史表的工具成立**（``fund_flow_page``，也就是 full）。
+        # brief / medium 只印"当日主力净流入"一行，1 行和 120 行对它们的输出完全
+        # 一样，"行数不够"因此不是降级——拿它拦缓存是纯亏：
+        #   - 这两个工具的页面兜底本来就不会触发（上面那个 if 要求 fund_flow_page），
+        #     所以 partial 对它们是**永久状态**，不是"下次可能好"，等不到那个下次；
+        #   - 代价实测：2026-09-07 收盘后 brief 15 次调用 15 次 Report cache skipped、
+        #     0 次命中，每次都全额打上游；连续三次调用还会因为上游当日行抖动给出
+        #     三个不同的值。
+        # "当日那一行还没落地"这个真问题由另一道守卫管（cache.is_cacheable_report
+        # 的 fund_flow_lagging），和行数无关，不受这里影响。
         fund_flow_partial = (
             requirements.fund_flow
+            and requirements.fund_flow_page
             and not _is_fetch_failure(fetched.get("fund_flow"))
             and _fund_flow_needs_page(fetched.get("fund_flow"))
         )

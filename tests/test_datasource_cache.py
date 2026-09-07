@@ -313,3 +313,66 @@ class TestPerNamespaceSwitch:
         monkeypatch.setattr(config, "CACHE_ENABLED", False)
         built = cache.Cache(cache.namespace("fund_flow"), enabled=True)
         assert built.enabled is True
+
+
+class TestPartialFundFlowOnlyBlocksTheToolThatRendersHistory:
+    """``fund_flow:partial`` 拦缓存的判据是"行数不够"，而只有 full 渲染历史表。
+
+    2026-09-07 定位：brief 只印"当日主力净流入"一行，1 行和 120 行对它的输出完全
+    一样；而它的页面兜底本来就不触发（要求 requirements.fund_flow_page），所以
+    partial 对它是**永久状态**，"下次页面可能就成功了"这个理由等不到那个下次。
+    代价实测：收盘后 brief 15 次调用 15 次 Report cache skipped、0 次命中，每次
+    都全额打上游，而且连续三次调用因为上游当日行抖动给出三个不同的值。
+    """
+
+    @staticmethod
+    def _partial(*, fund_flow: bool, fund_flow_page: bool, complete: bool) -> bool:
+        """照搬 cn_stock_source 里那个判据，参数化后单独测。"""
+        from finmcp.datasource.cn_stock_source import (
+            _fund_flow_needs_page, _is_fetch_failure,
+        )
+
+        value = {"complete": complete}
+        return bool(
+            fund_flow
+            and fund_flow_page
+            and not _is_fetch_failure(value)
+            and _fund_flow_needs_page(value)
+        )
+
+    def test_full_still_refuses_to_cache_a_one_row_history(self):
+        """full 渲染历史表，1 行确实是降级，仍然要拦。"""
+        assert self._partial(fund_flow=True, fund_flow_page=True, complete=False) is True
+
+    def test_brief_is_cacheable_with_only_the_delay_row(self):
+        """brief 不渲染历史表，一行就是它的完整答案。"""
+        assert self._partial(fund_flow=True, fund_flow_page=False, complete=False) is False
+
+    def test_a_complete_history_is_never_partial(self):
+        for page in (True, False):
+            assert self._partial(fund_flow=True, fund_flow_page=page, complete=True) is False
+
+    def test_a_call_that_did_not_ask_for_fund_flow_is_never_partial(self):
+        assert self._partial(fund_flow=False, fund_flow_page=True, complete=False) is False
+
+    def test_the_source_still_wires_the_flag_the_same_way(self):
+        """判据不能只活在测试里——源码里那四个条件必须还是这四个。"""
+        import inspect
+
+        from finmcp.datasource import cn_stock_source
+
+        src = inspect.getsource(cn_stock_source)
+        block = src[src.index("fund_flow_partial = ("):]
+        block = block[: block.index("\n        )")]
+        for needed in ("requirements.fund_flow", "requirements.fund_flow_page",
+                       "_is_fetch_failure", "_fund_flow_needs_page"):
+            assert needed in block, f"{needed} 不在判据里了：{block}"
+
+    def test_the_landing_guard_is_a_separate_concern(self):
+        """"当日那一行还没落地"由 fund_flow_lagging 管，和行数无关，不受这次改动影响。"""
+        from finmcp.cache import PHASE_CLOSED, is_cacheable_report
+
+        assert is_cacheable_report("报告正文", phase=PHASE_CLOSED,
+                                   fund_flow_lagging=True) is False
+        assert is_cacheable_report("报告正文", phase=PHASE_CLOSED,
+                                   fund_flow_lagging=False) is True
