@@ -190,7 +190,11 @@ async def fetch_batch_reports(
     symbols_label = ",".join(raw_symbols)
     start_time = time.time()
     date_label = f", date={date}" if date else ""
-    requirements = FetchRequirements(fund_flow_rows=max(1, int(fund_flow_limit or 15)))
+    requirements = FetchRequirements(
+        fund_flow_rows=max(1, int(fund_flow_limit or 15)),
+        # 只有 full 渲染历史资金流向表，其余模式不为它去打浏览器页面
+        fund_flow_page=(mode == "full"),
+    )
     report_cache = get_report_cache()
 
     def _probe_cache(symbol: str):
@@ -297,7 +301,8 @@ async def fetch_batch_reports(
     _active_report_requests += 1
     logger.info(
         "Starting %s query request_id=%s symbols=%s%s active=%s "
-        "fetch_finance=%s fetch_fund_flow=%s fetch_realtime=%s fetch_unadjusted=%s",
+        "fetch_finance=%s fetch_fund_flow=%s fetch_realtime=%s fetch_unadjusted=%s "
+        "fetch_fund_flow_page=%s",
         mode,
         request_id or "-",
         symbols_label,
@@ -307,6 +312,7 @@ async def fetch_batch_reports(
         requirements.fund_flow,
         requirements.realtime,
         requirements.unadjusted_kline,
+        requirements.fund_flow_page,
     )
     
     # 2. 准备容器

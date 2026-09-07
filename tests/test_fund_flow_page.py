@@ -463,7 +463,7 @@ class TestLoadRetry:
         attempts = []
         good = parse_fund_flow_page(FULL_PAGE.read_text(encoding="utf-8"))
 
-        async def flaky(symbol, context, *, loads=1, satisfies=None):
+        async def flaky(symbol, context, *, loads=1, satisfies=None, stats=None):
             attempts.append(loads)
             if len(attempts) == 1:
                 raise realtime_ff.FundFlowPageBlocked("cold")
@@ -621,7 +621,7 @@ class TestLoadAttempts:
         results = [partial, full]
         seen = []
 
-        async def flaky(symbol, context, *, loads=1, satisfies=None):
+        async def flaky(symbol, context, *, loads=1, satisfies=None, stats=None):
             item = results[len(seen)]
             seen.append(item)
             if isinstance(item, Exception):
@@ -646,7 +646,7 @@ class TestLoadAttempts:
         partial, _ = self._pages()
         seen = []
 
-        async def always_partial(symbol, context, *, loads=1, satisfies=None):
+        async def always_partial(symbol, context, *, loads=1, satisfies=None, stats=None):
             seen.append(symbol)
             return partial
 
@@ -666,7 +666,7 @@ class TestLoadAttempts:
         _, full = self._pages()
         seen = []
 
-        async def good(symbol, context, *, loads=1, satisfies=None):
+        async def good(symbol, context, *, loads=1, satisfies=None, stats=None):
             seen.append(symbol)
             return full
 

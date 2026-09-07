@@ -129,6 +129,19 @@ JSON 外壳没有变。
   同名（比乐咕少 7 个小板块），乐咕缺的级由它补，乐咕给全时不发请求。**服务器 `.env` 里若写死了
   `SECTOR_TAXONOMY_PROVIDERS=shenwan`，新默认不会生效，要改成两项或删掉这一行。**
 
+### 09-07 首个交易日的修正（收盘后部署）
+
+- **浏览器身份回到 main 分支的原样。** 2.0.0 给资金流向页面加的伪装（`--disable-blink-features=AutomationControlled`、
+  CDP 覆盖 UA 与 client hints、注入脚本、zh-CN 上下文）在部署机上适得其反：盘外两次交错 A/B，每种身份 36 次加载，
+  main 原样 36/36 拿到今日块，只加那个参数 26/36，完整伪装 23/36。上午 brief 的实时资金流命中率因此从
+  main 时期的 92 到 95 掉到 54。伪装改为 `BROWSER_DISGUISE=1` 才启用，默认关。
+- **被拒不再 reload，直接换 tab；接口断连后给页面 6 秒自己重发；缺的那块是接口拒的就不再加载。**
+  部署机数据：首加载被拒后靠新 tab 救回 7 次、reload 3 次；12 次在首次断连后 1.9 到 3.7 秒内由页面自己重发拿到。
+- **实时那条路接上熔断器**（`fund_flow_browser`，与历史兜底共用阈值、窗口、冷却），只有"要今日却被拒"计失败。
+- **brief 与 medium 不再为历史表去打页面**（`FetchRequirements.fund_flow_page`），只有 full 渲染历史表。
+- 部署方要同时把 .env 里的 `FUND_FLOW_PAGE_MAX_LOADS` 回到 `2`、`FUND_FLOW_PAGE_COOLDOWN_SECONDS` 回到 `60`：
+  09-07 上午部署机是 5 和 20，一个标的一次调用最多 10 次加载压在十几秒内，是滑块成批出现的放大器。
+
 ### 已知限制
 
 - **科创50（`SH000688`）的历史资金流仍只有当日一行。** 它没有资金流向页面，`push2delay` 也只回最近一天，

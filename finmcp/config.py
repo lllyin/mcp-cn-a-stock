@@ -272,19 +272,19 @@ FUND_FLOW_PAGE_COOLDOWN_SECONDS = max(
 #     所以省不下任何东西。
 FUND_FLOW_PAGE_MAX_LOADS = max(1, int(env("FUND_FLOW_PAGE_MAX_LOADS", "2")))
 
-# 把无头浏览器的自报特征改成普通浏览器的样子。默认开。
+# 把无头浏览器的自报特征改成普通浏览器的样子。
 #
-# 起因是实测发现 sec-ch-ua 在每个请求头里写着 "HeadlessChrome";v="145" —— 这不是
-# 细微指纹而是自报身份，而且和我们原先硬编码的 UA（Chrome/120）自相矛盾；在 Linux
-# 服务器上还会变成 UA 说 Macintosh、sec-ch-ua-platform 说 Linux 的第二重矛盾。
-#
-# 实测 2026-09-04 三个方案的指纹与内存（浏览器进程树 footprint，四个标的）：
-#   现状 headless_shell + 硬编码 UA : sec-ch-ua 说 HeadlessChrome，63.7/95 MiB
-#   换完整 Chromium 新无头          : 指纹全对，但 323/401 MiB（+260，超预算）
-#   本方案（CDP 覆盖 + locale）     : 指纹全对，65.7/111 MiB（+2/+16）
-# 所以走本方案。置 0 可一键退回原样，用于对照或伪装反而招致拦截时回滚。
+# 默认关。2026-09-07 部署机盘外两次交错 A/B，每种身份 36 次加载、同一批标的、同一判定：
+#   main 原样身份（无头、固定 UA、不伪装）                       今日块 36/36，kline 接口断连 0
+#   只加 --disable-blink-features=AutomationControlled            26/36，断连 16
+#   完整伪装（该参数 + CDP 覆盖 UA/client hints + 注入脚本 + zh-CN）23/36，断连 16
+# 东财 push2 的数据接口对"明显的无头"放行、对"伪装过的"拒绝；滑块弹窗（checkuser）对
+# 三种身份都弹，但不拦数据。所以伪装整套改为显式开启才生效，默认走 main 的身份。
+# 09-04 本机实测"不加参数 2/16、加上 15/16"是本机网络下的结果，对部署机不成立；本机与
+# 部署机面对的风控门不同，浏览器身份的结论只能在部署机上测。
+# 伪装的实现保留（CDP 覆盖 + locale，浏览器进程树 +2/+16 MiB），要对照时置 1。
 BROWSER_DISGUISE = _parse_bool(
-    env("BROWSER_DISGUISE"), True
+    env("BROWSER_DISGUISE"), False
 )
 
 # 对外声明哪个平台：auto | real | macos | windows。

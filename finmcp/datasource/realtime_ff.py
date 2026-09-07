@@ -18,12 +18,16 @@ from ..config import (
     BROWSER_IDLE_TIMEOUT_SECONDS,
     BROWSER_KEEP_PAGES,
     BROWSER_MAX_PAGES,
+    FUND_FLOW_PAGE_COOLDOWN_SECONDS,
+    FUND_FLOW_PAGE_FAILURE_WINDOW_SECONDS,
     FUND_FLOW_PAGE_MAX_LOADS,
+    FUND_FLOW_PAGE_OPEN_AFTER_FAILURES,
     FUND_FLOW_PAGE_RETRY_DELAY_MS,
     FUND_FLOW_PAGE_REUSE_SECONDS,
     FUND_FLOW_PAGE_TABLE_WAIT_SECONDS,
 )
 from ..observability import log_context
+from .breaker import SourceBreaker
 from .fund_flow_page import (
     HISTORY_TABLE_ID,
     FundFlowPage,
@@ -53,6 +57,42 @@ _idle_task: asyncio.Task | None = None
 # 整个浏览器同时开着的页面数上限。页面在这段区间内创建也在区间内关闭，所以这个
 # 值同时就是"同时几个渲染进程"，是峰值内存的直接决定项。见配置项的实测数据。
 SEMAPHORE = asyncio.Semaphore(BROWSER_MAX_PAGES)
+
+#: main 分支的浏览器身份：无头、固定这串 UA、不加任何伪装。2026-09-07 部署机盘外两次交错
+#: A/B（每种身份 36 次加载、同一批 6 只个股、同一判定）：这套身份今日块 36/36、kline 接口
+#: 断连 0；只加 --disable-blink-features=AutomationControlled 就掉到 26/36、断连 16；再加
+#: CDP 覆盖与注入脚本 23/36。东财 push2 的数据接口对"明显的无头"放行、对"伪装过的"拒绝，
+#: 而滑块弹窗（checkuser）对谁都弹、不拦数据。所以 BROWSER_DISGUISE 关着时就用这一套。
+LEGACY_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+_LAUNCH_ARGS = [
+    "--disable-gpu",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-default-apps",
+    "--no-first-run",
+    "--mute-audio",
+]
+
+#: 资金流接口第一次断连之后，再给页面这么多秒让它自己重发。2026-09-07 部署机实测 72 次
+#: 非 main 身份的加载里有 12 次在首次断连后 1.9 到 3.7 秒内拿到了今日数据，是页面脚本
+#: 自己重发的；第一次断连就判被拒等于把这些数据扔掉。6 秒盖住实测最长的 3.7 秒。
+REFUSAL_GRACE_SECONDS = 6.0
+
+#: 浏览器层自己的熔断器。原先只有历史兜底那条路有熔断，实时那条路没有：滑块一出现，
+#: 实时调用方照样一个标的接一个标的地连发（09-07 上午 15 只标的 95 次加载），把偶发
+#: 的拒绝喂成整批的滑块。阈值、窗口、冷却与历史兜底共用同一组配置。只有"要今日却被拒"
+#: 才计失败——daykline 在 main 身份下也有一半被拒，历史缺失是常态，不能让它把实时停掉。
+_PAGE_BREAKER = SourceBreaker(
+    "fund_flow_browser",
+    FUND_FLOW_PAGE_OPEN_AFTER_FAILURES,
+    FUND_FLOW_PAGE_COOLDOWN_SECONDS,
+    window=FUND_FLOW_PAGE_FAILURE_WINDOW_SECONDS,
+)
 _inflight: dict[str, asyncio.Task[dict]] = {}
 _inflight_waiters: dict[str, int] = {}
 _inflight_keep_alive: dict[str, bool] = {}
@@ -338,29 +378,19 @@ async def get_context() -> BrowserContext:
             new_browser = None
             try:
                 new_playwright = await async_playwright().start()
+                launch_args = list(_LAUNCH_ARGS)
+                if BROWSER_DISGUISE:
+                    # 隐掉 navigator.webdriver。09-04 本机实测不带 0/8、带上 7/8；09-07
+                    # 部署机实测正相反，带上之后 kline 接口断连从 0/36 涨到 16/36。它只随
+                    # 伪装一起开，默认不带，见 config.BROWSER_DISGUISE。
+                    launch_args.insert(0, "--disable-blink-features=AutomationControlled")
                 new_browser = await new_playwright.chromium.launch(
                     headless=not BROWSER_HEADFUL,
-                    args=[
-                        # 不带这一条时 navigator.webdriver 为 true，东财的资金流
-                        # 接口对页面发出的 /fflow/ 请求直接空响应。实测同一时间、
-                        # 8 只沪深标的各加载一次：不带 0/8，带上 7/8，与有头模式
-                        # 的 7/8 持平。所以服务器上不需要有头，也不需要 Xvfb。
-                        "--disable-blink-features=AutomationControlled",
-                        "--disable-gpu",
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-extensions",
-                        "--disable-background-networking",
-                        "--disable-default-apps",
-                        "--no-first-run",
-                        "--mute-audio",
-                    ],
+                    args=launch_args,
                 )
-                # 不再硬编码 UA 字符串。硬编码解决不了问题还制造新问题：它只改
-                # navigator.userAgent，sec-ch-ua 仍由真实构建给出，于是一个请求里
-                # UA 说 Chrome/120、client hints 说 HeadlessChrome/145，自相矛盾；
-                # 在 Linux 服务器上更糟，UA 说 Macintosh 而 sec-ch-ua-platform 说
-                # Linux。一致的伪装在 _disguise_page 里按真实版本号现算。
+                # 默认用 main 的身份：固定 UA 字符串 Chrome/120，client hints 照旧写着
+                # HeadlessChrome/145，自相矛盾——但这正是部署机上唯一 36/36 通过的身份
+                # （见 LEGACY_UA 的注释）。开了伪装才走 disguise_page 那套自洽的覆盖。
                 context_options = {
                     "java_script_enabled": True,
                     "bypass_csp": True,
@@ -376,6 +406,8 @@ async def get_context() -> BrowserContext:
                         viewport={"width": 1920, "height": 1080},
                         screen={"width": 1920, "height": 1080},
                     )
+                else:
+                    context_options["user_agent"] = LEGACY_UA
                 new_context = await new_browser.new_context(**context_options)
                 if BROWSER_DISGUISE:
                     await new_context.add_init_script(_HEADLESS_GAPS_SCRIPT)
@@ -564,6 +596,9 @@ async def _race_with_refusal(coro, refused: asyncio.Event):
         await asyncio.wait(
             {task, refusal}, return_when=asyncio.FIRST_COMPLETED
         )
+        if refusal.done() and not task.done() and REFUSAL_GRACE_SECONDS > 0:
+            # 被拒之后页面脚本会自己重发一次，给它几秒；等到了就当没被拒过。
+            await asyncio.wait({task}, timeout=REFUSAL_GRACE_SECONDS)
     finally:
         for pending in (task, refusal):
             if not pending.done():
@@ -618,15 +653,23 @@ async def load_fund_flow_page(
     *,
     loads: int = 1,
     satisfies=None,
+    stats: dict | None = None,
 ) -> FundFlowPage:
     """加载页面，解析出今日与历史两块。
 
     今日和历史都在同一个页面上、都由 ``/fflow/`` 接口填充，所以分两次加载既浪费
     一次 Chromium，又多一次被拒的机会。两个等待并发进行，耗时上限与合并前一致。
 
-    ``loads`` 是这一个 tab 允许的加载次数：第一次 goto，没拿到（想要的）数据就在
-    同一个 tab 上 reload。实测 reload 便宜一半——同一标的第二次加载 p50 0.240s，
-    而关掉再开新 tab 是 0.452s，且 CDP 的 UA 覆盖能活过 reload、不用重装。
+    ``loads`` 是这一个 tab 允许的加载次数：第一次 goto，页面空着但没被拒（冷启动没填
+    完、开盘前）就在同一个 tab 上 reload。实测 reload 便宜一半——同一标的第二次加载
+    p50 0.240s，而关掉再开新 tab 是 0.452s。
+
+    **被拒不 reload。** 同一个 tab 刷新带不走滑块，新 tab 才带得走：09-07 部署机
+    首加载被拒后靠重试救回的 10 次里，新 tab 7 次、reload 3 次。被拒直接抛给
+    ``_load_page_shared``，由它决定还要不要换 tab。缺的那一块是接口拒的（今日到了、
+    历史被拒，或反过来）也不再加载，再来一次只是再被拒一次；拿到的那块交给调用方。
+
+    ``stats`` 给调用方回填 ``loads``（实际加载次数）和 ``refused``（被拒且仍缺的块）。
 
     reload 刻意留在同一段信号量持有区间内：整个浏览器同时开着的 tab 数是靠
     ``SEMAPHORE`` 隐式限住的（页面在这段区间里创建也在这段区间里关闭），tab 一旦
@@ -662,6 +705,10 @@ async def load_fund_flow_page(
             for pattern in BLOCKED_PATTERNS:
                 await page.route(pattern, block_route)
 
+            if stats is None:
+                stats = {}
+            stats["loads"] = 0
+            stats["refused"] = set()
             last_refusal = None
             parsed = None
             for index in range(max(1, loads)):
@@ -679,9 +726,11 @@ async def load_fund_flow_page(
                 how = "reload" if index else "new_tab"
                 outcome = "error"
                 logged = False
-                parsed, last_refusal = await _load_once(
+                parsed, last_refusal, refused_blocks = await _load_once(
                     page, symbol, url, reload=bool(index)
                 )
+                stats["loads"] += 1
+                stats["refused"] = refused_blocks
                 outcome = (
                     "blocked_captcha"
                     if last_refusal is not None and last_refusal.captcha
@@ -697,9 +746,15 @@ async def load_fund_flow_page(
                     time.perf_counter() - started_at,
                 )
                 logged = True
+                if last_refusal is not None:
+                    # 被拒：不在这个 tab 上 reload，交给上层换 tab（或放弃）。
+                    break
                 if parsed is None:
                     continue
                 if satisfies is None or satisfies(parsed):
+                    return parsed
+                if refused_blocks:
+                    # 缺的那一块是接口拒的，reload 填不上；把拿到的这块交出去。
                     return parsed
             if parsed is not None:
                 # 拿到了数据但不满足调用方要的那一块，交给上层决定要不要换 tab 再试。
@@ -763,7 +818,12 @@ class _PageRefusal(FundFlowPageRefused):
 
 
 async def _load_once(page, symbol: str, url: str, *, reload: bool):
-    """在给定页面上跑一次加载，返回 (解析结果 或 None, 被拒异常 或 None)。"""
+    """在给定页面上跑一次加载。
+
+    返回 ``(解析结果 或 None, 被拒异常 或 None, 被拒且仍缺的块)``。第三项是
+    ``{"today", "history"}`` 的子集：接口断连过、页面自己重发也没补上的那一块。
+    调用方据此决定还要不要重试——缺的块是接口拒的，再加载只是再被拒一次。
+    """
     refused: list = []
     today_refused = asyncio.Event()
     history_refused = asyncio.Event()
@@ -800,6 +860,12 @@ async def _load_once(page, symbol: str, url: str, *, reload: bool):
 
     # 页面渲染成功但两块都没值，同时相关请求被拒。停牌和开盘前也会得到空值，
     # 但那时不会有请求失败，所以两个条件必须同时成立才算"被拒"。
+    refused_blocks = set()
+    if today_refused.is_set() and not (parsed is not None and parsed.has_today):
+        refused_blocks.add("today")
+    if history_refused.is_set() and not (parsed is not None and parsed.history):
+        refused_blocks.add("history")
+
     got_nothing = parsed is None or (not parsed.history and not parsed.has_today)
     if got_nothing and refused:
         captcha = parsed is not None and parsed.captcha_present
@@ -811,10 +877,10 @@ async def _load_once(page, symbol: str, url: str, *, reload: bool):
         return None, _PageRefusal(
             f"{symbol} 资金流接口拒绝了 {len(refused)} 个请求（空响应），{reason}",
             captcha=captcha,
-        )
+        ), refused_blocks
     if parsed is None:
-        return None, None
-    return parsed, None
+        return None, None, refused_blocks
+    return parsed, None, refused_blocks
 
 
 def _page_to_realtime_dict(symbol: str, page: FundFlowPage) -> dict:
@@ -948,20 +1014,25 @@ async def _load_page_shared(
     # 整段重试盖在一次借用里：中途被空闲回收拆掉浏览器，会让 tab 和 CDP 覆盖一起
     # 失效，而被拒之后的重试正是最需要稳定的时候。
     async with browser_lease() as context:
+        if _PAGE_BREAKER.should_skip():
+            # 浏览器层刚被连续拒过：这一刻再加载只会把滑块续下去，直接告诉调用方没有。
+            raise FundFlowPageRefused(f"{symbol} 浏览器层熔断中，暂不加载页面")
         budget = FUND_FLOW_PAGE_MAX_LOADS
         predicate = lambda page: _satisfies(page, require_history, require_today)
         last_error = None
         used = 0
 
         while used < budget:
-            # 每个 tab 最多两次加载：goto，没数据就 reload。剩余预算不足就少给。
+            # 每个 tab 最多两次加载：goto，空着但没被拒就 reload。剩余预算不足就少给。
             loads = min(2, budget - used)
-            used += loads
+            stats: dict = {}
             try:
                 page = await load_fund_flow_page(
-                    symbol, context, loads=loads, satisfies=predicate
+                    symbol, context, loads=loads, satisfies=predicate, stats=stats
                 )
             except FundFlowPageRefused as e:
+                # 被拒时 load_fund_flow_page 只加载了一次就抛出来，按实际次数记账。
+                used += stats.get("loads", loads)
                 last_error = e
                 if used < budget:
                     logger.info(
@@ -971,8 +1042,27 @@ async def _load_page_shared(
                         budget,
                     )
                     continue
+                _PAGE_BREAKER.record(success=False)
                 raise
-            if predicate(page) or used >= budget:
+            used += stats.get("loads", loads)
+            if predicate(page):
+                _PAGE_BREAKER.record(success=True)
+                return page
+            refused = stats.get("refused") or set()
+            if refused:
+                # 缺的那一块是接口拒的，换 tab 也填不上。只有"要今日却被拒"才喂给熔断器：
+                # 历史那一块在 main 身份下本来就有一半被拒，不能让它把实时停掉。
+                logger.info(
+                    "资金流向页面缺的那块被接口拒绝，不再重试 symbol=%s 今日=%s 历史=%d 被拒=%s",
+                    symbol,
+                    page.has_today,
+                    len(page.history),
+                    ",".join(sorted(refused)),
+                )
+                if require_today and "today" in refused:
+                    _PAGE_BREAKER.record(success=False)
+                return page
+            if used >= budget:
                 return page
             logger.info(
                 "资金流向页面数据不全，换一个 tab symbol=%s 已用%d/%d次加载 今日=%s 历史=%d",

@@ -26,6 +26,11 @@ class FetchRequirements:
     #: 主源给全部历史，缓存了少的那份之后不能让要得多的请求命中它，否则缓存让数据
     #: 变少了。取数本身不看它——上游请求跟行数无关。见 docs/cache-design.md §4.7。
     fund_flow_rows: int = 15
+    #: 资金流历史取不到时，允不允许去浏览器页面补历史表。只有 full 渲染历史表，brief 和
+    #: medium 不渲染；为一张不渲染的表去打页面，代价全落在同一个浏览器上的实时那条路：
+    #: 09-07 部署机盘中 15 只标的 95 次页面加载，一半以上是历史兜底的重试，触发滑块后
+    #: 当日实时一起被拒。取当日实时不看这一项。
+    fund_flow_page: bool = True
 
     @classmethod
     def technical(cls) -> "FetchRequirements":

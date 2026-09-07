@@ -1097,7 +1097,10 @@ def test_breaker_can_be_disabled(monkeypatch, kline_breaker):
     calls = []
     _failing_eastmoney(monkeypatch, calls)
     _stub_tencent_provider(monkeypatch, lambda request: _sample_kline_frame())
-    monkeypatch.setattr(source_module, "SOURCE_BREAKER_ENABLED", False)
+    from finmcp.datasource import breaker as breaker_module
+
+    # 开关由 breaker 模块自己读；抽出去之后要 patch 那边，不是 cn_stock_source 的转发名
+    monkeypatch.setattr(breaker_module, "SOURCE_BREAKER_ENABLED", False)
     datasource = CNStockDataSource()
 
     for _ in range(kline_breaker.threshold + 3):
@@ -2007,3 +2010,29 @@ async def test_a_symbol_with_a_page_still_goes_through_the_slot(monkeypatch):
 
     assert result is not None
     assert used == [True]
+
+
+@pytest.mark.asyncio
+async def test_brief_never_pays_for_the_page_history(monkeypatch):
+    """brief 不渲染历史表，资金流历史取不到也不去打浏览器页面。
+
+    09-07 部署机盘中 15 只标的 95 次页面加载，一半以上是 brief 触发的历史兜底重试；这些
+    加载喂出的滑块把同一浏览器上的当日实时一起拒掉。取当日实时那条路不受此项影响。
+    """
+    from finmcp.datasource import realtime_ff as realtime_ff_module
+
+    datasource = _page_fallback_datasource(
+        monkeypatch, source_module._fetch_failure("fund_flow")
+    )
+
+    async def unexpected(symbol):
+        raise AssertionError("brief 不该为历史表加载页面")
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", unexpected)
+
+    result = await datasource.fetch_stock_data_with_requirements(
+        "SZ300408", "2024-01-01", "2026-09-03",
+        requirements=FetchRequirements(fund_flow_page=False),
+    )
+
+    assert result.fetch_failures == ["fund_flow"]

@@ -312,7 +312,8 @@ async def test_markdown_reports_preserve_all_datasource_requirements(monkeypatch
     response = await app_module.fetch_batch_reports("SZ002463", mode, "")
 
     assert response.errors == {}
-    assert seen["requirements"] == FetchRequirements()
+    # 只有 full 渲染历史资金流向表，也只有它允许为历史去打浏览器页面；其余项目三种模式相同
+    assert seen["requirements"] == FetchRequirements(fund_flow_page=(mode == "full"))
 
 
 @pytest.mark.asyncio
