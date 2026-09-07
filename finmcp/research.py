@@ -6,6 +6,7 @@
 
 import asyncio
 import datetime
+import logging
 from dataclasses import dataclass
 from io import StringIO
 from typing import Dict, Optional, TextIO
@@ -20,7 +21,11 @@ from .datasource.base import FetchRequirements
 from .datasource import trading_calendar
 from . import market_session
 from .datasource.realtime_ff import get_fund_flow
+from .datasource import realtime_fund_flow_source
+from .datasource.fund_flow_source import FundFlowRequest
 from .symbols import symbol_with_name
+
+logger = logging.getLogger("finmcp")
 
 
 def compute_kdj(close: ndarray, high: ndarray, low: ndarray, n: int = 9, m1: int = 3, m2: int = 3) -> tuple:
@@ -520,6 +525,37 @@ def print_api_fund_flow_if_today(
     return has_fund_flow
 
 
+async def print_provider_realtime_fund_flow(
+    fp: TextIO, symbol: str, data: Dict[str, ndarray]
+) -> bool:
+    """没有资金流向页面的标的（科创50 等）盘中走 realtime_fund_flow 那层 provider。
+
+    输出和页面路径同一种形状：一行标的名称、五行"当日X净流入 … X净占比"，下游解析同一套
+    正则。接口不给净占比，用净流入除以当日成交额（``AMOUNT`` 最后一根，单位元）；成交额
+    没有就写 ``--``，不编数。取不到返回 False，调用方照旧写"暂无实时资金流向"。
+    """
+    pure_code = "".join(c for c in symbol if c.isdigit())
+    if not pure_code:
+        return False
+    request = FundFlowRequest(code=pure_code, symbol=symbol, is_index=pure_code in ALL_INDICES)
+    try:
+        flow = await asyncio.to_thread(realtime_fund_flow_source.resolve, request)
+    except Exception:
+        logger.warning("实时资金流 provider 取数异常 %s", symbol, exc_info=True)
+        return False
+    if flow is None:
+        return False
+
+    amounts = data.get("AMOUNT")
+    amount = float(amounts[-1]) if amounts is not None and len(amounts) and amounts[-1] > 0 else None
+    prefix = get_realtime_fund_flow_prefix(pure_code, data)
+    print(f"- 标的名称: {data.get('NAME') or flow.name or symbol}", file=fp)
+    for kind, net in flow.rows():
+        ratio = f"{net / amount:.2%}" if amount else "--"
+        print(f"- {prefix}{kind}净流入: {format_fund_flow_amount(net)}  {kind}净占比: {ratio}", file=fp)
+    return True
+
+
 def has_realtime_fund_flow_values(res: dict) -> bool:
     """Return whether Playwright realtime scraping yielded any non-placeholder amount."""
     amount_keys = ["主力净流入", "超大单净流入", "大单净流入", "中单净流入", "小单净流入"]
@@ -805,8 +841,11 @@ async def build_trading_data(
             import json
             target_code = get_realtime_fund_flow_target(symbol, data)
             if target_code is None:
+                # 没有页面的标的：先看 API 日线有没有当天行（盘中没有），再问分钟线那层
+                # provider，都没有才写暂无。顺序不动是为了让有当天行时的输出逐字不变。
                 if not print_api_fund_flow_if_today(fp, data):
-                    print("- 暂无实时资金流向", file=fp)
+                    if not await print_provider_realtime_fund_flow(fp, symbol, data):
+                        print("- 暂无实时资金流向", file=fp)
             else:
                 try:
                     if (

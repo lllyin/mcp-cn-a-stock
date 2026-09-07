@@ -141,6 +141,11 @@ JSON 外壳没有变。
 - **brief 与 medium 不再为历史表去打页面**（`FetchRequirements.fund_flow_page`），只有 full 渲染历史表。
 - 部署方要同时把 .env 里的 `FUND_FLOW_PAGE_MAX_LOADS` 回到 `2`、`FUND_FLOW_PAGE_COOLDOWN_SECONDS` 回到 `60`：
   09-07 上午部署机是 5 和 20，一个标的一次调用最多 10 次加载压在十几秒内，是滑块成批出现的放大器。
+- **科创50 这类无页面标的盘中有实时资金流了。** 新能力 `realtime_fund_flow`，`eastmoney_delay` 取 push2delay 分钟线
+  最后一行（当日累计五档净流入），净占比按当日成交额折算；`REALTIME_FUND_FLOW_PROVIDERS` 接线，默认开。
+  报告形状与页面路径一致：一行标的名称加五行 `当日X净流入 … X净占比`。
+- **同花顺日 K 两处修正。** 年份文件 5xx 或非 JSONP 现在抛出让链路落到腾讯，不再当"没上市"静默跳过
+  （本机曾因此少了 240 日五行）；404 才是没上市。盘中当天的占位行（开高低为空）跳过，不再让整个源报错。
 
 ### 已知限制
 

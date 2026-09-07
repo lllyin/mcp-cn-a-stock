@@ -128,9 +128,20 @@ class TonghuashunPlatform(pf.Platform):
             url = _YEAR_URL.format(base=_BASE, code=code, segment=segment, year=year)
             response = session.get(url, headers=_HEADERS, timeout=15)
             body = response.text
-            if not body or "(" not in body:
-                # 某一年没有（标的还没上市）不是错，接着取下一年。
+            if response.status_code == 404:
+                # 那一年没有这个标的（还没上市），文件本身不存在：C马矿 2026-09-01 上市，
+                # 它的 2025 年文件就是 404 空正文。不是错，接着取下一年。
+                logger.debug("同花顺 %s 年文件不存在（未上市）code=%s", year, code)
                 continue
+            if response.status_code != 200 or not body or "(" not in body:
+                # 5xx 或正文不是 JSONP 是取数失败，不是"那年没有"。以前这里 continue：
+                # 2026-09-07 本机 2024、2025 两年文件 502 被静默跳过，科创50 只剩 2026 年
+                # 164 根，报告少了 240 日五行且无日志；若失败的是当年文件，序列会停在去年、
+                # 均线全部算错。抛出去让链路落到下一个源，数据由腾讯补齐。
+                raise RuntimeError(
+                    f"同花顺 {year} 年文件 HTTP {response.status_code}"
+                    + ("" if body and "(" in body else "，正文不是 JSONP")
+                )
             payload = json.loads(body[body.index("(") + 1: body.rindex(")")])
             rows.extend(self._rows(payload))
         if not rows:
@@ -167,15 +178,25 @@ class TonghuashunPlatform(pf.Platform):
                 day = datetime.datetime.strptime(parts[0], "%Y%m%d").date()
             except ValueError:
                 continue
+            if not all(parts[1:5]):
+                # 盘中当天的占位行：开高低为空、收盘等于昨收、成交额为空，例如
+                # ``20260907,,,,1577.36,0,,0.000,,,0``（2026-09-07 科创50，部署机当天 6 次
+                # 因此整个源报 ValueError 落到腾讯）。当天那根由盘中 bar 补，这里跳过。
+                continue
             out.append({
                 "日期": day,
                 # 注意列序：同花顺是 开-高-低-收，不是别家的 开-收-高-低
                 "开盘": float(parts[1]), "最高": float(parts[2]),
                 "最低": float(parts[3]), "收盘": float(parts[4]),
-                "成交量": float(parts[5]), "成交额": float(parts[6]),
-                "换手率": float(parts[7]) / 100 if len(parts) > 7 and parts[7] else 0.0,
+                "成交量": _num(parts[5]), "成交额": _num(parts[6]),
+                "换手率": _num(parts[7]) / 100 if len(parts) > 7 else 0.0,
             })
         return out
+
+
+def _num(text: str) -> float:
+    """空串当 0：停牌日的成交量、成交额可能是空的，不该让整个源报错。"""
+    return float(text) if text else 0.0
 
 
 pf.register(TonghuashunPlatform())

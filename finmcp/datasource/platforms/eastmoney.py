@@ -33,6 +33,7 @@ from typing import Optional
 
 from .. import platform as pf
 from ..fund_flow_source import FundFlowHistory
+from ..realtime_fund_flow_source import RealtimeFundFlow
 from ..sector_fund_flow import SectorFlow, SectorFundFlowBoard
 
 logger = logging.getLogger("finmcp")
@@ -77,6 +78,10 @@ _FUND_FLOW_COLUMNS = [
 ]
 _FUND_FLOW_FIELDS = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
 _DELAY_FUND_FLOW_URL = "https://push2delay.eastmoney.com/api/qt/stock/fflow/daykline/get"
+#: 分钟线：每分钟一行，最后一行是当日累计。字段位置与日线前六位相同：时刻、主力、小单、
+#: 中单、大单、超大单；接口对 klt=1 不给净占比字段。zjlx 页面"今日"栏就是它填的。
+_DELAY_MINUTE_FUND_FLOW_URL = "https://push2delay.eastmoney.com/api/qt/stock/fflow/kline/get"
+_MINUTE_FUND_FLOW_FIELDS = "f51,f52,f53,f54,f55,f56"
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/81.0.4044.138 Safari/537.36")
 
@@ -212,7 +217,7 @@ class EastmoneyDelayPlatform(pf.Platform):
     """
 
     name, label = "eastmoney_delay", "东财(delay)"
-    capabilities = frozenset({"fund_flow"})
+    capabilities = frozenset({"fund_flow", "realtime_fund_flow"})
 
     @staticmethod
     def _get(secid: str) -> dict:
@@ -239,6 +244,44 @@ class EastmoneyDelayPlatform(pf.Platform):
         if not klines:
             return None
         return FundFlowHistory(frame=_fund_flow_frame(klines), complete=False)
+
+    @staticmethod
+    def _get_minutes(secid: str) -> dict:
+        """分钟线一次请求。单拎出来是为了测试能不联网注入响应。"""
+        import time
+
+        import requests
+
+        response = requests.get(
+            _DELAY_MINUTE_FUND_FLOW_URL,
+            params={
+                "lmt": "0", "klt": "1", "secid": secid,
+                "fields1": "f1,f2,f3,f7", "fields2": _MINUTE_FUND_FLOW_FIELDS,
+                "ut": "b2884a393a59ad64002292a3e90d46a5", "_": int(time.time() * 1000),
+            },
+            headers={"User-Agent": _UA},
+            timeout=15,
+        )
+        return response.json()
+
+    def fetch_realtime_fund_flow(self, request) -> Optional[RealtimeFundFlow]:
+        """分钟线最后一行 = 当日累计五档净流入。盘外分钟线是空的，返回 None 让调用方按暂无处理。"""
+        payload = self._get_minutes(request.secid)
+        data = (payload or {}).get("data") or {}
+        klines = data.get("klines") or []
+        if not klines:
+            return None
+        parts = str(klines[-1]).split(",")
+        if len(parts) < 6:
+            return None
+        try:
+            main, small, medium, large, xlarge = (float(x) for x in parts[1:6])
+        except ValueError:
+            return None
+        return RealtimeFundFlow(
+            time=parts[0], main_net=main, xl_net=xlarge, l_net=large, m_net=medium, s_net=small,
+            name=str(data.get("name") or ""), source=self.name,
+        )
 
 
 pf.register(EastmoneyPlatform())
