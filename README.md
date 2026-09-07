@@ -251,7 +251,8 @@ mcporter call cn-stock market_events \
 | 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
 | `BASIC_INFO_PROVIDERS` | 基本数据（市值、市盈率、市净率）的尝试顺序，后面的源补前面缺的字段：<br>`eastmoney` 字段最全，需要网关或未被封的出口<br>`tencent` 无需鉴权，没有网关的部署靠它兜住这一组 | `eastmoney`<br>`tencent`<br>`off`<br>（默认 `eastmoney,tencent`） |
-| `INTRADAY_QUOTE_PROVIDERS` | 盘中实时行情的尝试顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`fund_flow_page` 复用已解析的资金流页面，不发请求但没有开高低<br>`tencent` 六项俱全 | `fund_flow_page`<br>`tencent`<br>`off`<br>（默认 `fund_flow_page,tencent`） |
+| `INTRADAY_QUOTE_PROVIDERS` | 盘中实时行情的尝试顺序，逗号分隔按序尝试，`off` 关闭整层。**当天那一根 K 线只认这一层**（日线端点给的当天行不作准）：<br>`fund_flow_page` 复用已解析的资金流页面，不发请求但没有开高低<br>`tencent` qt.gtimg.cn，字段全<br>`tonghuashun` realhead 接口，字段全 | `fund_flow_page`<br>`tencent`<br>`tonghuashun`<br>`off`<br>（默认 `fund_flow_page,tencent,tonghuashun`） |
+| `INTRADAY_QUOTE_PROVIDERS_INDEX` | **指数**用的顺序，和上一项分开配：指数的成交量各源口径差得多。创业板指当日成交量实测——东财 172,310,434 手、同花顺 172,310,430 手、腾讯与新浪都是 165,865,859 手（低 3.885%）。东财是基准源，所以指数把同花顺排前面；个股两家逐位一致，不换 | 同上（默认 `fund_flow_page,tonghuashun,tencent`） |
 | `INTRADAY_QUOTE_CROSS_CHECK_PCT` | 拿到第一个可用报价后再问剩下的源一遍，字段相差超过这个值就打 WARNING。每个标的多一次上游请求，只在怀疑某个源口径不对时开 | 百分比，`0` 关闭（默认 `0`） |
 | `TRADING_CALENDAR_PROVIDERS` | 判「今天开不开市」的日历来源，判断入口统一在 `finmcp.market_calendar`：<br>`sina` 上交所公布的交易日名单，最权威<br>`holiday_cn` [NateScarlet/holiday-cn](https://github.com/NateScarlet/holiday-cn) 的国务院放假安排换算而来；对 728 天实测与 `sina` 一致 99.863%，唯一差异是 2024-02-09 除夕交易所多休<br>`weekday` 兜底，周一到周五算交易日（同一区间错 56 天）| `sina`<br>`holiday_cn`<br>`weekday`<br>`off`<br>（默认 `sina,holiday_cn,weekday`） |
 | `FUND_FLOW_PROVIDERS` | 个股/指数资金流 HTTP 层的取数顺序（浏览器页面兜底另算，挂在这一层之后）：<br>`eastmoney` 给全部历史，走伪装通道<br>`eastmoney_delay` 同一接口的 push2delay 主机，只回当日一行，但主源拒绝出口 IP 时它还通；补的是没有资金流向页面的标的（科创 50 这类指数） | `eastmoney`<br>`eastmoney_delay`<br>`off`<br>（默认 `eastmoney,eastmoney_delay`） |

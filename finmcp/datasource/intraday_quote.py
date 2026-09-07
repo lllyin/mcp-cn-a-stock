@@ -37,6 +37,20 @@ logger = logging.getLogger("finmcp")
 # 启用哪些 provider、按什么顺序。留空或设为 off 则整层关闭，调用方拿到 None。
 PROVIDER_ORDER_ENV = "INTRADAY_QUOTE_PROVIDERS"
 DEFAULT_PROVIDER_ORDER = ("fund_flow_page", "tencent", "tonghuashun")
+#: **指数单独一条顺序**，判据和历史 K 线那一层一样（``kline_source`` 的常量注释）：
+#: 指数的成交量各源口径差得多，而同花顺与东财一致。2026-09-07 收盘后四方核对
+#: 创业板指当日成交量：
+#:
+#:     东财 push2delay f47   172,310,434 手   ← 本项目的基准源
+#:     同花顺 realhead       172,310,430 手   ✅ 与东财一致
+#:     腾讯 qt.gtimg.cn      165,865,859 手   低 3.885%
+#:     新浪 hq.sinajs.cn     165,865,859 手   与腾讯一字不差（同源，互相校验不了）
+#:
+#: 上证/深证/科创50 四家全部逐位一致，个股与 ETF 也一致（12 个标的实测），所以
+#: **只有指数需要换这个顺序**。个股不换的理由和 K 线那层相同：同花顺的限流策略
+#: 未知，而个股是流量大头；指数就那么几个，暴露面小，值得为 3.885% 换过去。
+INDEX_PROVIDER_ORDER = ("fund_flow_page", "tonghuashun", "tencent")
+INDEX_PROVIDER_ORDER_ENV = "INTRADAY_QUOTE_PROVIDERS_INDEX"
 _DISABLED = {"", "off", "none", "0", "false"}
 
 
@@ -174,11 +188,20 @@ def registered() -> tuple:
     return tuple(_PROVIDERS)
 
 
-def configured_order() -> tuple:
-    """按配置解析启用顺序。未知名字会被忽略并告警，不让服务起不来。"""
-    raw = env(PROVIDER_ORDER_ENV)
+def configured_order(symbol: Optional[str] = None) -> tuple:
+    """按配置解析启用顺序。未知名字会被忽略并告警，不让服务起不来。
+
+    指数走 ``INDEX_PROVIDER_ORDER``，理由见那个常量的注释（成交量口径）。
+    判断用结构规则而不是名单——漏判一个指数的后果是它的成交量偏 3.9%。
+    """
+    from .kline_frame import _is_index_code
+
+    is_index = bool(symbol) and _is_index_code(tencent_code(symbol) or "")
+    env_name = INDEX_PROVIDER_ORDER_ENV if is_index else PROVIDER_ORDER_ENV
+    default = INDEX_PROVIDER_ORDER if is_index else DEFAULT_PROVIDER_ORDER
+    raw = env(env_name)
     if raw is None:
-        names = DEFAULT_PROVIDER_ORDER
+        names = default
     elif raw.strip().lower() in _DISABLED:
         return ()
     else:
@@ -208,7 +231,7 @@ def resolve(
     而不是让调用方拿到一个填不满的结果。
     """
     context = context or QuoteContext()
-    names = tuple(order if order is not None else configured_order())
+    names = tuple(order if order is not None else configured_order(symbol))
     for index, name in enumerate(names):
         provider = _PROVIDERS.get(name)
         if provider is None:
@@ -237,7 +260,7 @@ def collect(
     """把所有能拿到的报价都取回来，用于交叉验证。"""
     context = context or QuoteContext()
     quotes = []
-    for name in order if order is not None else configured_order():
+    for name in order if order is not None else configured_order(symbol):
         provider = _PROVIDERS.get(name)
         if provider is None:
             continue
@@ -436,14 +459,15 @@ def tencent_code(symbol: str) -> Optional[str]:
 #: 两个坑写在这里，别再踩：
 #:   - ``13`` 是**股**，不是手，而且指数也是股（上证 47,737,526,000 股 = 4.77亿手，
 #:     与交易所定稿值一致）。腾讯那个端点相反——它的 ``[6]`` 主板给手、科创板给股。
-#:   - ``1771976`` **不是换手率**。实测它和腾讯的换手率完全不符（茅台 0.906 vs
-#:     0.20、50ETF 1.299 vs 8.14），语义未知，所以这个源不提供换手率。
-#:     这正是它排在腾讯之后的原因：排前面会让所有个股的当日 bar 丢掉换手率。
+#:   - 换手率是 ``1968584``，不是 ``1771976``。两个都是小数、量级也像，第一次核对时
+#:     取错了那个，于是误判"这个源没有换手率"。判据是拿腾讯的换手率逐个比：
+#:     茅台 0.202/0.20、宁德 0.579/0.58、中芯 1.566/1.57、50ETF 8.137/8.14、
+#:     美的 0.333/0.33 —— ``1968584`` 五个全中，``1771976`` 五个全不中。
 #: ``time`` 是服务器时刻，``updateTime`` 才是数据时刻，取后者。
 TONGHUASHUN_QUOTE_FIELDS = {
     "last": "10", "prev_close": "6", "open": "7", "high": "8", "low": "9",
     "volume_shares": "13", "amount_yuan": "19", "change_pct": "199112",
-    "code": "5", "as_of": "updateTime",
+    "turnover_pct": "1968584", "code": "5", "as_of": "updateTime",
 }
 TONGHUASHUN_QUOTE_URL = "https://d.10jqka.com.cn/v6/realhead/hs_{code}/last.js"
 
@@ -522,9 +546,7 @@ class TonghuashunQuoteProvider(QuoteProvider):
             low=number("low"),
             volume_lots=volume_lots,
             amount_yuan=amount_yuan,
-            # 换手率这个源给不了，见 TONGHUASHUN_QUOTE_FIELDS 的注释。留 None 而不是 0：
-            # upsert_intraday_bar 会保留源里原有的换手率，写 0 会把它抹掉。
-            turnover_pct=None,
+            turnover_pct=number("turnover_pct"),
             as_of=_compact_timestamp(items.get(TONGHUASHUN_QUOTE_FIELDS["as_of"])),
         )
 

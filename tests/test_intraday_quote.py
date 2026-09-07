@@ -669,7 +669,7 @@ class TestTonghuashunQuoteProvider:
         'quotebridge_v6_realhead_hs_1A0001_last({"items":{'
         '"10":"3932.70","6":"3930.12","7":"3942.51","8":"3948.42","9":"3916.49",'
         '"13":"47737526000.00","19":"897904010000.00","199112":"0.07",'
-        '"1771976":"0.884","5":"1A0001","name":"上证指数",'
+        '"1968584":"1.000","1771976":"0.884","5":"1A0001","name":"上证指数",'
         '"time":"2026-09-07 17:33:38 北京时间","updateTime":"2026-09-07 15:00"}})'
     )
 
@@ -701,12 +701,15 @@ class TestTonghuashunQuoteProvider:
         quote = self._fetch(monkeypatch)
         assert quote.volume_lots == pytest.approx(477_375_260)
 
-    def test_it_does_not_pretend_to_know_turnover(self, monkeypatch):
-        """1771976 不是换手率（实测茅台 0.906 vs 腾讯 0.20），所以这个源不给。
+    def test_the_turnover_field_is_1968584_not_1771976(self, monkeypatch):
+        """两个字段都是小数、量级也像，取错那个会让"这个源没有换手率"的结论成立。
 
-        留 None 而不是 0：upsert_intraday_bar 会保留源里原有的换手率，写 0 会抹掉它。
+        判据是拿腾讯的换手率逐个比：1968584 五个标的全中（茅台 0.202/0.20、
+        50ETF 8.137/8.14），1771976 五个全不中（茅台 0.906 vs 0.20）。
         """
-        assert self._fetch(monkeypatch).turnover_pct is None
+        quote = self._fetch(monkeypatch)
+        assert quote.turnover_pct == pytest.approx(1.000)      # 1968584
+        assert quote.turnover_pct != pytest.approx(0.884)      # 1771976，取错就是这个
 
     def test_the_data_timestamp_is_compacted(self, monkeypatch):
         """契约要求 as_of 的前 8 位能按 %Y%m%d 解析，分隔符必须去掉。
@@ -730,8 +733,23 @@ class TestTonghuashunQuoteProvider:
         """沪市 000 开头不在内部码表里时不发请求——问了会拿回同名深市个股。"""
         assert iq.TonghuashunQuoteProvider().fetch("SH000998", iq.QuoteContext()) is None
 
-    def test_it_is_registered_after_tencent(self):
-        """排在腾讯之后：排前面会让所有个股的当日 bar 丢掉换手率。"""
-        order = iq.DEFAULT_PROVIDER_ORDER
+    def test_indices_prefer_it_and_everything_else_prefers_tencent(self):
+        """按类别分，不按标的。
+
+        指数用它：创业板指当日成交量四方核对——东财 172,310,434、同花顺
+        172,310,430、腾讯/新浪 165,865,859（低 3.885%），东财是基准源。
+        个股不用它：12 个标的实测两家逐位一致，而同花顺的限流策略未知、个股是
+        流量大头，没有收益就不该把热路径换过去。
+        """
         assert "tonghuashun" in iq.registered()
-        assert order.index("tencent") < order.index("tonghuashun")
+        for index_symbol in ("SH000001", "SZ399006", "SH000688", "BJ899050"):
+            order = iq.configured_order(index_symbol)
+            assert order.index("tonghuashun") < order.index("tencent"), index_symbol
+        for other in ("SH600519", "SZ300750", "SH688981", "SH512480", "BJ920021"):
+            order = iq.configured_order(other)
+            assert order.index("tencent") < order.index("tonghuashun"), other
+
+    def test_the_index_order_is_configurable_on_its_own(self, monkeypatch):
+        monkeypatch.setenv("INTRADAY_QUOTE_PROVIDERS_INDEX", "tencent")
+        assert iq.configured_order("SZ399006") == ("tencent",)
+        assert "tonghuashun" in iq.configured_order("SH600519")
