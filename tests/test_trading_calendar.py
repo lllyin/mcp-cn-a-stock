@@ -97,7 +97,10 @@ def test_the_loop_terminates_even_if_the_calendar_says_nothing_is_open():
 def test_the_weekday_fallback_is_a_registered_platform():
     assert "weekday" in pf.registered(tc.CAPABILITY)
     assert "sina" in pf.registered(tc.CAPABILITY)
-    assert tc.DEFAULT_PROVIDER_ORDER == ("sina", "weekday")
+    # 断性质不断字面量：加一个日历源不该让这条测试失败，但下面两条性质
+    # 必须一直成立——真名单在最前，"只知道星期"的兜底在最后。
+    assert tc.DEFAULT_PROVIDER_ORDER[0] == "sina"
+    assert tc.DEFAULT_PROVIDER_ORDER[-1] == "weekday"
 
 
 def test_the_whole_layer_can_be_turned_off(monkeypatch):

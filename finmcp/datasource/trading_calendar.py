@@ -22,15 +22,24 @@
 
 ## 降级不是 if/else，是一个平台
 
-取不到日历就退回"周一到周五算交易日"——也就是接入之前的行为，**永远不比现在差**。
-这条降级路径在这里不是藏在代码里的 try/except，而是一个叫 ``weekday`` 的内建平台，
-配成 ``TRADING_CALENDAR_PROVIDERS=sina,weekday``。降级从代码里的暗礁变成配置里
-看得见的一行，也就能被单独关掉、单独测试。
+取不到日历就逐级往下退，最后退到"周一到周五算交易日"——也就是接入之前的行为,
+**永远不比现在差**。这条降级路径不是藏在代码里的 try/except，而是配置里看得见的
+一行 ``TRADING_CALENDAR_PROVIDERS=sina,holiday_cn,weekday``，于是每一级都能被单独
+关掉、单独测试。三级的差别是量出来的:
+
+    sina        交易所公布的交易日名单本身，最权威
+    holiday_cn  国务院放假安排换算而来，不含交易所临时休市，但节假日全对
+    weekday     只知道周一到周五，把春节、国庆整段算成交易日
+
+中间那一级补的是实打实的落差:2015 年以来 32 个长假，直接退到 weekday 会把最长的
+误当成 6 个交易日，而 holiday_cn 把这 32 个全部算对。
 """
 
 from __future__ import annotations
 
+import bisect
 import datetime
+import functools
 import logging
 from dataclasses import dataclass
 from typing import Optional
@@ -43,7 +52,7 @@ logger = logging.getLogger("finmcp")
 
 CAPABILITY = "trading_calendar"
 PROVIDER_ORDER_ENV = "TRADING_CALENDAR_PROVIDERS"
-DEFAULT_PROVIDER_ORDER = ("sina", "weekday")
+DEFAULT_PROVIDER_ORDER = ("sina", "holiday_cn", "weekday")
 
 
 # ── 契约 ────────────────────────────────────────────────────────
@@ -87,7 +96,8 @@ pf.define_capability(CAPABILITY, Calendar)
 
 
 # 平台实现在 platforms/ 下：新浪（同时提供 kline，是同一个平台的两种能力）、
-# weekday（纯计算的兜底）。这里只留契约和对外的判断函数。
+# holiday_cn（国务院放假安排换算）、weekday（纯计算的兜底）。
+# 这里只留契约和对外的判断函数。
 
 
 # ── 取数与缓存 ──────────────────────────────────────────────────
@@ -95,6 +105,21 @@ pf.define_capability(CAPABILITY, Calendar)
 # 缓存这一维：TTL 型（和交易时段无关，日历一年才发布一次），落盘。
 # 落盘的理由和分级表一样：有效期以天计，而进程重启是分钟级的事——不落盘等于
 # 每次重启都重付一次上游。
+#
+# ## 为什么不加后台刷新线程（调研过，结论是不加）
+#
+# 现在的行为已经是"每天第一次查询时刷一次，失败就继续用旧的"：TTL 86400 秒管
+# "每天一次"，``max_age_seconds`` 管"上游挂了还能用多久"，单飞管"并发只取一份"，
+# 落盘管"重启不重付"。缺的只有一点——刷新是**阻塞**首个调用方的，不是后台静默。
+#
+# 那一下值多少钱，量过：sina 363 ms、holiday_cn 兜底 1082 ms、weekday 0 ms，
+# **一天一次**。对照 brief 的 P90 是 50 秒级。也就是说后台化能省的是"一天一次、
+# 几百毫秒"，而代价是一个常驻线程或任务（AGENTS.md §三 明确要求避免无界线程），
+# 外加一个新的失败模式：刷新任务静默死掉之后，日历会一路旧到 max_age 才被发现。
+#
+# 收益说不清到值得的量级，副作用是确定的，所以不做（AGENTS.md §六）。
+# 同理也没有另起一层"按年缓存 holiday-cn 原始 JSON"：那些年份文件的解析结果已经
+# 落在这个命名空间的磁盘缓存里了，再加一层是重复。
 CACHE_NAMESPACE = "calendar"
 
 cache.register_namespace(cache.Namespace(
@@ -213,6 +238,41 @@ def trading_days(start: datetime.date, end: datetime.date,
     return out
 
 
+@functools.lru_cache(maxsize=2)
+def _sorted_days(days: frozenset) -> tuple:
+    """名单排好序的版本，给 bisect 用。frozenset 自己缓存 hash，所以查这个表很便宜。"""
+    return tuple(sorted(days))
+
+
+def missing_trading_days(start: datetime.date, end: datetime.date,
+                         calendar: Optional[Calendar] = None) -> int:
+    """开区间 ``(start, end)`` 里还剩几个交易日。
+
+    用途是问"相邻两根 K 线之间，这个源少给了几根"。**长假在这里天然是 0**，所以
+    调用方不需要"多少个自然日算长假"这种代理阈值——那种阈值 2026-09-07 之前是
+    15 个自然日，而实测春节能到 11 个自然日，只剩 4 天余量。
+
+    日历取不到、或者名单没盖住这一段时退回按星期数。实测 2015 年以来最长的长假
+    （春节 11 个自然日）按星期会被数成 6，所以调用方的阈值只要大于 6，降级状态下
+    长假仍然不会被当成缺口。
+    """
+    if end <= start:
+        return 0
+    cal = calendar if calendar is not None else load()
+    if cal is not None and cal.days:
+        days = _sorted_days(cal.days)
+        # 上下边界都要查。``knows()`` 只管上边界，而一份只有今年的名单会把去年的
+        # 交易日全判成"不开市"——那样缺口检查会静默失效，比没有更糟。
+        if days[0] <= start and cal.knows(end):
+            return max(0, bisect.bisect_left(days, end) - bisect.bisect_right(days, start))
+    count, cursor = 0, start + datetime.timedelta(days=1)
+    while cursor < end:
+        if _fallback(cursor):
+            count += 1
+        cursor += datetime.timedelta(days=1)
+    return count
+
+
 __all__ = [
     "CAPABILITY",
     "Calendar",
@@ -221,6 +281,7 @@ __all__ = [
     "PROVIDER_ORDER_ENV",
     "is_trading_day",
     "load",
+    "missing_trading_days",
     "next_trading_day",
     "previous_trading_day",
     "reset_cache",
