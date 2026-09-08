@@ -32,6 +32,7 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import json
+import math
 import os
 import re
 import shutil
@@ -93,6 +94,27 @@ STOCK_ONLY = frozenset((STOCK,))
 #
 # 所以按标的的判据一律不做，取到就是取到，没取到就是没取到。分数会因此变低，
 # 但那个低才是真的。
+def rate_text(value: float) -> str:
+    """百分比文案。**绝不向上取整到 100%**。
+
+    `:.0f` 会把 528/530 = 99.62% 印成 `100%`，于是表头声称满分、明细写着少了 2 项，
+    同一行里自相矛盾——而这是发布前的闸门，读表头的人多半不会再去数明细。
+    同理不把 0.4% 印成 `0%`：那会让"几乎全挂"看着像"全挂"，两者要采取的行动不同。
+
+    所以一律向下取整到 0.1，只有真的等于 100 才写 100。少报一点是安全的方向：
+    闸门宁可拦下一个本可以放行的版本，也不该放行一个看着满分的残缺版本。
+    """
+    if value >= 100.0:
+        return "100"
+    if value <= 0.0:
+        return "0"
+    floored = math.floor(value * 10) / 10.0
+    if floored <= 0.0:                      # 0 < value < 0.1
+        return "<0.1"
+    return f"{floored:.0f}" if floored.is_integer() else f"{floored:.1f}"
+
+
+
 @dataclass(frozen=True)
 class Dimension:
     name: str
@@ -1851,22 +1873,22 @@ def render_report(
 
     lines.append("# 上线数据验证报告")
     lines.append("")
-    lines.append(f"## 结论：可用率 **{score.overall:.0f}%**　{score.verdict}")
+    lines.append(f"## 结论：可用率 **{rate_text(score.overall)}%**　{score.verdict}")
     lines.append("")
     lines.append("| 指标 | 分数 | 明细 |")
     lines.append("| --- | ---: | --- |")
     lines.append(
-        f"| 工具可用率 | {score.tool_rate:.0f}% | "
+        f"| 工具可用率 | {rate_text(score.tool_rate)}% | "
         f"{score.tools_ok}/{score.tools_total} 个调用拿到了返回 |"
     )
     lines.append(
-        f"| 维度完整率 | {score.dimension_rate:.0f}% | "
+        f"| 维度完整率 | {rate_text(score.dimension_rate)}% | "
         f"{score.dims_ok}/{score.dims_total} 项该有的数据真的有"
         "（实时探活，见第三节矩阵）|"
     )
     if score.docs_total:
         lines.append(
-            f"| 回归一致率 | {score.baseline_rate:.0f}% | "
+            f"| 回归一致率 | {rate_text(score.baseline_rate)}% | "
             f"{score.docs_ok}/{score.docs_total} 份基线文档重放后没有未解释的漂移"
             + (f"；{score.known} 份命中已核实的上游差异，不计分" if score.known else "")
             + " |"
@@ -1966,7 +1988,7 @@ def render_report(
         rate = (
             "—"
             if completeness.graded == 0
-            else f"{completeness.available * 100 / completeness.graded:.0f}%"
+            else f"{rate_text(completeness.available * 100 / completeness.graded)}%"
         )
         names = sorted({item.dimension.name for item in completeness.bad})
         summary = "、".join(names) if names else "—"
@@ -2144,7 +2166,7 @@ def render_report(
     lines.append("")
     # 第三个返回值给控制台用，和报告标题同一句式：先分数、再定性。
     # 控制台常常是唯一被看到的输出，只给"有降级"而不给分数，等于要人去翻文件。
-    return "\n".join(lines), failed, f"可用率 {score.overall:.0f}%　{score.verdict}"
+    return "\n".join(lines), failed, f"可用率 {rate_text(score.overall)}%　{score.verdict}"
 
 
 # ── 十、入口 ────────────────────────────────────────────────────

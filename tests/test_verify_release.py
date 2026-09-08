@@ -1039,3 +1039,48 @@ class TestMemoryAccounting:
     def test_the_reader_returns_none_where_smaps_rollup_does_not_exist(self):
         """macOS 上没有 /proc，读不到要安静地返回 None，不是抛异常。"""
         assert verify._pss_kib(999999) is None
+
+
+class TestRateTextNeverRoundsUp:
+    """百分比文案绝不向上取整到 100%。
+
+    2026-09-08 那份报告：表头写「维度完整率 100%」，同一行的明细写着 528/530
+    ——`:.0f` 把 99.62 进位成了 100。这是发布前的闸门，读表头的人多半不会再去数明细，
+    而"满分"和"少了两项"要采取的行动不同。
+    """
+
+    def test_the_case_that_started_this(self):
+        assert verify.rate_text(528 * 100 / 530) == "99.6"
+
+    def test_a_real_hundred_is_still_a_clean_hundred(self):
+        for ok, total in ((530, 530), (22, 22), (29, 29), (1, 1)):
+            assert verify.rate_text(ok * 100 / total) == "100"
+
+    def test_it_never_rounds_down_to_zero_either(self):
+        """0.4% 印成 0% 会让「几乎全挂」看着像「全挂」，两者要做的事不同。"""
+        assert verify.rate_text(0.0) == "0"
+        assert verify.rate_text(0.04) == "<0.1"
+        assert verify.rate_text(0.4) == "0.4"
+
+    @pytest.mark.parametrize("value", [0.05, 12.34, 50.0, 89.99, 99.0, 99.94, 99.999])
+    def test_it_never_overstates(self, value):
+        shown = verify.rate_text(value)
+        got = 0.05 if shown == "<0.1" else float(shown)
+        assert got <= value + 1e-9, f"{value} 显示成 {shown}，吹高了"
+        assert value - got < 0.1 + 1e-9, f"{value} 显示成 {shown}，少报太多"
+
+    def test_an_integral_rate_has_no_trailing_zero(self):
+        assert verify.rate_text(95.0) == "95"
+        assert verify.rate_text(90.0) == "90"
+
+    def test_no_formatting_site_bypasses_it(self):
+        """新加一处百分比时忘了用它，问题会原样回来。"""
+        import inspect
+        import re
+
+        src = inspect.getsource(verify)
+        # rate_text 自己的实现里有 :.0f，别把它算进来
+        body = src.replace(inspect.getsource(verify.rate_text), "")
+        offenders = [line.strip() for line in body.splitlines()
+                     if re.search(r"(rate|overall|available)[^\"']*:\.0f\}%", line)]
+        assert not offenders, offenders
