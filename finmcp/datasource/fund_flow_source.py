@@ -54,17 +54,42 @@ class FundFlowRequest:
     symbol: Optional[str] = None    # SH600519 这种带市场前缀的
     is_index: bool = False
 
+    #: 纯代码猜市场时算沪市的前缀。``6`` 是主板加科创板 688，``5`` 是沪市基金/ETF。
+    #:
+    #: **不要加 ``9``。** 沪市 B 股是 900xxx，但北交所是 92xxxx，两者都以 9 开头，
+    #: 加了会把北交所判成沪市。B 股这一档就先空着——本项目的标的池里没有 B 股，而
+    #: 猜错市场的后果是静默取空（见 ``exchange``），不值得为一个没人查的档位冒险。
+    _SHANGHAI_CODE_PREFIXES = ("6", "5")
+
     @property
     def exchange(self) -> str:
         """AkShare 的 ``market`` 参数：``sh`` / ``sz``。
 
-        规则原样搬自 ``cn_stock_source._fetch_fund_flow_sync``，一个字都没改：指数看
-        前缀，个股看代码首位。北交所落进 ``sz``——AkShare 里 sz 和 bj 映射到同一个
-        市场号 0，所以 secid 一样，不影响结果。
+        **带前缀的 ``symbol`` 优先。** 它是调用方给的权威答案，而按纯代码猜市场是
+        有洞的：这里原先写 ``code.startswith("6")``（连同上面那句"原样搬自
+        ``cn_stock_source``，一个字都没改"），把**沪市 5 开头的基金全判成深市**。
+
+        踩过，而且是在线上：``SH512480`` 算出 secid ``0.512480``，东财返回
+        ``rc=100``、0 行；正确的 ``1.512480`` 有 121 行。2026-09-08 的表现是伪装通道
+        一进冷却，``eastmoney`` 被跳过、``eastmoney_delay`` 也因为共用这个错 secid 而
+        拿不到，于是沪市 ETF 的资金流向整维变成"暂无资金流向数据"——当天落地 4 次
+        （512480、588200 各两次，都在盘前和收盘后）。个股没露出来，是因为它们的
+        secid 本来就是对的。同一秒的日志里 AkShare 那条 base_info 用的是
+        ``secid=1.512480``，两处算法不一致正是这个 bug 的现场证据。
+
+        没有 ``symbol`` 时才退回按代码猜，前缀表见 ``_SHANGHAI_CODE_PREFIXES``。
+        其余一律 ``sz``——北交所也落这里，AkShare 的 market_map 里 sz 和 bj 是同一个
+        市场号 0，secid 一样，不影响结果。
+
+        ``is_index`` 不再参与判断：指数原先就是看 ``symbol`` 前缀的，而现在所有标的
+        都先看它，那一支单独的分支已经被这一条包含了。
         """
-        if self.is_index:
-            return "sh" if (self.symbol or "").startswith("SH") else "sz"
-        return "sh" if self.code.startswith("6") else "sz"
+        prefixed = (self.symbol or "").upper()
+        if prefixed.startswith("SH"):
+            return "sh"
+        if prefixed.startswith(("SZ", "BJ")):
+            return "sz"
+        return "sh" if self.code.startswith(self._SHANGHAI_CODE_PREFIXES) else "sz"
 
     @property
     def secid(self) -> str:

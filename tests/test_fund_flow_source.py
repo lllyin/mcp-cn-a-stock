@@ -63,10 +63,46 @@ def test_a_missing_column_or_empty_table_violates_it():
     ("000688", "SH000688", True, "sh", "1.000688"),
     ("399006", "SZ399006", True, "sz", "0.399006"),
     ("159326", None, False, "sz", "0.159326"),
+    ("688008", "SH688008", False, "sh", "1.688008"),    # 科创板也是 6 开头
+    ("899050", "BJ899050", True, "sz", "0.899050"),     # 北交所指数
 ])
-def test_exchange_and_secid_follow_the_old_rule(code, symbol, is_index, exchange, secid):
+def test_exchange_and_secid(code, symbol, is_index, exchange, secid):
     request = ffs.FundFlowRequest(code=code, symbol=symbol, is_index=is_index)
     assert (request.exchange, request.secid) == (exchange, secid)
+
+
+@pytest.mark.parametrize("code,symbol", [
+    ("512480", "SH512480"),     # 半导体ETF国联安
+    ("588200", "SH588200"),     # 科创芯片ETF嘉实
+    ("510300", "SH510300"),     # 沪深300ETF
+    ("511990", "SH511990"),     # 华宝添益（货币ETF）
+])
+def test_shanghai_funds_are_not_mistaken_for_shenzhen(code, symbol):
+    """沪市 5 开头的基金必须判成沪市。
+
+    原先这里写 ``code.startswith("6")``，于是 ``SH512480`` 算出 ``0.512480``，东财
+    对这个 secid 返回 ``rc=100``、0 行，而 ``1.512480`` 有 121 行。线上后果不是报错
+    而是**静默取空**：2026-09-08 伪装通道一冷却，``eastmoney`` 被跳过、
+    ``eastmoney_delay`` 共用这个错 secid 也拿不到，沪市 ETF 的资金流向整维变成
+    "暂无资金流向数据"，当天落地 4 次。
+    """
+    request = ffs.FundFlowRequest(code=code, symbol=symbol)
+    assert (request.exchange, request.secid) == ("sh", f"1.{code}")
+
+
+@pytest.mark.parametrize("code,exchange", [
+    ("512480", "sh"), ("588200", "sh"), ("600519", "sh"), ("688008", "sh"),
+    ("159326", "sz"), ("000333", "sz"), ("300223", "sz"),
+    ("920021", "sz"),   # 北交所 92 开头：加 "9" 进沪市前缀表就会把它判错
+    ("899050", "sz"),
+])
+def test_code_only_fallback(code, exchange):
+    """没有带前缀的 symbol 时按代码猜，这条路 cn_stock_source 会走到。
+
+    ``symbol`` 为空时 ``_fetch_fund_flow_sync`` 照样构造请求（那里有
+    ``if symbol else ""``），所以兜底规则也得对，不能只修 symbol 那一支。
+    """
+    assert ffs.FundFlowRequest(code=code).exchange == exchange
 
 
 # --- 顺序：完整历史优先，不完整只留行数多的 ---------------------------------
