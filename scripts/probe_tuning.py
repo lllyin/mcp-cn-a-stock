@@ -47,9 +47,10 @@
 
 用法
 ----
-    .venv/bin/python scripts/probe_tuning.py all                          # facts → browser → recommend
+    .venv/bin/python scripts/probe_tuning.py all                          # facts → browser → tonghuashun → recommend
     .venv/bin/python scripts/probe_tuning.py facts
     .venv/bin/python scripts/probe_tuning.py browser [--identities legacy,disguise] [--batches 6] [--max-tabs 3] [--force]
+    .venv/bin/python scripts/probe_tuning.py tonghuashun [--rounds 6] [--window-days 730]
     .venv/bin/python scripts/probe_tuning.py recommend [--env .env] [--service-base-mib 243]
     .venv/bin/python scripts/probe_tuning.py verify --env-file <dir>/.env.recommended [--only brief,medium,full]
 
@@ -109,6 +110,7 @@ DEFAULTS = {
     "BROWSER_HEADFUL": "0",
     "BROWSER_KEEP_PAGES": "0",
     "CACHE_ENABLED": "1",
+    "KLINE_TONGHUASHUN_BUDGET_SECONDS": "45",
 }
 
 # ── 判据阈值 ──────────────────────────────────────────────────────
@@ -121,6 +123,18 @@ DECLINE_MAX = 0.20
 MIN_SERVICE_SAMPLES = 10
 QUEUE_WAIT_RANGE = (3, 15)
 BUDGET_MAX = 40
+
+#: 同花顺 K 线总预算的判据。预算要坐在**成功**取数的最大耗时之上——砍掉一次本来能
+#: 成功的取数，指数的成交量就退到腾讯口径、低约 3.5%，那是拿正确的数换耗时。
+#: 所以用 max 而不是分位数，再乘一个余量。
+THS_MIN_SAMPLES = 12
+THS_MARGIN = 1.5
+THS_BUDGET_RANGE = (20, 120)
+#: 一次取数跨几年就发几个请求，所以窗口长度直接决定最坏耗时。默认量 2 年，
+#: 和报告里 240 日均量要的跨度同量级。
+THS_WINDOW_DAYS = 730
+#: 只量指数：tonghuashun 在 KLINE_PROVIDERS_INDEX 里排第一，个股走腾讯，量了用不上。
+THS_SYMBOLS = ("SH000001", "SZ399001", "SZ399006", "SH000688")
 
 #: 32 只两市大盘股，都有 zjlx 页面。固定名单是为了跨机器、跨日期可比。
 DEFAULT_SYMBOLS = (
@@ -914,6 +928,110 @@ def run_browser(args) -> int:
     return 0
 
 
+# ── tonghuashun：K 线源的总预算 ───────────────────────────────────
+#
+# 量的是 platforms/tonghuashun.py 的 fetch_kline 端到端耗时，逐次记成功/失败。
+# 预算要坐在**成功**取数的最大耗时之上，所以只有成功的那些进判据；失败的耗时只用来
+# 说明「不设预算时最坏能拖多久」。
+
+
+def probe_tonghuashun_once(symbol: str, window_days: int) -> dict:
+    """跑一次真实的 fetch_kline，返回耗时和结果。不走缓存，也不碰服务。"""
+    import datetime as _dt
+
+    from finmcp.datasource import kline_source
+    from finmcp.datasource.platforms import tonghuashun
+
+    end = _dt.date.today()
+    request = kline_source.KlineRequest(
+        code="".join(c for c in symbol if c.isdigit()),
+        start_date=(end - _dt.timedelta(days=window_days)).strftime("%Y-%m-%d"),
+        end_date=end.strftime("%Y-%m-%d"),
+        adjust="qfq",
+        symbol=symbol,
+    )
+    started = time.monotonic()
+    try:
+        frame = tonghuashun.TonghuashunPlatform().fetch_kline(request)
+    except Exception as error:                      # noqa: BLE001 - 逐次记账，别中断整轮
+        return {"symbol": symbol, "seconds": round(time.monotonic() - started, 3),
+                "ok": False, "rows": 0, "error": f"{type(error).__name__}: {error}"[:160]}
+    seconds = round(time.monotonic() - started, 3)
+    rows = 0 if frame is None else len(frame)
+    return {"symbol": symbol, "seconds": seconds, "ok": rows > 0, "rows": rows,
+            "error": None if rows else "返回空"}
+
+
+def run_tonghuashun(args) -> int:
+    """按固定名单反复取 K 线，量出当前环境到同花顺的耗时分布。"""
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # 指数优先：它们才是 tonghuashun 排第一的那一类，个股走腾讯，量了也用不上。
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()] or list(THS_SYMBOLS)
+    records = []
+    for round_no in range(args.rounds):
+        for symbol in symbols:
+            record = probe_tonghuashun_once(symbol, args.window_days) | {"round": round_no + 1}
+            records.append(record)
+            print(f"[tonghuashun] 第 {record['round']}/{args.rounds} 轮 {symbol:10s} "
+                  f"{record['seconds']:6.2f}s {'ok ' + str(record['rows']) + ' 根' if record['ok'] else record['error']}")
+            if args.pause:
+                time.sleep(args.pause)
+    ok = [r["seconds"] for r in records if r["ok"]]
+    bad = [r["seconds"] for r in records if not r["ok"]]
+    result = {"generated": _now_text(), "window_days": args.window_days,
+              "symbols": symbols, "rounds": args.rounds,
+              "records": records,
+              "ok": summarise_values(ok), "failed": summarise_values(bad)}
+    write_json(out_dir / "tonghuashun.json", result)
+    print(f"[tonghuashun] 成功 {len(ok)}/{len(records)}："
+          f"p50 {result['ok'].get('p50')}s、p90 {result['ok'].get('p90')}s、max {result['ok'].get('max')}s")
+    if bad:
+        print(f"[tonghuashun] 失败 {len(bad)} 次，耗时 max {result['failed'].get('max')}s"
+              f"（不设预算时最坏能拖这么久）")
+    print(f"[tonghuashun] 写入 {out_dir / 'tonghuashun.json'}")
+    return 0
+
+
+def decide_tonghuashun_budget(measured: Optional[dict]) -> Decision:
+    """预算 = 成功取数的最大耗时 × 余量，夹在区间内。
+
+    用 max 不用分位数：判据是"不能砍掉本来能成功的取数"，分位数按定义会砍掉尾部。
+    """
+    key = "KLINE_TONGHUASHUN_BUDGET_SECONDS"
+    stats = (measured or {}).get("ok") or {}
+    n = stats.get("n", 0)
+    if n < THS_MIN_SAMPLES:
+        return Decision(key, DEFAULTS[key], "inconclusive",
+                        f"成功取数只有 {n} 次，不足 {THS_MIN_SAMPLES}，保持默认")
+    slowest = stats["max"]
+    raw = math.ceil(slowest * THS_MARGIN)
+    low, high = THS_BUDGET_RANGE
+    value = int(min(high, max(low, raw)))
+    # 夹过就得说，不然读的人会以为 value 是 max × 余量算出来的。这台机器网络快时
+    # raw 会小到个位数，落到下限；反过来慢到 raw > high 时落到上限，那说明这条链路
+    # 本来就该换源，而不是把预算继续放大。
+    if raw < low:
+        how = f"取 max × {THS_MARGIN} = {raw}s，低于下限 {low}s，按下限"
+    elif raw > high:
+        how = f"取 max × {THS_MARGIN} = {raw}s，高于上限 {high}s，按上限——这条链路慢到该换源了"
+    else:
+        how = f"取 max × {THS_MARGIN} = {value}s"
+    failed = (measured or {}).get("failed") or {}
+    if not failed.get("n"):
+        tail = "；本轮没有失败取数，预算是给上游抽风那天留的"
+    elif value < failed["max"]:
+        tail = f"；失败 {failed['n']} 次、最长 {failed['max']}s，预算能把它们截在 {value}s"
+    else:
+        # 推荐值高过失败耗时，这一轮它一次都不会触发。不改推荐值——把预算压到成功
+        # 取数之下就是在丢数据；该做的是换源或者查这条链路为什么慢。
+        tail = (f"；失败 {failed['n']} 次、最长 {failed['max']}s，**短于推荐值**，"
+                f"这个预算截不住它们——成功和失败的耗时分不开，先查链路而不是压预算")
+    return Decision(key, str(value), "measured",
+                    f"成功取数 {n} 次，p50 {stats['p50']}s、p90 {stats['p90']}s、"
+                    f"max {slowest}s；{how}{tail}")
+
+
 # ── recommend：规则 ───────────────────────────────────────────────
 
 
@@ -1242,7 +1360,8 @@ def render_report(*, facts: Optional[dict], browser: Optional[dict], decisions: 
     return "\n".join(L)
 
 
-def build_decisions(facts: Optional[dict], browser: Optional[dict], service_base_mib: Optional[float] = None) -> list:
+def build_decisions(facts: Optional[dict], browser: Optional[dict], service_base_mib: Optional[float] = None,
+                    tonghuashun: Optional[dict] = None) -> list:
     summary = (browser or {}).get("summary") or {}
     # JSON 往返后 reached/success_at/recovery 的键是字符串，这里统一成 int。
     for arm in summary.values():
@@ -1264,17 +1383,19 @@ def build_decisions(facts: Optional[dict], browser: Optional[dict], service_base
     pages, conc = decide_max_pages((browser or {}).get("memory"), base, base_source)
     channel = Decision("HTTP_CHANNEL", "auto", "default",
                        "网关可用走 proxy，否则伪装通道；伪装通道再被拒时运行时自己暂停并退回，无需按机器改")
-    return [disguise, loads, wait, budget, pages, conc, channel]
+    ths = decide_tonghuashun_budget(tonghuashun)
+    return [disguise, loads, wait, budget, pages, conc, channel, ths]
 
 
 def run_recommend(args) -> int:
     out_dir = Path(args.out_dir)
     facts = read_json(out_dir / "facts.json")
     browser = read_json(out_dir / "browser.json")
+    tonghuashun = read_json(out_dir / "tonghuashun.json")
     if facts is None and browser is None:
         print(f"{out_dir} 里没有 facts.json 也没有 browser.json，先跑 facts / browser 或 all", file=sys.stderr)
         return 2
-    decisions = build_decisions(facts, browser, getattr(args, "service_base_mib", None))
+    decisions = build_decisions(facts, browser, getattr(args, "service_base_mib", None), tonghuashun)
     env_path = Path(args.env)
     values = _dotenv(env_path)
     lint = lint_env(values, {d.key: d for d in decisions})
@@ -1419,6 +1540,8 @@ def run_all(args) -> int:
     code = run_browser(args)
     if code:
         print("[all] 浏览器探测没跑成，仍按 facts 出推荐（浏览器相关项会标为未测）")
+    if run_tonghuashun(args):
+        print("[all] 同花顺探测没跑成，K 线预算会保持默认")
     return run_recommend(args)
 
 
@@ -1446,6 +1569,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     p_browser.add_argument("--symbols", default="", help="逗号分隔的六位代码，缺省 32 只大盘股")
     p_browser.add_argument("--force", action="store_true", help="盘中也跑（会和线上调用抢出口额度）")
 
+    p_ths = sub.add_parser("tonghuashun", help="反复取指数 K 线，量当前环境到同花顺的耗时分布，定总预算")
+    common(p_ths)
+    p_ths.add_argument("--rounds", type=int, default=6, help="每个标的重复几轮")
+    p_ths.add_argument("--symbols", default="", help="逗号分隔的带前缀代码，缺省四大指数")
+    p_ths.add_argument("--window-days", type=int, default=THS_WINDOW_DAYS,
+                       help="取数窗口的自然日数；跨几年就发几个请求，直接决定最坏耗时")
+    p_ths.add_argument("--pause", type=float, default=1.0, help="每次之间歇几秒，别把对方打出限流")
+
     p_rec = sub.add_parser("recommend", help="按判据出 .env.recommended、report.md，并比对线上 .env")
     common(p_rec)
     p_rec.add_argument("--env", default=str(PROJECT_ROOT / ".env"), help="要比对的线上 .env 路径")
@@ -1459,9 +1590,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p_verify.add_argument("--only", default="brief,medium,full", help="传给 verify_release 的 --only；空串则全部工具")
     p_verify.add_argument("--timeout", type=float, default=60.0, help="等实例就绪的秒数")
 
-    p_all = sub.add_parser("all", help="facts → browser → recommend")
+    p_all = sub.add_parser("all", help="facts → browser → tonghuashun → recommend")
     common(p_all)
-    for source in (p_facts, p_browser, p_rec):
+    for source in (p_facts, p_browser, p_ths, p_rec):
         for action in source._actions:
             if action.dest in ("help", "out_dir") or any(o in {a.option_strings[0] for a in p_all._actions if a.option_strings} for o in action.option_strings):
                 continue
@@ -1506,7 +1637,7 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     _require_venv()
     handlers = {"facts": run_facts, "browser": run_browser, "recommend": run_recommend,
-                "verify": run_verify, "all": run_all}
+                "tonghuashun": run_tonghuashun, "verify": run_verify, "all": run_all}
     return handlers[args.command](args)
 
 

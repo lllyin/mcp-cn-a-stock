@@ -43,8 +43,10 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import time
 from typing import Optional
 
+from ...config import KLINE_TONGHUASHUN_BUDGET_SECONDS
 from .. import platform as pf
 from ..kline_frame import _finalize_fallback_frame
 
@@ -96,7 +98,16 @@ _YEAR_URL = "{base}/hs_{code}/{segment}/{year}.js"
 #: 只重试 1 次：502 返回很快（约 150ms），按独立失败率算一次重试把 50% 压到约 25%，
 #: 再多一次的边际收益减半而每次失败都要多付一个请求。404 不重试——那是「未上市」
 #: 或缺口，重试改变不了。
+#:
+#: 注意重试的代价不对称：502 很快返回，超时要付满 ``_REQUEST_TIMEOUT``、重试就是两倍。
+#: 所以重试被 ``KLINE_TONGHUASHUN_BUDGET_SECONDS`` 关着，只能花预算剩下的部分。
 _YEAR_FILE_RETRIES = 1
+
+#: 单个年份文件的超时。和总预算的分工：每个文件最多等这么久，整个源最多等那么久。
+_REQUEST_TIMEOUT = 15
+
+#: 预算剩不到这么多秒就不再发请求——注定超时的请求只是把失败推迟，还占着一个连接。
+_MIN_USEFUL_SLICE = 2.0
 
 
 def tonghuashun_code(prefixed: str) -> Optional[str]:
@@ -147,12 +158,33 @@ class TonghuashunPlatform(pf.Platform):
         # 关掉等于把它彻底断了。别的平台都没有这一句，这个也不该有。
         session = requests.Session()
 
+        # 整个源一次取数的总预算，见 config.KLINE_TONGHUASHUN_BUDGET_SECONDS。
+        # 用 monotonic 而不是 time()：量的是流逝时间，NTP 拨一下时钟不该影响它。
+        deadline = (
+            time.monotonic() + KLINE_TONGHUASHUN_BUDGET_SECONDS
+            if KLINE_TONGHUASHUN_BUDGET_SECONDS > 0 else None
+        )
+
         rows = []
         for year in years:
             url = _YEAR_URL.format(base=_BASE, code=code, segment=segment, year=year)
             # 5xx 与「正文不是 JSONP」重试；404 不重试（未上市或缺口，重试无用）。
             for attempt in range(_YEAR_FILE_RETRIES + 1):
-                response = session.get(url, headers=_HEADERS, timeout=15)
+                timeout = _REQUEST_TIMEOUT
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining < _MIN_USEFUL_SLICE:
+                        # 必须抛，不能拿 rows 凑一份返回：少了中间某一年就是**断裂的
+                        # 序列**，而断裂的序列列是齐的、每个值都在合理区间，源"成功"
+                        # 返回，涨跌幅跨缺口算、均线全错（SH000688 报成 +20.17% 就是
+                        # 这么来的）。抛出去让链路落到腾讯，那里给的是完整序列。
+                        raise RuntimeError(
+                            f"同花顺取数用尽 {KLINE_TONGHUASHUN_BUDGET_SECONDS:.0f}s "
+                            f"总预算（已取 {len(rows)} 行，还缺 {year} 年起）"
+                        )
+                    # 最后一个请求不许探出预算——否则预算只是个建议。
+                    timeout = min(_REQUEST_TIMEOUT, remaining)
+                response = session.get(url, headers=_HEADERS, timeout=timeout)
                 body = response.text
                 transient = response.status_code != 404 and (
                     response.status_code != 200 or not body or "(" not in body

@@ -566,6 +566,20 @@ CACHE_DIR = os.path.normpath(
 # 硬拦的后果是 K 线和均线整段消失，比均线偏一点严重得多。
 KLINE_MAX_GAP_TRADING_DAYS = max(0, int(env("KLINE_MAX_GAP_TRADING_DAYS", "10")))
 
+# 同花顺取一次 K 线的**总**预算（秒），置 0 关闭。用尽即判该源失败，链路回退到下一个源。
+#
+# 它按年份取文件，一个跨 N 年的窗口要 N 个请求，每个各自一次 DNS + connect + read。
+# 没有这一项时最坏耗时是「文件数 × 单次超时 × 重试」，随窗口线性增长、没有上界；
+# 调小单次超时治不了，只是换个系数。
+#
+# 取值：必须大于**本环境成功取数的最大耗时**，否则会砍掉本来能拿到的结果，指数的
+# 成交量随之退到腾讯口径（低约 3.5%）——那是拿正确的数换耗时。默认 45 适用于成功
+# 取数在 40s 以内的环境；用 `probe_tuning.py tonghuashun` 量一遍当前环境的分布再定。
+KLINE_TONGHUASHUN_BUDGET_SECONDS = max(
+    0.0,
+    float(env("KLINE_TONGHUASHUN_BUDGET_SECONDS", "45")),
+)
+
 
 def cache_ttl(namespace: str, default: float) -> float:
     """某个命名空间的 TTL 覆盖：``CACHE_<NS>_TTL_SECONDS``。"""
