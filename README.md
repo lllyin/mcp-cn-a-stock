@@ -36,7 +36,7 @@ CnStock 是一个面向大模型和 MCP 客户端的 A 股数据服务。
 - Python 3.12 或更高版本。
 - Linux、macOS；生产部署推荐 Ubuntu。
 - 推荐使用 [uv](https://docs.astral.sh/uv/) 管理依赖。
-- 可访问 AkShare、efinance 使用的公开行情接口。
+- 能访问公开行情接口，不需要账号或密钥。
 - Chromium：盘中实时资金流和 `market_breadth` 的首选数据源需要，`start.sh` 会在缺失时自动安装。
 
 ## 快速安装
@@ -89,16 +89,10 @@ tail -f logs/cn-stock-mcp.log
 ./stop.sh && ./start.sh --clear-cache
 ```
 
-用在**代码没变、但缓存里的数是坏的**时候：某个上游那一次给了个错值，正好在那个
-纪元里被写进磁盘层。重启带不走它——磁盘层是跨重启的，而闭市纪元没有 TTL，周五
-傍晚写进去的错值能一路服务到周一开盘。
+用在**代码没变、但缓存里存了错值**的时候。闭市期间的缓存跨重启保留、也不过期，所以光重启
+带不走它。
 
-**部署后不用加这个参数。** 渲染指纹（`finmcp/cache.py` 的 `_render_fingerprint`）
-把整个包一起哈希，代码一变缓存键就跟着变，部署前写的条目自动够不着。而且它是内容
-寻址不是删除：回滚到旧版本时指纹变回旧值，那批条目在保留期内还能接着用，手动清过
-就没了。
-
-服务正在跑时这个参数不会执行（会提示先 `./stop.sh`）——清掉正在被读的缓存会出事。
+**部署后不用加**，升级会自动让旧缓存失效。服务正在跑时这个参数不执行，会提示先停服务。
 
 也可以前台运行并选择 transport：
 
@@ -197,8 +191,8 @@ mcporter call cn-stock market_events \
 
 **首次调用较慢**
 
-首次请求可能包含模块初始化、浏览器启动、认证刷新或上游连接建立。请结合
-`logs/cn-stock-mcp.log` 中的分段耗时判断，不要只比较单次冷启动。
+首次请求要额外做启动、认证和建连，属于一次性开销。判断快慢请看
+`logs/cn-stock-mcp.log` 里的分段耗时，不要只比较单次冷启动。
 
 **指定日期没有数据**
 
@@ -207,7 +201,11 @@ mcporter call cn-stock market_events \
 **报告里出现“盘中实时数据暂时不可用”**
 
 东财资金流接口和页面兜底都没取到数据，其余部分不受影响。这是瞬时状态，不会被写进缓存。
-科创 50（`SH000688`）等没有资金流向页面的指数在盘中本来就没有这一段。
+
+**`full` 缺“历史资金流向”**
+
+东财只给部分指数提供资金流向页面（科创 50 `SH000688` 就没有）。没有页面的标的只剩一个来源，
+那个来源拒绝当前出口 IP 时这一段就缺失。同一份报告里的“资金流向”（当日）来自另一处，通常还在。
 
 **`market_breadth` 出现 fallback warning**
 
@@ -236,14 +234,14 @@ mcporter call cn-stock market_events \
 
 | 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
-| `HTTP_CHANNEL` | 访问东财行情主机的方式：<br>`auto` 网关可用时走 `proxy`，否则降级 `impersonate`<br>`proxy` 经授权网关和代理出口，按积分计费<br>`impersonate` 本机直连 + 浏览器 TLS 指纹<br>`direct` 本机直连 + 原生 `requests`，可写作 `off` | `auto`<br>`proxy`<br>`impersonate`<br>`direct`<br>（默认 `auto`） |
-| `IMPERSONATE_RETRY` | 单个请求的伪装尝试次数，用尽后改用原生 `requests` 重放一次 | 正整数（默认 `3`） |
+| `HTTP_CHANNEL` | 访问东财行情主机的方式：<br>`auto` 网关可用时走 `proxy`，否则降级 `impersonate`<br>`proxy` 经授权网关和代理出口，按积分计费<br>`impersonate` 本机直连，伪装成浏览器<br>`direct` 本机直连，不做伪装，可写作 `off` | `auto`<br>`proxy`<br>`impersonate`<br>`direct`<br>（默认 `auto`） |
+| `IMPERSONATE_RETRY` | 单个请求的伪装尝试次数，用尽后不带伪装再试一次 | 正整数（默认 `3`） |
 | `IMPERSONATE_TIMEOUT_SECONDS` | 单次伪装请求的超时 | 秒（默认 `8`） |
-| `IMPERSONATE_BROWSER` | 伪装的浏览器指纹 | curl_cffi 浏览器名（默认 `chrome`） |
+| `IMPERSONATE_BROWSER` | 伪装成哪个浏览器 | 浏览器名，如 `chrome`、`safari`（默认 `chrome`） |
 | `IMPERSONATE_SUSPEND_AFTER_FAILURES` | 连续多少次请求打满重试仍失败后暂停伪装通道 | 正整数（默认 `4`） |
 | `IMPERSONATE_SUSPEND_SECONDS` | 暂停时长。期间东财源直接跳过，改用备用源 | 秒（默认 `300`） |
 
-只有 4 个东方财富主机会被接管，其余主机原样直连；详见[出站 HTTP 通道](docs/technical-details.md#6-出站-http-通道)。
+只有少数东方财富行情主机会被接管，其余原样直连；详见[出站 HTTP 通道](docs/technical-details.md#6-出站-http-通道)。
 
 ### AkShare Proxy Patch（可选，付费）
 
@@ -260,29 +258,37 @@ mcporter call cn-stock market_events \
 从旧版本升级时注意：这个开关以前默认开启，现在需要显式写 `AKSHARE_PROXY_ENABLED=1`
 才会继续走网关，否则自动降级到 `impersonate`。
 
-### 盘中行情与资金流
+### 取数源与顺序
 
-盘中的当日 K 线 bar 由一层可插拔的实时行情 provider 补齐，资金流在东财接口不可用时回退到
-浏览器加载的资金流向页面。两者都可以整层关闭。
+每一维数据都可以配多个来源，逗号分隔按顺序尝试，前一个没取到就问下一个，`off` 关掉整层。
+多个来源各给一部分字段时会合起来用。
 
 | 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
 | `BASIC_INFO_PROVIDERS` | 基本数据（市值、市盈率、市净率）的尝试顺序，后面的源补前面缺的字段：<br>`eastmoney` 字段最全，需要网关或未被封的出口<br>`tencent` 无需鉴权，没有网关的部署靠它兜住这一组 | `eastmoney`<br>`tencent`<br>`off`<br>（默认 `eastmoney,tencent`） |
-| `INTRADAY_QUOTE_PROVIDERS` | 盘中实时行情的尝试顺序，逗号分隔按序尝试，`off` 关闭整层。**当天那一根 K 线只认这一层**（日线端点给的当天行不作准）：<br>`fund_flow_page` 复用已解析的资金流页面，不发请求但没有开高低<br>`tencent` qt.gtimg.cn，字段全<br>`tonghuashun` realhead 接口，字段全 | `fund_flow_page`<br>`tencent`<br>`tonghuashun`<br>`off`<br>（默认 `fund_flow_page,tencent,tonghuashun`） |
-| `INTRADAY_QUOTE_PROVIDERS_INDEX` | **指数**用的顺序，和上一项分开配：指数的成交量各源口径差得多。创业板指当日成交量实测——东财 172,310,434 手、同花顺 172,310,430 手、腾讯与新浪都是 165,865,859 手（低 3.885%）。东财是基准源，所以指数把同花顺排前面；个股两家逐位一致，不换 | 同上（默认 `fund_flow_page,tonghuashun,tencent`） |
+| `INTRADAY_QUOTE_PROVIDERS` | 盘中实时行情的尝试顺序，逗号分隔按序尝试，`off` 关闭整层。**当天那一根 K 线只认这一层**（历史 K 线给的当天数据不作准）：<br>`fund_flow_page` 复用已解析的资金流页面，不发请求但没有开高低<br>`tencent` 字段全<br>`tonghuashun` 字段全 | `fund_flow_page`<br>`tencent`<br>`tonghuashun`<br>`off`<br>（默认 `fund_flow_page,tencent,tonghuashun`） |
+| `INTRADAY_QUOTE_PROVIDERS_INDEX` | **指数**用的顺序，和上一项分开配：指数的成交量各源口径不一致，腾讯/新浪比东财/同花顺低约 3.5%（两家同源，互相校验不了）。东财是基准源，所以指数把同花顺排前面；个股各源逐位一致，不换 | 同上（默认 `fund_flow_page,tonghuashun,tencent`） |
 | `INTRADAY_QUOTE_CROSS_CHECK_PCT` | 拿到第一个可用报价后再问剩下的源一遍，字段相差超过这个值就打 WARNING。每个标的多一次上游请求，只在怀疑某个源口径不对时开 | 百分比，`0` 关闭（默认 `0`） |
-| `TRADING_CALENDAR_PROVIDERS` | 判「今天开不开市」的日历来源，判断入口统一在 `finmcp.market_calendar`：<br>`sina` 上交所公布的交易日名单，最权威<br>`holiday_cn` [NateScarlet/holiday-cn](https://github.com/NateScarlet/holiday-cn) 的国务院放假安排换算而来；对 728 天实测与 `sina` 一致 99.863%，唯一差异是 2024-02-09 除夕交易所多休<br>`weekday` 兜底，周一到周五算交易日（同一区间错 56 天）| `sina`<br>`holiday_cn`<br>`weekday`<br>`off`<br>（默认 `sina,holiday_cn,weekday`） |
-| `FUND_FLOW_PROVIDERS` | 个股/指数资金流 HTTP 层的取数顺序（浏览器页面兜底另算，挂在这一层之后）：<br>`eastmoney` 给全部历史，走伪装通道<br>`eastmoney_delay` 同一接口的 push2delay 主机，只回当日一行，但主源拒绝出口 IP 时它还通；补的是没有资金流向页面的标的（科创 50 这类指数） | `eastmoney`<br>`eastmoney_delay`<br>`off`<br>（默认 `eastmoney,eastmoney_delay`） |
-| `REALTIME_FUND_FLOW_PROVIDERS` | 没有资金流向页面的标的（科创50 等）盘中实时资金流的来源。`eastmoney_delay` 取 push2delay 分钟线最后一行，即当日累计五档净流入，净占比按当日成交额折算；有页面的标的不走这里 | `eastmoney_delay`<br>`off`<br>（默认 `eastmoney_delay`） |
+| `TRADING_CALENDAR_PROVIDERS` | 判「今天开不开市」的日历来源：<br>`sina` 上交所公布的交易日名单，最权威<br>`holiday_cn` [NateScarlet/holiday-cn](https://github.com/NateScarlet/holiday-cn) 的国务院放假安排换算而来，与交易所名单的差异只在个别调休日<br>`weekday` 兜底，周一到周五算交易日——长假会被整段算成交易日，所以放最后 | `sina`<br>`holiday_cn`<br>`weekday`<br>`off`<br>（默认 `sina,holiday_cn,weekday`） |
+| `FUND_FLOW_PROVIDERS` | 个股/指数资金流的来源顺序（页面兜底另算，排在这一层之后）：<br>`eastmoney` 给全部历史<br>`eastmoney_delay` 只回当日一行，但主源拒绝当前出口时它还通 | `eastmoney`<br>`eastmoney_delay`<br>`off`<br>（默认 `eastmoney,eastmoney_delay`） |
+| `REALTIME_FUND_FLOW_PROVIDERS` | 没有资金流向页面的标的（科创 50 等）盘中实时资金流的来源，给当日累计的五档净流入；有页面的标的不走这里 | `eastmoney_delay`<br>`off`<br>（默认 `eastmoney_delay`） |
 | `SECTOR_FUND_FLOW_PROVIDERS` | 板块资金流的取数顺序：<br>`eastmoney` 字段全<br>`eastmoney_dataapi` 只有主力净额，但主源连不上时它还通；报告备注里会标出是降级源 | `eastmoney`<br>`eastmoney_dataapi`<br>`off`<br>（默认 `eastmoney,eastmoney_dataapi`） |
-| `SECTOR_TAXONOMY_PROVIDERS` | 板块分级表的来源，用来只排同一层——东财的行业板块名单是一棵树摊平的（496 个），不分级会让父子板块同时上榜、同一笔钱数两遍。默认排申万二级，和东财官网那张榜逐位一致：<br>`shenwan` 申万宏源的行业分类，经 AkShare 抓乐咕乐股页面<br>`swsresearch` 申万宏源研究所官网的接口，同一套分类的第二个源，乐咕乐股对机房 IP 回人机验证页时靠它补<br>同一套标准的源会合并：前一个缺的级由后一个补<br>`off` 退回全部板块一起排，报告里会标出来 | `shenwan,swsresearch`<br>`shenwan`<br>`off`<br>（默认 `shenwan,swsresearch`） |
-| `KLINE_PROVIDERS_INDEX` | **指数**用的兜底顺序，和下一项分开配：指数的成交量各源口径差得多（创业板指相差 3.52%），同花顺与东财一致 | 同上（默认 `tonghuashun,tencent,sina`） |
+| `SECTOR_TAXONOMY_PROVIDERS` | 板块分级表的来源，用来只排同一层——东财的行业板块名单把各级混在一起，不分级会让父子板块同时上榜、同一笔钱数两遍。默认排申万二级，和东财官网那张榜一致：<br>`shenwan`、`swsresearch` 是同一套申万分类的两个来源，一个不通时另一个补上，缺的级也会互补<br>`off` 退回全部板块一起排，报告里会标出来 | `shenwan,swsresearch`<br>`shenwan`<br>`off`<br>（默认 `shenwan,swsresearch`） |
+| `KLINE_PROVIDERS` | 东财那一级取不到时，**个股/ETF** 的兜底顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`tonghuashun` 不覆盖北交所<br>`tencent` 个股/ETF/指数都覆盖，北交所大半不认<br>`sina` 覆盖腾讯不认的北交所代码，但不认 ETF 和创业板指<br>三家各补各的洞 | `tonghuashun`<br>`tencent`<br>`sina`<br>`off`<br>（默认 `tencent,sina`） |
+| `KLINE_PROVIDERS_INDEX` | **指数**用的兜底顺序，和 `KLINE_PROVIDERS` 分开配：腾讯/新浪的指数成交量比东财/同花顺低约 3.5%，这个量级不能忽略，所以指数按准确度排而不是按稳定性 | 同上（默认 `tonghuashun,tencent,sina`） |
 | `KLINE_TONGHUASHUN_BUDGET_SECONDS` | 同花顺取一次 K 线的**总**预算，用尽即判该源失败、链路回退。它按年份取文件，跨 N 年就是 N 个请求，没有这一项时最坏耗时随窗口线性增长、没有上界。取值必须大于本环境**成功**取数的最大耗时，否则会砍掉本来能拿到的结果、让指数成交量退到腾讯口径（低约 3.5%）；用 `probe_tuning.py tonghuashun` 量当前环境的分布再定 | 秒，`0` 关闭（默认 `45`） |
 | `KLINE_MAX_GAP_TRADING_DAYS` | 相邻两根 K 线之间允许缺多少个**交易日**，超过就判该源失败、让链路回退。防的是「序列断裂」——列是齐的、数值也在合理区间，源「成功」返回，但涨跌幅会跨缺口计算、均线全错。单位是交易日而非自然日，所以长假在结构上就是 0，阈值只用来容忍停牌（10 是 2018 年后重大资产重组停牌的上限）。是偏好不是硬条件：每个源都带同样缺口时（真实长期停牌）会宽松再问一轮并放行，不会让 K 线整段缺失 | 交易日，`0` 关闭（默认 `10`） |
-| `KLINE_PROVIDERS` | 东财那一级取不到时，**个股/ETF** 的兜底顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`tonghuashun` 不覆盖北交所<br>`tencent` 个股/ETF/指数都覆盖，北交所大半不认<br>`sina` 覆盖腾讯不认的北交所代码，但不认 ETF 和创业板指<br>三家各补各的洞 | `tonghuashun`<br>`tencent`<br>`sina`<br>`off`<br>（默认 `tencent,sina`） |
+
+### 资金流页面兜底
+
+东财资金流接口不可用时，改用浏览器加载东财的资金流向页面取同一份数据。这条路不花网关积分，
+但每次要付一个页面加载，所以下面每一项都是在给它设上界——它不该在压力下变成常态。
+
+| 配置名 | 作用 | 可选参数 |
+| --- | --- | --- |
 | `FUND_FLOW_PAGE_ENABLED` | 东财资金流接口不可用时，是否回退到资金流向页面 | `0`<br>`1`<br>（默认 `1`） |
 | `FUND_FLOW_PAGE_CONCURRENCY` | 同时进行的兜底页面加载数。要和 `BROWSER_MAX_PAGES` 一起调，只提一个另一个就成了新瓶颈 | 正整数（默认 `3`） |
-| `FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS` | 单个标的等一个名额的上限，等不到就跳过兜底。必须大于一次页面加载的耗时（实测 p90 7.5s） | 秒（默认 `8`） |
+| `FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS` | 单个标的等一个名额的上限，等不到就跳过兜底。必须大于一次页面加载的耗时，否则一批里的最后一个标的结构上永远排不到；用 `scripts/probe_tuning.py` 量当前环境的分布 | 秒（默认 `8`） |
 | `FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS` | 一次请求里所有标的等名额的总时长上限，必须大于上一项 | 秒，`0` 关闭（默认 `15`） |
 | `FUND_FLOW_PAGE_TABLE_WAIT_SECONDS` | 等历史表渲染完成的上限 | 秒（默认 `15`） |
 | `FUND_FLOW_PAGE_REUSE_SECONDS` | 同一标的页面解析结果的复用窗口，避免一次请求内重复加载同一页面 | 秒，`0` 关闭复用（默认 `30`） |
@@ -294,7 +300,7 @@ mcporter call cn-stock market_events \
 
 ### 上游源熔断
 
-某个上游源连续失败时直接跳过它，不必每次请求都把整条 provider 链走完。
+某个来源连续失败时直接跳过它，不必每次请求都把整条备用链走完。
 
 | 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
@@ -304,8 +310,7 @@ mcporter call cn-stock market_events \
 
 ### 并发与线程池
 
-AkShare 和 efinance 的接口是同步网络调用，由一个有界线程池执行。Ubuntu 2 核 4G 建议保持默认值，
-调高会增加上游压力，并不保证降低延迟。
+取数用一个有界线程池执行。小内存机器建议保持默认值，调高会增加上游压力，并不保证降低延迟。
 
 | 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
@@ -319,7 +324,7 @@ AkShare 和 efinance 的接口是同步网络调用，由一个有界线程池�
 
 交易所的时刻表是死的（09:30 开盘、15:00 收盘），但上游不在这些时刻定稿：盘前已经开始
 更新当日数据，盘后还要整理一会儿。下面几项就是调这个提前量和延后量的，越界会夹回合法
-区间并告警。它们同时决定报告缓存的纪元划分和盘中资金流走哪条分支。
+区间并告警。它们同时决定报告缓存按什么时段划分、以及盘中资金流从哪里取。
 
 | 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
@@ -339,9 +344,8 @@ AkShare 和 efinance 的接口是同步网络调用，由一个有界线程池�
 | `CACHE_INTRADAY_TTL_SECONDS` | 盘中软过期秒数的默认值，`0` 表示盘中绝不复用。盘中数值持续变动，这个 TTL 只用于合并突发重复请求 | 秒（默认 `30`） |
 | `CACHE_STALE_ON_ERROR` | 软过期后刷新失败，是否继续用旧值。用了一定会在输出里标注；跨纪元的旧值永远不给 | `0`<br>`1`<br>（默认 `1`） |
 | `CACHE_DISK_ENABLED` | 跨重启保留闭市纪元的条目。傍晚纪元长达 16 小时，周末达 64 小时 | `0`<br>`1`<br>（默认 `1`） |
-| `CACHE_DIR` | 磁盘层目录，相对项目根目录。每个命名空间一个子目录 | 路径（默认 `.runtime/cache`） |
+| `CACHE_DIR` | 缓存文件目录，相对项目根目录。每个命名空间一个子目录 | 路径（默认 `.runtime/cache`） |
 | `CACHE_<命名空间>_MAX_ENTRIES`<br>`CACHE_<命名空间>_TTL_SECONDS` | 单个命名空间的覆盖，命名空间有 `report`、`market_events`、`sector_flow`、`market_breadth`、`finance`、`calendar`、`taxonomy`。例：`CACHE_REPORT_MAX_ENTRIES=512` | 正整数 / 秒 |
-
 | `CACHE_<命名空间>_ENABLED` | 单独关掉某一层缓存，缺省跟随 `CACHE_ENABLED`。用于 A/B——只有总开关时无法把收益归因到某一层 | `0`/`1`（默认跟随总开关） |
 | `CACHE_FUND_FLOW_MAX_ROWS` | 资金流历史一条最多缓存多少行。主源给全部历史（老标的数千行），截断可控内存；请求要的行数超过存下来的会判未命中、照常打上游，所以不会让数据变少 | 正整数（默认 `250`） |
 | `CONF_DIR` | 参考数据目录（指数名单、代码表、板块表）。默认随包发布，正常不用配；指到别处可临时替换而不重装，只放要改的那个文件即可，其余仍从包内读 | 路径（默认包内 `finmcp/confs`） |
@@ -354,7 +358,7 @@ AkShare 和 efinance 的接口是同步网络调用，由一个有界线程池�
 | 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
 | `MARKET_BREADTH_AUTH_FILE` | 同花顺认证缓存文件 | 路径（默认 `.runtime/tonghuashun-auth.json`） |
-| `MARKET_BREADTH_COOLDOWN_SECONDS` | 同花顺认证失败后的冷却时间，冷却期内 `market_breadth` 直接用 efinance | 秒（默认 `300`） |
+| `MARKET_BREADTH_COOLDOWN_SECONDS` | 同花顺认证失败后的冷却时间，冷却期内 `market_breadth` 直接用备用源 | 秒（默认 `300`） |
 
 ### 浏览器与虚拟显示
 
@@ -362,10 +366,10 @@ AkShare 和 efinance 的接口是同步网络调用，由一个有界线程池�
 
 | 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
-| `BROWSER_MAX_PAGES` | 整个浏览器同时开着的页面数上限。这同时就是同时有几个渲染进程，是峰值内存的直接决定项：每多一个并发页约 +130 MiB | 正整数（默认 `3`） |
-| `BROWSER_IDLE_TIMEOUT_SECONDS` | **盘中**多久没人调用就关掉浏览器。默认 90 分钟盖住午休，关早了下一批调用要重新等冷启动（+2.19s） | 秒，`0` 整层关闭回收（总开关，不看时段）（默认 `5400`） |
-| `BROWSER_IDLE_TIMEOUT_CLOSED_SECONDS` | **盘外**（收盘后、非交易日）的空闲回收超时。盘外没有午休要盖，而浏览器进程树占 378 MiB（热空闲共 621 MiB，拆掉后 243 MiB） | 秒，`0` 盘外不回收、盘中照旧（默认 `300`） |
-| `BROWSER_DISGUISE` | 把无头浏览器的自报特征改成普通浏览器的样子。默认关：机房出口的机器上实测原样身份全通、伪装后被拒更多，开发机上可能相反；这台机器该用哪种用 `scripts/probe_tuning.py` 量，置 1 启用伪装 | `0`<br>`1`<br>（默认 `0`） |
+| `BROWSER_MAX_PAGES` | 整个浏览器同时开着的页面数上限。这同时就是同时有几个渲染进程，是峰值内存的直接决定项——每多一个并发页就多一个渲染进程 | 正整数（默认 `3`） |
+| `BROWSER_IDLE_TIMEOUT_SECONDS` | **盘中**多久没人调用就关掉浏览器。默认 90 分钟盖住午休，关早了下一批调用要重新等冷启动 | 秒，`0` 整层关闭回收（总开关，不看时段）（默认 `5400`） |
+| `BROWSER_IDLE_TIMEOUT_CLOSED_SECONDS` | **盘外**（收盘后、非交易日）的空闲回收超时。盘外没有午休要盖，而浏览器进程树是常驻内存的大头，拆掉能省下大部分 | 秒，`0` 盘外不回收、盘中照旧（默认 `300`） |
+| `BROWSER_DISGUISE` | 把无头浏览器的自报特征改成普通浏览器的样子。哪种身份被拒得少取决于出口 IP，两个方向都出现过，所以默认关、由实测决定：用 `scripts/probe_tuning.py` 量当前环境，置 1 启用伪装 | `0`<br>`1`<br>（默认 `0`） |
 | `BROWSER_CLAIM_PLATFORM` | 对外声明哪个平台。`auto` 下 Windows/macOS 照实报，Linux 报 macOS | `auto`<br>`real`<br>`macos`<br>`windows`<br>（默认 `auto`） |
 | `BROWSER_NO_SANDBOX` | 为 Chromium 添加 `--no-sandbox`。会降低隔离，仅在 sandbox 确实不可用时启用 | `0`<br>`1`<br>（默认 `0`） |
 | `XVFB_DISPLAY_NUMBER` | 无 `DISPLAY` 时 `start.sh` 使用的 Xvfb 起始显示号，被占用则依次往后试到 109 | 整数（默认 `99`） |
