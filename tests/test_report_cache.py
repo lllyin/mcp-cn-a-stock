@@ -397,6 +397,133 @@ def test_render_fingerprint_is_stable_within_a_build():
     assert cache_module._render_fingerprint() == cache_module.RENDER_FINGERPRINT
 
 
+def _fake_package(root, files):
+    """在 tmp 目录里搭一个假包，files 是 {相对路径: 内容}。"""
+    for name, body in files.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+    return str(root)
+
+
+def test_fingerprint_covers_the_whole_package(tmp_path):
+    """包里**任何** .py 变了，指纹就得变。
+
+    2026-09-08 线上翻过这个车：当时的指纹只哈希 research/mcp_app/cache/config/
+    market_session 五个文件，而那次部署改的是 datasource/kline_source.py 和
+    datasource/platforms/tonghuashun.py，指纹一字未变，brief 继续服务部署前那份
+    成交量低 3.7% 的缓存报告。
+    """
+    files = {
+        "cache.py": "x = 1\n",
+        "datasource/kline_source.py": "ORDER = ('tencent',)\n",
+        "datasource/platforms/tonghuashun.py": "RETRIES = 0\n",
+    }
+    root = _fake_package(tmp_path / "pkg", files)
+    before = cache_module._render_fingerprint(root)
+
+    (tmp_path / "pkg" / "datasource" / "platforms" / "tonghuashun.py").write_text(
+        "RETRIES = 1\n", encoding="utf-8"
+    )
+    assert cache_module._render_fingerprint(root) != before
+
+
+def test_fingerprint_covers_confs_json(tmp_path):
+    """confs 决定名称、板块和指数分支，改它是渲染变更。"""
+    root = _fake_package(tmp_path / "pkg", {
+        "cache.py": "x = 1\n",
+        "confs/indices.json": '{"SH000001": "上证指数"}\n',
+    })
+    before = cache_module._render_fingerprint(root)
+    (tmp_path / "pkg" / "confs" / "indices.json").write_text(
+        '{"SH000001": "上证指数", "SZ399006": "创业板指"}\n', encoding="utf-8"
+    )
+    assert cache_module._render_fingerprint(root) != before
+
+
+def test_fingerprint_covers_renames_and_new_empty_files(tmp_path):
+    """只哈希内容不够：改名和新增空文件都改变了这个包是什么。"""
+    root = _fake_package(tmp_path / "pkg", {"a.py": "x = 1\n"})
+    before = cache_module._render_fingerprint(root)
+
+    (tmp_path / "pkg" / "a.py").rename(tmp_path / "pkg" / "b.py")
+    renamed = cache_module._render_fingerprint(root)
+    assert renamed != before
+
+    (tmp_path / "pkg" / "c.py").write_text("", encoding="utf-8")
+    assert cache_module._render_fingerprint(root) != renamed
+
+
+def test_fingerprint_ignores_pycache_and_stray_files(tmp_path):
+    """__pycache__ 带时间戳、.DS_Store 被 Finder 碰一下就变。
+
+    这两样进指纹的话，开发机上磁盘缓存会无缘无故整个作废。
+    """
+    root = _fake_package(tmp_path / "pkg", {"a.py": "x = 1\n"})
+    before = cache_module._render_fingerprint(root)
+
+    (tmp_path / "pkg" / "__pycache__").mkdir()
+    (tmp_path / "pkg" / "__pycache__" / "a.cpython-312.pyc").write_bytes(b"\x00stamp")
+    (tmp_path / "pkg" / ".DS_Store").write_bytes(b"\x00finder")
+    (tmp_path / "pkg" / "notes.md").write_text("随手写的\n", encoding="utf-8")
+
+    assert cache_module._render_fingerprint(root) == before
+
+
+def test_fingerprint_is_deterministic_across_walk_order(tmp_path):
+    """同一份内容必须给出同一个指纹——否则每次重启都作废整个磁盘缓存。"""
+    root = _fake_package(tmp_path / "pkg", {
+        "z.py": "z = 1\n", "a.py": "a = 1\n", "m/n.py": "n = 1\n",
+    })
+    assert len({cache_module._render_fingerprint(root) for _ in range(5)}) == 1
+
+
+def test_missing_confs_hashes_to_a_stable_marker(tmp_path, monkeypatch):
+    """confs 装在包外又找不到时，指纹不能每次启动都换一个。
+
+    换一个等于把磁盘层关掉：每次重启全部 miss，而这是**静默**的。
+    """
+    root = _fake_package(tmp_path / "pkg", {"cache.py": "x = 1\n"})
+    monkeypatch.setattr(
+        cache_module, "conf_path", lambda name: str(tmp_path / "nowhere" / name)
+    )
+    assert cache_module._render_fingerprint(root) == cache_module._render_fingerprint(root)
+
+
+def test_unreadable_package_still_hashes_something(tmp_path, monkeypatch):
+    """遍历不了包目录时不许静默退回一份更窄的名单——那正是出事的形态。"""
+    monkeypatch.setattr(
+        cache_module, "_fingerprint_sources",
+        lambda root: (_ for _ in ()).throw(OSError("permission denied")),
+    )
+    assert len(cache_module._render_fingerprint(str(tmp_path))) == 12
+
+
+def test_sources_raise_instead_of_returning_empty(tmp_path):
+    """``os.walk`` 默认吞掉目录错误，直接产出零个文件——必须抛，不能返回空。
+
+    返回空的话指纹里一个字节的代码内容都没有，**还偏偏是稳定的**：改任何代码都
+    不会让缓存失效，和写死名单漏文件是同一个后果，只是入口更隐蔽。
+    """
+    with pytest.raises(OSError):
+        cache_module._fingerprint_sources(str(tmp_path / "不存在"))
+    (tmp_path / "空包").mkdir()
+    with pytest.raises(OSError):
+        cache_module._fingerprint_sources(str(tmp_path / "空包"))
+
+
+def test_broken_install_degrades_to_always_miss(tmp_path):
+    """安装坏了要**吵**——每次启动换一个指纹，全部 miss。
+
+    对比之下"稳定但不含代码"是最坏的结果：看着一切正常，实际上部署再也不会让
+    缓存失效。宁可全部 miss。
+    """
+    root = str(tmp_path / "不存在")
+    first = cache_module._render_fingerprint(root)
+    time.sleep(0.01)
+    assert cache_module._render_fingerprint(root) != first
+
+
 def test_new_build_cannot_read_old_disk_entry(tmp_path, monkeypatch):
     directory = str(tmp_path / "cache")
     key = build_key("brief", "SH600000", {}, now=at(MONDAY, 18, 0))

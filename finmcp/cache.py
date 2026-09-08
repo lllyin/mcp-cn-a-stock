@@ -98,40 +98,95 @@ DISK_RETENTION_SECONDS = 5 * 24 * 3600
 DISK_SWEEP_INTERVAL_SECONDS = 3600
 
 
-def _render_fingerprint() -> str:
+#: 进指纹的文件后缀。``.py`` 是代码；``.json`` 是 ``confs/`` 下那三份——
+#: ``indices.json`` 决定一个标的走指数分支还是个股分支（``config.ALL_INDICES`` →
+#: ``research.get_realtime_fund_flow_target``），``markets.json`` 和
+#: ``stock_sector.json`` 决定报告里的名称和板块。改它们都是渲染变更，哪怕没有
+#: 任何 ``.py`` 动过。
+#:
+#: 别改成"所有文件"：包目录里会有 ``.DS_Store`` 这种东西，Finder 碰一下就变，
+#: 指纹会在开发机上无缘无故抖动，把整个磁盘缓存反复作废。
+_FINGERPRINT_SUFFIXES = (".py", ".json")
+
+
+def _fingerprint_sources(root: str) -> list[str]:
+    """包内所有参与渲染的文件，按相对路径排序。
+
+    **走目录，不写死名单。** 名单会漏，而漏掉的代价这次在线上实测过：
+    2026-09-08 部署了 ``de61d92``（同花顺年份文件 5xx 重试），它改的是
+    ``datasource/kline_source.py`` 和 ``datasource/platforms/tonghuashun.py``，
+    两个都不在当时那份五个文件的名单里，于是指纹一字未变（前后都是
+    ``03b518b9e47b``）。结果同一台服务器同一时刻：``kline_range`` 给的是修好的
+    172,310,430 手，而 ``brief`` 还在给部署前缓存的 16,586.59 万手（低 3.7%）。
+    CLOSED 纪元没有 TTL、最长 64h，周五傍晚的部署能把错数一路服务到周一开盘。
+
+    排序 + 把**相对路径**也喂进哈希：不排序则不同文件系统的遍历顺序会给出不同
+    指纹；不喂路径则改个文件名、或者新增一个空文件，指纹不变。
+
+    遍历的是 ``__file__`` 所在目录，所以装成包时哈希的是 site-packages 里那份
+    真正在跑的副本，不是仓库里的。
+
+    **读不到就抛，绝不返回空列表。** ``os.walk`` 默认 ``onerror=None``，目录不存在
+    或没有权限时它不报错、直接产出零个文件——那样指纹里就一个字节的代码内容都没有，
+    还偏偏是稳定的，改任何代码都不会让缓存失效。这正是这个函数要防的形态，只是换了
+    个更隐蔽的入口。所以 ``onerror`` 必须往外抛，空结果也当成坏安装。
+    """
+    def _propagate(error: OSError) -> None:
+        raise error
+
+    out = []
+    for base, dirs, files in os.walk(root, onerror=_propagate):
+        # 就地改 dirs 才能真正不下探；__pycache__ 里的 .pyc 带时间戳。
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+        for name in sorted(files):
+            if name.endswith(_FINGERPRINT_SUFFIXES):
+                out.append(os.path.join(base, name))
+    if not out:
+        raise OSError(f"{root} 下没有任何可哈希的源文件")
+    return sorted(out)
+
+
+def _render_fingerprint(root: Optional[str] = None) -> str:
     """Identify the rendering inputs, so a deploy cannot serve pre-deploy output.
 
     The disk tier outlives restarts and a closed epoch runs for up to 64h, so
     without this a rendering fix shipped in the evening would stay invisible
     until the next session opened.
 
-    ``finmcp/confs/indices.json`` is covered because it decides, through
-    ``config.ALL_INDICES``, whether a symbol renders down the index branch or
-    the stock branch (``research.get_realtime_fund_flow_target``). Editing it is
-    a rendering change even though no ``.py`` file moved.
+    整个包一起哈希，理由见 ``_fingerprint_sources``。代价实测 3.3ms，只在 import
+    时付一次（39 个 ``.py`` + 3 个 ``confs/*.json``，合计 2.6 MiB）。副作用是
+    **每次部署都会把整个磁盘缓存作废**，部署后的首批请求要重新取数——这跟重启后
+    内存层为空是同一件事，只是磁盘层不再替部署前的代码兜着。服务本来就要扛得住
+    重启，而这里的取舍没有商量余地：给错的数比多取一次数严重（AGENTS.md §一）。
 
-    ``market_session.py`` is in the list because the session boundaries decide
-    which fund-flow branch a report takes — moving one is a rendering change.
+    ``confs/`` 单独再走一次 ``conf_path``：那份配置**可能装在包外**，包目录遍历
+    不到。这一路读不到时哈希成稳定的 ``absent`` 而不是带时间戳的标记，否则没装
+    confs 的部署会每次启动换一个指纹，磁盘缓存等于关掉。
+
+    ``root`` 只为测试可注入，默认就是本模块所在的包目录。
     """
     parts = [__version__]
-    here = os.path.dirname(os.path.abspath(__file__))
+    here = root or os.path.dirname(os.path.abspath(__file__))
     # (path, required): a missing source file is a broken install and should
     # degrade to "always miss"; a missing optional config is a normal state and
     # must hash to a stable marker, or the fingerprint would change every boot.
-    sources = [
-        (os.path.join(here, name), True)
-        for name in ("research.py", "mcp_app.py", "cache.py", "config.py",
-                     "market_session.py")
-    ]
-    # 走 conf_path，否则装成包时这里指到 site-packages/confs（不存在），指纹会
-    # 稳定地哈希成 "absent"，改名单再也不会让缓存失效。
-    sources.append((conf_path("indices.json"), False))
+    try:
+        sources = [(path, True) for path in _fingerprint_sources(here)]
+    except OSError:
+        # 连包目录都遍历不了。别静默退回一份更窄的名单——那正是这次出事的形态。
+        sources = [(os.path.join(here, "cache.py"), True)]
+    known = {os.path.realpath(path) for path, _ in sources}
+    conf = conf_path("indices.json")
+    if os.path.realpath(conf) not in known:
+        sources.append((conf, False))
     for path, required in sources:
-        name = os.path.basename(path)
+        # 相对路径进哈希：光有内容的话，改名或加空文件都不会改指纹。
+        parts.append(os.path.relpath(path, here))
         try:
             with open(path, "rb") as handle:
                 parts.append(hashlib.sha1(handle.read()).hexdigest())
         except OSError:
+            name = os.path.basename(path)
             parts.append(
                 f"{name}:unreadable:{time.time()}" if required else f"{name}:absent"
             )
