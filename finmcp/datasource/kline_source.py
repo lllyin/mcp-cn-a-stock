@@ -214,6 +214,32 @@ def configured_order(request: Optional[KlineRequest] = None) -> tuple:
     return pf.configured_order(CAPABILITY, PROVIDER_ORDER_ENV, DEFAULT_PROVIDER_ORDER)
 
 
+
+def _log_caliber_change(request: KlineRequest, resolved, order: tuple) -> None:
+    """指数落到非首选源时留一行日志——换源会**静默改变成交量口径**。
+
+    只记日志，不进 tool 的 warnings：这一条是给排查用的，不该让每份报告都顶着
+    一句读者用不上的话。
+
+    为什么只对指数记：12 个标的实测（个股、ETF、北交所、四个指数），腾讯与同花顺
+    的收盘价 12/12 逐位一致，成交量 11/12 一致——**只有创业板指不一致**。所以对
+    个股和 ETF 换源不改口径，记了是噪音。
+
+    这一行要能直接解释报告里的数：2026-09-08 08:17 线上创业板指报 16586.59 万手 /
+    5085.13亿，而权威（东财、同花顺 app、平安证券 app）是 17231.04 / 5120.15。
+    成因就是同花顺的年份文件 502、链路落到腾讯，而报告里看不出来。
+    """
+    if resolved is None or not order or not request.is_index:
+        return
+    if resolved.platform == order[0]:
+        return
+    logger.warning(
+        "指数 %s 的 K 线来自 %s 而不是首选的 %s——**成交量口径会变**："
+        "腾讯/新浪比东财/同花顺低约 3.5%%（成交额约 0.7%%），"
+        "受影响的是当日与各周期的均量、均额。报告里看不出来，查数对不上时先看这一行。",
+        request.code, resolved.platform, order[0],
+    )
+
 def resolve(
     request: KlineRequest,
     *,
@@ -260,6 +286,7 @@ def resolve(
 
     if resolved is None:
         return None
+    _log_caliber_change(request, resolved, resolved_order)
     return KlineResult(frame=resolved.value, provider=resolved.platform)
 
 

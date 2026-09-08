@@ -82,6 +82,22 @@ _SSE_INDEX_CODES = {
 #: 按年取还有个好处：跨年请求自然只多取一个文件，不会因为窗口长一天就翻倍。
 _YEAR_URL = "{base}/hs_{code}/{segment}/{year}.js"
 
+#: 年份文件 5xx 的重试次数（不含首次）。
+#:
+#: 5xx 抛出去是对的——静默 continue 会得到一条断裂的序列而链路不回退。但抛出去的
+#: 代价是**整个源失败**，对指数就是整条 240 根序列换成腾讯口径、成交量低 3.5%，
+#: 而报告里看不出来。一次瞬时 502 不该付这么大的代价。
+#:
+#: 判据是它确实瞬时：2026-09-08 机房出口的线上日志里同花顺 kline 6 成功 6 失败（**50%**），
+#: 全部是 502，而且 08:13:26、08:17:55、08:17:56 三个时刻**同一秒内既有 502 又有成功**
+#: ——同一个 2024.js 相隔 0.27 秒一次 502 一次 200。同一时刻家用宽带出口打 24 次
+#: 全部 200，所以这是那个出口特有的间歇性拒绝，不是同花顺整体挂了。
+#:
+#: 只重试 1 次：502 返回很快（约 150ms），按独立失败率算一次重试把 50% 压到约 25%，
+#: 再多一次的边际收益减半而每次失败都要多付一个请求。404 不重试——那是「未上市」
+#: 或缺口，重试改变不了。
+_YEAR_FILE_RETRIES = 1
+
 
 def tonghuashun_code(prefixed: str) -> Optional[str]:
     """带市场前缀的码（``sh600519``/``sz399006``/``bj920021``）→ 同花顺认的代码。
@@ -134,8 +150,19 @@ class TonghuashunPlatform(pf.Platform):
         rows = []
         for year in years:
             url = _YEAR_URL.format(base=_BASE, code=code, segment=segment, year=year)
-            response = session.get(url, headers=_HEADERS, timeout=15)
-            body = response.text
+            # 5xx 与「正文不是 JSONP」重试；404 不重试（未上市或缺口，重试无用）。
+            for attempt in range(_YEAR_FILE_RETRIES + 1):
+                response = session.get(url, headers=_HEADERS, timeout=15)
+                body = response.text
+                transient = response.status_code != 404 and (
+                    response.status_code != 200 or not body or "(" not in body
+                )
+                if not transient or attempt == _YEAR_FILE_RETRIES:
+                    break
+                logger.debug(
+                    "同花顺 %s 年文件 HTTP %s，重试第 %d 次 code=%s",
+                    year, response.status_code, attempt + 1, code,
+                )
             if response.status_code == 404:
                 # 404 分两种，判据是"已经取到过行没有"——years 是升序遍历（旧→新）：
                 #
@@ -163,6 +190,7 @@ class TonghuashunPlatform(pf.Platform):
                 raise RuntimeError(
                     f"同花顺 {year} 年文件 HTTP {response.status_code}"
                     + ("" if body and "(" in body else "，正文不是 JSONP")
+                    + f"（已重试 {_YEAR_FILE_RETRIES} 次）"
                 )
             payload = json.loads(body[body.index("(") + 1: body.rindex(")")])
             rows.extend(self._rows(payload))

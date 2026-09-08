@@ -143,3 +143,99 @@ def test_the_whole_tier_can_be_turned_off(monkeypatch):
 def test_provider_is_the_public_way_to_reach_one():
     assert kline_source.provider("tencent").label == "腾讯"
     assert kline_source.provider("没有这个源") is None
+
+
+# --- 换源改口径要留日志 -------------------------------------------------------
+
+
+class TestCaliberChangeIsLogged:
+    """指数落到非首选源时，成交量口径会**静默**变——日志里必须留下来。
+
+    2026-09-08 08:17 线上创业板指报 16586.59 万手 / 5085.13亿，而权威（东财、
+    同花顺 app、平安证券 app）是 17231.04 / 5120.15。成因是同花顺的年份文件 502、
+    链路落到腾讯。报告里 16586.59 和 17231.04 一样自信、一样没有标注，
+    用户是靠比对两台机器才发现的。
+
+    只记日志、不进 tool 的 warnings（用户定的）：这条是给排查用的。
+    """
+
+    class _Fake(pf.Platform):
+        capabilities = frozenset({"kline"})
+
+        def __init__(self, name):
+            self.name = self.label = name
+
+        def fetch_kline(self, request):
+            import pandas as pd
+
+            days = pd.date_range("2026-01-05", periods=30, freq="B").date.tolist()
+            frame = pd.DataFrame({"日期": days})
+            for column in FALLBACK_FRAME_COLUMNS:
+                if column != "日期":
+                    frame[column] = [1.0] * len(days)
+            return frame
+
+    def _resolve(self, symbol, order, caplog):
+        import logging
+
+        for name in order:
+            pf.register(self._Fake(name), replace=True)
+        try:
+            with caplog.at_level(logging.WARNING, logger="finmcp"):
+                kline_source.resolve(_request(symbol), order=order)
+            return [r.getMessage() for r in caplog.records]
+        finally:
+            for name in order:
+                pf.unregister(name)
+
+    def test_an_index_falling_back_says_the_caliber_changed(self, caplog):
+        messages = self._resolve("SZ399006", ("首选源", "备用源"), caplog)
+        # 首选源能给结果时不该有这条
+        assert not any("口径" in m for m in messages), messages
+        caplog.clear()
+        messages = self._resolve("SZ399006", ("备用源",), caplog)
+        assert messages == [] or not any("口径" in m for m in messages)
+
+    def test_it_fires_when_the_winner_is_not_the_first_choice(self, caplog):
+        import logging
+
+        class Dead(pf.Platform):
+            name = label = "dead"
+            capabilities = frozenset({"kline"})
+
+            def fetch_kline(self, request):
+                raise RuntimeError("2026 年文件 HTTP 502")
+
+        pf.register(Dead(), replace=True)
+        pf.register(self._Fake("alive"), replace=True)
+        try:
+            with caplog.at_level(logging.WARNING, logger="finmcp"):
+                kline_source.resolve(_request("SZ399006"), order=("dead", "alive"))
+            messages = [r.getMessage() for r in caplog.records]
+        finally:
+            pf.unregister("dead"); pf.unregister("alive")
+        hit = [m for m in messages if "口径" in m]
+        assert hit, messages
+        assert "3.5" in hit[0], "得写出偏多少，否则看到日志也不知道严重性"
+        assert "alive" in hit[0] and "dead" in hit[0], "得写出是谁替了谁"
+
+    def test_a_stock_falling_back_stays_quiet(self, caplog):
+        """个股/ETF 换源不改口径（12 个标的实测两家逐位一致），记了是噪音。"""
+        import logging
+
+        class Dead(pf.Platform):
+            name = label = "dead"
+            capabilities = frozenset({"kline"})
+
+            def fetch_kline(self, request):
+                raise RuntimeError("挂了")
+
+        pf.register(Dead(), replace=True)
+        pf.register(self._Fake("alive"), replace=True)
+        try:
+            with caplog.at_level(logging.WARNING, logger="finmcp"):
+                kline_source.resolve(_request("SH600519"), order=("dead", "alive"))
+            messages = [r.getMessage() for r in caplog.records]
+        finally:
+            pf.unregister("dead"); pf.unregister("alive")
+        assert not any("口径" in m for m in messages), messages
