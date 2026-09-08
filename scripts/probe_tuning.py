@@ -190,15 +190,37 @@ def _ps_table() -> dict:
     return procs
 
 
+#: 这台机器支不支持 PSS。拿当前进程探一次——它一定存在，所以这个判断只反映
+#: "有没有 /proc/<pid>/smaps_rollup"，不会被"某个子进程刚退出"污染。
+_PSS_SUPPORTED = os.path.exists(f"/proc/{os.getpid()}/smaps_rollup")
+
+
+# 为什么要把"进程没了"和"读不到 PSS"分开：浏览器那一档有 8 个以上 Chromium 进程在
+# 不断起落，只要有一个撞上"列进程树"和"读 smaps"之间的空隙，旧写法就把整个样本判废。
+# 实测过一轮：facts 那一档读到了 121.9 MiB PSS，而同一次运行的 browser 三级内存阶梯
+# 全是"（无 PSS）"，于是报告写成"这台机器读不到 PSS"。结果是唯一能判 BROWSER_MAX_PAGES
+# 的机器上这一项永远出不了结论，而内存正是它要守的那条线。
 def _pss_mib(pid: int) -> Optional[float]:
+    """该进程的 PSS，单位 MiB。
+
+    **进程已经退出时返回 0.0 而不是 None。** 这两件事必须分开：``None`` 的含义是
+    "这台机器读不到 PSS"，会让整棵树的样本作废；而一个在"列进程树"和"读 smaps"
+    之间退出的进程，到测量那一刻本来就不占内存，记 0 才是对的。
+
+    混在一起的代价是实打实的，见函数上面那段注释。
+    """
+    if not _PSS_SUPPORTED:
+        return None
     try:
         with open(f"/proc/{pid}/smaps_rollup", "rb") as handle:
             for line in handle:
                 if line.startswith(b"Pss:"):
                     return float(line.split()[1]) / 1024.0
+    except (FileNotFoundError, ProcessLookupError):
+        return 0.0          # 采样与读取之间退出了，不占内存
     except (OSError, ValueError, IndexError):
-        return None
-    return None
+        return None         # 权限不足之类：这台机器读不到，样本作废
+    return None             # smaps_rollup 在但没有 Pss 行（内核太老）
 
 
 def tree_memory(root_pid: int) -> dict:

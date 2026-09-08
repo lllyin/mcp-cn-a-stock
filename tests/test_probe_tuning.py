@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import os
 import datetime as dt
 import importlib.util
 import json
@@ -412,3 +413,55 @@ class TestVenvGuard:
         for line in doc.splitlines():
             if "scripts/probe_tuning.py" in line:
                 assert re.search(r"\.venv/bin/python scripts/probe_tuning\.py", line), line
+
+
+# ── PSS 采样：进程退出 ≠ 读不到 PSS ────────────────────────────
+
+
+class TestPssSampling:
+    """浏览器那一档有 8+ 个 Chromium 进程在起落，只要一个撞上"列进程树"和
+    "读 smaps"之间的空隙，旧写法就把整个样本判废。
+
+    实测过一轮：facts 那一档读到了 121.9 MiB PSS，而 browser 那一档
+    三级阶梯全是「（无 PSS）」——于是 report.md 写成"这台机器读不到 PSS（macOS 或
+    无 /proc 权限）"，**唯一能判 BROWSER_MAX_PAGES 的机器上这一项永远出不了结论**，
+    而内存正是它要守的那条线。
+    """
+
+    def test_an_exited_process_counts_as_zero_not_unknown(self, monkeypatch):
+        monkeypatch.setattr(probe, "_PSS_SUPPORTED", True)
+        def gone(*a, **k):
+            raise FileNotFoundError(2, "No such file or directory")
+        monkeypatch.setattr("builtins.open", gone)
+        assert probe._pss_mib(999999) == 0.0, "退出的进程不占内存，记 0"
+
+    def test_no_permission_is_unknown(self, monkeypatch):
+        monkeypatch.setattr(probe, "_PSS_SUPPORTED", True)
+        def denied(*a, **k):
+            raise PermissionError(13, "Permission denied")
+        monkeypatch.setattr("builtins.open", denied)
+        assert probe._pss_mib(1) is None, "读不到才是 None，会让样本作废"
+
+    def test_a_platform_without_proc_is_unknown(self, monkeypatch):
+        monkeypatch.setattr(probe, "_PSS_SUPPORTED", False)
+        assert probe._pss_mib(os.getpid()) is None
+
+    def test_support_is_probed_on_a_process_that_certainly_exists(self):
+        """用当前进程探，所以这个标志只反映平台能力，不会被"子进程刚退出"污染。"""
+        import inspect
+
+        src = inspect.getsource(probe)
+        marker = src[src.index("_PSS_SUPPORTED = "):]
+        assert "os.getpid()" in marker.split("\n")[0], marker.split("\n")[0]
+
+    def test_a_tree_with_one_vanished_child_still_reports_pss(self, monkeypatch):
+        """整棵树的样本不该因为一个子进程退出就丢掉 PSS。"""
+        monkeypatch.setattr(probe, "_PSS_SUPPORTED", True)
+        monkeypatch.setattr(probe, "_ps_table",
+                            lambda: {1: (0, 100.0, "python"), 2: (1, 200.0, "chrome")})
+        monkeypatch.setattr(probe, "_pss_mib",
+                            lambda pid: 80.0 if pid == 1 else 0.0)   # 2 号已退出
+        got = probe.tree_memory(1)
+        assert got["metric"] == "pss"
+        assert got["pss_mib"] == 80.0
+        assert got["processes"] == 2
