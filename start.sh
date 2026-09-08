@@ -16,6 +16,35 @@ XVFB_PID_FILE="$SCRIPT_DIR/cn-stock-mcp-xvfb.pid"
 XVFB_LOG_FILE="$LOG_DIR/cn-stock-mcp-xvfb.log"
 PORT=8686
 
+CLEAR_CACHE=0
+for arg in "$@"; do
+    case "$arg" in
+        --clear-cache) CLEAR_CACHE=1 ;;
+        -h|--help)
+            echo "用法: ./start.sh [--clear-cache]"
+            echo
+            echo "  --clear-cache  启动前丢掉磁盘缓存里的全部纪元目录。"
+            echo
+            echo "什么时候用：**代码没变、但缓存里的数是坏的**。比如某个上游那一次"
+            echo "给了个错值正好被写进去了，重启并不会让它消失——磁盘层跨重启，"
+            echo "而闭市纪元没有 TTL，最长能服务 64 小时。"
+            echo
+            echo "部署后不用加。渲染指纹（finmcp/cache.py:_render_fingerprint）"
+            echo "哈希整个包，代码一变缓存键就变，旧条目自动够不着——而且是"
+            echo "内容寻址不是删除，回滚到旧版本时旧条目还能继续用。"
+            exit 0
+            ;;
+        *)
+            # 认不出的参数必须拒绝，不能忽略。`./start.sh --clear-cahce` 手滑打错
+            # 一个字母，忽略的话服务照常起来、缓存一个字节没动，而人以为清过了——
+            # 和上面"服务已在运行时静默跳过"是同一类坑。
+            echo "❌ 不认识的参数: $arg"
+            echo "   用法: ./start.sh [--clear-cache]，详见 ./start.sh --help"
+            exit 1
+            ;;
+    esac
+done
+
 # 创建日志目录
 mkdir -p "$LOG_DIR"
 
@@ -58,10 +87,27 @@ if [ -f "$PID_FILE" ]; then
         echo "服务已在运行 (PID: $PID)"
         echo "访问地址: http://127.0.0.1:$PORT/cnstock/mcp"
         echo "查看日志: tail -f $LOG_FILE"
+        # 这一句不能省。不说的话，`./start.sh --clear-cache` 打印"服务已在运行"
+        # 然后退出，看着像成功了，而缓存一个字节都没动。
+        if [ "$CLEAR_CACHE" = "1" ]; then
+            echo
+            echo "⚠️  --clear-cache 没有执行：服务在跑，清了正在被读的缓存会出事。"
+            echo "    要清就先 ./stop.sh，再 ./start.sh --clear-cache"
+        fi
         exit 0
     else
         rm -f "$PID_FILE"
     fi
+fi
+
+# 清缓存必须在服务起来之前——起来之后再清，正在服务的请求会一边读一边被删。
+if [ "$CLEAR_CACHE" = "1" ]; then
+    echo "=== 清磁盘缓存 ==="
+    python scripts/clear_cache.py || {
+        echo "❌ 清缓存失败，不启动服务——带着一份说不清状态的缓存跑，"
+        echo "   比不启动更难查。"
+        exit 1
+    }
 fi
 
 cleanup_stale_xvfb_pid() {
