@@ -117,7 +117,7 @@ pf.define_capability(CAPABILITY, Calendar)
 # 几百毫秒"，而代价是一个常驻线程或任务（AGENTS.md §三 明确要求避免无界线程），
 # 外加一个新的失败模式：刷新任务静默死掉之后，日历会一路旧到 max_age 才被发现。
 #
-# 收益说不清到值得的量级，副作用是确定的，所以不做（AGENTS.md §六）。
+# 收益说不清到值得的量级，副作用是确定的，所以不做（AGENTS.md §五）。
 # 同理也没有另起一层"按年缓存 holiday-cn 原始 JSON"：那些年份文件的解析结果已经
 # 落在这个命名空间的磁盘缓存里了，再加一层是重复。
 CACHE_NAMESPACE = "calendar"
