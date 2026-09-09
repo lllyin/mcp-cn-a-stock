@@ -191,12 +191,34 @@ start_xvfb_if_needed
 # 启动服务
 echo "正在启动 $APP_NAME 服务..."
 
-# 上一轮的日志留一份。下面的 nohup 用 > 重定向，会把日志截断成空——上一次是怎么
-# 挂的、挂之前打了什么，全没了，而那正是重启之后最想看的东西。只留一代：同名直接
-# 覆盖，日志目录不会随重启次数无限长。
+# 归档上一轮的日志。下面的 nohup 用 > 重定向，会把日志截断成空——上一次是怎么挂的、
+# 挂之前打了什么，全没了，而那正是重启之后最想看的东西。
+#
+# 文件名带启动时刻，一天内重启多次也不会互相覆盖（原先固定叫 .bak，只留一代，
+# 一天重启两次就把更早那次冲掉了）。health 工具默认把归档一起算进统计。
+#
+# LOG_RETENTION_DAYS：归档保留几天，默认 3。按**天数**清而不是按份数清——按份数
+# 清的话，一次密集重启就能把前几天的日志顶掉，而"前几天出过什么"正是要查的。
+# 想省磁盘就调小；调成 0 表示不保留归档（只留当前那一份）。
+LOG_RETENTION_DAYS="$(conf LOG_RETENTION_DAYS)"
+LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-3}"
 if [ -s "$LOG_FILE" ]; then
-    mv -f "$LOG_FILE" "$LOG_FILE.bak"
-    echo "上一轮日志: $LOG_FILE.bak"
+    ARCHIVED_LOG="$LOG_FILE.$(date +%Y%m%d-%H%M%S)"
+    mv -f "$LOG_FILE" "$ARCHIVED_LOG"
+    echo "上一轮日志: $ARCHIVED_LOG"
+fi
+# 只清 "<日志名>.<后缀>"，当前那份没有后缀、匹配不上。历史上的 .bak 也归这条管。
+#
+# 0 要单独处理：find 的 -mtime +0 是"超过 24 小时"，当天刚归档的那份删不掉，
+# 而 0 的意思是一份都不留。
+if [ -d "$LOG_DIR" ]; then
+    if [ "$LOG_RETENTION_DAYS" -eq 0 ] 2>/dev/null; then
+        find "$LOG_DIR" -maxdepth 1 -type f -name "$(basename "$LOG_FILE").*" \
+            -delete 2>/dev/null || true
+    else
+        find "$LOG_DIR" -maxdepth 1 -type f -name "$(basename "$LOG_FILE").*" \
+            -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+    fi
 fi
 echo "日志文件: $LOG_FILE"
 

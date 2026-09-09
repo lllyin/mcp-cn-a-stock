@@ -187,6 +187,13 @@ def render(data: dict) -> str:
     # 或别的实例的日志，窗口的结束时刻就对不上刚才那次调用。
     if window.get("name"):
         line += f"，数据来自 {window['name']}"
+    # 读了几份要说出来。窗口一下子从几分钟变成几天，读者得知道是因为把归档也算了，
+    # 而不是以为服务连着跑了三天。
+    archives = max(0, len(window.get("files") or []) - 1)
+    if archives:
+        line += f" + {archives} 份归档"
+    elif window.get("archived") is False:
+        line += "（未计归档）"
     out += [line, ""]
 
     icon, summary = _verdict(data)

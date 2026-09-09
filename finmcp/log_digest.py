@@ -168,16 +168,32 @@ class Series:
         return result
 
 
-def log_files(log_file: str, since: str) -> list:
-    """按时间顺序返回要读的文件。当前那个天然就是本次启动至今。
+def log_files(log_file: str, since: str, *, archived: bool = True) -> list:
+    """要读哪些文件，**按旧到新**排。
+
+    ``archived=False`` 只看当前那一份，也就是"本次启动至今"。默认把 start.sh 留下的
+    归档一起读进来（``<日志名>.<启动时刻>``，历史上的 ``.bak`` 同样认），这样
+    ``since`` 放宽到 today 或某个时刻时，跨过重启的那一段才不会凭空消失。
+
+    **按 mtime 排而不是按文件名排。** ``digest`` 里 ``first_at`` 取第一次见到的时刻、
+    ``last_at`` 取最后一次，顺序错了窗口两头就错了。而按名字排靠不住：旧的 ``.bak``
+    和新的 ``.20260909-152319`` 放在一起，字典序会把 ``.bak`` 排到最新那批之后。
 
     收的是**文件路径**不是目录：发布形态安装时包在 site-packages 里而日志写在仓库下，
     服务自己推不出来，由 start.sh 把 LOG_FILE 导进来（见 config.LOG_FILE）。
     """
-    previous = log_file + ".bak"
-    if since == "startup":
-        return [log_file] if os.path.exists(log_file) else []
-    return [p for p in (previous, log_file) if os.path.exists(p)]
+    current = [log_file] if os.path.exists(log_file) else []
+    if not archived:
+        return current
+    directory, prefix = os.path.dirname(log_file) or ".", os.path.basename(log_file) + "."
+    try:
+        found = [os.path.join(directory, name) for name in os.listdir(directory)
+                 if name.startswith(prefix)]
+    except OSError:
+        # 目录读不到就只用当前那份，别让整个工具挂在一次 listdir 上。
+        return current
+    older = sorted((p for p in found if os.path.isfile(p)), key=os.path.getmtime)
+    return older + current
 
 
 def _read(path: str) -> tuple:
@@ -220,13 +236,17 @@ def resolve_since(since: str, now: dt.datetime) -> Optional[dt.datetime]:
 
 
 def digest(log_file: str, *, since: str = "startup", symbol: str = "",
-           now: Optional[dt.datetime] = None) -> dict:
-    """扫日志，产出 health 要的全部结构化数据。"""
+           archived: bool = True, now: Optional[dt.datetime] = None) -> dict:
+    """扫日志，产出 health 要的全部结构化数据。
+
+    ``archived`` 决定要不要把 start.sh 留下的归档一起算进来（默认要）。关掉就只看
+    当前那一份，也就是本次启动至今。
+    """
     now = now or dt.datetime.now()
     floor = resolve_since(since, now)
     wanted = {s.strip().upper() for s in symbol.split(",") if s.strip()}
 
-    paths, truncated, text = log_files(log_file, since), False, []
+    paths, truncated, text = log_files(log_file, since, archived=archived), False, []
     for path in paths:
         body, cut = _read(path)
         truncated = truncated or cut
@@ -349,6 +369,7 @@ def digest(log_file: str, *, since: str = "startup", symbol: str = "",
                    "restarts": max(0, restarts - 1) if since != "startup" else 0,
                    "version": version, "fingerprint": fingerprint,
                    "files": [os.path.basename(p) for p in paths],
+                   "archived": archived,
                    # 只留文件名。这份报告会发给 MCP 调用方，绝对路径会把服务器的
                    # 目录结构一起带出去。想知道读的是不是对的那个文件，看窗口的
                    # from → to：读到过期或别的实例的日志，时间戳就对不上。

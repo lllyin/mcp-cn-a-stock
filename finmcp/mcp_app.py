@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import functools
 import logging
 import time
 import uuid
@@ -1196,6 +1197,7 @@ async def sector_fund_flow(
 async def health(
   since: str = "startup",
   symbol: str = "",
+  include_archived: bool = True,
   ctx: Context = None,  # type: ignore
 ) -> str:
   """服务自身的健康概览：缺了哪些数据、可用率多少、耗时有没有变慢。
@@ -1210,9 +1212,12 @@ async def health(
     - 期间发生过哪些会影响数据的事件（通道冷却、源熔断、指数 K 线口径变更）
 
   Args:
-    since: 时间窗。``startup``（本次启动至今，默认）、``epoch``（当前市场纪元）、
+    since: 时间窗。``startup``（默认，不设时间下界）、``epoch``（当前市场纪元）、
            ``today``、``30m``/``2h``、或 ``YYYY-MM-DD HH:MM``。
     symbol: 逗号分隔的标的代码，只看这几个。用来回答"为什么某个标的缺资金流"。
+    include_archived: 归档日志要不要一起统计，默认要。start.sh 每次启动会把上一轮
+           日志归档、保留数天（见 LOG_RETENTION_DAYS），所以默认能看到跨重启的历史。
+           关掉就只看当前那一份，也就是本次启动至今。
 
   Returns:
     一屏 Markdown。
@@ -1222,12 +1227,14 @@ async def health(
 
   started_at = time.perf_counter()
   data = await asyncio.to_thread(
-    log_digest.digest, LOG_FILE, since=since, symbol=symbol)
+    functools.partial(log_digest.digest, LOG_FILE, since=since, symbol=symbol,
+                      archived=include_archived))
   report = health_report.render(data)
   # 这一行自己也会进日志，所以只记结果不记内容，免得下一次 health 把自己的输出
   # 当成数据读进去。
-  logger.info("Finished health since=%s symbols=%d rate=%s elapsed=%.3fs",
-              since, len(data["symbols"]),
+  logger.info("Finished health since=%s archived=%s files=%d symbols=%d rate=%s "
+              "elapsed=%.3fs",
+              since, include_archived, len(data["window"]["files"]), len(data["symbols"]),
               data["availability"].get("rate"), time.perf_counter() - started_at)
   return report
 

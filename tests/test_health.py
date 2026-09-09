@@ -11,6 +11,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -662,3 +663,127 @@ def test_a_clean_run_with_source_switches_does_not_claim_everything_is_normal():
 def test_a_genuinely_clean_run_still_says_everything_is_normal():
     """别把上面那条修成"永远不说正常"。"""
     assert health_report._verdict(_data())[1] == "一切正常"
+
+
+# --- 归档日志：轮转与聚合 -----------------------------------------------------
+
+
+def _touch(path, days_ago=0, body="x\n"):
+    path.write_text(body, encoding="utf-8")
+    when = dt.datetime.now() - dt.timedelta(days=days_ago, hours=1)
+    os.utime(path, (when.timestamp(), when.timestamp()))
+    return path
+
+
+def _rotation_snippet() -> str:
+    """从 start.sh 里抽出轮转那一段，原样跑。
+
+    抄一份到测试里就成了"测试我抄的那份"——真正出货的那段改了测试照样绿。
+    锚点是那两行，start.sh 重构掉它们时这条测试会直接报错，那时本来就该回来看一眼。
+    """
+    script = (Path(__file__).resolve().parents[1] / "start.sh").read_text(encoding="utf-8")
+    start = script.index('if [ -s "$LOG_FILE" ]; then')
+    end = script.index('echo "日志文件: $LOG_FILE"')
+    return script[start:end]
+
+
+def _run_rotation(tmp_path, retention="3"):
+    log_dir = tmp_path / "logs"
+    log_file = log_dir / "cn-stock-mcp.log"
+    program = (f'set -e\nLOG_DIR={log_dir!s}\nLOG_FILE={log_file!s}\n'
+               f'LOG_RETENTION_DAYS={retention}\n' + _rotation_snippet())
+    proc = subprocess.run(["bash", "-c", program], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    return sorted(p.name for p in log_dir.iterdir())
+
+
+def test_rotation_keeps_one_archive_per_start(tmp_path):
+    """归档名带启动时刻。原先固定叫 .bak 只留一代，一天重启两次就把更早那次冲掉。"""
+    (tmp_path / "logs").mkdir()
+    _touch(tmp_path / "logs" / "cn-stock-mcp.log", body="上一轮\n")
+    names = _run_rotation(tmp_path)
+    archives = [n for n in names if n != "cn-stock-mcp.log"]
+    assert len(archives) == 1
+    assert re.fullmatch(r"cn-stock-mcp\.log\.\d{8}-\d{6}", archives[0]), archives
+
+
+def test_rotation_prunes_by_age_and_spares_other_logs(tmp_path):
+    """保留近三天，更早的清掉。
+
+    文件名不带日期含义——清理看的是 mtime，跟名字里写什么无关，所以这里故意用
+    ``.aged<N>`` 命名，免得读者以为按名字算。当前那份没有后缀，绝不能被匹配到；
+    同目录下别的日志（Xvfb 那份）也不能被误删。
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    for days in (1, 2, 3, 4, 9):
+        _touch(log_dir / f"cn-stock-mcp.log.aged{days}", days_ago=days)
+    _touch(log_dir / "cn-stock-mcp.log.bak", days_ago=30)     # 旧命名也归这条管
+    _touch(log_dir / "cn-stock-mcp-xvfb.log", days_ago=30)    # 别名文件不许被误删
+    _touch(log_dir / "cn-stock-mcp.log", body="当前\n")
+
+    names = _run_rotation(log_dir.parent)
+    assert "cn-stock-mcp-xvfb.log" in names, "清理误伤了别的日志"
+    kept = {n for n in names if ".aged" in n or n.endswith(".bak")}
+    assert kept == {"cn-stock-mcp.log.aged1", "cn-stock-mcp.log.aged2",
+                    "cn-stock-mcp.log.aged3"}, sorted(kept)
+    # 当前那份被改名成了新归档；重建空文件是 nohup 重定向干的，不在这段里。
+    fresh = [n for n in names if re.fullmatch(r"cn-stock-mcp\.log\.\d{8}-\d{6}", n)]
+    assert len(fresh) == 1
+    assert (log_dir / fresh[0]).read_text() == "当前\n"
+
+
+def test_zero_retention_keeps_no_archive_at_all(tmp_path):
+    """0 的意思是一份不留。
+
+    find 的 ``-mtime +0`` 是"超过 24 小时"，当天刚归档的那份删不掉——0 必须单独处理，
+    否则文档写着"不保留"而实际上留着今天的。
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    _touch(log_dir / "cn-stock-mcp.log.20260909-120000")      # 刚归档的
+    _touch(log_dir / "cn-stock-mcp.log", body="当前\n")
+    names = _run_rotation(log_dir.parent, retention="0")
+    assert [n for n in names if n != "cn-stock-mcp.log"] == []
+
+
+def test_archived_logs_are_aggregated_by_default(tmp_path):
+    log = _write(tmp_path, [_symbol_line("11:00:01", "SZ000333", 2.0, present=17, expected_n=17)])
+    _touch(tmp_path / "cn-stock-mcp.log.20260909-100000",
+           body=_symbol_line("10:00:01", "SH600519", 2.0, present=17, expected_n=17) + "\n")
+    assert len(log_digest.digest(log)["symbols"]) == 2
+    assert len(log_digest.digest(log, archived=False)["symbols"]) == 1
+
+
+def test_files_are_ordered_by_mtime_not_by_name(tmp_path):
+    """窗口两头取的是第一条和最后一条时刻，顺序错了两头就错。
+
+    按名字排靠不住：旧的 ``.bak`` 和新的 ``.20260909-152319`` 混在一起时，
+    字典序会把 ``.bak``（其实最旧）排到最新那批之后。
+    """
+    log = _write(tmp_path, [_symbol_line("12:00:01", "SZ000333", 2.0, present=17, expected_n=17)])
+    _touch(tmp_path / "cn-stock-mcp.log.bak", days_ago=2,
+           body=_symbol_line("09:00:01", "SH600519", 2.0, present=17, expected_n=17) + "\n")
+    _touch(tmp_path / "cn-stock-mcp.log.20260909-110000", days_ago=1,
+           body=_symbol_line("11:00:01", "SH601318", 2.0, present=17, expected_n=17) + "\n")
+    window = log_digest.digest(log)["window"]
+    assert window["files"] == ["cn-stock-mcp.log.bak",
+                              "cn-stock-mcp.log.20260909-110000",
+                              "cn-stock-mcp.log"]
+    assert window["from"].endswith("09:00:01") and window["to"].endswith("12:00:01")
+
+
+def test_the_header_says_how_many_archives_were_read(tmp_path):
+    """窗口一下子从几分钟变成几天，读者得知道是因为把归档也算了。"""
+    log = _write(tmp_path, [_symbol_line("11:00:01", "SZ000333", 2.0, present=17, expected_n=17)])
+    _touch(tmp_path / "cn-stock-mcp.log.20260909-100000",
+           body=_symbol_line("10:00:01", "SH600519", 2.0, present=17, expected_n=17) + "\n")
+    assert "+ 1 份归档" in health_report.render(log_digest.digest(log))
+    assert "（未计归档）" in health_report.render(log_digest.digest(log, archived=False))
+
+
+def test_an_unreadable_log_directory_falls_back_to_the_current_file(tmp_path):
+    """别让整个工具挂在一次 listdir 上。"""
+    log = _write(tmp_path, [_symbol_line("11:00:01", "SZ000333", 2.0, present=17, expected_n=17)])
+    assert log_digest.log_files(log, "startup", archived=True)
+    assert log_digest.log_files(str(tmp_path / "gone" / "x.log"), "startup") == []
