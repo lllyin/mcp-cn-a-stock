@@ -280,8 +280,11 @@ def digest(log_file: str, *, since: str = "startup", symbol: str = "",
             continue
         if floor is not None and stamp < floor.strftime("%Y-%m-%d %H:%M:%S"):
             continue
-        first_at = first_at or stamp
-        last_at = stamp
+        # 取 min/max 而不是"第一条 / 最后一条"：窗口两头不该取决于行的先后。
+        # 聚合归档时读的是好几个文件，而且服务是多线程写日志，同一秒内的行本来就
+        # 可能乱序——按出现顺序取，末尾一条稍早的行就能把窗口尾巴拽回去。
+        first_at = stamp if first_at is None else min(first_at, stamp)
+        last_at = stamp if last_at is None else max(last_at, stamp)
 
         if (m := _RE_VERSION.search(line)):
             restarts += 1
