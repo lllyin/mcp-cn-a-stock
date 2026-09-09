@@ -344,7 +344,10 @@ def digest(log_file: str, *, since: str = "startup", symbol: str = "",
                    "restarts": max(0, restarts - 1) if since != "startup" else 0,
                    "version": version, "fingerprint": fingerprint,
                    "files": [os.path.basename(p) for p in paths],
-                   "path": log_file, "truncated": truncated},
+                   # 只留文件名。这份报告会发给 MCP 调用方，绝对路径会把服务器的
+                   # 目录结构一起带出去。想知道读的是不是对的那个文件，看窗口的
+                   # from → to：读到过期或别的实例的日志，时间戳就对不上。
+                   "name": os.path.basename(log_file), "truncated": truncated},
         "symbols": symbols,
         "availability": _availability(symbols, inferred_sources),
         "missing": [{"dimension": name, "count": count,

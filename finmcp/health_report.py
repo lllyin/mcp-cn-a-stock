@@ -36,7 +36,8 @@ def _verdict(data: dict) -> tuple:
     """
     window = data.get("window") or {}
     if not window.get("files"):
-        return "❓", f"读不到日志文件 {window.get('path') or '(未配置)'}，无法判断——请检查 LOG_FILE"
+        return "❓", (f"读不到日志文件 {window.get('name') or '(未配置)'}"
+                     "，无法判断——请检查 LOG_FILE")
     # 耗时也要算进"有没有数据"：标的全部失败时 symbols 是空的，但 Data task 那些行
     # 还在，说明服务确实在干活，该照常给结论。
     any_latency = any(entry["stats"] for entry in data["latency"].values())
@@ -120,11 +121,11 @@ def render(data: dict) -> str:
         line += f"，渲染指纹 {window['fingerprint']}"
     if window.get("restarts"):
         line += f"，窗口内重启 {window['restarts']} 次"
-    # 读的是哪个文件要写出来。LOG_FILE 可以被 .env 覆盖（main.py 是
-    # load_dotenv(override=True)），指到一个存在但过期的日志上时，报告本身是这里
-    # 唯一能露出破绽的地方。
-    if window.get("path"):
-        line += f"，数据来自 {window['path']}"
+    # 只写文件名，不写路径：这份报告会发给 MCP 调用方，绝对路径会把服务器的目录
+    # 结构一起带出去。读没读错文件由上面那行的 from → to 时间戳露出来——读到过期
+    # 或别的实例的日志，窗口的结束时刻就对不上刚才那次调用。
+    if window.get("name"):
+        line += f"，数据来自 {window['name']}"
     out += [line, ""]
 
     icon, summary = _verdict(data)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -356,14 +357,18 @@ def test_latency_alone_still_counts_as_data(tmp_path):
 
 
 def test_the_report_says_which_log_it_read(tmp_path):
-    """LOG_FILE 可被 .env 覆盖（main.py 是 load_dotenv(override=True)）。
+    """写文件名，不写路径。
 
-    指到一个**存在但过期**的日志时不会报错，报告里的这一行是唯一能露出破绽的地方。
+    LOG_FILE 可被 .env 覆盖（main.py 是 load_dotenv(override=True)），指到一个
+    **存在但过期**的日志时不会报错。露出破绽的是抬头的 from → to 时间戳，不是路径
+    ——路径印出来等于把服务器目录结构发给调用方，见下面那条。
     """
     log = _write(tmp_path, [
         _symbol_line("10:00:01", "SZ000333", 2.0, present=17, expected_n=17),
     ])
-    assert log in health_report.render(log_digest.digest(log))
+    report = health_report.render(log_digest.digest(log))
+    assert "数据来自 cn-stock-mcp.log" in report
+    assert log not in report
 
 
 # --- 单维可用率 --------------------------------------------------------------
@@ -453,3 +458,34 @@ def test_the_attribution_tables_agree_with_the_contract():
         assert set(table.values()) <= names, "归到了契约里没有的维度"
     assert not (set(rc.DEGRADED_DIMENSION) & set(rc.NOT_APPLICABLE_MARKERS)), \
         "同一句既算降级又算正当缺席"
+
+
+# --- 别把服务器路径带出去 -----------------------------------------------------
+
+
+def test_the_report_never_leaks_the_server_path(tmp_path):
+    """报告会发给 MCP 调用方，绝对路径会把服务器的目录结构一起带出去。
+
+    读没读错文件由抬头的 from → to 时间戳露出来（读到过期或别的实例的日志，窗口
+    结束时刻就对不上刚才那次调用），不需要为此把路径印出来。
+    """
+    deep = tmp_path / "SECRETDIR" / "acme-prod-01" / "srv"
+    deep.mkdir(parents=True)
+    log = _write(deep, [
+        _symbol_line("10:00:01", "SZ000333", 2.0, present=17, expected_n=17),
+    ])
+    data = log_digest.digest(log)
+    report = health_report.render(data)
+    blob = json.dumps(data, ensure_ascii=False, default=str)
+
+    for secret in ("SECRETDIR", "acme-prod-01", str(tmp_path)):
+        assert secret not in report, f"渲染输出里带出了 {secret}"
+        assert secret not in blob, f"digest 结构里带出了 {secret}"
+    assert "cn-stock-mcp.log" in report          # 文件名还是要写，只是不带路径
+
+
+def test_an_unreadable_log_reports_the_name_not_the_path(tmp_path):
+    """读不到时同样只写文件名。该查什么由"请检查 LOG_FILE"这句指出来。"""
+    _, why = health_report._verdict(log_digest.digest(str(tmp_path / "deep" / "nope.log")))
+    assert "nope.log" in why and "LOG_FILE" in why
+    assert str(tmp_path) not in why
