@@ -67,23 +67,33 @@ def test_closed_loop_stops_launching_at_deadline(monkeypatch):
 
 
 def test_closed_loop_staggers_worker_start(monkeypatch):
+    """每个 worker 起步前按 slot × stagger 错开。
+
+    **不看墙钟。** 原先是量前三次调用的时刻差，那样必然偶发：worker 睡到
+    (workers-1)*stagger 才醒、醒来先查截止时间，机器一卡它就一次调用都发不出，
+    断言取 started[2] 抛 IndexError。把 duration 从 0.15s 提到 0.4s 只是把能扛的
+    事件循环停顿从 140ms 抬到 380ms，减少了但消除不了——这条测试本质依赖时间。
+
+    改成记录 worker 向 asyncio.sleep 要了多久：那就是错开这件事本身，与机器快慢无关。
+    """
     stagger, workers = 0.05, 3
     monkeypatch.setattr(loadtest, "CLOSED_LOOP_STAGGER_S", stagger)
+    delays = []
+    real_sleep = asyncio.sleep
+
+    async def spy(delay, *args, **kwargs):
+        delays.append(delay)
+        return await real_sleep(0, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "sleep", spy)
     tracker = _tracker()
-    # duration 要留足最后一个 worker 起步之后的余量：它睡到 (workers-1)*stagger 才醒，
-    # 醒来先查截止时间。余量太小时机器一卡它就直接退出，一次调用都发不出去，
-    # 断言取 started[2] 于是抛 IndexError——测试偶发挂在这里，不是被测代码的问题。
-    # 单次调用 hold 比 duration 长，保证每个 worker 只发一次，起步时刻即前三次调用。
-    duration = (workers - 1) * stagger + 0.3
     asyncio.run(
-        loadtest.run_closed_loop("u", workers, duration, MIX, POOL, 5.0,
-                                 call=_fake_call(duration + 0.2, tracker))
+        loadtest.run_closed_loop("u", workers, 0.05, MIX, POOL, 5.0,
+                                 call=_fake_call(0.0, tracker))
     )
-    started = sorted(tracker["started"])
-    assert len(started) == workers, f"只有 {len(started)} 个 worker 起了步，应该有 {workers} 个"
-    # 三个 worker 错开起步，不在同一瞬间到达
-    gaps = [b - a for a, b in zip(started, started[1:])]
-    assert all(gap >= stagger * 0.8 for gap in gaps), gaps
+    # 假调用的 hold 是 0，所以非零的那些延时只可能来自错开。
+    assert sorted({d for d in delays if d}) == [stagger, stagger * (workers - 1)], delays
+    assert delays.count(0) >= 1, "第一个 worker 应当立刻起步（slot 0 × stagger = 0）"
 
 
 def test_closed_loop_follows_tool_mix(monkeypatch):
