@@ -129,7 +129,11 @@ BUDGET_MAX = 40
 #: 所以用 max 而不是分位数，再乘一个余量。
 THS_MIN_SAMPLES = 12
 THS_MARGIN = 1.5
-THS_BUDGET_RANGE = (20, 120)
+#: 下限**不是常数**，按「年份文件数 × 单次超时」推算，见 decide_tonghuashun_budget。
+#: 写死过 20，而实测很快的环境会被夹到那里——20 秒装不下一个跨年窗口：第一个年份
+#: 文件占满超时就只剩 5 秒，第二个被削到 5 秒、大概率超时，整个源判失败，而慢一点
+#: 但本来能成的网络就这么被砍掉了。
+THS_BUDGET_MAX = 120
 #: 一次取数跨几年就发几个请求，所以窗口长度直接决定最坏耗时。默认量 2 年，
 #: 和报告里 240 日均量要的跨度同量级。
 THS_WINDOW_DAYS = 730
@@ -962,6 +966,24 @@ def probe_tonghuashun_once(symbol: str, window_days: int) -> dict:
             "error": None if rows else "返回空"}
 
 
+def _year_file_count(window_days: int) -> int:
+    """这个窗口要取几个年份文件。算法和 tonghuashun.fetch_kline 里那段一致。
+
+    这是预算下限的来源：一次取数最坏就是「文件数 × 单次超时」，预算低于它，跨年窗口
+    的后面几个文件必然被削到超时——而被砍掉的是本来能成功的取数。
+    """
+    today = dt.date.today()
+    cutoff = today - dt.timedelta(days=window_days + 20)   # fetch_kline 也往前多推 20 天
+    return len(range(cutoff.year, today.year + 1))
+
+
+def _ths_request_timeout() -> float:
+    """单个年份文件的超时，从平台模块读，别在这里抄一份常数。"""
+    from finmcp.datasource.platforms import tonghuashun
+
+    return float(tonghuashun._REQUEST_TIMEOUT)
+
+
 def run_tonghuashun(args) -> int:
     """按固定名单反复取 K 线，量出当前环境到同花顺的耗时分布。"""
     out_dir = Path(args.out_dir)
@@ -981,6 +1003,10 @@ def run_tonghuashun(args) -> int:
     bad = [r["seconds"] for r in records if not r["ok"]]
     result = {"generated": _now_text(), "window_days": args.window_days,
               "symbols": symbols, "rounds": args.rounds,
+              # 预算的下限按「年份文件数 × 单次超时」推算，所以这两个数要一起记下来，
+              # 不能让判据自己再猜一遍窗口。
+              "year_files": _year_file_count(args.window_days),
+              "request_timeout": _ths_request_timeout(),
               "records": records,
               "ok": summarise_values(ok), "failed": summarise_values(bad)}
     write_json(out_dir / "tonghuashun.json", result)
@@ -994,9 +1020,18 @@ def run_tonghuashun(args) -> int:
 
 
 def decide_tonghuashun_budget(measured: Optional[dict]) -> Decision:
-    """预算 = 成功取数的最大耗时 × 余量，夹在区间内。
+    """预算 = max(成功取数最慢 × 余量, 年份文件数 × 单次超时)，上限夹住。
 
-    用 max 不用分位数：判据是"不能砍掉本来能成功的取数"，分位数按定义会砍掉尾部。
+    两个下界都是必须的，取大的那个：
+
+    - **成功取数最慢 × 余量**：预算低于它就会砍掉本来能成功的取数，指数的成交量
+      随之退到腾讯口径。用 max 不用分位数——分位数按定义会砍掉尾部。
+    - **年份文件数 × 单次超时**：一次取数最坏就是这个乘积。预算低于它，跨年窗口
+      后面的文件会被削到不够用而超时，同样是砍掉本来能成功的取数。这一项和网络快慢
+      无关，所以网络很快的环境也不该把预算压到它以下。
+
+    第二项是后加的：原先下限写死 20，而快网络会被夹到那里，而 20 秒装不下一个跨年
+    窗口（第一个文件占满 15 秒就只剩 5 秒），推荐值本身成了会丢数据的值。
     """
     key = "KLINE_TONGHUASHUN_BUDGET_SECONDS"
     stats = (measured or {}).get("ok") or {}
@@ -1004,30 +1039,38 @@ def decide_tonghuashun_budget(measured: Optional[dict]) -> Decision:
     if n < THS_MIN_SAMPLES:
         return Decision(key, DEFAULTS[key], "inconclusive",
                         f"成功取数只有 {n} 次，不足 {THS_MIN_SAMPLES}，保持默认")
+    files = (measured or {}).get("year_files") or 1
+    timeout = (measured or {}).get("request_timeout") or _ths_request_timeout()
+    floor = int(math.ceil(files * timeout))
     slowest = stats["max"]
-    raw = math.ceil(slowest * THS_MARGIN)
-    low, high = THS_BUDGET_RANGE
-    value = int(min(high, max(low, raw)))
-    # 夹过就得说，不然读的人会以为 value 是 max × 余量算出来的。这台机器网络快时
-    # raw 会小到个位数，落到下限；反过来慢到 raw > high 时落到上限，那说明这条链路
-    # 本来就该换源，而不是把预算继续放大。
-    if raw < low:
-        how = f"取 max × {THS_MARGIN} = {raw}s，低于下限 {low}s，按下限"
-    elif raw > high:
-        how = f"取 max × {THS_MARGIN} = {raw}s，高于上限 {high}s，按上限——这条链路慢到该换源了"
+    measured_low = math.ceil(slowest * THS_MARGIN)
+    # 上限只夹「实测那一侧」，夹不动下限：窗口拉长时 floor 会超过上限，那时候该听
+    # floor——低于它就是在丢数据，而上限只是"别推荐一个荒唐的大数"。
+    value = int(max(floor, min(THS_BUDGET_MAX, measured_low)))
+
+    capped = measured_low > THS_BUDGET_MAX and value == THS_BUDGET_MAX
+    if measured_low <= floor:
+        how = (f"取 max × {THS_MARGIN} = {measured_low}s，但装不下一次完整取数"
+               f"（{files} 个年份文件 × {timeout:g}s 超时 = {floor}s），按后者")
+    elif capped:
+        how = (f"取 max × {THS_MARGIN} = {measured_low}s，高于上限 {THS_BUDGET_MAX}s，"
+               f"按上限——这条链路慢到该换源了")
     else:
-        how = f"取 max × {THS_MARGIN} = {value}s"
+        how = f"取 max × {THS_MARGIN} = {value}s，高于 {files}×{timeout:g}s 的下限"
+
     failed = (measured or {}).get("failed") or {}
     if not failed.get("n"):
         tail = "；本轮没有失败取数，预算是给上游抽风那天留的"
     elif value < failed["max"]:
         tail = f"；失败 {failed['n']} 次、最长 {failed['max']}s，预算能把它们截在 {value}s"
     else:
-        # 推荐值高过失败耗时，这一轮它一次都不会触发。不改推荐值——把预算压到成功
-        # 取数之下就是在丢数据；该做的是换源或者查这条链路为什么慢。
+        # 推荐值高过失败耗时，这一轮它一次都不会触发。不改推荐值——把预算压到下界
+        # 以下就是在丢数据；该做的是换源或者查这条链路为什么慢。
         tail = (f"；失败 {failed['n']} 次、最长 {failed['max']}s，**短于推荐值**，"
                 f"这个预算截不住它们——成功和失败的耗时分不开，先查链路而不是压预算")
-    return Decision(key, str(value), "measured",
+
+    status = "default" if str(value) == DEFAULTS[key] else "measured"
+    return Decision(key, str(value), status,
                     f"成功取数 {n} 次，p50 {stats['p50']}s、p90 {stats['p90']}s、"
                     f"max {slowest}s；{how}{tail}")
 

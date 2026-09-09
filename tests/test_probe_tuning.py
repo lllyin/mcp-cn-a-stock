@@ -465,3 +465,78 @@ class TestPssSampling:
         assert got["metric"] == "pss"
         assert got["pss_mib"] == 80.0
         assert got["processes"] == 2
+
+
+# --- 同花顺 K 线总预算 ---------------------------------------------------------
+
+
+def _ths(max_seconds, *, n=24, files=3, timeout=15.0, failed=None):
+    out = {"ok": {"n": n, "p50": 0.1, "p90": 0.2, "max": max_seconds},
+           "year_files": files, "request_timeout": timeout}
+    if failed:
+        out["failed"] = failed
+    return out
+
+
+@pytest.mark.parametrize("max_seconds", [0.05, 0.3, 5.09, 12.0, 29.9, 30.0, 40.85, 95.0])
+def test_budget_never_dips_below_one_full_fetch(max_seconds):
+    """推荐值永远装得下一次完整取数：年份文件数 × 单次超时。
+
+    这一条是补出来的。原先下限写死 20，而网络很快的环境会被夹到那里——20 秒装不下
+    一个跨年窗口（第一个年份文件占满 15 秒就只剩 5 秒，第二个被削到 5 秒、大概率
+    超时，整个源判失败），也就是说**推荐值本身是个会丢数据的值**，还和
+    tests/test_tonghuashun_kline.py 里 `> _REQUEST_TIMEOUT * 2` 那条不变量互相矛盾。
+    """
+    files, timeout = 3, 15.0
+    decision = probe.decide_tonghuashun_budget(_ths(max_seconds, files=files, timeout=timeout))
+    assert int(decision.value) >= files * timeout
+
+
+def test_budget_agrees_with_the_platform_invariant():
+    """probe 推荐的值必须过得了平台侧那条不变量，否则两处会打架。"""
+    from finmcp.datasource.platforms import tonghuashun
+
+    for max_seconds in (0.05, 5.09, 40.85, 95.0):
+        value = int(probe.decide_tonghuashun_budget(_ths(max_seconds)).value)
+        assert value > tonghuashun._REQUEST_TIMEOUT * 2
+
+
+def test_budget_floor_wins_over_the_cap_on_a_long_window():
+    """窗口拉长时下限会超过上限，那时候听下限。
+
+    上限的作用只是"别推荐一个荒唐的大数"，而低于下限是在丢数据，两者冲突时后者优先。
+    `--window-days` 是使用者可以传的，所以这条走得到。
+    """
+    files = 11                                   # 约 10 年窗口
+    decision = probe.decide_tonghuashun_budget(_ths(0.3, files=files, timeout=15.0))
+    assert int(decision.value) == files * 15
+    assert int(decision.value) > probe.THS_BUDGET_MAX
+
+
+def test_budget_recommends_raising_when_the_link_is_slow():
+    """成功取数慢到超过下限时，推荐值要跟着抬，不能停在默认。"""
+    decision = probe.decide_tonghuashun_budget(
+        _ths(40.85, n=40, failed={"n": 3, "max": 89.33}))
+    assert decision.value == "62"               # ceil(40.85 × 1.5)
+    assert decision.status == "measured"
+    assert "89.33" in decision.evidence         # 要说明预算截得住那些失败
+
+
+def test_budget_says_default_when_the_measurement_lands_on_it():
+    """夹到下限、而下限正好等于默认值时，状态是 default 不是 measured。
+
+    不然 recommend 的表里会给一个「推荐 45 / 默认 45」却标着 measured ← 的行，
+    读的人会以为要改。
+    """
+    decision = probe.decide_tonghuashun_budget(_ths(5.09))
+    assert decision.value == probe.DEFAULTS["KLINE_TONGHUASHUN_BUDGET_SECONDS"]
+    assert decision.status == "default"
+    assert "装不下一次完整取数" in decision.evidence
+
+
+def test_year_file_count_matches_the_platform():
+    """文件数的算法要和 fetch_kline 里那段一致，否则下限算错。"""
+    today = dt.date.today()
+    for window_days in (30, 365, 730, 3650):
+        cutoff = today - dt.timedelta(days=window_days + 20)
+        assert probe._year_file_count(window_days) == len(range(cutoff.year, today.year + 1))

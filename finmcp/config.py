@@ -572,9 +572,10 @@ KLINE_MAX_GAP_TRADING_DAYS = max(0, int(env("KLINE_MAX_GAP_TRADING_DAYS", "10"))
 # 没有这一项时最坏耗时是「文件数 × 单次超时 × 重试」，随窗口线性增长、没有上界；
 # 调小单次超时治不了，只是换个系数。
 #
-# 取值：必须大于**本环境成功取数的最大耗时**，否则会砍掉本来能拿到的结果，指数的
-# 成交量随之退到腾讯口径（低约 3.5%）——那是拿正确的数换耗时。默认 45 适用于成功
-# 取数在 40s 以内的环境；用 `probe_tuning.py tonghuashun` 量一遍当前环境的分布再定。
+# 取值有两个下界，取大的那个：一是**本环境成功取数的最大耗时**，二是**一次取数要发
+# 的请求数 × 单次超时**（跨几年就几个请求）。低于任何一个都会砍掉本来能拿到的结果，
+# 指数的成交量随之退到腾讯口径（低约 3.5%）——那是拿正确的数换耗时。
+# 用 `probe_tuning.py tonghuashun` 量一遍当前环境，它会把两个下界都算进去。
 KLINE_TONGHUASHUN_BUDGET_SECONDS = max(
     0.0,
     float(env("KLINE_TONGHUASHUN_BUDGET_SECONDS", "45")),
