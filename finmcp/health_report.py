@@ -76,6 +76,39 @@ def _verdict(data: dict) -> tuple:
     return icon, ("；".join(problems) if problems else "一切正常")
 
 
+def _dimension_table(data: dict) -> list:
+    """每一维单独的"拿到 / 该拿到"。
+
+    总可用率是一个把所有维度拌在一起的数：19 维满分、1 维全挂，加起来还有 95%，
+    看着没事。要回答"资金流向到底缺不缺"，只能一维一维地看。
+
+    分母按**工具和标的类别**算，不是按调用次数：``brief`` 不要求历史资金流向、
+    ETF 没有财务报表、指数没有市值——那些不进分母（见 report_contract）。
+    所以同一维在不同工具下分母不同，这是对的。
+
+    降级算没拿到；钉日期查询没有"实时"资金流那种正当缺席，在 log_digest 里就已经
+    摘出分母了。
+    """
+    rows = data.get("dimensions") or []
+    if not rows:
+        return []
+    out = ["## 各维度可用率", "",
+           "分母是**这些调用本该有这一维几次**，不是调用了几次：brief 不要求历史资金流向、"
+           "ETF 没有财务报表，那些不进分母。段落在但写着「暂无…」算没拿到。", "",
+           "| 维度 | 上游源 | 该有 | 拿到 | 缺失 | 降级 | 可用率 | 涉及标的 |",
+           "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |"]
+    # 差的排前面：大屏先给问题，同率的按维度名排，免得同一份日志两次跑出不同顺序。
+    for row in sorted(rows, key=lambda r: (r["rate"], r["dimension"])):
+        symbols = "、".join(row["symbols"][:4]) or "—"
+        if len(row["symbols"]) > 4:
+            symbols += f" 等 {len(row['symbols'])} 个"
+        rate = _pct(row["rate"])
+        out.append(f"| {row['dimension']} | {row['source']} | {row['expected']} | "
+                   f"{row['got']} | {row['missing'] or '—'} | {row['degraded'] or '—'} | "
+                   f"{'**' + rate + '**' if row['rate'] < 1 else rate} | {symbols} |")
+    return out + [""]
+
+
 def render(data: dict) -> str:
     """一屏 Markdown。段落顺序按"先结论、再细节"排,读者从上往下越读越细。"""
     window, availability = data["window"], data["availability"]
@@ -124,9 +157,16 @@ def render(data: dict) -> str:
         out.append("窗口内没有完成的标的，算不出可用率。")
     out.append("")
 
+    out += _dimension_table(data)
+
     # 缺失明细
     if not data["missing"] and data.get("failed_sources"):
-        out += ["## 缺了什么", "", "只有源级线索（这份日志没有维度级字段）：", "",
+        # 两种情形共用这一段，说法要分开：维度级数据在、且全都拿到了，说明源失败被
+        # 兜底救回来了——那是好消息，不能写成"没有维度级字段"。
+        covered = data["availability"].get("method") == "measured"
+        lead = ("维度都拿到了，但下面这些源失败过——兜底把数据补上了，源本身仍然要看："
+                if covered else "只有源级线索（这份日志没有维度级字段）：")
+        out += ["## 缺了什么", "", lead, "",
                 "| 上游源 | 失败次数 |", "| --- | ---: |"]
         for source, count in sorted(data["failed_sources"].items(), key=lambda x: -x[1]):
             out.append(f"| {source} | {count} |")
@@ -143,6 +183,11 @@ def render(data: dict) -> str:
     if data.get("degraded"):
         out += ["**渲染出来但没有值**：" + "、".join(
             f"{k}×{v}" for k, v in sorted(data["degraded"].items(), key=lambda x: -x[1])), ""]
+    if data.get("not_applicable"):
+        # 单列，别混进上面那行。钉日期查询没有"实时"资金流是正当缺席，写成"没有值"
+        # 会让人去查一个不存在的故障。
+        out += ["**正当缺席（不计入分母）**：" + "、".join(
+            f"{k}×{v}" for k, v in sorted(data["not_applicable"].items(), key=lambda x: -x[1])), ""]
 
     # 耗时
     out += ["## 耗时", "",

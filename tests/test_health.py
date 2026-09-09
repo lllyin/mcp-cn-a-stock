@@ -120,11 +120,12 @@ def _line(stamp, text):
     return f"2026-09-09 {stamp},000 INFO {text}"
 
 
-def _symbol_line(stamp, symbol, total, present=None, expected_n=None, missing="-"):
+def _symbol_line(stamp, symbol, total, present=None, expected_n=None, missing="-",
+                 tool="brief", degraded="-"):
     tail = ""
     if present is not None:
-        tail = f" present={present}/{expected_n} missing={missing} degraded=-"
-    return _line(stamp, f"Finished symbol request_id=r1 tool=brief symbol={symbol} "
+        tail = f" present={present}/{expected_n} missing={missing} degraded={degraded}"
+    return _line(stamp, f"Finished symbol request_id=r1 tool={tool} symbol={symbol} "
                         f"raw_data=1.0s render=1.0s total={total}s chars=900{tail}")
 
 
@@ -363,3 +364,92 @@ def test_the_report_says_which_log_it_read(tmp_path):
         _symbol_line("10:00:01", "SZ000333", 2.0, present=17, expected_n=17),
     ])
     assert log in health_report.render(log_digest.digest(log))
+
+
+# --- 单维可用率 --------------------------------------------------------------
+
+
+def _dims(data):
+    return {r["dimension"]: r for r in data["dimensions"]}
+
+
+def test_the_denominator_follows_the_tool_not_the_call_count(tmp_path):
+    """brief 不要求历史资金流向，full 要求——同一维在两个工具下分母不同。
+
+    按"调用了几次"当分母会让 brief 把历史资金流向记成缺失，而它本来就不该有。
+    """
+    log = _write(tmp_path, [
+        _symbol_line("10:00:01", "SZ000333", 2.0, present=17, expected_n=17, tool="brief"),
+        _symbol_line("10:00:02", "SZ000333", 2.0, present=20, expected_n=20, tool="full"),
+    ])
+    dims = _dims(log_digest.digest(log))
+    assert dims["历史资金流向"]["expected"] == 1     # 只有那次 full 算数
+    assert dims["价格"]["expected"] == 2            # 两个工具都要求
+    assert dims["历史资金流向"]["rate"] == 1.0
+
+
+def test_the_denominator_also_follows_the_symbol_class(tmp_path):
+    """ETF 没有财务报表、指数没有市值——不进分母，不是缺失。"""
+    log = _write(tmp_path, [
+        _symbol_line("10:00:01", "SZ000333", 2.0, present=20, expected_n=20, tool="full"),
+        _symbol_line("10:00:02", "SH512480", 2.0, present=11, expected_n=11, tool="full"),
+        _symbol_line("10:00:03", "SH000001", 2.0, present=11, expected_n=11, tool="full"),
+    ])
+    dims = _dims(log_digest.digest(log))
+    assert dims["财务数据"]["expected"] == 1        # 只有个股
+    assert dims["总市值"]["expected"] == 1
+    assert dims["历史资金流向"]["expected"] == 3    # 三类都算
+    assert all(r["rate"] == 1.0 for r in dims.values())
+
+
+def test_a_degraded_section_counts_as_not_returned(tmp_path):
+    """段落在但写着"暂无…"要算没拿到——问的是返回了数据没有。"""
+    log = _write(tmp_path, [
+        _symbol_line("10:00:01", "SZ000333", 2.0, present=17, expected_n=17,
+                     degraded="暂无资金流向数据"),
+        _symbol_line("10:00:02", "SZ000333", 2.0, present=17, expected_n=17),
+    ])
+    flow = _dims(log_digest.digest(log))["资金流向"]
+    assert (flow["expected"], flow["degraded"], flow["got"]) == (2, 1, 1)
+    assert flow["rate"] == 0.5
+    assert flow["symbols"] == ["SZ000333"]
+
+
+def test_a_pinned_date_query_is_not_a_fund_flow_failure(tmp_path):
+    """钉日期的查询没有"实时"资金流可言——正当缺席，摘出分母，不算降级。
+
+    真踩过：一批钉日期的基线重放让资金流可用率从 100% 掉到 64.3%，而什么都没坏。
+    换任何源结果都一样，和 ETF 没有财务报表是同一类。
+    """
+    log = _write(tmp_path, [
+        _symbol_line("10:00:01", "SZ000333", 2.0, present=17, expected_n=17,
+                     degraded="指定日期查询暂不展示实时资金流向"),
+        _symbol_line("10:00:02", "SZ000333", 2.0, present=17, expected_n=17),
+    ])
+    data = log_digest.digest(log)
+    flow = _dims(data)["资金流向"]
+    assert (flow["expected"], flow["degraded"], flow["rate"]) == (1, 0, 1.0)
+    assert data["not_applicable"] == {"指定日期查询暂不展示实时资金流向": 1}
+    assert data["degraded"] == {}                       # 没混进降级
+    assert "正当缺席" in health_report.render(data)      # 但要说出来，不是悄悄扣掉
+
+
+def test_lines_without_the_measured_fields_stay_out_of_the_denominator(tmp_path):
+    """老日志没有 present= 时不知道它缺了什么，按"零缺失"计入会把可用率抬高。"""
+    log = _write(tmp_path, [
+        _symbol_line("10:00:01", "SZ000333", 2.0),                       # 老格式
+        _symbol_line("10:00:02", "SZ000333", 2.0, present=16, expected_n=17,
+                     missing="资金流向"),
+    ])
+    flow = _dims(log_digest.digest(log))["资金流向"]
+    assert flow["expected"] == 1 and flow["rate"] == 0.0
+
+
+def test_the_attribution_tables_agree_with_the_contract():
+    """归属表写错一个字就会把降级记到无辜的维度头上，或者永远匹配不上。"""
+    names = {d.name for dims in rc.CONTRACT.values() for d in dims}
+    for table in (rc.DEGRADED_DIMENSION, rc.NOT_APPLICABLE_MARKERS):
+        assert set(table) <= set(rc.DEGRADED_MARKERS), "标记不在 DEGRADED_MARKERS 里"
+        assert set(table.values()) <= names, "归到了契约里没有的维度"
+    assert not (set(rc.DEGRADED_DIMENSION) & set(rc.NOT_APPLICABLE_MARKERS)), \
+        "同一句既算降级又算正当缺席"

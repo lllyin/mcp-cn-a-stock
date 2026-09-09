@@ -29,7 +29,8 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .report_contract import CONTRACT, expected
+from .report_contract import (
+    CONTRACT, DEGRADED_DIMENSION, NOT_APPLICABLE_MARKERS, expected)
 
 #: 一次最多读多少字节。日志一天能到几 MB，长期跑更大；这个工具自己绝不能变成
 #: 性能问题。超了就从尾部截断并在 warnings 里说明。
@@ -237,7 +238,15 @@ def digest(log_file: str, *, since: str = "startup", symbol: str = "",
     missing_symbols = defaultdict(set)
     missing_last: dict = {}
     degraded_counter: Counter = Counter()
+    not_applicable_counter: Counter = Counter()
     inferred_sources: Counter = Counter()
+    # 单维可用率的分子分母。分母不是"调用了几次"，而是**这次调用本该有这一维几次**——
+    # brief 不要求历史资金流向、ETF 没有财务报表，那些不进分母（见 report_contract）。
+    dim_expected: Counter = Counter()
+    dim_missing: Counter = Counter()
+    dim_degraded: Counter = Counter()
+    dim_symbols = defaultdict(set)
+    dim_source: dict = {}
     events = defaultdict(lambda: {"count": 0, "first": None, "last": None, "detail": "", "items": Counter()})
 
     for line in lines:
@@ -272,7 +281,30 @@ def digest(log_file: str, *, since: str = "startup", symbol: str = "",
                 missing_symbols[name].add(sym)
                 missing_last[name] = m.group(1)
             for name in degraded:
-                degraded_counter[name] += 1
+                if name in NOT_APPLICABLE_MARKERS:
+                    not_applicable_counter[name] += 1     # 正当缺席，不是降级
+                else:
+                    degraded_counter[name] += 1
+            # 只有带 present= 的行才算进单维分母。老日志没有这个字段，不知道它缺了
+            # 什么，按"零缺失"计入会把可用率抬高——宁可样本少，不要虚高。
+            if total is not None:
+                # 正当缺席的先摘掉：钉日期的查询没有"实时"资金流可言，进了分母就是
+                # 拿一批重放把可用率打下去，而什么都没坏。
+                skip = {NOT_APPLICABLE_MARKERS[x] for x in degraded
+                        if x in NOT_APPLICABLE_MARKERS}
+                for dimension in expected(m.group(3), sym):
+                    if dimension.name in skip:
+                        continue
+                    dim_expected[dimension.name] += 1
+                    dim_source[dimension.name] = dimension.source
+                for name in miss:
+                    dim_missing[name] += 1
+                    dim_symbols[name].add(sym)
+                # 一份报告里同一维可能触发不止一句降级提示，按维度去重后再计数。
+                for name in {DEGRADED_DIMENSION[x] for x in degraded
+                             if x in DEGRADED_DIMENSION}:
+                    dim_degraded[name] += 1
+                    dim_symbols[name].add(sym)
             continue
 
         if (m := _RE_SKIPPED.search(line)):
@@ -320,6 +352,19 @@ def digest(log_file: str, *, since: str = "startup", symbol: str = "",
                      "last_at": missing_last.get(name)}
                     for name, count in missing_counter.most_common()],
         "degraded": dict(degraded_counter),
+        "not_applicable": dict(not_applicable_counter),
+        # 每一维单独的"拿到 / 该拿到"。降级算没拿到——问的是返回了数据没有，
+        # 一个写着"暂无…"的空段落，对使用者和整段消失是一回事。
+        "dimensions": [
+            {"dimension": name, "source": dim_source.get(name, "-"),
+             "expected": count,
+             "missing": dim_missing.get(name, 0),
+             "degraded": dim_degraded.get(name, 0),
+             "got": count - dim_missing.get(name, 0) - dim_degraded.get(name, 0),
+             "rate": (count - dim_missing.get(name, 0) - dim_degraded.get(name, 0)) / count,
+             "symbols": sorted(dim_symbols.get(name, ()))}
+            for name, count in dim_expected.items()
+        ],
         # 源级失败次数。有 present= 时它是旁证，没有时它是唯一的缺失线索。
         "failed_sources": dict(inferred_sources),
         "latency": _latency(batches, Series([(s["at"], s["total"]) for s in symbols]),

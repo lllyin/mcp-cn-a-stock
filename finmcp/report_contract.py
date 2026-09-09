@@ -116,6 +116,37 @@ DEGRADED_MARKERS = {
 }
 
 
+#: 降级提示语归属哪一维。算单维可用率时"段落在但写着暂无"要算**没拿到**——问的是
+#: 返回了数据没有，一个空段落对使用者和整段消失是一回事。
+#:
+#: 只归属**渲染层确实会打印、且位置明确**的那几句(见 research.py 里各段的边界)。
+#: ``暂无数据`` / ``获取失败`` 是防御性的通用词，渲染层并不产出，归不到具体维度，
+#: 不进这张表——宁可少算一次降级，也不要把它记到无辜的维度头上。
+#:
+#: ``历史资金流向`` 没有降级形态：那一段为空时整段不打印(``if not indices: return``)，
+#: 于是 ``scan`` 直接判为缺失，不需要在这里出现。
+DEGRADED_DIMENSION = {
+    "暂无实时资金流向": "资金流向",
+    "暂无资金流向数据": "资金流向",
+    "盘中实时数据暂时不可用": "资金流向",
+    "暂无财务数据": "财务数据",
+    "暂无年度财务数据": "财务数据",
+}
+
+#: 这一句出现时，那一维是**正当缺席**——不进分母，也不算没拿到。
+#:
+#: 和上面那张表的区别是"能不能怪源"。钉了日期的查询问的是过去某天，那天没有"实时"
+#: 资金流可言，渲染层因此只打一行提示(``IS_HISTORICAL_QUERY`` 分支)，换任何源都
+#: 一样——和 ETF 没有财务报表是同一类。算成降级的话，一批钉日期的重放就能把资金流
+#: 的可用率从 100% 打到 64%，而什么都没坏。
+#:
+#: 对**探活**是另一回事：探活一律不钉日期，这一句在那里出现就说明有人给探活加了
+#: ``date=``，是 bug 不是缺席。所以只在这里放行，``DEGRADED_MARKERS`` 里仍然留着它。
+NOT_APPLICABLE_MARKERS = {
+    "指定日期查询暂不展示实时资金流向": "资金流向",
+}
+
+
 def expected(tool: str, symbol: str) -> tuple[Dimension, ...]:
     """这个标的在这个工具下**应该**有哪些维度。分母就是它。"""
     return tuple(d for d in CONTRACT.get(tool, ()) if d.applies(symbol))
@@ -148,6 +179,7 @@ def degraded_in(text: str) -> list[str]:
 
 
 __all__ = [
-    "ALL_CLASSES", "CONTRACT", "DEGRADED_MARKERS", "Dimension", "ETF", "INDEX",
+    "ALL_CLASSES", "CONTRACT", "DEGRADED_DIMENSION", "DEGRADED_MARKERS",
+    "Dimension", "ETF", "INDEX", "NOT_APPLICABLE_MARKERS",
     "STOCK", "STOCK_ONLY", "classify", "degraded_in", "expected", "is_index", "scan",
 ]
