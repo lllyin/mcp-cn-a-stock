@@ -904,7 +904,7 @@ def test_the_provenance_line_comes_right_after_the_title(tmp_path):
     ])
     lines = health_report.render(log_digest.digest(log)).splitlines()
     assert lines[0].startswith("# 服务健康")
-    assert lines[2].startswith("版本 "), lines[:5]
+    assert lines[2].startswith("> 版本 "), lines[:5]
     assert "数据来自 cn-stock-mcp.log" in lines[2]
     # 结论和 KPI 表都排在它后面
     assert lines.index(_verdict_line("\n".join(lines))) > 2

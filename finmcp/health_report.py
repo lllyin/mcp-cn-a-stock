@@ -210,6 +210,8 @@ def _headline(data: dict) -> list:
     # 底下每个数都只在这个前提下成立，所以先交代，再给结论和数。
     # 它不是 KPI 表的脚注（"备注在表下"那条说的是一节里的表和它的说明），
     # 放到表下面反而要读者读完数再回头确认前提。
+    #
+    # 用引用块：它是出处不是数据，跟正文分开排，扫的时候可以整块跳过。
     meta = [f"版本 {window.get('version') or '—'}"]
     if window.get("fingerprint"):
         meta.append(f"渲染指纹 {window['fingerprint']}")
@@ -223,7 +225,7 @@ def _headline(data: dict) -> list:
         source = window["name"] + (f" + {archives} 份归档" if archives else
                                    "（未计归档）" if window.get("archived") is False else "")
         meta.append(f"数据来自 {source}")
-    out += [" · ".join(meta), ""]
+    out += ["> " + " · ".join(meta), ""]
 
     icon, summary = _verdict(data)
     out += [f"**{icon} {summary}**", ""]
