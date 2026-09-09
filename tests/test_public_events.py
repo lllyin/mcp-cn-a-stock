@@ -422,3 +422,156 @@ def test_injected_ak_modules_bypass_the_cache():
     for _ in range(3):
         public_events._fetch_source(fake, "lhb", "20260820", 1, False, use_cache=False)
     assert len(calls) == 3
+
+
+# ── 带缓存那条路：取不到 ≠ 当天没有 ──────────────────────────────────
+#
+# 下面这组之前一条都没有：18 个测试全走 use_cache=False，而 use_cache=True 才是
+# 生产路径。缺的正是它，所以"源崩了报 SUCCESS"这个 bug 一直没被测出来。
+
+
+class _Boom:
+    """上游炸给你看。"""
+
+    def __init__(self, error=None):
+        self.error = error or RuntimeError("上游 502")
+        self.calls = 0
+
+    def stock_lhb_detail_em(self, start_date, end_date):
+        self.calls += 1
+        raise self.error
+
+    def stock_notice_report(self, symbol, date):
+        self.calls += 1
+        # 只有最早那天炸，其余正常——用来验证"少一天不能不吭声"
+        if date == "20260818":
+            raise self.error
+        return pd.DataFrame([{"代码": "600000", "名称": "x", "公告标题": "t",
+                              "公告日期": date}])
+
+
+def _cached(monkeypatch):
+    """强制走生产的带缓存路径。
+
+    ``use_cache=use_direct_requests``，而注入了 ak_module 就意味着 use_direct_requests
+    是 False，所以公开入口没法直接测到这条路。
+    """
+    real = public_events._fetch_source
+    monkeypatch.setattr(public_events, "_fetch_source",
+                        lambda *a, **kw: real(*a, **{**kw, "use_cache": True}))
+
+
+def test_a_crashed_source_is_failed_not_an_empty_day(monkeypatch):
+    """源崩了要报 FAILED，不能报"SUCCESS，0 条"。
+
+    ``get_or_load`` 咽掉异常返回 None 是它对别的调用方的正当契约（回退是常态）。
+    照单收下当成空表，响应就会说"SUCCESS / raw_row_count=0"再附一句"空结果不代表
+    当日无事件"——源崩了却被描述成当天可能真没事件，调用方无从分辨。
+    """
+    _cached(monkeypatch)
+    response = fetch_public_market_events_sync(
+        "2026-08-20", "20260820", ["lhb"], 1, [], 1000, ak_module=_Boom())
+    status = response.source_statuses[0]
+    assert status.status == "FAILED"
+    assert "502" in (status.error or "")            # 原始异常没被吞成一句泛化的话
+    assert not any("不代表当日无事件" in w for w in response.warnings)
+
+
+def test_a_genuinely_empty_day_stays_successful(monkeypatch):
+    """当天真没有事件仍然是 SUCCESS——别把上面那条修成"空表一律算失败"。
+
+    能分开是因为本命名空间 cacheable 拒收空表：真空返回的是包着空表的 Entry，
+    只有取不到才给 None。
+    """
+    class Quiet:
+        def stock_lhb_detail_em(self, start_date, end_date):
+            return pd.DataFrame()
+
+    _cached(monkeypatch)
+    response = fetch_public_market_events_sync(
+        "2026-08-20", "20260820", ["lhb"], 1, [], 1000, ak_module=Quiet())
+    status = response.source_statuses[0]
+    assert status.status == "SUCCESS" and status.raw_row_count == 0
+    assert any("不代表当日无事件" in w for w in response.warnings)
+
+
+def test_an_upstream_returning_none_is_also_a_failure(monkeypatch):
+    """上游给 None 同样是没取到，不是当天没有。"""
+    class Nothing:
+        def stock_lhb_detail_em(self, start_date, end_date):
+            return None
+
+    _cached(monkeypatch)
+    response = fetch_public_market_events_sync(
+        "2026-08-20", "20260820", ["lhb"], 1, [], 1000, ak_module=Nothing())
+    assert response.source_statuses[0].status == "FAILED"
+
+
+def test_serving_a_stale_pool_says_so(monkeypatch):
+    """旧值兜底时数据是好的，但源此刻同样是崩的——按 get_or_load 的约定要标出来。
+
+    不标的话响应是干净的 SUCCESS，看不出这份池子可能不含之后新增的事件。
+    """
+    monkeypatch.setattr(cache, "get_or_load", lambda *a, **kw: cache.Entry(
+        value=pd.DataFrame([{"代码": "600000", "名称": "x", "上榜日": "2026-08-20"}]),
+        fresh=False, age_seconds=930.0))
+    _cached(monkeypatch)
+    response = fetch_public_market_events_sync(
+        "2026-08-20", "20260820", ["lhb"], 1, [], 1000, ak_module=_Boom())
+    status = response.source_statuses[0]
+    assert status.status == "SUCCESS" and status.raw_row_count == 1   # 旧值照常返回
+    assert any("缓存值" in w and "16 分钟" in w for w in response.warnings)
+
+
+def test_a_fresh_hit_is_not_flagged_stale(monkeypatch):
+    """fresh=True 不能也挂上旧值告警，否则告警天天有、等于没有。"""
+    monkeypatch.setattr(cache, "get_or_load", lambda *a, **kw: cache.Entry(
+        value=pd.DataFrame([{"代码": "600000", "名称": "x", "上榜日": "2026-08-20"}]),
+        fresh=True, age_seconds=0.0))
+    _cached(monkeypatch)
+    response = fetch_public_market_events_sync(
+        "2026-08-20", "20260820", ["lhb"], 1, [], 1000, ak_module=_Boom())
+    assert not any("缓存值" in w for w in response.warnings)
+
+
+def test_one_source_failing_does_not_sink_the_others(monkeypatch):
+    """一个源崩了，别的源照常返回——回退是常态。"""
+    class Mixed(_Boom):
+        def stock_zt_pool_em(self, date):
+            return pd.DataFrame([{"代码": "300001", "名称": "涨停", "涨跌幅": 20.0}])
+
+    _cached(monkeypatch)
+    response = fetch_public_market_events_sync(
+        "2026-08-20", "20260820", ["lhb", "limit_up"], 1, [], 1000, ak_module=Mixed())
+    by_source = {s.source: s.status for s in response.source_statuses}
+    assert by_source == {"lhb": "FAILED", "limit_up": "SUCCESS"}
+    assert [e.source for e in response.events] == ["limit_up"]
+
+
+def test_a_partial_announcement_window_keeps_what_it_got(monkeypatch):
+    """公告少取到一天，其余几天照常返回,并且**说出来**缺了哪天。
+
+    两个极端都不对：静默丢掉那天就是悄悄给了个更小的池子；为一天失败判整源失败、
+    一条不返回，是把已经拿到手的数据又扔掉——同样让数据变少（AGENTS §一）。
+    """
+    _cached(monkeypatch)
+    boom = _Boom()          # 只有 20260818 那天炸，其余两天正常
+    response = fetch_public_market_events_sync(
+        "2026-08-20", "20260820", ["announcements"], 3, [], 1000, ak_module=boom)
+    status = response.source_statuses[0]
+    assert status.status == "SUCCESS"
+    assert status.raw_row_count == 2, "另外两天的公告被一起扔了"
+    assert any("20260818" in w and "没取到" in w for w in response.warnings), \
+        "少了一天却没吭声"
+
+
+def test_an_announcement_window_that_fails_completely_is_a_failure(monkeypatch):
+    """全部天都取不到就没有"部分"可言了，那就是整源失败。"""
+    class AllBad(_Boom):
+        def stock_notice_report(self, symbol, date):
+            raise self.error
+
+    _cached(monkeypatch)
+    response = fetch_public_market_events_sync(
+        "2026-08-20", "20260820", ["announcements"], 3, [], 1000, ak_module=AllBad())
+    assert response.source_statuses[0].status == "FAILED"

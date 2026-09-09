@@ -201,6 +201,8 @@ def fetch_public_market_events_sync(
     warnings: list[str] = []
     output: list[PublicEventRecord] = []
     for source in sources:
+        stale_days: list = []
+        missing_days: list = []
         try:
             frame = _fetch_source(
                 ak_module,
@@ -210,6 +212,8 @@ def fetch_public_market_events_sync(
                 use_direct_requests,
                 # 注入了 ak_module 的是测试路径，别把桩数据腌进进程级缓存。
                 use_cache=use_direct_requests,
+                stale_days=stale_days,
+                missing_days=missing_days,
             )
             records = _normalize_source(source, frame, iso_date)
             raw_count = len(records)
@@ -231,6 +235,18 @@ def fetch_public_market_events_sync(
                 matched_row_count=matched_count,
                 returned_row_count=len(records),
             ))
+            if missing_days:
+                days = "、".join(sorted(d for d, _ in missing_days))
+                warnings.append(
+                    f"{source} 有 {len(missing_days)} 天没取到（{days}）；"
+                    f"下面是其余几天的结果，池子不完整"
+                )
+            if stale_days:
+                oldest = max(age for _, age in stale_days) / 60.0
+                warnings.append(
+                    f"{source} 有 {len(stale_days)} 天用的是最旧 {oldest:.0f} 分钟前的缓存值；"
+                    "上游此刻取不到，数据可能不含之后新增的事件"
+                )
             if raw_count == 0:
                 warnings.append(
                     f"{source} 在 {iso_date} 返回空结果；公开池可能存在历史保留窗口，空结果不代表当日无事件"
@@ -340,16 +356,47 @@ def _cached_day(
     use_direct_requests: bool,
     *,
     use_cache: bool,
+    stale_days: Optional[list] = None,
 ) -> pd.DataFrame:
+    """一个源、一天，带缓存。**取不到**和**当天真没有**必须分开往上报。
+
+    ``get_or_load`` 把 loader 的异常咽掉只记日志、返回 None（那是它对别的调用方的
+    正当契约：回退是常态）。这里要是把 None 当成空表返回，调用方看到的就是
+    ``status=SUCCESS, raw_row_count=0`` 外加一句"公开池可能有历史保留窗口"——
+    源崩了却被说成当天无事件，比没有这个字段更糟。
+
+    能这么分是因为本命名空间 ``cacheable`` 拒收空表：源当天真的没有事件时
+    ``get_or_load`` 返回的是**包着空表的 Entry**，只有取数失败才给 None。
+
+    ``entry.fresh=False`` 是软过期后刷新失败、继续用旧值——数据是好的，但源此刻
+    同样是崩的，按 ``get_or_load`` 的约定要标进输出，记进 ``stale_days``。
+    """
     if not use_cache:
         return _fetch_source_day(ak_module, source, compact_date, use_direct_requests)
+
+    failure: list[Exception] = []
+
+    def load() -> pd.DataFrame:
+        try:
+            return _fetch_source_day(ak_module, source, compact_date, use_direct_requests)
+        except Exception as error:
+            failure.append(error)          # get_or_load 只会记日志，原始异常在这里留一份
+            raise
+
     entry = cache.get_or_load(
         CACHE_NAMESPACE,
         f"{source}:{compact_date}",
-        lambda: _fetch_source_day(ak_module, source, compact_date, use_direct_requests),
+        load,
         epoch=_epoch_for(source, compact_date),
     )
-    return pd.DataFrame() if entry is None else entry.value
+    if entry is not None:
+        if not entry.fresh and stale_days is not None:
+            stale_days.append((compact_date, entry.age_seconds))
+        return entry.value
+    if failure:
+        raise failure[0]
+    # 没抛异常又没结果：上游给了 None。同样是没取到，不是当天没有。
+    raise RuntimeError(f"{source} {compact_date} 上游返回空值")
 
 
 def _fetch_source(
@@ -360,10 +407,21 @@ def _fetch_source(
     use_direct_requests: bool,
     *,
     use_cache: bool = False,
+    stale_days: Optional[list] = None,
+    missing_days: Optional[list] = None,
 ) -> pd.DataFrame:
-    """一个源在这次查询里要的全部原始数据，按天取、按天缓，最后拼起来。"""
+    """一个源在这次查询里要的全部原始数据，按天取、按天缓，最后拼起来。
+
+    公告按 lookback 天逐天取。**某一天取不到时照常返回其余几天**，同时把缺了哪天
+    记进 ``missing_days``，由调用方讲出来。
+
+    两种极端都不对：静默丢掉那一天，就是悄悄给了个更小的池子；为一天失败把整个源
+    判失败、一条不返回，是拿到手的数据又扔掉——同样让数据变少（AGENTS §一）。
+    全部天都取不到才是整源失败。
+    """
     def day(value: str) -> pd.DataFrame:
-        return _cached_day(ak_module, source, value, use_direct_requests, use_cache=use_cache)
+        return _cached_day(ak_module, source, value, use_direct_requests,
+                           use_cache=use_cache, stale_days=stale_days)
 
     if source == "earnings_forecast":
         report_period = _latest_completed_report_period(compact_date)
@@ -380,10 +438,18 @@ def _fetch_source(
 
     # 公告本来就是按天取的，逐天缓存于是天然让不同 lookback 的查询共用条目。
     anchor = datetime.strptime(compact_date, "%Y%m%d")
-    frames = [
-        day((anchor - timedelta(days=offset)).strftime("%Y%m%d"))
-        for offset in range(announcement_lookback_days)
-    ]
+    frames, failures = [], []
+    for offset in range(announcement_lookback_days):
+        value = (anchor - timedelta(days=offset)).strftime("%Y%m%d")
+        try:
+            frames.append(day(value))
+        except Exception as error:
+            if missing_days is None:      # 调用方没准备接缺口，那就别把它咽了
+                raise
+            failures.append(value)
+            missing_days.append((value, str(error)))
+    if failures and len(failures) == announcement_lookback_days:
+        raise RuntimeError(f"公告 {announcement_lookback_days} 天全部取不到")
     frames = [f for f in frames if f is not None and not f.empty]
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
