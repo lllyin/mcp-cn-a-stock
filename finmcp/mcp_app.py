@@ -12,7 +12,7 @@ from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from . import research
+from . import report_contract, research
 from .cache import build_key, get_report_cache, is_cacheable_report
 from .datasource import get_datasource
 from .datasource.base import FETCH_FAILURES_KEY, FetchRequirements
@@ -410,9 +410,32 @@ async def fetch_batch_reports(
                         symbol,
                         ",".join(fetch_failures),
                     )
+                # 报告里实际渲染出了哪些维度。`health` 靠这一段算**实测**可用率——
+                # 没有它就只能按上游失败反推，而"源成功返回、字段却是空的"那一类
+                # （沪市 ETF 的资金流出现过）在日志里一条失败都没有，反推看不见。
+                #
+                # 开销：实测 brief 11µs / full 93µs（真实报告文本，20000 次取均值），
+                # 对比单标的耗时 p50 5.75s 是 1/62000。仍然用 isEnabledFor 挡一层，
+                # 日志级别关掉时连这点也不付。
+                dimensions = ""
+                if logger.isEnabledFor(logging.INFO):
+                    try:
+                        present, missing = report_contract.scan(
+                            output["reports"][symbol], mode, symbol)
+                        degraded = report_contract.degraded_in(output["reports"][symbol])
+                        dimensions = (f" present={len(present)}/{len(present) + len(missing)}"
+                                      f" missing={','.join(missing) or '-'}"
+                                      f" degraded={','.join(degraded) or '-'}")
+                    except Exception:
+                        # 单独兜住：这一段只是为了写日志，而它就在产出报告的 try 里，
+                        # 外层 except 会把报告换成 "Error during processing"。观测出错
+                        # 就丢掉一份已经渲染好、甚至已经进了缓存的报告，是拿数据换
+                        # 统计（AGENTS §一）。宁可这一次没有维度字段。
+                        logger.warning("维度统计失败 request_id=%s tool=%s symbol=%s",
+                                       request_id or "-", mode, symbol, exc_info=True)
                 logger.info(
                     "Finished symbol request_id=%s tool=%s symbol=%s "
-                    "raw_data=%.3fs render=%.3fs total=%.3fs chars=%s",
+                    "raw_data=%.3fs render=%.3fs total=%.3fs chars=%s%s",
                     request_id or "-",
                     mode,
                     symbol,
@@ -420,6 +443,7 @@ async def fetch_batch_reports(
                     time.perf_counter() - render_started_at,
                     time.perf_counter() - symbol_started_at,
                     len(output["reports"][symbol]),
+                    dimensions,
                 )
             except Exception as e:
                 err_msg = str(e)
@@ -1165,6 +1189,46 @@ async def sector_fund_flow(
       sector_type, period, board.as_of, board.source, len(board.sectors),
       len(board.at_level(level)) if board.levels_known else "未分级",
       int(board.partial), time.perf_counter() - started_at)
+  return report
+
+
+@mcp_app.tool()
+async def health(
+  since: str = "startup",
+  symbol: str = "",
+  ctx: Context = None,  # type: ignore
+) -> str:
+  """服务自身的健康概览：缺了哪些数据、可用率多少、耗时有没有变慢。
+
+  读的是本服务写下的日志，**不发任何上游请求**——零积分、零上游压力，随时可调，
+  也不会因为"查健康"反过来把服务打挂。想知道"现在还能不能取到数"是探活的活，
+  不在这里。
+
+  回答三类问题：
+    - 这段时间缺了哪些维度、涉及哪些标的、最近一次什么时候
+    - 各阶段的耗时分布（次数/平均/p50/p90/p95/最大）以及有没有环比变慢
+    - 期间发生过哪些会影响数据的事件（通道冷却、源熔断、指数 K 线口径变更）
+
+  Args:
+    since: 时间窗。``startup``（本次启动至今，默认）、``epoch``（当前市场纪元）、
+           ``today``、``30m``/``2h``、或 ``YYYY-MM-DD HH:MM``。
+    symbol: 逗号分隔的标的代码，只看这几个。用来回答"为什么某个标的缺资金流"。
+
+  Returns:
+    一屏 Markdown。
+  """
+  from .config import LOG_FILE
+  from . import health_report, log_digest
+
+  started_at = time.perf_counter()
+  data = await asyncio.to_thread(
+    log_digest.digest, LOG_FILE, since=since, symbol=symbol)
+  report = health_report.render(data)
+  # 这一行自己也会进日志，所以只记结果不记内容，免得下一次 health 把自己的输出
+  # 当成数据读进去。
+  logger.info("Finished health since=%s symbols=%d rate=%s elapsed=%.3fs",
+              since, len(data["symbols"]),
+              data["availability"].get("rate"), time.perf_counter() - started_at)
   return report
 
 

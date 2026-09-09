@@ -493,3 +493,32 @@ async def test_every_cached_tool_logs_its_hit():
         if miss_marker not in source:
             missing.append(f"{name}: 缺未命中日志")
     assert missing == [], f"日志缺失: {missing}"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_dimension_scan_never_costs_the_caller_a_report(
+    tmp_path, deterministic_render, monkeypatch, caplog
+):
+    """维度统计只为写日志，它出错不能把报告换成一句 "Error during processing"。
+
+    那一段就写在产出报告的 try 里，而外层 except 正是这么处理异常的。注入验证过：
+    一份已经渲染好、并且已经写进报告缓存的报告，被一次统计异常换成了错误字符串——
+    缓存里是好的、返回给调用方的是错的，两边还不一致。观测层不该吃掉数据（§一）。
+    """
+    from finmcp import report_contract
+
+    install_cache(tmp_path, enabled=False)
+    good = await mcp_app.fetch_batch_reports("SH600000", "brief", "test")
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("契约表写坏了")
+
+    monkeypatch.setattr(report_contract, "scan", boom)
+    # 必须是 INFO：那一段被 `logger.isEnabledFor(logging.INFO)` 挡着，级别设成
+    # WARNING 的话 scan 压根不会被调到，三条断言全都是平凡通过。
+    with caplog.at_level(logging.INFO, logger="finmcp"):
+        broken = await mcp_app.fetch_batch_reports("SH600000", "brief", "test")
+
+    assert broken.errors == {}, "统计失败被当成了取数失败"
+    assert broken.reports["SH600000"] == good.reports["SH600000"], "报告被统计异常吃掉了"
+    assert any("维度统计失败" in r.getMessage() for r in caplog.records), "出错了却没留下痕迹"

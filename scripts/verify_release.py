@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+import importlib.util
 import json
 import math
 import os
@@ -75,25 +76,51 @@ ALL_TOOLS = (
 # source 是这一维背后的上游源，缺失时报告直接给出该去看哪一层，省一次翻代码。
 
 
-STOCK, ETF, INDEX = "stock", "etf", "index"
-ALL_CLASSES = frozenset((STOCK, ETF, INDEX))
-# 只有个股才有的那些维度。ETF 没有市盈率、市净率、财务报表和所属行业（服务端在
-# `_fetch_finance_sync` 里对 1xxxxx/5xxxxx 直接返回 None）；指数连市值都没有。
-# 不分类的话，一次 full + ETF 的探活会凭空报出 10 项"缺失"，全是误报。
-STOCK_ONLY = frozenset((STOCK,))
+# 维度契约、类别判定和降级提示语在包里，服务渲染完当场比对一次读的是同一张表
+# （见 finmcp/report_contract.py）。两处各存一份的话，同一件事发版闸门报一个可用率、
+# health 工具报另一个，两个数都没法用。
 
 
-# 这里只按"哪一类标的本来就没有这一维"排除，不按具体是哪个标的排除。
-#
-# 区别在于是不是会变：ETF 没有市盈率，是因为它没有盈利这个东西，换任何源都不会
-# 有——这是标的本身的属性。而"科创50 拿不到资金流向"是**当前这条源**的属性：
-# 浏览器兜底走的 data.eastmoney.com/zjlx/ 没有科创50 的页面，但 2026-09-04 服务器
-# 开着网关采的 logs/s1_index.json 里，SH000688 的今日主力净流入是 -42.67亿——同
-# 一个标的，换条源就有了。曾经这里硬编码了一份"有页面的指数"名单，把 SH000688
-# 判成"本来就没有"，于是那台机器上真实的一处缺失被记成了满分。
-#
-# 所以按标的的判据一律不做，取到就是取到，没取到就是没取到。分数会因此变低，
-# 但那个低才是真的。
+def _load_report_contract():
+    """把那张表拿进来，但**不为它装齐整个服务**。
+
+    ``import finmcp.report_contract`` 会先执行 ``finmcp/__init__.py``，那一句
+    ``from .mcp_app import mcp_app`` 把 FastMCP、pandas、pydantic 全拉进来。而这个
+    闸门自己只用标准库、取数靠 mcporter 子进程——要求装齐服务依赖才能跑，等于把
+    "任何 python3 都能跑闸门"这条废掉；偏偏最需要它的时候（服务环境本身可疑）
+    正是装不全的时候。
+
+    所以：装得全就正常 import，和服务共用同一个模块对象；装不全就按文件路径只加载
+    ``report_contract`` 这一个模块——它是纯标准库的，同一个文件，同一张表。
+    """
+    try:
+        import finmcp.report_contract as module
+        return module, "finmcp 包"
+    except ImportError:
+        path = PROJECT_ROOT / "finmcp" / "report_contract.py"
+        spec = importlib.util.spec_from_file_location("finmcp_report_contract", path)
+        module = importlib.util.module_from_spec(spec)
+        # 先登记再执行：dataclasses 装饰类型字段时要 sys.modules[cls.__module__]，
+        # 不登记会在 class Dimension 那一行抛 AttributeError: 'NoneType'。
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module, str(path)
+
+
+_contract, CONTRACT_SOURCE = _load_report_contract()
+
+ALL_CLASSES = _contract.ALL_CLASSES
+CONTRACT = _contract.CONTRACT
+DEGRADED_MARKERS = _contract.DEGRADED_MARKERS
+Dimension = _contract.Dimension
+ETF = _contract.ETF
+INDEX = _contract.INDEX
+STOCK = _contract.STOCK
+STOCK_ONLY = _contract.STOCK_ONLY
+classify = _contract.classify
+is_index = _contract.is_index
+
+
 def rate_text(value: float) -> str:
     """百分比文案。**绝不向上取整到 100%**。
 
@@ -115,94 +142,6 @@ def rate_text(value: float) -> str:
 
 
 
-@dataclass(frozen=True)
-class Dimension:
-    name: str
-    marker: str          # 在报告文本里的行首特征
-    source: str          # 由哪个上游源提供
-    applies_to: frozenset = ALL_CLASSES
-
-    def applies(self, symbol: str) -> bool:
-        return classify(symbol) in self.applies_to
-
-
-_BASIC = (
-    Dimension("股票代码", "- 股票代码:", "realtime"),
-    Dimension("股票名称", "- 股票名称:", "realtime"),
-    Dimension("数据日期", "- 数据日期:", "kline"),
-    Dimension("行业概念", "- 行业概念:", "realtime", applies_to=STOCK_ONLY),
-    Dimension("总市值", "- 总市值:", "realtime", applies_to=STOCK_ONLY),
-    Dimension("流通市值", "- 流通市值:", "realtime", applies_to=STOCK_ONLY),
-    Dimension("市盈率(静)", "- 市盈率(静):", "realtime", applies_to=STOCK_ONLY),
-    Dimension("市盈率(动)", "- 市盈率(动):", "realtime", applies_to=STOCK_ONLY),
-    Dimension("市净率", "- 市净率:", "realtime", applies_to=STOCK_ONLY),
-    Dimension("净资产收益率", "- 净资产收益率:", "realtime", applies_to=STOCK_ONLY),
-)
-
-_TRADING = (
-    Dimension("价格", "## 价格", "kline"),
-    Dimension("涨跌幅", "## 涨跌幅", "kline"),
-    Dimension("振幅", "## 振幅", "kline"),
-    Dimension("成交量", "## 成交量(万手)", "kline"),
-    Dimension("成交额", "## 成交额(亿)", "kline"),
-    Dimension("资金流向", "## 资金流向", "fund_flow"),
-    # 换手率 = 成交量 / 流通股本，分母来自 realtime 的市值，所以 realtime 挂了
-    # 表现是"换手率整段不见了"，而不是数字不对。
-    Dimension("换手率", "## 换手率", "realtime(流通市值)", applies_to=STOCK_ONLY),
-)
-
-# 财务报表只有个股有。历史资金流向原先整类排除了指数，但实测 full 对 SH000001
-# 和 SZ399006 都渲染出了完整的历史表——排除等于把真实拿到的数据不计分。
-# 技术指标算的是 K 线，三类都有。
-_FINANCE = (Dimension("财务数据", "# 财务数据", "finance", STOCK_ONLY),)
-_HISTORY_FLOW = (
-    Dimension("历史资金流向", "## 历史资金流向", "fund_flow"),
-)
-_TECHNICAL = (Dimension("技术指标", "# 技术指标", "kline"),)
-
-CONTRACT: dict[str, tuple[Dimension, ...]] = {
-    "brief": _BASIC + _TRADING,
-    "medium": _BASIC + _TRADING + _FINANCE,
-    "full": _BASIC + _TRADING + _HISTORY_FLOW + _FINANCE + _TECHNICAL,
-}
-
-# 报告里这些句子说明某一维是"渲染出来了但没有值"。有值和有段落标题是两回事，
-# 只查标题会把降级当成正常。
-#
-# 这张表必须和 research.py 里所有"没数据"的 print 一一对上，不能靠猜。查法：
-#
-#   ast 遍历 research.py 的 print，抓第一个字符串参数里带 暂无/不可用/失败 的
-#
-# 2026-09-04 漏过一次：``暂无资金流向数据`` 不在表里，于是四个标的的资金流其实是
-# 空的，而矩阵把它们全标成了 ✅——比没有这张表更糟，是给了假保证。渲染层加一句
-# 新的提示语就要往这里加一行，有测试盯着这件事。
-DEGRADED_MARKERS = {
-    # 探活一律不钉日期，所以这一句不该出现。出现了说明有人给探活加了 date=，
-    # 那会让"实时资金流取不取得到"这件事永远查不出来——是 bug 不是正当缺席。
-    "指定日期查询暂不展示实时资金流向": "探活钉了日期？实时资金流因此查不到，检查调用参数",
-    "暂无实时资金流向": "实时资金流没取到（主源被拒且页面兜底也没成）",
-    "暂无资金流向数据": "资金流整段为空",
-    "暂无财务数据": "财务报表没取到",
-    "暂无年度财务数据": "财务报表里没有年度期",
-    "盘中实时数据暂时不可用": "盘中回退整层被跳过或熔断",
-    "暂无数据": "该维度取到空值",
-    "获取失败": "该维度取数失败",
-}
-
-# 指数判定与服务端保持一致，见 cn_stock_source._INDEX_CODE_PREFIXES。
-_INDEX_PREFIXES = {"sh": ("000",), "sz": ("399",), "bj": ("899",)}
-
-
-def is_index(symbol: str) -> bool:
-    normalized = (symbol or "").lower()
-    return normalized[2:].startswith(_INDEX_PREFIXES.get(normalized[:2], ()))
-
-
-def classify(symbol: str) -> str:
-    """个股 / ETF / 指数。ETF 的判据与服务端一致：六位码以 1 或 5 开头。"""
-    if is_index(symbol):
-        return INDEX
-    return ETF if (symbol or "")[2:].startswith(("1", "5")) else STOCK
 
 
 # ── 二、调用 ────────────────────────────────────────────────────

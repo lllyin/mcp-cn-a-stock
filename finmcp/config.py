@@ -582,6 +582,11 @@ KLINE_TONGHUASHUN_BUDGET_SECONDS = max(
 )
 
 
+# 服务日志文件的路径，``health`` 工具读它。start.sh 启动时会把实际路径导进来，
+# 正常不用配；只有直接跑 main.py 又把输出重定向到别处时才需要。
+LOG_FILE = env("LOG_FILE") or os.path.join(_PROJECT_ROOT, "logs", "cn-stock-mcp.log")
+
+
 def cache_ttl(namespace: str, default: float) -> float:
     """某个命名空间的 TTL 覆盖：``CACHE_<NS>_TTL_SECONDS``。"""
     return max(0.0, float(env(f"CACHE_{namespace.upper()}_TTL_SECONDS", str(default))))

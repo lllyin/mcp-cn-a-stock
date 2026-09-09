@@ -27,6 +27,7 @@ CnStock 是一个面向大模型和 MCP 客户端的 A 股数据服务。
 | `sector_fund_flow` | 行业/概念/地域板块的资金流排行，与东财官网同口径 | Markdown 表格 |
 | `market_breadth` | 全市场涨跌家数、涨跌停和十档分布 | 严格 JSON |
 | `market_events` | 指定日期的龙虎榜、涨停池、公告和业绩预告 | 严格 JSON |
+| `health` | 服务自身的可用率、缺失明细、耗时分布和事件；只读日志，不发上游请求 | Markdown |
 
 完整报告示例：[兆易创新 SH603986](docs/SH603986-full.md)。
 各工具的返回字段见[技术实现说明](docs/technical-details.md#9-输出与错误契约)。
@@ -269,6 +270,7 @@ mcporter call cn-stock market_events \
 | `INTRADAY_QUOTE_PROVIDERS` | 盘中实时行情的尝试顺序，逗号分隔按序尝试，`off` 关闭整层。**当天那一根 K 线只认这一层**（历史 K 线给的当天数据不作准）：<br>`fund_flow_page` 复用已解析的资金流页面，不发请求但没有开高低<br>`tencent` 字段全<br>`tonghuashun` 字段全 | `fund_flow_page`<br>`tencent`<br>`tonghuashun`<br>`off`<br>（默认 `fund_flow_page,tencent,tonghuashun`） |
 | `INTRADAY_QUOTE_PROVIDERS_INDEX` | **指数**用的顺序，和上一项分开配：指数的成交量各源口径不一致，腾讯/新浪比东财/同花顺低约 3.5%（两家同源，互相校验不了）。东财是基准源，所以指数把同花顺排前面；个股各源逐位一致，不换 | 同上（默认 `fund_flow_page,tonghuashun,tencent`） |
 | `INTRADAY_QUOTE_CROSS_CHECK_PCT` | 拿到第一个可用报价后再问剩下的源一遍，字段相差超过这个值就打 WARNING。每个标的多一次上游请求，只在怀疑某个源口径不对时开 | 百分比，`0` 关闭（默认 `0`） |
+| `LOG_FILE` | 服务日志文件的路径，`health` 工具读它算可用率和耗时。`start.sh` 启动时会把实际路径传进来，正常不用配 | 路径（默认 `logs/cn-stock-mcp.log`） |
 | `TRADING_CALENDAR_PROVIDERS` | 判「今天开不开市」的日历来源：<br>`sina` 上交所公布的交易日名单，最权威<br>`holiday_cn` [NateScarlet/holiday-cn](https://github.com/NateScarlet/holiday-cn) 的国务院放假安排换算而来，与交易所名单的差异只在个别调休日<br>`weekday` 兜底，周一到周五算交易日——长假会被整段算成交易日，所以放最后 | `sina`<br>`holiday_cn`<br>`weekday`<br>`off`<br>（默认 `sina,holiday_cn,weekday`） |
 | `FUND_FLOW_PROVIDERS` | 个股/指数资金流的来源顺序（页面兜底另算，排在这一层之后）：<br>`eastmoney` 给全部历史<br>`eastmoney_delay` 只回当日一行，但主源拒绝当前出口时它还通 | `eastmoney`<br>`eastmoney_delay`<br>`off`<br>（默认 `eastmoney,eastmoney_delay`） |
 | `REALTIME_FUND_FLOW_PROVIDERS` | 没有资金流向页面的标的（科创 50 等）盘中实时资金流的来源，给当日累计的五档净流入；有页面的标的不走这里 | `eastmoney_delay`<br>`off`<br>（默认 `eastmoney_delay`） |
@@ -276,7 +278,7 @@ mcporter call cn-stock market_events \
 | `SECTOR_TAXONOMY_PROVIDERS` | 板块分级表的来源，用来只排同一层——东财的行业板块名单把各级混在一起，不分级会让父子板块同时上榜、同一笔钱数两遍。默认排申万二级，和东财官网那张榜一致：<br>`shenwan`、`swsresearch` 是同一套申万分类的两个来源，一个不通时另一个补上，缺的级也会互补<br>`off` 退回全部板块一起排，报告里会标出来 | `shenwan,swsresearch`<br>`shenwan`<br>`off`<br>（默认 `shenwan,swsresearch`） |
 | `KLINE_PROVIDERS` | 东财那一级取不到时，**个股/ETF** 的兜底顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`tonghuashun` 不覆盖北交所<br>`tencent` 个股/ETF/指数都覆盖，北交所大半不认<br>`sina` 覆盖腾讯不认的北交所代码，但不认 ETF 和创业板指<br>三家各补各的洞 | `tonghuashun`<br>`tencent`<br>`sina`<br>`off`<br>（默认 `tencent,sina`） |
 | `KLINE_PROVIDERS_INDEX` | **指数**用的兜底顺序，和 `KLINE_PROVIDERS` 分开配：腾讯/新浪的指数成交量比东财/同花顺低约 3.5%，这个量级不能忽略，所以指数按准确度排而不是按稳定性 | 同上（默认 `tonghuashun,tencent,sina`） |
-| `KLINE_TONGHUASHUN_BUDGET_SECONDS` | 同花顺取一次 K 线的**总**预算，用尽即判该源失败、链路回退。它按年份取文件，跨 N 年就是 N 个请求，没有这一项时最坏耗时随窗口线性增长、没有上界。取值必须大于本环境**成功**取数的最大耗时，否则会砍掉本来能拿到的结果、让指数成交量退到腾讯口径（低约 3.5%）；用 `probe_tuning.py tonghuashun` 量当前环境的分布再定 | 秒，`0` 关闭（默认 `45`） |
+| `KLINE_TONGHUASHUN_BUDGET_SECONDS` | 同花顺取一次 K 线的**总**预算，用尽即判该源失败、链路回退。它按年份取文件，跨 N 年就是 N 个请求，没有这一项时最坏耗时随窗口线性增长、没有上界。取值有两个下界，取大的那个：本环境**成功**取数的最大耗时，以及一次取数要发的请求数 × 单次超时。低于任何一个都会砍掉本来能拿到的结果、让指数成交量退到腾讯口径（低约 3.5%）；用 `probe_tuning.py tonghuashun` 量，它会把两个都算进去 | 秒，`0` 关闭（默认 `45`） |
 | `KLINE_MAX_GAP_TRADING_DAYS` | 相邻两根 K 线之间允许缺多少个**交易日**，超过就判该源失败、让链路回退。防的是「序列断裂」——列是齐的、数值也在合理区间，源「成功」返回，但涨跌幅会跨缺口计算、均线全错。单位是交易日而非自然日，所以长假在结构上就是 0，阈值只用来容忍停牌（10 是 2018 年后重大资产重组停牌的上限）。是偏好不是硬条件：每个源都带同样缺口时（真实长期停牌）会宽松再问一轮并放行，不会让 K 线整段缺失 | 交易日，`0` 关闭（默认 `10`） |
 
 ### 资金流页面兜底

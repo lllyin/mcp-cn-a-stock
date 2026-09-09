@@ -207,6 +207,9 @@ else
     EXEC_CMD=(python main.py)
 fi
 
+# 把日志路径告诉进程本身。发布形态安装时包在 site-packages 里，而日志写在仓库
+# 下，服务自己推不出来——health 工具要读它，推错就读到一个空目录。
+export LOG_FILE
 nohup "${EXEC_CMD[@]}" --transport http --port "$PORT" > "$LOG_FILE" 2>&1 &
 PID=$!
 echo "$PID" > "$PID_FILE"
