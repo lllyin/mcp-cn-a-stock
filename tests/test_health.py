@@ -195,67 +195,110 @@ def test_batch_rows_are_dropped_when_filtering_by_symbol(tmp_path):
     assert log_digest.digest(log, symbol="SZ000333")["latency"]["整批总计"]["stats"] is None
 
 
-# --- 趋势：两个真踩过的坑 -------------------------------------------------------
+# --- 逐小时比：本小时 vs 上一小时 -------------------------------------------
+#
+# 这一组是三版设计换下来的。前两版都在真实日志上算出过假的"性能下降"：按样本数
+# 对半（密集采样那段缓存全热、天然快）算出 +251%；跨市场时段直接对半算出
+# +98% ~ +787%。第三版按时间中点对半，数对了但切分点取决于日志跨度——换个
+# since 同一批数据能得出不同的涨跌，而且同一列里七个阶段其实是七个切分点。
+# 现在按整点小时分桶：边界是绝对的，不用向读者解释切分点在哪。
 
 
 def _series(pairs):
-    return log_digest.Series([(f"2026-09-09 {t},000"[:19], v) for t, v in pairs])
+    return log_digest.Series([(f"2026-09-09 {t}", v) for t, v in pairs])
 
 
-def test_trend_needs_enough_samples_at_all():
-    """样本不够就不判。十来个样本的 p90 是噪音。"""
-    assert _series([(f"10:{i // 60:02d}:{i % 60:02d}", 1.0) for i in range(20)]).trend() is None
+def _hour(h, n, value, minute_from=0):
+    return [(f"{h:02d}:{minute_from + i:02d}:00", value) for i in range(n)]
 
 
-def test_trend_needs_enough_samples_on_each_half_not_just_in_total():
-    """总数够、但集中在前半段——这种也不能判。
-
-    按时间对半之后后半可能只剩几个样本，拿它们的 p90 跟前半比就是在比噪音。
-    总数门槛拦不住这种形状:下面 105 个样本远超门槛，后半却只有 5 个。
-    """
-    dense = [(f"10:00:{s:02d}", 1.0) for s in range(60)] + \
-            [(f"10:01:{s:02d}", 1.0) for s in range(40)]
-    tail = [("11:00:00", 9.0), ("11:15:00", 9.0), ("11:30:00", 9.0),
-            ("11:45:00", 9.0), ("12:00:00", 9.0)]
-    assert _series(dense + tail).trend() is None
+def test_no_trend_with_only_one_hour_of_data():
+    assert _series(_hour(10, 40, 1.0)).trend() is None
 
 
-def test_trend_splits_by_time_not_by_sample_count():
-    """按样本数对半是错的。
-
-    真实日志里 10:10–10:38 有一段密集采样、之后是稀疏的正常调用，按样本数对半
-    分出来基线 26 分钟、当前 4 小时 46 分，跨度差 11 倍。那段密集调用缓存全热、
-    天然快，于是算出 +251% 的"性能下降"——纯粹是采样密度的假象。
-    """
-    dense = [(f"10:00:{s:02d}", 1.0) for s in range(60)]                   # 一分钟内 60 个快的
-    sparse = [(f"{10 + m // 60:02d}:{m % 60:02d}:00", 2.0)                 # 之后 80 分钟每分钟一个慢的
-              for m in range(1, 81)]
-    trend = _series(dense + sparse).trend()
+def test_the_comparison_is_hour_against_hour():
+    trend = _series(_hour(10, 30, 1.0) + _hour(11, 30, 2.0)).trend()
     assert trend is not None
-    # 按样本数对半会切成"前半 70 个、后半 70 个"，基线里几乎全是那批天然快的，
-    # 算出接近 +100% 的假性能下降。按时间中点（10:40）切，两边都以 2.0s 为主，
-    # 真实结论是"没变化"。
-    assert trend["change_pct"] == 0
-    assert trend["baseline"]["n"] != trend["current"]["n"]  # 时间等长，样本数本就不该相等
+    assert (trend["previous"][11:], trend["hour"][11:]) == ("10", "11")
+    assert trend["baseline"]["p90"] == 1.0 and trend["current"]["p90"] == 2.0
+    assert round(trend["change_pct"]) == 100
 
 
-def test_trend_never_compares_across_market_epochs():
-    """跨时段不可比。盘中走缓存和页面，收盘后重新取数，本来就不是一回事。"""
-    live = [(f"10:{m:02d}:00", 1.0) for m in range(60)]
-    evening = [(f"17:{m:02d}:00", 9.0) for m in range(60)]
-    epoch_of = lambda stamp: "live" if stamp[11:13] < "16" else "evening"   # noqa: E731
-    trend = _series(live + evening).trend(epoch_of)
-    assert trend is not None
-    assert trend["epoch"] == "evening"          # 只在最近那个够样本的纪元内比
-    assert trend["baseline"]["max"] == 9.0      # 没把盘中那 1.0s 混进来
+def test_a_gap_hour_is_not_treated_as_the_previous_hour():
+    """11 点一次调用都没有时，不能拿 10 点的数当"上一小时"——那是在编。"""
+    assert _series(_hour(10, 30, 1.0) + _hour(12, 30, 2.0)).trend() is None
 
 
-def test_trend_skips_the_percentage_when_the_baseline_is_tiny():
-    """基线 p90 接近 0 时不给百分比——多数是缓存命中的阶段，除出来的 ±100% 没意义。"""
-    fast = [(f"10:{m:02d}:00", 0.0) for m in range(60)]
-    slow = [(f"11:{m:02d}:00", 0.4) for m in range(60)]
-    trend = _series(fast + slow).trend()
+def test_both_hours_need_enough_samples():
+    """样本少于门槛时 p90 基本就是最大值，拿两个最大值比涨跌是在比噪音。"""
+    few = log_digest.MIN_HOUR_SAMPLES - 1
+    assert _series(_hour(10, 30, 1.0) + _hour(11, few, 2.0)).trend() is None
+    assert _series(_hour(10, few, 1.0) + _hour(11, 30, 2.0)).trend() is None
+    assert _series(_hour(10, 30, 1.0)
+                   + _hour(11, log_digest.MIN_HOUR_SAMPLES, 2.0)).trend() is not None
+
+
+def test_the_answer_does_not_move_when_the_query_window_grows():
+    """同一批数据，多读进来几小时历史，"本小时 vs 上一小时"必须还是那个数。
+
+    这正是换掉"窗口对半"的理由：对半分的切分点取决于日志跨度，把 since 从 30m
+    调到 today 就能让同一段数据算出不同的涨跌，而读者会以为性能变了。
+    """
+    recent = _hour(13, 30, 1.0) + _hour(14, 30, 2.0)
+    narrow = _series(recent).trend()
+    wide = _series(_hour(9, 50, 9.0) + _hour(10, 50, 0.1) + recent).trend()
+    assert narrow["change_pct"] == wide["change_pct"]
+    assert (narrow["previous"], narrow["hour"]) == (wide["previous"], wide["hour"])
+
+
+def test_a_cross_phase_comparison_is_flagged_not_refused():
+    """小时边界和市场时段边界不重合，按纪元筛桶会把桶自己切碎。
+
+    所以跨时段照样给数，但标出来——盘中和收盘后走的不是一条路，那个涨跌多半是
+    换了时段而不是变慢了。
+    """
+    epoch_of = lambda s: "live" if s[11:13] < "16" else "evening"   # noqa: E731
+    same = _series(_hour(10, 30, 1.0) + _hour(11, 30, 1.0)).trend(epoch_of)
+    across = _series(_hour(15, 30, 1.0) + _hour(16, 30, 1.0)).trend(epoch_of)
+    assert same["cross_phase"] is False
+    assert across["cross_phase"] is True
+    assert across["change_pct"] is not None, "标注就够了，不该拒绝给数"
+
+
+def test_the_percentage_is_skipped_when_the_baseline_is_tiny():
+    """基线 p90 接近 0 时不给百分比——多是缓存命中的阶段，除出来的 ±100% 没意义。"""
+    trend = _series(_hour(10, 30, 0.0) + _hour(11, 30, 0.4)).trend()
     assert trend is not None and trend["change_pct"] is None
+
+
+# --- 逐小时可用率 ------------------------------------------------------------
+
+
+def test_hourly_availability_says_when_it_started(tmp_path):
+    """合起来的一个百分比分不出"一小时前坏过、现在好了"和"正在坏"。"""
+    log = _write(tmp_path, [
+        _symbol_line("10:00:01", "SZ000333", 2.0, present=17, expected_n=17),
+        _symbol_line("10:30:01", "SH512480", 2.0, present=8, expected_n=9,
+                     missing="资金流向"),
+        _symbol_line("11:00:01", "SZ000333", 2.0, present=17, expected_n=17),
+    ])
+    data = log_digest.digest(log)
+    hours = {r["hour"][11:]: r for r in data["hours"]}
+    assert hours["10"]["rate"] < 1 and hours["10"]["missing"] == {"资金流向": 1}
+    assert hours["11"]["rate"] == 1.0
+    assert [r["hour"][11:] for r in data["hours"]] == ["11", "10"], "新的要排前面"
+    report = health_report.render(data)
+    assert "## 逐小时可用率" in report
+    assert "| 10:00 |" in report and "| 11:00 |" in report
+
+
+def test_hours_without_measured_fields_are_left_out(tmp_path):
+    """老日志不知道缺了什么，按"零缺失"计入会把那一小时抬成满分。"""
+    log = _write(tmp_path, [
+        _symbol_line("10:00:01", "SZ000333", 2.0),                   # 老格式
+        _symbol_line("11:00:01", "SZ000333", 2.0, present=17, expected_n=17),
+    ])
+    assert [r["hour"][11:] for r in log_digest.digest(log)["hours"]] == ["11"]
 
 
 # --- 结论 --------------------------------------------------------------------
@@ -571,23 +614,22 @@ def test_a_failing_dimension_still_gets_its_own_row(tmp_path):
     assert len(row[0].strip("|").split("|")) == len(header.strip("|").split("|"))
 
 
-def test_the_trend_footnote_does_not_claim_one_window_for_every_stage(tmp_path):
-    """每个阶段按自己的样本时间对半，切分点本来就不同。
+def test_the_latency_footnote_names_the_two_hours_it_compared(tmp_path):
+    """列名和脚注都不许再叫"环比"。
 
-    拿某一个阶段的区间当整列的说明就是在撒谎——资金流页面只在盘中跑，它的跨度和
-    K 线取数不是一回事。
+    会计意义的环比是"与上一期相比"，而它比的是本小时对上一小时——现在名副其实了，
+    但脚注仍要写清是哪两个小时，否则读者还是得猜。
     """
     lines = []
-    for i in range(80):
-        t = f"{10 + i // 60:02d}:{i % 60:02d}:00"
-        lines.append(_line(t, "Data task _fetch_kline_sync request_id=r tool=brief "
-                              f"symbol=SZ000333 admission=0.0s queue=0.0s service=1.0s"))
-        lines.append(_line(t, "Data task _fetch_finance_sync request_id=r tool=full "
-                              f"symbol=SZ000333 admission=0.0s queue=0.0s service=2.0s"))
+    for hour in (10, 11):
+        for i in range(30):
+            lines.append(_line(f"{hour}:{i:02d}:00",
+                               "Data task _fetch_kline_sync request_id=r tool=brief "
+                               "symbol=SZ000333 admission=0.0s queue=0.0s service=1.0s"))
     report = health_report.render(log_digest.digest(_write(tmp_path, lines)))
-    assert "不是会计意义的环比" in report
-    assert "自己的样本时间" in report
-    assert "环比 |" not in report        # 列名也不许再叫环比
+    assert "| 本小时 vs 上一小时 |" in report
+    assert "环比" not in report
+    assert "11:00 这一小时的 p90 比 10:00 那一小时" in report
 
 
 def test_no_latency_rows_means_no_table_at_all(tmp_path):

@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from .log_digest import EVENTS
+from .log_digest import EVENTS, MIN_HOUR_SAMPLES
 
 #: 结论的判据。写成表而不是散在渲染代码里——阈值要能一眼看全、一处改完。
 #: 取值理由：95% 是"少了一整维"的量级（一个 17 维的报告少一维就是 94%）；
@@ -76,7 +76,7 @@ def _verdict(data: dict) -> tuple:
     for name, entry in data["latency"].items():
         change = (entry["trend"] or {}).get("change_pct")
         if change is not None and change > TREND_WARN_PCT:
-            problems.append(("warn", f"{name} p90 后半段 {change:+.0f}%"))
+            problems.append(("warn", f"{name} p90 比上一小时 {change:+.0f}%"))
             break
 
     # 源失败排最后，而且要说清楚兜住了没有。维度齐全时它是"值得看"，不是"出事了"。
@@ -147,6 +147,30 @@ def _dimension_table(data: dict) -> list:
     return out
 
 
+def _hourly_table(data: dict) -> list:
+    """逐小时可用率。
+
+    总可用率只回答"缺不缺"，逐小时回答**什么时候开始缺的**——一小时前坏过、现在
+    已经好了，和正在坏，要采取的行动完全不同，而一个合起来的百分比把这两件事写成
+    同一个数。
+
+    新的排前面：读者最先要知道的是"现在"。
+    """
+    rows = data.get("hours") or []
+    if not rows:
+        return []
+    out = ["## 逐小时可用率", "",
+           "| 小时 | 调用 | 该有维度 | 拿到 | 可用率 | 缺了什么 |",
+           "| --- | ---: | ---: | ---: | ---: | --- |"]
+    for row in rows:
+        missing = "、".join(f"{k}×{v}" for k, v in row["missing"].items()) or "—"
+        rate = _pct(row["rate"])
+        out.append(f"| {row['hour'][11:]}:00 | {row['symbols']} | {row['expected']} "
+                   f"| {row['present']} "
+                   f"| {'**' + rate + '**' if (row['rate'] or 1) < 1 else rate} | {missing} |")
+    return out + [""]
+
+
 def render(data: dict) -> str:
     """一屏 Markdown。段落顺序按"先结论、再细节"排,读者从上往下越读越细。"""
     window, availability = data["window"], data["availability"]
@@ -199,6 +223,7 @@ def render(data: dict) -> str:
     out.append("")
 
     out += _dimension_table(data)
+    out += _hourly_table(data)
 
     # 缺失明细
     if not data["missing"] and data.get("failed_sources"):
@@ -231,40 +256,38 @@ def render(data: dict) -> str:
             f"{k}×{v}" for k, v in sorted(data["not_applicable"].items(), key=lambda x: -x[1])), ""]
 
     # 耗时
-    # 列名不写"环比"：会计意义的环比是"与上一期相比"（上月、上季），而这里是
-    # **同一个窗口内后半段对前半段**，不是两个周期。用错词会让人以为在跟昨天比。
     staged = [(name, e) for name, e in data["latency"].items() if e["stats"]]
     if not staged:
         # 一行数据都没有时别画个空表。只有表头的表比不画更糟——读者会以为渲染坏了。
         out += ["## 耗时", "", "窗口内没有取数记录。"]
     else:
         out += ["## 耗时", "",
-                "| 阶段 | 次数 | 平均 | p50 | p90 | p95 | 最大 | 后半 vs 前半 |",
+                "| 阶段 | 次数 | 平均 | p50 | p90 | p95 | 最大 | 本小时 vs 上一小时 |",
                 "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
     for name, entry in staged:
         stats, trend = entry["stats"], entry["trend"]
         if trend is None:
-            change = "样本不足"
+            change = "—"
         elif trend["change_pct"] is None:
             change = "基线太小"
         else:
             mark = " ⚠️" if trend["change_pct"] > TREND_WARN_PCT else ""
             change = f"{trend['change_pct']:+.0f}%{mark}"
+            if trend["cross_phase"]:
+                change += "（跨时段）"
         out.append(f"| {name} | {stats['n']} | {_sec(stats['avg'])} | {_sec(stats['p50'])} "
                    f"| {_sec(stats['p90'])} | {_sec(stats['p95'])} | **{_sec(stats['max'])}** "
                    f"| {change} |")
     trends = [e["trend"] for e in data["latency"].values() if e["trend"]]
     if trends:
-        # 不能拿某一个阶段的区间当整列的说明：**每个阶段各按自己的样本时间对半**，
-        # 样本跨度不同（资金流页面只在盘中跑）区间就不同。所以只说规则，区间给范围。
-        epochs = sorted({t["epoch"] for t in trends if t["epoch"]})
-        mids = sorted(t["mid"][11:] for t in trends)
-        span = mids[0] if mids[0] == mids[-1] else f"{mids[0]} ~ {mids[-1]}"
-        out += ["", f"> **不是会计意义的环比**：拿的是同一个窗口里后半段的 p90 比前半段的 p90，"
-                    f"不是跟上一天或上一个小时比。每个阶段按**自己的样本时间**对半，"
-                    f"所以切分点各不相同（本次落在 {span}）。"
-                    + (f"只在同一纪元内比（{'、'.join(epochs)}）——" if epochs else "")
-                    + "盘中和收盘后走的不是一条路，跨纪元的涨跌是假的。"]
+        hour, previous = trends[0]["hour"][11:], trends[0]["previous"][11:]
+        note = (f"> 最后一列 = **{hour}:00 这一小时的 p90 比 {previous}:00 那一小时**。"
+                f"两个小时各自的样本都得够 {MIN_HOUR_SAMPLES} 次才给这个数，"
+                f"不够就写「—」；上一小时一次调用都没有也不比。")
+        if any(t["cross_phase"] for t in trends):
+            note += ("标了「跨时段」的那几行，两个小时分属盘中和收盘后——"
+                     "两边走的不是一条路，那个涨跌多半是换了时段而不是变慢了。")
+        out += ["", note]
     out.append("")
 
     # 最慢的几次

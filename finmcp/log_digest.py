@@ -77,20 +77,14 @@ STAGES = {
 }
 
 
-#: 判趋势时**每一半**要的最小样本量。低于它只报当前值，不报涨跌——十来个样本的
-#: p95 是噪音，把噪音说成"性能下降"比不说更糟。
-MIN_TREND_SAMPLES = 30
+#: 逐小时比 p90 时，**每个小时**要的最小样本量。低于它只报当前值，不报涨跌：
+#: 样本少于十来个时 p90 基本就是最大值，拿两个最大值比涨跌是在比噪音。
+#: 按小时分桶之后这个门槛不能沿用"窗口对半"时代的 30——低频服务一小时不见得有
+#: 三十次调用，那样每一行都会写"样本不足"，等于这一列不存在。
+MIN_HOUR_SAMPLES = 10
 #: 基线 p90 低于这个数就不给百分比。多数是缓存命中的阶段 p90 本来就接近 0，
 #: 除出来的 ±100% 没有意义。
 _TREND_MIN_P90 = 0.5
-
-
-def _mid_stamp(start: str, end: str) -> str:
-    """两个时刻的中点，仍然是字符串（日志行按字符串比大小就够）。"""
-    fmt = "%Y-%m-%d %H:%M:%S"
-    a = dt.datetime.strptime(start, fmt)
-    b = dt.datetime.strptime(end, fmt)
-    return (a + (b - a) / 2).strftime(fmt)
 
 
 @dataclass
@@ -115,49 +109,60 @@ class Series:
     def stats(self) -> Optional[dict]:
         return self._stats([v for _, v in self.values])
 
+    def by_hour(self) -> dict:
+        """按整点小时分桶，键是 ``YYYY-MM-DD HH``。"""
+        buckets: dict = defaultdict(list)
+        for stamp, value in self.values:
+            buckets[stamp[:13]].append(value)
+        return buckets
+
     def trend(self, epoch_of=None) -> Optional[dict]:
-        """**同一个纪元内**后半段 vs 前半段。
+        """**本小时 vs 上一个小时**，比的是 p90。
 
-        必须限定在一个纪元里。踩过：一份 10:08→20:11 的日志跨了盘中、收盘、傍晚
-        三个时段，直接对半分算出来 +98% ~ +787%，看着像性能崩了，其实只是换了运行
-        时段——盘中资金流走缓存和页面，收盘后重新取数，两者本来就不是一回事。
-        跨时段的基线不可比，比出来的涨跌是假的。
+        用整点小时分桶，因为小时边界是绝对的：读者不用问"切分点在哪"，换个查询窗口
+        同一份数据也算得出同一个数。
 
-        按**时间中点**对半，两边都要过 MIN_TREND_SAMPLES 才给结论。
+        原先是"窗口对半分"，那个设计有两处站不住：切分点取决于日志跨度，每个阶段
+        各按自己的样本时间算，同一列里其实是七个不同的切分点；改一下 ``since``
+        同一批数据就能得出不同的涨跌。也踩过更糟的两版——按样本数对半（密集采样那
+        一段缓存全热、天然快，算出 +251% 的假性能下降），和跨市场时段直接对半
+        （+98% ~ +787%，其实只是盘中和收盘后走的不是一条路）。
 
-        按样本数对半是错的，也踩过：一份日志里 10:10–10:38 有一段密集采样、之后是
-        稀疏的正常调用，对半分出来基线 26 分钟、当前 4 小时 46 分，跨度差 11 倍。
-        那段密集调用缓存全热、天然快，于是算出 +251% 的"性能下降"——纯粹是采样
-        密度的假象。性能变化要比的是同样长的两段时间。
+        ``上一个小时``取的是**相邻**的那个整点。中间那小时没有调用就不比——拿两小时
+        前的数当"上一小时"是在编。
 
-        p90 太小时不给百分比：财务取数多数是缓存命中、p90 本来就是 0，除出来的
-        ±100% 没有意义。
+        两个小时都要够 ``MIN_HOUR_SAMPLES``：样本少于它时 p90 基本就是最大值，
+        拿两个最大值比涨跌是在比噪音。
+
+        ``epoch_of`` 只用来**标注**，不再用来拒绝比较：小时边界和市场时段边界不重合
+        （15:00 那一桶前半是盘中、后半是收盘整理），按纪元筛桶会把桶自己切碎。跨了
+        时段的比较照样给数，但标出来，让读者知道那个涨跌可能只是换了时段。
         """
-        values, epoch = self.values, None
-        if epoch_of is not None and values:
-            # 取**最近的、样本够的**那个纪元。直接取最新样本所在的纪元不行：傍晚那一档
-            # 常常只有零星几次调用，会把所有阶段的趋势一起判成"样本不足"，而盘中那一
-            # 大段明明够。
-            grouped: dict = {}
-            for stamp, value in values:
-                grouped.setdefault(epoch_of(stamp), []).append((stamp, value))
-            usable = [(max(v)[0], k, v) for k, v in grouped.items()
-                      if len(v) >= MIN_TREND_SAMPLES * 2]
-            if not usable:
-                return None
-            _, epoch, values = max(usable)
-        if len(values) < MIN_TREND_SAMPLES * 2:
+        buckets = self.by_hour()
+        if len(buckets) < 2:
             return None
-        ordered = sorted(values)
-        start, end = ordered[0][0], ordered[-1][0]
-        midpoint = _mid_stamp(start, end)
-        early = [v for t, v in ordered if t < midpoint]
-        late = [v for t, v in ordered if t >= midpoint]
-        if min(len(early), len(late)) < MIN_TREND_SAMPLES:
+        hour = max(buckets)
+        previous = (dt.datetime.strptime(hour, "%Y-%m-%d %H")
+                    - dt.timedelta(hours=1)).strftime("%Y-%m-%d %H")
+        if previous not in buckets:
             return None
-        before, after = self._stats(early), self._stats(late)
-        result = {"baseline": before, "current": after, "epoch": epoch,
-                  "from": start, "mid": midpoint, "to": end, "change_pct": None}
+        current, baseline = buckets[hour], buckets[previous]
+        if min(len(current), len(baseline)) < MIN_HOUR_SAMPLES:
+            return None
+        after, before = self._stats(current), self._stats(baseline)
+        epochs = None
+        if epoch_of is not None:
+            # 每桶取一个代表时刻问纪元就够了：只是为了标注跨没跨时段。
+            ordered = sorted(self.values)
+            pick = {h: next(t for t, _ in ordered if t.startswith(h))
+                    for h in (previous, hour)}
+            epochs = (epoch_of(pick[previous]), epoch_of(pick[hour]))
+        result = {"baseline": before, "current": after,
+                  "hour": hour, "previous": previous, "change_pct": None,
+                  "cross_phase": bool(epochs and epochs[0] != epochs[1]),
+                  "epochs": epochs}
+        # 基线 p90 太小时不给百分比：财务取数多数是缓存命中、p90 本来就是 0，
+        # 除出来的 ±100% 没有意义。
         if before["p90"] >= _TREND_MIN_P90:
             result["change_pct"] = (after["p90"] - before["p90"]) / before["p90"] * 100
         return result
@@ -358,6 +363,9 @@ def digest(log_file: str, *, since: str = "startup", symbol: str = "",
         "not_applicable": dict(not_applicable_counter),
         # 每一维单独的"拿到 / 该拿到"。降级算没拿到——问的是返回了数据没有，
         # 一个写着"暂无…"的空段落，对使用者和整段消失是一回事。
+        # 逐小时可用率。总数只回答"缺不缺"，逐小时回答"什么时候开始缺的"——
+        # 一段时间前坏过、现在已经好了，和正在坏，要采取的行动完全不同。
+        "hours": _by_hour(symbols),
         "dimensions": [
             {"dimension": name, "source": dim_source.get(name, "-"),
              "expected": count,
@@ -396,6 +404,32 @@ def _latency(batches: Series, per_symbol: Series, stages: dict, pages: Series) -
     series["资金流页面"] = pages
     return {name: {"stats": s.stats(), "trend": s.trend(_epoch_of)}
             for name, s in series.items()}
+
+
+def _by_hour(symbols: list) -> list:
+    """按整点小时汇总可用率，新的排前面。
+
+    只算带 ``present=`` 的行：老日志不知道它缺了什么，按"零缺失"计入会把某个小时
+    抬成满分。那种情况整节留空，由"说明"里讲清楚。
+    """
+    buckets: dict = {}
+    for item in symbols:
+        if not item.get("expected"):
+            continue
+        row = buckets.setdefault(item["at"][:13], {
+            "hour": item["at"][:13], "symbols": 0, "expected": 0, "present": 0,
+            "missing": Counter()})
+        row["symbols"] += 1
+        row["expected"] += item["expected"]
+        row["present"] += item["present"]
+        for name in item.get("missing") or ():
+            row["missing"][name] += 1
+    out = []
+    for row in sorted(buckets.values(), key=lambda r: r["hour"], reverse=True):
+        row["rate"] = row["present"] / row["expected"] if row["expected"] else None
+        row["missing"] = dict(row["missing"].most_common())
+        out.append(row)
+    return out
 
 
 def _availability(symbols: list, inferred_sources: Counter) -> dict:
