@@ -191,16 +191,39 @@ def _hourly_table(data: dict) -> list:
 
 
 def _headline(data: dict) -> list:
-    """标题 + 结论 + 一行 KPI + 元信息。
+    """标题 → 元信息 → 结论 → 一行 KPI。
 
     可用率上标题：它是这份报告的那个数，读者扫第一行就该看到，而不是往下找一节。
+
+    元信息（版本、指纹、读了哪些文件）紧跟标题：它是这份报告的**出处**，底下每个数
+    都只在这个前提下成立。曾经把它放到 KPI 表下面当脚注，那要读者读完数再回头确认
+    前提——顺序反了。
+
     结论用粗体行不用小标题——`## ⚠️ 资金流向缺了 2 次` 当标题读起来像备注，
-    小标题该是"结论""耗时"这种section名，不是内容本身。
-    元信息（版本、指纹、读了哪些文件）放表下面：它是备注，不是要扫的数。
+    小标题该是"各维度可用率""耗时"这种 section 名，不是内容本身。
     """
     window, availability = data["window"], data["availability"]
     rate = availability.get("rate")
     out = [f"# 服务健康　可用率 {_pct(rate)}", ""]
+
+    # 元信息紧跟标题：它是这份报告的出处——哪个版本、哪份指纹、读了哪些文件。
+    # 底下每个数都只在这个前提下成立，所以先交代，再给结论和数。
+    # 它不是 KPI 表的脚注（"备注在表下"那条说的是一节里的表和它的说明），
+    # 放到表下面反而要读者读完数再回头确认前提。
+    meta = [f"版本 {window.get('version') or '—'}"]
+    if window.get("fingerprint"):
+        meta.append(f"渲染指纹 {window['fingerprint']}")
+    if window.get("restarts"):
+        meta.append(f"窗口内重启 {window['restarts']} 次")
+    # 只写文件名，不写路径：这份报告会发给 MCP 调用方，绝对路径会把服务器的目录结构
+    # 一起带出去。读没读错文件由下面那个时间窗露出来——读到过期或别的实例的日志，
+    # 窗口的结束时刻就对不上刚才那次调用。
+    if window.get("name"):
+        archives = max(0, len(window.get("files") or []) - 1)
+        source = window["name"] + (f" + {archives} 份归档" if archives else
+                                   "（未计归档）" if window.get("archived") is False else "")
+        meta.append(f"数据来自 {source}")
+    out += [" · ".join(meta), ""]
 
     icon, summary = _verdict(data)
     out += [f"**{icon} {summary}**", ""]
@@ -233,20 +256,7 @@ def _headline(data: dict) -> list:
         "",
     ]
 
-    meta = [f"版本 {window.get('version') or '—'}"]
-    if window.get("fingerprint"):
-        meta.append(f"渲染指纹 {window['fingerprint']}")
-    if window.get("restarts"):
-        meta.append(f"窗口内重启 {window['restarts']} 次")
-    # 只写文件名，不写路径：这份报告会发给 MCP 调用方，绝对路径会把服务器的目录结构
-    # 一起带出去。读没读错文件由上面那个时间窗露出来——读到过期或别的实例的日志，
-    # 窗口的结束时刻就对不上刚才那次调用。
-    if window.get("name"):
-        archives = max(0, len(window.get("files") or []) - 1)
-        source = window["name"] + (f" + {archives} 份归档" if archives else
-                                   "（未计归档）" if window.get("archived") is False else "")
-        meta.append(f"数据来自 {source}")
-    return out + ["> " + " · ".join(meta), ""]
+    return out
 
 
 def _missing_section(data: dict) -> list:

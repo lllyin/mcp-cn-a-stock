@@ -305,6 +305,11 @@ def test_hours_without_measured_fields_are_left_out(tmp_path):
 # --- 结论 --------------------------------------------------------------------
 
 
+def _verdict_line(report: str) -> str:
+    """结论那一行。按特征找，不按行号——行号会随排版调整而漂。"""
+    return next(l for l in report.splitlines() if l.startswith("**") and l.endswith("**"))
+
+
 def _kpi_row(report: str) -> str:
     """抬头那张 KPI 表的数据行。"""
     lines = report.splitlines()
@@ -832,8 +837,8 @@ def test_section_headings_are_section_names_not_content(tmp_path):
     report = health_report.render(log_digest.digest(log))
     assert not any(("⚠️" in s or "✅" in s or "❌" in s or "❓" in s) for s in _sections(report)), \
         _sections(report)
-    verdict = report.splitlines()[2]
-    assert verdict.startswith("**⚠️ ") and verdict.endswith("**"), verdict
+    verdict = _verdict_line(report)
+    assert verdict.startswith("**⚠️ "), verdict
     assert "资金流向缺了 1 次" in verdict
     assert verdict.count("94.1%") == 0, "标题里已经有这个数了，别再说一遍"
 
@@ -886,3 +891,21 @@ def test_the_window_edges_do_not_depend_on_line_order(tmp_path):
     window = log_digest.digest(log)["window"]
     assert window["from"].endswith("12:00:00")
     assert window["to"].endswith("15:00:00"), window["to"]
+
+
+def test_the_provenance_line_comes_right_after_the_title(tmp_path):
+    """版本 / 指纹 / 读了哪些文件是这份报告的**出处**，紧跟标题。
+
+    底下每个数都只在这个前提下成立。曾经把它放到 KPI 表下面当脚注，那要读者读完数
+    再回头确认前提——顺序反了。
+    """
+    log = _write(tmp_path, [
+        _symbol_line("10:00:01", "SZ000333", 2.0, present=17, expected_n=17),
+    ])
+    lines = health_report.render(log_digest.digest(log)).splitlines()
+    assert lines[0].startswith("# 服务健康")
+    assert lines[2].startswith("版本 "), lines[:5]
+    assert "数据来自 cn-stock-mcp.log" in lines[2]
+    # 结论和 KPI 表都排在它后面
+    assert lines.index(_verdict_line("\n".join(lines))) > 2
+    assert "版本 " not in "\n".join(lines[3:]), "元信息只该出现一次"
