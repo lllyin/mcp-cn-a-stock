@@ -266,7 +266,9 @@ def _data(**over):
     # ❓，测不到真正的阈值。
     base = {"window": {"from": "a", "to": "b", "version": "2.0.0",
                        "files": ["cn-stock-mcp.log"], "path": "/x/cn-stock-mcp.log"},
-            "symbols": [{"symbol": "SZ000333"}],
+            # 字段要跟真实 digest 一致：渲染"最慢的几次"会读 total 和 at
+            "symbols": [{"symbol": "SZ000333", "tool": "brief", "at": "2026-09-09 10:00:01",
+                         "total": 1.1, "present": 17, "expected": 17, "missing": []}],
             "availability": {"rate": 1.0, "expected": 10, "present": 10,
                              "method": "measured"},
             "missing": [], "degraded": {}, "failed_sources": {},
@@ -489,3 +491,132 @@ def test_an_unreadable_log_reports_the_name_not_the_path(tmp_path):
     _, why = health_report._verdict(log_digest.digest(str(tmp_path / "deep" / "nope.log")))
     assert "nope.log" in why and "LOG_FILE" in why
     assert str(tmp_path) not in why
+
+
+# --- 结论的优先级：按对数据的影响排 -------------------------------------------
+
+
+def test_a_silent_caliber_change_reaches_the_verdict():
+    """口径变了要上结论。
+
+    数据还在、可用率照样满分，但同一个字段换了含义——报告上看不出来，比"取不到"
+    更难发现。踩过：一次 1572/1572 全绿的运行，头条写的是"fund_flow 源失败 38 次"
+    （兜底已补齐），而"指数 K 线换源、成交量口径变了 16 次"只出现在最底下的事件表里。
+    """
+    icon, why = health_report._verdict(_data(events={"caliber_change": {"count": 16}}))
+    assert icon == "⚠️" and "口径" in why
+
+
+def test_a_covered_source_failure_ranks_behind_the_caliber_change():
+    icon, why = health_report._verdict(_data(
+        events={"caliber_change": {"count": 16}}, failed_sources={"fund_flow": 38}))
+    assert why.index("口径") < why.index("fund_flow"), why
+    assert "兜底" in why, "没说清数据其实是齐的"
+
+
+def test_a_crash_is_stated_before_the_softer_problems():
+    """最重的排最前。读者只看第一句时，那一句得是最要紧的。"""
+    _, why = health_report._verdict(_data(
+        events={"session_crash": {"count": 1}, "caliber_change": {"count": 3}},
+        availability={"rate": 0.9, "method": "measured"}))
+    assert why.startswith("会话崩溃"), why
+
+
+def test_a_covered_source_failure_is_not_reported_as_missing_data():
+    """维度一处不缺时，"缺失最多"那一格该写"无"。
+
+    原先的条件是"没有缺失就退回源级"，于是一次全绿的运行在这一格写着
+    "fund_flow（源）38 次"，而那 38 次已经被兜底补上了——同一份报告里
+    可用率 100%、缺失 38 次，自相矛盾。
+    """
+    report = health_report.render(_data(failed_sources={"fund_flow": 38}))
+    kpi = [l for l in report.splitlines() if l.startswith("| **")][0]
+    assert "| 无 " in kpi, kpi
+    assert "38" not in kpi
+
+
+def test_an_old_log_still_falls_back_to_source_level():
+    """没有维度级明细时退回源级——那时写"无"才是撒谎。"""
+    report = health_report.render(_data(
+        availability={"rate": None, "method": "inferred"},
+        failed_sources={"fund_flow": 38}))
+    kpi = [l for l in report.splitlines() if l.startswith("| **")][0]
+    assert "fund_flow（源） 38 次" in kpi, kpi
+
+
+# --- 大屏：先给问题 ----------------------------------------------------------
+
+
+def test_all_green_dimensions_collapse_to_one_line(tmp_path):
+    """二十行 100% 会把有问题的那行挤到屏幕外，而大屏的用处就是一眼看到问题。"""
+    log = _write(tmp_path, [
+        _symbol_line("10:00:01", "SZ000333", 2.0, present=17, expected_n=17),
+    ])
+    report = health_report.render(log_digest.digest(log))
+    assert "维全部拿到" in report
+    assert "| 价格 | kline |" not in report          # 满分的不单独占行
+    assert "该有" in report                          # 分母范围还在，"有没有缺"照样答得上
+
+
+def test_a_failing_dimension_still_gets_its_own_row(tmp_path):
+    """别把上面那条修成"一律折叠"——有问题的必须单独成行，带上标的。"""
+    log = _write(tmp_path, [
+        _symbol_line("10:00:01", "SZ000333", 2.0, present=17, expected_n=17),
+        _symbol_line("10:00:02", "SH512480", 2.0, present=8, expected_n=9, missing="资金流向"),
+    ])
+    report = health_report.render(log_digest.digest(log))
+    row = [l for l in report.splitlines() if l.startswith("| 资金流向 |")]
+    assert row and "SH512480" in row[0], report
+    header = [l for l in report.splitlines() if l.startswith("| 维度 |")][0]
+    assert len(row[0].strip("|").split("|")) == len(header.strip("|").split("|"))
+
+
+def test_the_trend_footnote_does_not_claim_one_window_for_every_stage(tmp_path):
+    """每个阶段按自己的样本时间对半，切分点本来就不同。
+
+    拿某一个阶段的区间当整列的说明就是在撒谎——资金流页面只在盘中跑，它的跨度和
+    K 线取数不是一回事。
+    """
+    lines = []
+    for i in range(80):
+        t = f"{10 + i // 60:02d}:{i % 60:02d}:00"
+        lines.append(_line(t, "Data task _fetch_kline_sync request_id=r tool=brief "
+                              f"symbol=SZ000333 admission=0.0s queue=0.0s service=1.0s"))
+        lines.append(_line(t, "Data task _fetch_finance_sync request_id=r tool=full "
+                              f"symbol=SZ000333 admission=0.0s queue=0.0s service=2.0s"))
+    report = health_report.render(log_digest.digest(_write(tmp_path, lines)))
+    assert "不是会计意义的环比" in report
+    assert "自己的样本时间" in report
+    assert "环比 |" not in report        # 列名也不许再叫环比
+
+
+def test_no_latency_rows_means_no_table_at_all(tmp_path):
+    """一行数据都没有时别画个空表——只有表头的表读者会以为渲染坏了。"""
+    log = _write(tmp_path, [_line("10:00:00", "cn-stock-mcp version=2.0.0")])
+    report = health_report.render(log_digest.digest(log))
+    assert "窗口内没有取数记录" in report
+    assert "| 阶段 | 次数 |" not in report
+
+
+def test_no_calls_at_all_does_not_claim_the_rate_was_inferred(tmp_path):
+    """一次调用都没有时 method 也是 inferred，但那时说"按上游失败推算"是无稽之谈。"""
+    log = _write(tmp_path, [_line("10:00:00", "cn-stock-mcp version=2.0.0")])
+    report = health_report.render(log_digest.digest(log))
+    assert "推算" not in report
+    assert "没有报告类调用" in report
+
+
+def test_a_clean_run_with_source_switches_does_not_claim_everything_is_normal():
+    """数据齐、没变口径，但期间换过源——写"一切正常"和下面的事件表自相矛盾。
+
+    也不能升成 ⚠️：网关关闭时浏览器兜底是稳态，天天亮黄灯的告警等于没有告警。
+    """
+    icon, why = health_report._verdict(_data(events={
+        "impersonate_cooldown": {"count": 1}, "source_breaker_open": {"count": 1}}))
+    assert icon == "✅"
+    assert "换过 2 次源" in why and "一切正常" not in why
+
+
+def test_a_genuinely_clean_run_still_says_everything_is_normal():
+    """别把上面那条修成"永远不说正常"。"""
+    assert health_report._verdict(_data())[1] == "一切正常"

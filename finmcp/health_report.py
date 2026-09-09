@@ -44,37 +44,60 @@ def _verdict(data: dict) -> tuple:
     if not (data["symbols"] or data["events"] or data["failed_sources"] or any_latency):
         return "❓", "窗口内没有任何调用记录，没有可判断的依据"
 
-    problems, worst = [], "ok"
+    # 按**对数据的影响**从重到轻排，不按代码顺序。踩过：一次数据 100% 完整的运行，
+    # 头条写的是"fund_flow 源失败 38 次"（兜底已经补上了），而同一份报告里
+    # "指数 K 线换源、成交量口径变了 16 次"只出现在最底下的事件表里——真正让数字
+    # 变了意思的那个被埋了，被兜住的那个上了头条。
+    problems: list = []
+    events, measured = data["events"], data["availability"].get("method") == "measured"
+
+    if (crashes := events.get("session_crash", {}).get("count")):
+        problems.append(("bad", f"会话崩溃 {crashes} 次"))
+
     rate = (data["availability"] or {}).get("rate")
     if rate is not None and rate < AVAILABILITY_BAD:
-        worst, _ = "bad", problems.append(f"可用率只有 {_pct(rate)}")
+        problems.append(("bad", f"可用率只有 {_pct(rate)}"))
     elif rate is not None and rate < AVAILABILITY_WARN:
-        worst, _ = "warn", problems.append(f"可用率 {_pct(rate)}")
+        problems.append(("warn", f"可用率 {_pct(rate)}"))
+
     if data["missing"]:
         top = data["missing"][0]
-        worst = "bad" if worst == "bad" else "warn"
-        problems.append(f"{top['dimension']}缺了 {top['count']} 次")
-    elif data.get("failed_sources"):
-        source, count = max(data["failed_sources"].items(), key=lambda x: x[1])
-        worst = "bad" if worst == "bad" else "warn"
-        problems.append(f"{source} 源失败 {count} 次")
-    if data["events"].get("session_crash", {}).get("count"):
-        worst = "bad"
-        problems.append(f"会话崩溃 {data['events']['session_crash']['count']} 次")
+        problems.append(("warn", f"{top['dimension']}缺了 {top['count']} 次"))
+
+    # 口径变了要进结论。数据还在、可用率照样满分，但同一个字段换了含义——按 §一
+    # 这比"取不到"更难发现，因为报告上看不出来。
+    if (caliber := events.get("caliber_change", {}).get("count")):
+        problems.append(("warn", f"指数 K 线换源 {caliber} 次，成交量口径变了"))
+
     for name, entry in data["latency"].items():
-        stats, trend = entry["stats"], entry["trend"]
-        if stats and stats["max"] > SLOW_SECONDS:
-            worst = "bad" if worst == "bad" else "warn"
-            problems.append(f"{name}最慢 {stats['max']:.0f}s")
+        if entry["stats"] and entry["stats"]["max"] > SLOW_SECONDS:
+            problems.append(("warn", f"{name}最慢 {entry['stats']['max']:.0f}s"))
             break
     for name, entry in data["latency"].items():
         change = (entry["trend"] or {}).get("change_pct")
         if change is not None and change > TREND_WARN_PCT:
-            worst = "bad" if worst == "bad" else "warn"
-            problems.append(f"{name} p90 环比 {change:+.0f}%")
+            problems.append(("warn", f"{name} p90 后半段 {change:+.0f}%"))
             break
-    icon = {"ok": "✅", "warn": "⚠️", "bad": "❌"}[worst]
-    return icon, ("；".join(problems) if problems else "一切正常")
+
+    # 源失败排最后，而且要说清楚兜住了没有。维度齐全时它是"值得看"，不是"出事了"。
+    if data.get("failed_sources"):
+        source, count = max(data["failed_sources"].items(), key=lambda x: x[1])
+        covered = measured and not data["missing"]
+        problems.append(("warn", f"{source} 源失败 {count} 次"
+                                 + ("（数据已由兜底补齐）" if covered else "")))
+
+    if problems:
+        icon = "❌" if any(p[0] == "bad" for p in problems) else "⚠️"
+        return icon, "；".join(text for _, text in problems)
+
+    # 数据齐、也没变口径，但期间换过源就不该写"一切正常"——下面事件表里明明列着
+    # 通道冷却和熔断，两句并排看是自相矛盾。也不能升成 ⚠️：网关关闭时浏览器兜底
+    # 是稳态，天天亮黄灯的告警等于没有告警。所以留 ✅，把次数说出来。
+    switches = sum(events.get(name, {}).get("count", 0)
+                   for name in ("impersonate_cooldown", "source_breaker_open"))
+    if switches:
+        return "✅", f"数据完整；期间换过 {switches} 次源，都兜住了（见事件）"
+    return "✅", "一切正常"
 
 
 def _dimension_table(data: dict) -> list:
@@ -95,19 +118,33 @@ def _dimension_table(data: dict) -> list:
         return []
     out = ["## 各维度可用率", "",
            "分母是**这些调用本该有这一维几次**，不是调用了几次：brief 不要求历史资金流向、"
-           "ETF 没有财务报表，那些不进分母。段落在但写着「暂无…」算没拿到。", "",
-           "| 维度 | 上游源 | 该有 | 拿到 | 缺失 | 降级 | 可用率 | 涉及标的 |",
-           "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |"]
-    # 差的排前面：大屏先给问题，同率的按维度名排，免得同一份日志两次跑出不同顺序。
-    for row in sorted(rows, key=lambda r: (r["rate"], r["dimension"])):
-        symbols = "、".join(row["symbols"][:4]) or "—"
-        if len(row["symbols"]) > 4:
-            symbols += f" 等 {len(row['symbols'])} 个"
-        rate = _pct(row["rate"])
-        out.append(f"| {row['dimension']} | {row['source']} | {row['expected']} | "
-                   f"{row['got']} | {row['missing'] or '—'} | {row['degraded'] or '—'} | "
-                   f"{'**' + rate + '**' if row['rate'] < 1 else rate} | {symbols} |")
-    return out + [""]
+           "ETF 没有财务报表，那些不进分母。段落在但写着「暂无…」算没拿到。", ""]
+
+    # 满分的那些只给一行汇总。二十行 100% 会把真正有问题的那一行挤到屏幕外，而大屏
+    # 的用处就是**一眼看到问题**。汇总里保留分母范围和按源的分布，"有没有缺"这个
+    # 问题照样答得上。
+    bad = sorted((r for r in rows if r["rate"] < 1), key=lambda r: (r["rate"], r["dimension"]))
+    good = [r for r in rows if r["rate"] >= 1]
+    if bad:
+        out += ["| 维度 | 上游源 | 该有 | 拿到 | 缺失 | 降级 | 可用率 | 涉及标的 |",
+                "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |"]
+        for row in bad:
+            symbols = "、".join(row["symbols"][:4]) or "—"
+            if len(row["symbols"]) > 4:
+                symbols += f" 等 {len(row['symbols'])} 个"
+            out.append(f"| {row['dimension']} | {row['source']} | {row['expected']} "
+                       f"| {row['got']} | {row['missing'] or '—'} | {row['degraded'] or '—'} "
+                       f"| **{_pct(row['rate'])}** | {symbols} |")
+        out.append("")
+    if good:
+        by_source: dict = {}
+        for row in good:
+            by_source.setdefault(row["source"], []).append(row["dimension"])
+        spread = sorted(r["expected"] for r in good)
+        span = f"{spread[0]}" if spread[0] == spread[-1] else f"{spread[0]}–{spread[-1]}"
+        detail = "、".join(f"{src} {len(names)} 维" for src, names in sorted(by_source.items()))
+        out += [f"**{len(good)} 维全部拿到**（各该有 {span} 次）：{detail}", ""]
+    return out
 
 
 def render(data: dict) -> str:
@@ -134,9 +171,12 @@ def render(data: dict) -> str:
     slowest = max((e["stats"]["max"], name) for name, e in data["latency"].items()
                   if e["stats"]) if any(e["stats"] for e in data["latency"].values()) else None
     top_missing = data["missing"][0] if data["missing"] else None
-    # 没有维度级明细时（旧日志缺 present= 字段），退回源级——显示"无"是在撒谎，
-    # 那 201 次失败是真实存在的。
-    if not top_missing and data.get("failed_sources"):
+    # 只在**没有维度级明细时**（旧日志缺 present= 字段）退回源级，那时显示"无"是在
+    # 撒谎。有维度级数据而且一处不缺，就该写"无"——原先的条件是"没有缺失就退回源级"，
+    # 于是一次 1572/1572 全绿的运行在这一格写着"fund_flow（源）38 次"，
+    # 而那 38 次已经被兜底补上了。
+    if not top_missing and data["availability"].get("method") != "measured" \
+            and data.get("failed_sources"):
         source, count = max(data["failed_sources"].items(), key=lambda x: x[1])
         top_missing = {"dimension": f"{source}（源）", "count": count}
     out += [
@@ -191,13 +231,18 @@ def render(data: dict) -> str:
             f"{k}×{v}" for k, v in sorted(data["not_applicable"].items(), key=lambda x: -x[1])), ""]
 
     # 耗时
-    out += ["## 耗时", "",
-            "| 阶段 | 次数 | 平均 | p50 | p90 | p95 | 最大 | 环比 |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
-    for name, entry in data["latency"].items():
+    # 列名不写"环比"：会计意义的环比是"与上一期相比"（上月、上季），而这里是
+    # **同一个窗口内后半段对前半段**，不是两个周期。用错词会让人以为在跟昨天比。
+    staged = [(name, e) for name, e in data["latency"].items() if e["stats"]]
+    if not staged:
+        # 一行数据都没有时别画个空表。只有表头的表比不画更糟——读者会以为渲染坏了。
+        out += ["## 耗时", "", "窗口内没有取数记录。"]
+    else:
+        out += ["## 耗时", "",
+                "| 阶段 | 次数 | 平均 | p50 | p90 | p95 | 最大 | 后半 vs 前半 |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    for name, entry in staged:
         stats, trend = entry["stats"], entry["trend"]
-        if not stats:
-            continue
         if trend is None:
             change = "样本不足"
         elif trend["change_pct"] is None:
@@ -208,12 +253,18 @@ def render(data: dict) -> str:
         out.append(f"| {name} | {stats['n']} | {_sec(stats['avg'])} | {_sec(stats['p50'])} "
                    f"| {_sec(stats['p90'])} | {_sec(stats['p95'])} | **{_sec(stats['max'])}** "
                    f"| {change} |")
-    trended = next((e["trend"] for e in data["latency"].values() if e["trend"]), None)
-    if trended:
-        out += ["", f"> 环比 = 同一纪元（{trended['epoch']}）内按时间对半，"
-                    f"{trended['from'][11:]}→{trended['mid'][11:]} 对 "
-                    f"{trended['mid'][11:]}→{trended['to'][11:]}，比的是 p90。"
-                    f"跨纪元不比——盘中和收盘后本来就不是一回事。"]
+    trends = [e["trend"] for e in data["latency"].values() if e["trend"]]
+    if trends:
+        # 不能拿某一个阶段的区间当整列的说明：**每个阶段各按自己的样本时间对半**，
+        # 样本跨度不同（资金流页面只在盘中跑）区间就不同。所以只说规则，区间给范围。
+        epochs = sorted({t["epoch"] for t in trends if t["epoch"]})
+        mids = sorted(t["mid"][11:] for t in trends)
+        span = mids[0] if mids[0] == mids[-1] else f"{mids[0]} ~ {mids[-1]}"
+        out += ["", f"> **不是会计意义的环比**：拿的是同一个窗口里后半段的 p90 比前半段的 p90，"
+                    f"不是跟上一天或上一个小时比。每个阶段按**自己的样本时间**对半，"
+                    f"所以切分点各不相同（本次落在 {span}）。"
+                    + (f"只在同一纪元内比（{'、'.join(epochs)}）——" if epochs else "")
+                    + "盘中和收盘后走的不是一条路，跨纪元的涨跌是假的。"]
     out.append("")
 
     # 最慢的几次
@@ -242,7 +293,9 @@ def render(data: dict) -> str:
 
     # 局限：这一节不能省，读的人得知道这份数字看不见什么
     notes = []
-    if availability.get("method") == "inferred":
+    # 一次调用都没有时 method 也是 inferred，但那时说"按上游失败推算"是无稽之谈——
+    # 没有东西可推。这种情况由下面那条"窗口内没有报告类调用"讲清楚。
+    if availability.get("method") == "inferred" and data["symbols"]:
         notes.append("可用率是**按上游失败推算**的，不是实测——这份日志还没有 `present=` 字段。"
                      "源成功返回但字段为空的那一类看不见。")
     if window.get("truncated"):
