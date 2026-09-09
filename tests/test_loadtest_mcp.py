@@ -67,15 +67,23 @@ def test_closed_loop_stops_launching_at_deadline(monkeypatch):
 
 
 def test_closed_loop_staggers_worker_start(monkeypatch):
-    monkeypatch.setattr(loadtest, "CLOSED_LOOP_STAGGER_S", 0.05)
+    stagger, workers = 0.05, 3
+    monkeypatch.setattr(loadtest, "CLOSED_LOOP_STAGGER_S", stagger)
     tracker = _tracker()
+    # duration 要留足最后一个 worker 起步之后的余量：它睡到 (workers-1)*stagger 才醒，
+    # 醒来先查截止时间。余量太小时机器一卡它就直接退出，一次调用都发不出去，
+    # 断言取 started[2] 于是抛 IndexError——测试偶发挂在这里，不是被测代码的问题。
+    # 单次调用 hold 比 duration 长，保证每个 worker 只发一次，起步时刻即前三次调用。
+    duration = (workers - 1) * stagger + 0.3
     asyncio.run(
-        loadtest.run_closed_loop("u", 3, 0.15, MIX, POOL, 5.0, call=_fake_call(0.5, tracker))
+        loadtest.run_closed_loop("u", workers, duration, MIX, POOL, 5.0,
+                                 call=_fake_call(duration + 0.2, tracker))
     )
-    first_three = sorted(tracker["started"][:3])
+    started = sorted(tracker["started"])
+    assert len(started) == workers, f"只有 {len(started)} 个 worker 起了步，应该有 {workers} 个"
     # 三个 worker 错开起步，不在同一瞬间到达
-    assert first_three[1] - first_three[0] >= 0.04
-    assert first_three[2] - first_three[1] >= 0.04
+    gaps = [b - a for a, b in zip(started, started[1:])]
+    assert all(gap >= stagger * 0.8 for gap in gaps), gaps
 
 
 def test_closed_loop_follows_tool_mix(monkeypatch):
