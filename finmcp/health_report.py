@@ -54,15 +54,20 @@ def _verdict(data: dict) -> tuple:
     if (crashes := events.get("session_crash", {}).get("count")):
         problems.append(("bad", f"会话崩溃 {crashes} 次"))
 
+    # 可用率**只贡献严重程度，不重复那个数字**：它已经在标题里了。有维度缺失时那一条
+    # 就是这个数字的解释，再写一遍"可用率 94.1%；资金流向缺了 1 次"是同一件事说两遍。
     rate = (data["availability"] or {}).get("rate")
+    level = None
     if rate is not None and rate < AVAILABILITY_BAD:
-        problems.append(("bad", f"可用率只有 {_pct(rate)}"))
+        level = "bad"
     elif rate is not None and rate < AVAILABILITY_WARN:
-        problems.append(("warn", f"可用率 {_pct(rate)}"))
-
+        level = "warn"
     if data["missing"]:
         top = data["missing"][0]
-        problems.append(("warn", f"{top['dimension']}缺了 {top['count']} 次"))
+        problems.append((level or "warn", f"{top['dimension']}缺了 {top['count']} 次"))
+    elif level:
+        # 没有维度级明细来解释，那就只能报这个数本身。
+        problems.append((level, f"可用率只有 {_pct(rate)}"))
 
     # 口径变了要进结论。数据还在、可用率照样满分，但同一个字段换了含义——按 §一
     # 这比"取不到"更难发现，因为报告上看不出来。
@@ -100,51 +105,65 @@ def _verdict(data: dict) -> tuple:
     return "✅", "一切正常"
 
 
+def _window_text(window: dict) -> str:
+    """时间窗。同一天就只写一次日期,跨天两头都写全——聚合归档时会跨好几天。"""
+    start, end = window.get("from"), window.get("to")
+    if not start or not end:
+        return "—"
+    if start[:10] == end[:10]:
+        return f"{start[5:16]} → {end[11:16]}"
+    return f"{start[5:16]} → {end[5:16]}"
+
+
 def _dimension_table(data: dict) -> list:
     """每一维单独的"拿到 / 该拿到"。
 
     总可用率是一个把所有维度拌在一起的数：19 维满分、1 维全挂，加起来还有 95%，
     看着没事。要回答"资金流向到底缺不缺"，只能一维一维地看。
 
+    **每一维都列出来**，不折叠满分的那些。曾经把 100% 的行折成一句汇总，说是"大屏
+    要先给问题"，结果把这一节存在的理由弄没了——它就是给人逐维核对的。差的排前面
+    并加粗，扫一眼就知道该看哪行，不需要靠删行来达到这个效果。
+
     分母按**工具和标的类别**算，不是按调用次数：``brief`` 不要求历史资金流向、
     ETF 没有财务报表、指数没有市值——那些不进分母（见 report_contract）。
     所以同一维在不同工具下分母不同，这是对的。
-
-    降级算没拿到；钉日期查询没有"实时"资金流那种正当缺席，在 log_digest 里就已经
-    摘出分母了。
     """
     rows = data.get("dimensions") or []
     if not rows:
         return []
     out = ["## 各维度可用率", "",
-           "分母是**这些调用本该有这一维几次**，不是调用了几次：brief 不要求历史资金流向、"
-           "ETF 没有财务报表，那些不进分母。段落在但写着「暂无…」算没拿到。", ""]
+           "| 维度 | 上游源 | 该有 | 拿到 | 缺失 | 降级 | 可用率 | 涉及标的 |",
+           "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |"]
+    # 差的排前面；同率按维度名排，免得同一份日志两次跑出不同顺序。
+    for row in sorted(rows, key=lambda r: (r["rate"], r["dimension"])):
+        symbols = "、".join(row["symbols"][:4]) or "—"
+        if len(row["symbols"]) > 4:
+            symbols += f" 等 {len(row['symbols'])} 个"
+        rate = _pct(row["rate"])
+        out.append(f"| {row['dimension']} | {row['source']} | {row['expected']} "
+                   f"| {row['got']} | {row['missing'] or '—'} | {row['degraded'] or '—'} "
+                   f"| {'**' + rate + '**' if row['rate'] < 1 else rate} | {symbols} |")
 
-    # 满分的那些只给一行汇总。二十行 100% 会把真正有问题的那一行挤到屏幕外，而大屏
-    # 的用处就是**一眼看到问题**。汇总里保留分母范围和按源的分布，"有没有缺"这个
-    # 问题照样答得上。
-    bad = sorted((r for r in rows if r["rate"] < 1), key=lambda r: (r["rate"], r["dimension"]))
-    good = [r for r in rows if r["rate"] >= 1]
-    if bad:
-        out += ["| 维度 | 上游源 | 该有 | 拿到 | 缺失 | 降级 | 可用率 | 涉及标的 |",
-                "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |"]
-        for row in bad:
-            symbols = "、".join(row["symbols"][:4]) or "—"
-            if len(row["symbols"]) > 4:
-                symbols += f" 等 {len(row['symbols'])} 个"
-            out.append(f"| {row['dimension']} | {row['source']} | {row['expected']} "
-                       f"| {row['got']} | {row['missing'] or '—'} | {row['degraded'] or '—'} "
-                       f"| **{_pct(row['rate'])}** | {symbols} |")
-        out.append("")
-    if good:
-        by_source: dict = {}
-        for row in good:
-            by_source.setdefault(row["source"], []).append(row["dimension"])
-        spread = sorted(r["expected"] for r in good)
-        span = f"{spread[0]}" if spread[0] == spread[-1] else f"{spread[0]}–{spread[-1]}"
-        detail = "、".join(f"{src} {len(names)} 维" for src, names in sorted(by_source.items()))
-        out += [f"**{len(good)} 维全部拿到**（各该有 {span} 次）：{detail}", ""]
-    return out
+    # 备注一律在表下面。
+    notes = ["分母是**这些调用本该有这一维几次**，不是调用了几次：brief 不要求历史资金流向、"
+             "ETF 没有财务报表，那些不进分母。段落在但写着「暂无…」算没拿到。"]
+    if data.get("degraded"):
+        notes.append("**渲染出来但没有值**：" + "、".join(
+            f"{k}×{v}" for k, v in sorted(data["degraded"].items(), key=lambda x: -x[1])))
+    if data.get("not_applicable"):
+        # 和上面那条分开。钉日期查询没有"实时"资金流是正当缺席，写成"没有值"会让人
+        # 去查一个不存在的故障。
+        notes.append("**正当缺席（不计入分母）**：" + "、".join(
+            f"{k}×{v}" for k, v in sorted(data["not_applicable"].items(), key=lambda x: -x[1])))
+    # 备注之间垫一行 ">"：连续的 "> " 行在 Markdown 里会并成同一段，两条备注挤成
+    # 一句读不出是两件事。
+    quoted: list = []
+    for note in notes:
+        if quoted:
+            quoted.append(">")
+        quoted.append(f"> {note}")
+    return out + [""] + quoted + [""]
 
 
 def _hourly_table(data: dict) -> list:
@@ -171,33 +190,20 @@ def _hourly_table(data: dict) -> list:
     return out + [""]
 
 
-def render(data: dict) -> str:
-    """一屏 Markdown。段落顺序按"先结论、再细节"排,读者从上往下越读越细。"""
-    window, availability = data["window"], data["availability"]
-    out = ["# 服务健康　" + f"{window['from'] or '—'} → {window['to'] or '—'}", ""]
+def _headline(data: dict) -> list:
+    """标题 + 结论 + 一行 KPI + 元信息。
 
-    version = window.get("version") or "—"
-    line = f"版本 {version}"
-    if window.get("fingerprint"):
-        line += f"，渲染指纹 {window['fingerprint']}"
-    if window.get("restarts"):
-        line += f"，窗口内重启 {window['restarts']} 次"
-    # 只写文件名，不写路径：这份报告会发给 MCP 调用方，绝对路径会把服务器的目录
-    # 结构一起带出去。读没读错文件由上面那行的 from → to 时间戳露出来——读到过期
-    # 或别的实例的日志，窗口的结束时刻就对不上刚才那次调用。
-    if window.get("name"):
-        line += f"，数据来自 {window['name']}"
-    # 读了几份要说出来。窗口一下子从几分钟变成几天，读者得知道是因为把归档也算了，
-    # 而不是以为服务连着跑了三天。
-    archives = max(0, len(window.get("files") or []) - 1)
-    if archives:
-        line += f" + {archives} 份归档"
-    elif window.get("archived") is False:
-        line += "（未计归档）"
-    out += [line, ""]
+    可用率上标题：它是这份报告的那个数，读者扫第一行就该看到，而不是往下找一节。
+    结论用粗体行不用小标题——`## ⚠️ 资金流向缺了 2 次` 当标题读起来像备注，
+    小标题该是"结论""耗时"这种section名，不是内容本身。
+    元信息（版本、指纹、读了哪些文件）放表下面：它是备注，不是要扫的数。
+    """
+    window, availability = data["window"], data["availability"]
+    rate = availability.get("rate")
+    out = [f"# 服务健康　可用率 {_pct(rate)}", ""]
 
     icon, summary = _verdict(data)
-    out += [f"## {icon} {summary}", ""]
+    out += [f"**{icon} {summary}**", ""]
 
     slowest = max((e["stats"]["max"], name) for name, e in data["latency"].items()
                   if e["stats"]) if any(e["stats"] for e in data["latency"].values()) else None
@@ -206,44 +212,46 @@ def render(data: dict) -> str:
     # 撒谎。有维度级数据而且一处不缺，就该写"无"——原先的条件是"没有缺失就退回源级"，
     # 于是一次 1572/1572 全绿的运行在这一格写着"fund_flow（源）38 次"，
     # 而那 38 次已经被兜底补上了。
-    if not top_missing and data["availability"].get("method") != "measured" \
+    if not top_missing and availability.get("method") != "measured" \
             and data.get("failed_sources"):
         source, count = max(data["failed_sources"].items(), key=lambda x: x[1])
         top_missing = {"dimension": f"{source}（源）", "count": count}
+
+    if availability.get("expected"):
+        coverage = (f"{availability['present']} / {availability['expected']}"
+                    f"（{'实测' if availability['method'] == 'measured' else '推算'}）")
+    else:
+        coverage = "—"
     out += [
-        "| 可用率 | 调用 | 缺失最多 | 最慢一次 |",
-        "| --- | --- | --- | --- |",
-        f"| **{_pct(availability.get('rate'))}** "
+        "| 时间窗 | 调用 | 维度完整 | 缺失最多 | 最慢一次 |",
+        "| --- | --- | --- | --- | --- |",
+        f"| {_window_text(window)} "
         f"| {len(data['symbols'])} 个标的 "
+        f"| {coverage} "
         f"| {top_missing['dimension'] + ' ' + str(top_missing['count']) + ' 次' if top_missing else '无'} "
         f"| {f'{slowest[0]:.1f}s（{slowest[1]}）' if slowest else '—'} |",
         "",
     ]
 
-    # 可用率
-    out += ["## 可用率", ""]
-    if availability.get("expected"):
-        out.append(f"{availability['present']} / {availability['expected']} 个维度"
-                   f"（{'实测' if availability['method'] == 'measured' else '按上游失败推算'}）")
-    else:
-        out.append("窗口内没有完成的标的，算不出可用率。")
-    out.append("")
+    meta = [f"版本 {window.get('version') or '—'}"]
+    if window.get("fingerprint"):
+        meta.append(f"渲染指纹 {window['fingerprint']}")
+    if window.get("restarts"):
+        meta.append(f"窗口内重启 {window['restarts']} 次")
+    # 只写文件名，不写路径：这份报告会发给 MCP 调用方，绝对路径会把服务器的目录结构
+    # 一起带出去。读没读错文件由上面那个时间窗露出来——读到过期或别的实例的日志，
+    # 窗口的结束时刻就对不上刚才那次调用。
+    if window.get("name"):
+        archives = max(0, len(window.get("files") or []) - 1)
+        source = window["name"] + (f" + {archives} 份归档" if archives else
+                                   "（未计归档）" if window.get("archived") is False else "")
+        meta.append(f"数据来自 {source}")
+    return out + ["> " + " · ".join(meta), ""]
 
-    out += _dimension_table(data)
-    out += _hourly_table(data)
 
-    # 缺失明细
-    if not data["missing"] and data.get("failed_sources"):
-        # 两种情形共用这一段，说法要分开：维度级数据在、且全都拿到了，说明源失败被
-        # 兜底救回来了——那是好消息，不能写成"没有维度级字段"。
-        covered = data["availability"].get("method") == "measured"
-        lead = ("维度都拿到了，但下面这些源失败过——兜底把数据补上了，源本身仍然要看："
-                if covered else "只有源级线索（这份日志没有维度级字段）：")
-        out += ["## 缺了什么", "", lead, "",
-                "| 上游源 | 失败次数 |", "| --- | ---: |"]
-        for source, count in sorted(data["failed_sources"].items(), key=lambda x: -x[1]):
-            out.append(f"| {source} | {count} |")
-        out.append("")
+def _missing_section(data: dict) -> list:
+    """缺了什么。表在上，"为什么维度还是齐的"这类解释在下。"""
+    out: list = []
     if data["missing"]:
         out += ["## 缺了什么", "",
                 "| 维度 | 次数 | 涉及标的 | 最近一次 |", "| --- | ---: | --- | --- |"]
@@ -253,24 +261,28 @@ def render(data: dict) -> str:
                 names += f" 等 {len(row['symbols'])} 个"
             out.append(f"| {row['dimension']} | {row['count']} | {names} | {row['last_at']} |")
         out.append("")
-    if data.get("degraded"):
-        out += ["**渲染出来但没有值**：" + "、".join(
-            f"{k}×{v}" for k, v in sorted(data["degraded"].items(), key=lambda x: -x[1])), ""]
-    if data.get("not_applicable"):
-        # 单列，别混进上面那行。钉日期查询没有"实时"资金流是正当缺席，写成"没有值"
-        # 会让人去查一个不存在的故障。
-        out += ["**正当缺席（不计入分母）**：" + "、".join(
-            f"{k}×{v}" for k, v in sorted(data["not_applicable"].items(), key=lambda x: -x[1])), ""]
+    elif data.get("failed_sources"):
+        out += ["## 缺了什么", "", "| 上游源 | 失败次数 |", "| --- | ---: |"]
+        for source, count in sorted(data["failed_sources"].items(), key=lambda x: -x[1]):
+            out.append(f"| {source} | {count} |")
+        # 两种情形共用这一节，说法要分开：维度级数据在、且全都拿到了，说明源失败被
+        # 兜底救回来了——那是好消息，不能写成"没有维度级字段"。
+        covered = data["availability"].get("method") == "measured"
+        out += ["", "> " + ("维度都拿到了，这些源失败被兜底补上了——数据是齐的，"
+                            "但源本身仍然要看。"
+                            if covered else "只有源级线索：这份日志没有维度级字段。"), ""]
+    return out
 
-    # 耗时
+
+def _latency_section(data: dict) -> list:
+    """耗时。表在上，怎么算的在下。"""
     staged = [(name, e) for name, e in data["latency"].items() if e["stats"]]
     if not staged:
         # 一行数据都没有时别画个空表。只有表头的表比不画更糟——读者会以为渲染坏了。
-        out += ["## 耗时", "", "窗口内没有取数记录。"]
-    else:
-        out += ["## 耗时", "",
-                "| 阶段 | 次数 | 平均 | p50 | p90 | p95 | 最大 | 本小时 vs 上一小时 |",
-                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+        return ["## 耗时", "", "窗口内没有取数记录。", ""]
+    out = ["## 耗时", "",
+           "| 阶段 | 次数 | 平均 | p50 | p90 | p95 | 最大 | 本小时 vs 上一小时 |",
+           "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
     for name, entry in staged:
         stats, trend = entry["stats"], entry["trend"]
         if trend is None:
@@ -285,43 +297,48 @@ def render(data: dict) -> str:
         out.append(f"| {name} | {stats['n']} | {_sec(stats['avg'])} | {_sec(stats['p50'])} "
                    f"| {_sec(stats['p90'])} | {_sec(stats['p95'])} | **{_sec(stats['max'])}** "
                    f"| {change} |")
+
     trends = [e["trend"] for e in data["latency"].values() if e["trend"]]
     if trends:
         hour, previous = trends[0]["hour"][11:], trends[0]["previous"][11:]
-        note = (f"> 最后一列 = **{hour}:00 这一小时的 p90 比 {previous}:00 那一小时**。"
+        note = (f"最后一列 = **{hour}:00 这一小时的 p90 比 {previous}:00 那一小时**。"
                 f"两个小时各自的样本都得够 {MIN_HOUR_SAMPLES} 次才给这个数，"
                 f"不够就写「—」；上一小时一次调用都没有也不比。")
         if any(t["cross_phase"] for t in trends):
             note += ("标了「跨时段」的那几行，两个小时分属盘中和收盘后——"
                      "两边走的不是一条路，那个涨跌多半是换了时段而不是变慢了。")
-        out += ["", note]
-    out.append("")
+        out += ["", f"> {note}"]
 
-    # 最慢的几次
     slow = sorted(data["symbols"], key=lambda s: -s["total"])[:3]
     if slow and slow[0]["total"] > SLOW_SECONDS / 6:
-        out += ["**最慢的几次**", "",
+        out += ["", "**最慢的几次**", "",
                 "| 时刻 | 工具 | 标的 | 耗时 |", "| --- | --- | --- | ---: |"]
         for row in slow:
-            out.append(f"| {row['at'][11:]} | {row['tool']} | {row['symbol']} | {row['total']:.2f}s |")
-        out.append("")
+            out.append(f"| {row['at'][11:]} | {row['tool']} | {row['symbol']} "
+                       f"| {row['total']:.2f}s |")
+    return out + [""]
 
-    # 事件
+
+def _events_section(data: dict) -> list:
     active = {k: v for k, v in data["events"].items() if v["count"]}
-    if active:
-        out += ["## 事件", "", "| 事件 | 次数 | 时段 | 说明 |", "| --- | ---: | --- | --- |"]
-        for kind, entry in sorted(active.items(), key=lambda x: -x[1]["count"]):
-            span = (f"{entry['first'][11:]} → {entry['last'][11:]}"
-                    if entry["first"] != entry["last"] else entry["first"][11:])
-            detail = entry["detail"] or EVENTS.get(kind, (None, kind))[1]
-            if entry.get("items"):
-                top = "、".join(f"{k}×{v}" for k, v in
-                               sorted(entry["items"].items(), key=lambda x: -x[1])[:4])
-                detail += f"（{top}）"
-            out.append(f"| {kind} | {entry['count']} | {span} | {detail} |")
-        out.append("")
+    if not active:
+        return []
+    out = ["## 事件", "", "| 事件 | 次数 | 时段 | 说明 |", "| --- | ---: | --- | --- |"]
+    for kind, entry in sorted(active.items(), key=lambda x: -x[1]["count"]):
+        span = (f"{entry['first'][11:]} → {entry['last'][11:]}"
+                if entry["first"] != entry["last"] else entry["first"][11:])
+        detail = entry["detail"] or EVENTS.get(kind, (None, kind))[1]
+        if entry.get("items"):
+            top = "、".join(f"{k}×{v}" for k, v in
+                           sorted(entry["items"].items(), key=lambda x: -x[1])[:4])
+            detail += f"（{top}）"
+        out.append(f"| {kind} | {entry['count']} | {span} | {detail} |")
+    return out + [""]
 
-    # 局限：这一节不能省，读的人得知道这份数字看不见什么
+
+def _notes_section(data: dict) -> list:
+    """局限。这一节不能省，读的人得知道这份数字看不见什么。"""
+    window, availability = data["window"], data["availability"]
     notes = []
     # 一次调用都没有时 method 也是 inferred，但那时说"按上游失败推算"是无稽之谈——
     # 没有东西可推。这种情况由下面那条"窗口内没有报告类调用"讲清楚。
@@ -332,9 +349,26 @@ def render(data: dict) -> str:
         notes.append("日志超过读取上限，只看了尾部，更早的记录没算进来。")
     if not data["symbols"]:
         notes.append("窗口内没有报告类调用，耗时和可用率都是空的。")
-    if notes:
-        out += ["## 说明", ""] + [f"- {n}" for n in notes]
-    return "\n".join(out).rstrip() + "\n"
+    return (["## 说明", ""] + [f"- {n}" for n in notes]) if notes else []
+
+
+def render(data: dict) -> str:
+    """一屏 Markdown。
+
+    排版三条规矩：
+      1. **可用率上标题**，扫第一行就看到这份报告的那个数；
+      2. **小标题只当 section 名**，结论用粗体行——把结论写成 ``## ⚠️ …`` 读起来像备注；
+      3. **有表格的一节，数据在上、备注在下**，一节里不要先读三行解释才看到数。
+    """
+    return "\n".join(
+        _headline(data)
+        + _dimension_table(data)
+        + _hourly_table(data)
+        + _missing_section(data)
+        + _latency_section(data)
+        + _events_section(data)
+        + _notes_section(data)
+    ).rstrip() + "\n"
 
 
 __all__ = ["AVAILABILITY_BAD", "AVAILABILITY_WARN", "SLOW_SECONDS", "TREND_WARN_PCT", "render"]

@@ -305,6 +305,13 @@ def test_hours_without_measured_fields_are_left_out(tmp_path):
 # --- 结论 --------------------------------------------------------------------
 
 
+def _kpi_row(report: str) -> str:
+    """抬头那张 KPI 表的数据行。"""
+    lines = report.splitlines()
+    header = next(i for i, l in enumerate(lines) if l.startswith("| 时间窗 |"))
+    return lines[header + 2]
+
+
 def _data(**over):
     # window.files 不能省：读不到日志时判定要走"无数据"分支，省掉它这里就全是
     # ❓，测不到真正的阈值。
@@ -574,7 +581,7 @@ def test_a_covered_source_failure_is_not_reported_as_missing_data():
     可用率 100%、缺失 38 次，自相矛盾。
     """
     report = health_report.render(_data(failed_sources={"fund_flow": 38}))
-    kpi = [l for l in report.splitlines() if l.startswith("| **")][0]
+    kpi = _kpi_row(report)
     assert "| 无 " in kpi, kpi
     assert "38" not in kpi
 
@@ -584,22 +591,26 @@ def test_an_old_log_still_falls_back_to_source_level():
     report = health_report.render(_data(
         availability={"rate": None, "method": "inferred"},
         failed_sources={"fund_flow": 38}))
-    kpi = [l for l in report.splitlines() if l.startswith("| **")][0]
-    assert "fund_flow（源） 38 次" in kpi, kpi
+    assert "fund_flow（源） 38 次" in _kpi_row(report)
 
 
 # --- 大屏：先给问题 ----------------------------------------------------------
 
 
-def test_all_green_dimensions_collapse_to_one_line(tmp_path):
-    """二十行 100% 会把有问题的那行挤到屏幕外，而大屏的用处就是一眼看到问题。"""
+def test_every_dimension_gets_its_own_row(tmp_path):
+    """满分的维度也要单独成行。
+
+    曾经把 100% 的行折成一句汇总，理由是"大屏要先给问题"——结果把这一节存在的理由
+    弄没了，它就是给人逐维核对的。差的排前面并加粗就够了，不需要靠删行。
+    """
     log = _write(tmp_path, [
         _symbol_line("10:00:01", "SZ000333", 2.0, present=17, expected_n=17),
     ])
-    report = health_report.render(log_digest.digest(log))
-    assert "维全部拿到" in report
-    assert "| 价格 | kline |" not in report          # 满分的不单独占行
-    assert "该有" in report                          # 分母范围还在，"有没有缺"照样答得上
+    data = log_digest.digest(log)
+    report = health_report.render(data)
+    for row in data["dimensions"]:
+        assert f"| {row['dimension']} | {row['source']} |" in report, row["dimension"]
+    assert "维全部拿到" not in report, "又折叠了"
 
 
 def test_a_failing_dimension_still_gets_its_own_row(tmp_path):
@@ -787,3 +798,91 @@ def test_an_unreadable_log_directory_falls_back_to_the_current_file(tmp_path):
     log = _write(tmp_path, [_symbol_line("11:00:01", "SZ000333", 2.0, present=17, expected_n=17)])
     assert log_digest.log_files(log, "startup", archived=True)
     assert log_digest.log_files(str(tmp_path / "gone" / "x.log"), "startup") == []
+
+
+# --- 排版规矩 ----------------------------------------------------------------
+
+
+def _sections(report: str) -> list:
+    return [l[3:] for l in report.splitlines() if l.startswith("## ")]
+
+
+def test_the_availability_percentage_is_on_the_first_line(tmp_path):
+    """可用率是这份报告的那个数，扫第一行就该看到，不该往下找一节。"""
+    log = _write(tmp_path, [
+        _symbol_line("10:00:01", "SZ000333", 2.0, present=16, expected_n=17,
+                     missing="资金流向"),
+    ])
+    report = health_report.render(log_digest.digest(log))
+    first = report.splitlines()[0]
+    assert first.startswith("# 服务健康")
+    assert "94.1%" in first, first
+    assert "## 可用率" not in report, "标题里有了就别再单开一节"
+
+
+def test_section_headings_are_section_names_not_content(tmp_path):
+    """`## ⚠️ 资金流向缺了 2 次` 当标题读起来像备注。
+
+    小标题该是"各维度可用率""耗时"这种 section 名；结论是内容，用粗体行。
+    """
+    log = _write(tmp_path, [
+        _symbol_line("10:00:01", "SZ000333", 2.0, present=16, expected_n=17,
+                     missing="资金流向"),
+    ])
+    report = health_report.render(log_digest.digest(log))
+    assert not any(("⚠️" in s or "✅" in s or "❌" in s or "❓" in s) for s in _sections(report)), \
+        _sections(report)
+    verdict = report.splitlines()[2]
+    assert verdict.startswith("**⚠️ ") and verdict.endswith("**"), verdict
+    assert "资金流向缺了 1 次" in verdict
+    assert verdict.count("94.1%") == 0, "标题里已经有这个数了，别再说一遍"
+
+
+def test_tables_come_before_their_notes(tmp_path):
+    """有表格的一节，数据在上、备注在下——不该先读三行解释才看到数。"""
+    lines = []
+    for hour in (10, 11):
+        for i in range(30):
+            lines.append(_line(f"{hour}:{i:02d}:00",
+                               "Data task _fetch_kline_sync request_id=r tool=brief "
+                               "symbol=SZ000333 admission=0.0s queue=0.0s service=1.0s"))
+    lines.append(_symbol_line("11:00:01", "SZ000333", 2.0, present=17, expected_n=17,
+                              degraded="指定日期查询暂不展示实时资金流向"))
+    report = health_report.render(log_digest.digest(_write(tmp_path, lines)))
+
+    body = report.splitlines()
+    for heading in ("各维度可用率", "耗时"):
+        at = body.index(f"## {heading}")
+        rest = body[at + 1:]
+        stop = next((i for i, l in enumerate(rest) if l.startswith("## ")), len(rest))
+        block = rest[:stop]
+        table = next(i for i, l in enumerate(block) if l.startswith("|"))
+        quotes = [i for i, l in enumerate(block) if l.startswith(">")]
+        assert quotes, f"{heading} 一节没有备注"
+        assert min(quotes) > table, f"{heading} 的备注跑到表格前面了"
+
+
+def test_consecutive_notes_do_not_merge_into_one_paragraph(tmp_path):
+    """连续的 "> " 行在 Markdown 里会并成同一段，两条备注挤成一句读不出是两件事。"""
+    log = _write(tmp_path, [
+        _symbol_line("10:00:01", "SZ000333", 2.0, present=17, expected_n=17,
+                     degraded="指定日期查询暂不展示实时资金流向"),
+    ])
+    report = health_report.render(log_digest.digest(log))
+    assert "\n>\n> " in report, "两条备注之间没有垫空引用行"
+
+
+def test_the_window_edges_do_not_depend_on_line_order(tmp_path):
+    """窗口两头取 min/max，不取"第一条 / 最后一条"。
+
+    聚合归档时读的是好几个文件，而且服务是多线程写日志，同一秒内的行本来就可能
+    乱序——按出现顺序取的话，末尾一条稍早的行就能把窗口尾巴拽回去。
+    """
+    log = _write(tmp_path, [
+        _symbol_line("12:00:00", "SZ000333", 2.0, present=17, expected_n=17),
+        _symbol_line("15:00:00", "SZ000333", 2.0, present=17, expected_n=17),
+        _line("13:00:00", "cn-stock-mcp version=2.0.0"),      # 乱序的一行落在末尾
+    ])
+    window = log_digest.digest(log)["window"]
+    assert window["from"].endswith("12:00:00")
+    assert window["to"].endswith("15:00:00"), window["to"]
