@@ -173,18 +173,29 @@ def _hourly_table(data: dict) -> list:
     已经好了，和正在坏，要采取的行动完全不同，而一个合起来的百分比把这两件事写成
     同一个数。
 
-    新的排前面：读者最先要知道的是"现在"。
+    新的排前面：读者最先要知道的是"现在"。排序在渲染层显式做一次，不依赖上游
+    ``data["hours"]`` 的既有顺序——数据可能经缓存或别的组装路径进来，展示顺序
+    不该由调用方碰巧决定。
+
+    跨天时小时列带 ``MM-DD`` 前缀：窗口覆盖两天以上时，光写 ``21:00`` 分不出
+    是哪天的 21 点；同一天内不重复日期，减少噪音。
     """
-    rows = data.get("hours") or []
+    rows = sorted(data.get("hours") or [], key=lambda r: r["hour"], reverse=True)
     if not rows:
         return []
+    # hour 格式 "YYYY-MM-DD HH"；最早行与最新行日期不同即跨天。
+    cross_day = rows[0]["hour"][:10] != rows[-1]["hour"][:10]
     out = ["## 逐小时可用率", "",
            "| 小时 | 调用 | 该有维度 | 拿到 | 可用率 | 缺了什么 |",
            "| --- | ---: | ---: | ---: | ---: | --- |"]
     for row in rows:
         missing = "、".join(f"{k}×{v}" for k, v in row["missing"].items()) or "—"
         rate = _pct(row["rate"])
-        out.append(f"| {row['hour'][11:]}:00 | {row['symbols']} | {row['expected']} "
+        if cross_day:
+            label = f"{row['hour'][5:7]}-{row['hour'][8:10]} {row['hour'][11:]}:00"
+        else:
+            label = f"{row['hour'][11:]}:00"
+        out.append(f"| {label} | {row['symbols']} | {row['expected']} "
                    f"| {row['present']} "
                    f"| {'**' + rate + '**' if (row['rate'] or 1) < 1 else rate} | {missing} |")
     return out + [""]
@@ -312,7 +323,12 @@ def _latency_section(data: dict) -> list:
 
     trends = [e["trend"] for e in data["latency"].values() if e["trend"]]
     if trends:
-        hour, previous = trends[0]["hour"][11:], trends[0]["previous"][11:]
+        # 跨天时（如 00 点比前一天 23 点）加日期前缀。
+        if trends[0]["hour"][:10] != trends[0]["previous"][:10]:
+            hour = f"{trends[0]['hour'][5:7]}-{trends[0]['hour'][8:10]} {trends[0]['hour'][11:]}"
+            previous = f"{trends[0]['previous'][5:7]}-{trends[0]['previous'][8:10]} {trends[0]['previous'][11:]}"
+        else:
+            hour, previous = trends[0]["hour"][11:], trends[0]["previous"][11:]
         note = (f"最后一列 = **{hour}:00 这一小时的 p90 比 {previous}:00 那一小时**。"
                 f"两个小时各自的样本都得够 {MIN_HOUR_SAMPLES} 次才给这个数，"
                 f"不够就写「—」；上一小时一次调用都没有也不比。")
@@ -323,10 +339,16 @@ def _latency_section(data: dict) -> list:
 
     slow = sorted(data["symbols"], key=lambda s: -s["total"])[:3]
     if slow and slow[0]["total"] > SLOW_SECONDS / 6:
+        # 窗口跨天时给时刻加 MM-DD 前缀。
+        w = data.get("window") or {}
+        slow_cross = bool(w.get("from") and w.get("to")
+                          and w["from"][:10] != w["to"][:10])
         out += ["", "**最慢的几次**", "",
                 "| 时刻 | 工具 | 标的 | 耗时 |", "| --- | --- | --- | ---: |"]
         for row in slow:
-            out.append(f"| {row['at'][11:]} | {row['tool']} | {row['symbol']} "
+            at = (f"{row['at'][5:7]}-{row['at'][8:10]} {row['at'][11:]}"
+                  if slow_cross else row["at"][11:])
+            out.append(f"| {at} | {row['tool']} | {row['symbol']} "
                        f"| {row['total']:.2f}s |")
     return out + [""]
 
@@ -337,8 +359,14 @@ def _events_section(data: dict) -> list:
         return []
     out = ["## 事件", "", "| 事件 | 次数 | 时段 | 说明 |", "| --- | ---: | --- | --- |"]
     for kind, entry in sorted(active.items(), key=lambda x: -x[1]["count"]):
-        span = (f"{entry['first'][11:]} → {entry['last'][11:]}"
-                if entry["first"] != entry["last"] else entry["first"][11:])
+        # 跨天加 MM-DD 前缀，免得读者分不清是哪天的事件。
+        if entry["first"][:10] != entry["last"][:10]:
+            span = (f"{entry['first'][5:7]}-{entry['first'][8:10]} {entry['first'][11:]}"
+                    f" → {entry['last'][5:7]}-{entry['last'][8:10]} {entry['last'][11:]}")
+        elif entry["first"] != entry["last"]:
+            span = f"{entry['first'][11:]} → {entry['last'][11:]}"
+        else:
+            span = entry["first"][11:]
         detail = entry["detail"] or EVENTS.get(kind, (None, kind))[1]
         if entry.get("items"):
             top = "、".join(f"{k}×{v}" for k, v in

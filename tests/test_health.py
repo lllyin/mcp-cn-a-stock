@@ -302,6 +302,83 @@ def test_hours_without_measured_fields_are_left_out(tmp_path):
     assert [r["hour"][11:] for r in log_digest.digest(log)["hours"]] == ["11"]
 
 
+def test_hourly_table_sorts_newest_first_even_if_rows_arrive_shuffled():
+    """上游顺序靠不住（缓存、别的组装路径），展示顺序在渲染层自己定。"""
+    hours = [{"hour": "2026-09-09 10", "symbols": 1, "expected": 17, "present": 17,
+              "rate": 1.0, "missing": {}},
+             {"hour": "2026-09-09 12", "symbols": 1, "expected": 17, "present": 17,
+              "rate": 1.0, "missing": {}},
+             {"hour": "2026-09-09 11", "symbols": 1, "expected": 17, "present": 17,
+              "rate": 1.0, "missing": {}}]
+    report = "\n".join(health_report._hourly_table({"hours": hours}))
+    labels = [l.split("|")[1].strip() for l in report.splitlines()
+              if l.startswith("| ") and ":00" in l]
+    assert labels == ["12:00", "11:00", "10:00"], "新的排前面，且不随输入顺序变"
+
+
+def test_hourly_table_adds_date_prefix_when_window_crosses_days():
+    """窗口跨两天以上时，光写 21:00 分不出是哪天的 21 点。"""
+    hours = [{"hour": "2026-09-09 21", "symbols": 1, "expected": 17, "present": 17,
+              "rate": 1.0, "missing": {}},
+             {"hour": "2026-09-09 10", "symbols": 1, "expected": 17, "present": 17,
+              "rate": 1.0, "missing": {}},
+             {"hour": "2026-09-08 21", "symbols": 1, "expected": 17, "present": 17,
+              "rate": 1.0, "missing": {}}]
+    report = "\n".join(health_report._hourly_table({"hours": hours}))
+    assert "| 09-09 21:00 |" in report
+    assert "| 09-09 10:00 |" in report
+    assert "| 09-08 21:00 |" in report
+    # 同一天内不重复日期——上面那条同日测试已经钉住 "| 10:00 |" 的形态。
+
+
+def _lat_stats():
+    """耗时段测试用的统计值：字段跟 digest 输出一致。"""
+    return {"n": 10, "avg": 1.2, "p50": 1.0, "p90": 2.0, "p95": 2.5, "max": 3.0}
+
+
+def test_latency_trend_note_prefixes_dates_when_hours_cross_days():
+    """00 点比的是前一天 23 点，光写小时读者会当成同一天。"""
+    data = _data(latency={"brief": {
+        "stats": _lat_stats(),
+        "trend": {"hour": "2026-09-09 00", "previous": "2026-09-08 23",
+                  "change_pct": 10.0, "cross_phase": False}}})
+    report = "\n".join(health_report._latency_section(data))
+    assert "09-09 00:00 这一小时" in report
+    assert "09-08 23:00 那一小时" in report
+
+
+def test_slow_table_prefixes_dates_when_window_crosses_days():
+    """窗口跨天时，最慢几次的时刻也要带日期；同一天内不加。"""
+    slow = {"symbol": "SZ000333", "tool": "brief", "at": "2026-09-08 23:40:12",
+            "total": 25.0, "present": 17, "expected": 17, "missing": []}
+    window = {"version": "2.0.0", "files": ["cn-stock-mcp.log"],
+              "path": "/x/cn-stock-mcp.log"}
+    crossed = _data(window={**window, "from": "2026-09-08 21:00",
+                            "to": "2026-09-09 09:00"},
+                    symbols=[slow],
+                    latency={"brief": {"stats": _lat_stats(), "trend": None}})
+    same_day = _data(window={**window, "from": "2026-09-09 09:00",
+                             "to": "2026-09-09 15:00"},
+                     symbols=[{**slow, "at": "2026-09-09 10:40:12"}],
+                     latency={"brief": {"stats": _lat_stats(), "trend": None}})
+    assert "| 09-08 23:40:12 |" in "\n".join(health_report._latency_section(crossed))
+    assert "| 10:40:12 |" in "\n".join(health_report._latency_section(same_day))
+
+
+def test_events_span_prefixes_dates_when_an_event_crosses_days():
+    """事件首末跨天时时段写全日期；同一天内不加，免得每行都拖个前缀。"""
+    crossed = _data(events={"source_switch": {
+        "count": 3, "first": "2026-09-08 21:15", "last": "2026-09-09 09:40",
+        "detail": "换源", "items": None}})
+    same_day = _data(events={"source_switch": {
+        "count": 2, "first": "2026-09-09 10:05", "last": "2026-09-09 11:30",
+        "detail": "换源", "items": None}})
+    assert "09-08 21:15 → 09-09 09:40" in "\n".join(health_report._events_section(crossed))
+    line = next(l for l in "\n".join(health_report._events_section(same_day)).splitlines()
+                if "source_switch" in l)
+    assert "09-" not in line
+
+
 # --- 结论 --------------------------------------------------------------------
 
 
