@@ -990,7 +990,8 @@ class CNStockDataSource(DataSource):
                 code, result.provider,
             )
         # is_market 从不为 True：页面兜底和缓存编解码都按这个约定。
-        return {"fund_flow": result.frame, "is_market": False, "complete": result.complete}
+        return {"fund_flow": result.frame, "is_market": False,
+                "complete": result.complete, "provider": result.provider}
 
     def _fetch_fund_flow_cached(
         self, code: str, symbol: str, rows_needed: int
@@ -1158,7 +1159,8 @@ class CNStockDataSource(DataSource):
         )
         # is_market 与主源保持一致：_fetch_fund_flow_sync 从不置 True，页面上的
         # 列名也是"收盘价/涨跌幅"这一套，不是指数那套带交易所前缀的列。
-        return {"fund_flow": pd.DataFrame(records), "is_market": False}
+        return {"fund_flow": pd.DataFrame(records), "is_market": False,
+                "provider": "page_fallback"}
 
     def _fetch_dividend_sync(self, code: str) -> Optional[Dict]:
         """同步获取分红数据"""
@@ -1448,6 +1450,26 @@ class CNStockDataSource(DataSource):
             stock_data.is_market = fund_flow_data.get("is_market", False)
             if not df.empty:
                 try:
+                    # 一致性检测放咽喉点：主源和页面兜底都汇到这里，两种来路都查。
+                    # 违反恒等式 = 这行不是真实成交的账（push2his 对部分客户端身份
+                    # 发扰动副本，200 + 行数齐全 + 收盘价真值，可用性指标看不见）。
+                    # 检测不过不丢弃——丢一行用户就少一行（AGENTS §一）——记成
+                    # 数据可疑，进 warnings 和 degraded，让读者和缓存守卫知道。
+                    # 每条记录前缀上游端点：事后排查"这份坏数据是谁给的"不用再猜。
+                    violations = fund_flow_source.consistency_violations(df)
+                    if violations:
+                        endpoint = fund_flow_source.provider_endpoint(
+                            fund_flow_data.get("provider"))
+                        stock_data.fund_flow_anomalies = [
+                            f"[{endpoint}] {v}" for v in violations
+                        ]
+                        shown = stock_data.fund_flow_anomalies[0] \
+                            if len(violations) == 1 \
+                            else f"{stock_data.fund_flow_anomalies[0]} 等 {len(violations)} 行"
+                        logger.warning(
+                            "资金流向数据一致性可疑 %s: %s",
+                            canonical_symbol, shown,
+                        )
                     stock_data.fund_flow_history = self._build_fund_flow_history(
                         df, canonical_symbol, stock_data.is_market
                     )

@@ -563,3 +563,64 @@ class TestImpersonatedHostsDegraded:
         channel._breaker.update(failures=0, suspended_until=_time.monotonic() + 0.01)
         _time.sleep(0.02)
         assert not channel.impersonated_hosts_degraded()
+
+
+# --- 凭据层对要求凭据的主机强制覆盖自洽头 -------------------------------------
+#
+# 起因：AkShare 显式硬编码 Chrome/81 的 UA，而 Python TLS 配 Chrome/81 头恰好是
+# 上游发"扰动副本"的那一档。旧实现只补缺失字段、尊重调用方显式 UA，等于对最需要
+# 防线的 akshare 路径一个字节都不生效——注释和实现互相矛盾。覆盖只对 needs_auth
+# 的主机生效，普通主机的调用方头原样不动。
+
+
+def test_auth_host_overrides_the_callers_ua(monkeypatch):
+    monkeypatch.setattr(channel.eastmoney_auth, "needs_auth", lambda url: True)
+    kwargs = channel._with_auth_headers(
+        "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get",
+        {"headers": {"User-Agent": "Chrome/81.0.4044.138"}},
+    )
+    sent = kwargs["headers"]
+    assert sent["User-Agent"] == channel._AUTH_UA
+    assert "Chrome/81" not in sent["User-Agent"]
+    # 客户端提示头一并补齐，整套自洽
+    assert sent["sec-ch-ua"] == channel._AUTH_IDENTITY_HEADERS["sec-ch-ua"]
+    assert sent["Referer"] == "https://data.eastmoney.com/"
+
+
+def test_non_auth_hosts_keep_the_callers_headers():
+    kwargs = channel._with_auth_headers(
+        "https://qt.gtimg.cn/q=sh600489",
+        {"headers": {"User-Agent": "something-custom"}},
+    )
+    assert kwargs == {"headers": {"User-Agent": "something-custom"}}
+
+
+def test_override_is_case_insensitive_and_single():
+    # 大小写不同的同名头要被换掉而不是并存，requests 会把两个都发出去
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(channel.eastmoney_auth, "needs_auth", lambda url: True)
+        kwargs = channel._with_auth_headers(
+            "https://push2.eastmoney.com/api/qt/stock/get",
+            {"headers": {"user-agent": "Chrome/81"}},
+        )
+        sent = kwargs["headers"]
+        assert sent["User-Agent"] == channel._AUTH_UA
+        assert sum(1 for k in sent if k.lower() == "user-agent") == 1
+    finally:
+        monkeypatch.undo()
+
+
+def test_auth_host_preserves_decorative_headers(monkeypatch):
+    # 分档只看身份头：调用方显式给的 Referer/Accept 有自己的语义，原样保留；
+    # 身份头仍然强制覆盖，两件事互不越界
+    monkeypatch.setattr(channel.eastmoney_auth, "needs_auth", lambda url: True)
+    kwargs = channel._with_auth_headers(
+        "https://push2.eastmoney.com/api/qt/stock/get",
+        {"headers": {"User-Agent": "Chrome/81",
+                     "Referer": "https://x/", "Accept": "application/json"}},
+    )
+    sent = kwargs["headers"]
+    assert sent["User-Agent"] == channel._AUTH_UA
+    assert sent["Referer"] == "https://x/"
+    assert sent["Accept"] == "application/json"

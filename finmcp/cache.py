@@ -330,6 +330,9 @@ def _encode_fund_flow(value: dict) -> dict:
         # 这份是不是该源能给的全部历史（eastmoney_delay 只给当日一行时为 False）。
         # 老条目没有这个键，按 True 读——它们都是主源或页面给的全份。
         "complete": bool(value.get("complete", True)),
+        # 哪个提供方给的。一致性告警靠它定位上游端点；老条目没有这个键，按 None
+        # 读——告警里落成"未知来源"，不影响检测本身。
+        "provider": value.get("provider"),
     }
 
 
@@ -340,6 +343,7 @@ def _decode_fund_flow(raw: dict) -> dict:
         "fund_flow": pd.DataFrame(raw.get("rows") or []),
         "is_market": bool(raw.get("is_market", False)),
         "complete": bool(raw.get("complete", True)),
+        "provider": raw.get("provider"),
     }
 
 

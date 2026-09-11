@@ -102,8 +102,11 @@ _DELAY_FUND_FLOW_URL = "https://push2delay.eastmoney.com/api/qt/stock/fflow/dayk
 #: 中单、大单、超大单；接口对 klt=1 不给净占比字段。zjlx 页面"今日"栏就是它填的。
 _DELAY_MINUTE_FUND_FLOW_URL = "https://push2delay.eastmoney.com/api/qt/stock/fflow/kline/get"
 _MINUTE_FUND_FLOW_FIELDS = "f51,f52,f53,f54,f55,f56"
+#: push2delay 的请求头。与 _PUSH2_HEADERS 用同一版 Chrome：旧版 UA 的请求会被
+#: push2his 分档成"扰动副本"或直接拒连（见 http_channel._AUTH_IDENTITY_HEADERS 的注释），
+#: 这里保持自洽的现代身份。
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-       "(KHTML, like Gecko) Chrome/81.0.4044.138 Safari/537.36")
+       "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
 
 
 def _fund_flow_frame(klines: list):

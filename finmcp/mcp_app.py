@@ -16,7 +16,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from . import report_contract, research
 from .cache import build_key, get_report_cache, is_cacheable_report
 from .datasource import get_datasource
-from .datasource.base import FETCH_FAILURES_KEY, FetchRequirements
+from .datasource.base import (FETCH_FAILURES_KEY, FUND_FLOW_ANOMALIES_KEY,
+                              FetchRequirements)
 from .datasource.market_breadth import get_market_breadth
 from .datasource.public_events import PublicEventPoolResponse, get_public_market_events
 from .config import BATCH_CONCURRENCY
@@ -393,9 +394,20 @@ async def fetch_batch_reports(
                         f"{symbol}: 资金流向数据止于 {flow_day}，比报告的数据日期 "
                         f"{kline_day} 晚一步——上游的当日资金流还没落地"
                     )
+                # 一致性检测咬住的扰动副本（算术不闭合的历史资金流行）在这里浮出：
+                # 数字看着齐全，但不是真实成交的账，读者必须知道哪些行不可信。
+                anomalies = raw_data.get(FUND_FLOW_ANOMALIES_KEY) or []
+                if anomalies:
+                    shown = anomalies[0] if len(anomalies) == 1 \
+                        else f"{len(anomalies)} 行（首见 {anomalies[0]}）"
+                    output["warnings"].append(
+                        f"{symbol}: 历史资金流向有 {shown} 违反内部恒等式"
+                        "（主力≠超大+大 / 四档之和≠0），数据疑似被上游扰动，不可信"
+                    )
                 if (
                     cache_key is not None
                     and not fetch_failures
+                    and not anomalies
                     and is_cacheable_report(
                         output["reports"][symbol],
                         phase=cache_key.phase, fund_flow_lagging=lag is not None,
@@ -410,6 +422,14 @@ async def fetch_batch_reports(
                         mode,
                         symbol,
                         ",".join(fetch_failures),
+                    )
+                elif anomalies:
+                    logger.info(
+                        "Report cache skipped request_id=%s tool=%s symbol=%s "
+                        "incomplete_sources=fund_flow:anomalous",
+                        request_id or "-",
+                        mode,
+                        symbol,
                     )
                 # 报告里实际渲染出了哪些维度。`health` 靠这一段算**实测**可用率——
                 # 没有它就只能按上游失败反推，而"源成功返回、字段却是空的"那一类

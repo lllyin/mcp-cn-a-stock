@@ -45,6 +45,14 @@ FUND_FLOW_COLUMNS = (
     "小单净流入-净额", "小单净流入-净占比",
 )
 
+#: 一致性检测的容差。原始接口的金额是精确值，四档之和恒为 0、主力恒等于超大+大；
+#: 页面兜底的金额经两位小数（万）渲染再解析回来，误差上限在千元级。1 万元远高于
+#: 舍入、远低于「扰动副本」档 30%-50% 的偏差（2026-09-11 实测主力 +3.3%、
+#: 超大 +30.5%、大单 -52.6%，收盘价和涨跌幅是真值）。占比是两位小数的舍入值，
+#: 主力+中+小三项之和恒为 0，每列 ±0.005 的舍入给 0.05 的和容差。
+_AMOUNT_TOLERANCE = 1e4      # 元
+_RATIO_TOLERANCE = 0.05      # 百分点
+
 
 @dataclass(frozen=True)
 class FundFlowRequest:
@@ -133,6 +141,20 @@ def configured_order() -> tuple:
     return pf.configured_order(CAPABILITY, PROVIDER_ORDER_ENV, DEFAULT_PROVIDER_ORDER)
 
 
+#: 各提供方对应的上游端点。一致性告警带上它，日志读者不用再翻源码查
+#: 「eastmoney 给的」到底是哪个接口。新提供方接入时在这里登记。
+PROVIDER_ENDPOINTS = {
+    "eastmoney": "push2his fflow/daykline(akshare)",
+    "eastmoney_delay": "push2delay fflow/daykline",
+    "page_fallback": "zjlx 页面 table_ls",
+}
+
+
+def provider_endpoint(name: Optional[str]) -> str:
+    """提供方 → 上游端点描述。未登记的名字原样返回，不让告警哑掉。"""
+    return PROVIDER_ENDPOINTS.get(name or "", f"未知来源 {name or '-'}")
+
+
 def _longer(accumulated, value):
     """合成规则：留行数多的那份。
 
@@ -142,6 +164,61 @@ def _longer(accumulated, value):
     if accumulated is None:
         return value
     return value if value.rows > accumulated.rows else accumulated
+
+
+def consistency_violations(frame) -> list:
+    """一行一格地报出违反资金流内部恒等式的行。
+
+    恒等式来自分桶的定义本身：主力 = 超大单 + 大单，主力+大+中+小 = 0，
+    占比口径同理（主力占比+中单占比+小单占比 = 0）。它们对任何真实交易日都
+    成立，所以违反即「这行不是真实成交的账」。
+
+    起因是 2026-09-11 的发现：push2his 会按请求身份给一部分客户端发一份金额
+    被扰动过的副本——HTTP 200、行数齐全、收盘价和涨跌幅是真值，只有各单净额
+    偏 30%-50%，任何可用性指标都看不见它。这项检测是唯一一道能当场咬住的
+    闸门；调用方按返回的 violations 决定记 warnings 还是换源重取。
+
+    只做算术，不发请求、不比 K 线。金额列有 NaN 的行跳过——那是页面占位符
+    （停牌之类），让 None 与 0 的区分保持原样。
+    """
+    issues: list = []
+    if frame is None or getattr(frame, "empty", True):
+        return issues
+    required = {"日期",
+                "主力净流入-净额", "超大单净流入-净额", "大单净流入-净额",
+                "中单净流入-净额", "小单净流入-净额",
+                "主力净流入-净占比", "中单净流入-净占比", "小单净流入-净占比"}
+    if not required <= set(frame.columns):
+        return issues
+    # itertuples 的命名元组会把中文列名改写成 _5 这类位置名，按列位取值。
+    order = list(frame.columns)
+    for values in frame.itertuples(index=False, name=None):
+        row = dict(zip(order, values))
+        date = row.get("日期", "?")
+        major, xl, big, mid, small = (row.get(name) for name in
+            ("主力净流入-净额", "超大单净流入-净额", "大单净流入-净额",
+             "中单净流入-净额", "小单净流入-净额"))
+        row_issues = []
+        if None not in (major, xl, big) and all(
+                isinstance(v, (int, float)) for v in (major, xl, big)):
+            drift = major - (xl + big)
+            if abs(drift) > _AMOUNT_TOLERANCE:
+                row_issues.append(f"主力({major:.0f}) != 超大+大({xl + big:.0f})，差 {drift:+.0f} 元")
+        if None not in (xl, big, mid, small) and all(
+                isinstance(v, (int, float)) for v in (xl, big, mid, small)):
+            total = xl + big + mid + small
+            if abs(total) > _AMOUNT_TOLERANCE:
+                row_issues.append(f"四档之和={total:+.0f} 元，应为 0")
+        mratio, mratio_mid, mratio_small = (row.get(name) for name in
+            ("主力净流入-净占比", "中单净流入-净占比", "小单净流入-净占比"))
+        if None not in (mratio, mratio_mid, mratio_small) and all(
+                isinstance(v, (int, float)) for v in (mratio, mratio_mid, mratio_small)):
+            total = mratio + mratio_mid + mratio_small
+            if abs(total) > _RATIO_TOLERANCE:
+                row_issues.append(f"占比之和(主力+中+小)={total:+.2f}%，应为 0")
+        if row_issues:
+            issues.append(f"{date}: " + "；".join(row_issues))
+    return issues
 
 
 def _enough(value: FundFlowHistory) -> bool:
@@ -183,6 +260,8 @@ __all__ = [
     "FundFlowResult",
     "PROVIDER_ORDER_ENV",
     "configured_order",
+    "consistency_violations",
+    "provider_endpoint",
     "registered",
     "resolve",
 ]

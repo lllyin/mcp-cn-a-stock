@@ -292,3 +292,114 @@ def test_cache_codec_round_trips_the_complete_flag():
     assert decoded["complete"] is False and len(decoded["fund_flow"]) == 1
     # 老条目没有这个键：按全份读
     assert cache._decode_fund_flow({"rows": [], "is_market": False})["complete"] is True
+
+
+def test_cache_codec_round_trips_the_provider():
+    value = {"fund_flow": _frame(1), "is_market": False, "complete": True,
+             "provider": "eastmoney"}
+    decoded = cache._decode_fund_flow(cache._encode_fund_flow(value))
+    assert decoded["provider"] == "eastmoney"
+    # 老条目没有这个键：按 None 读，告警落"未知来源"，检测本身不受影响
+    assert cache._decode_fund_flow({"rows": []})["provider"] is None
+
+
+def test_provider_endpoint_names_the_upstream():
+    # 告警的定位能力：看到 provider 名就知道是哪个接口给的
+    assert "push2his" in ffs.provider_endpoint("eastmoney")
+    assert "push2delay" in ffs.provider_endpoint("eastmoney_delay")
+    assert "zjlx" in ffs.provider_endpoint("page_fallback")
+    # 未登记的名字原样返回，告警不能哑掉
+    assert ffs.provider_endpoint("someone_new") == "未知来源 someone_new"
+    assert ffs.provider_endpoint(None).startswith("未知来源")
+
+
+# --- 一致性检测：恒等式违反 = 这行不是真实成交的账 ---------------------------
+#
+# 起因是 2026-09-11：push2his 按请求身份给扰动副本——200、行数齐全、收盘价和
+# 涨跌幅是真值，只有各单净额偏 30%-50%。任何可用性指标都看不见，只能靠算术。
+# 真值取自服务器 curl 的原样返回（基线与东财页面一致），扰动值取自当时基线
+# 比对抓到的那两行。
+
+
+def _row(date, major, xl, big, mid, small, main_r=0.0, mid_r=0.0, small_r=0.0):
+    """构造一行 AkShare 列序的资金流。金额单位元，占比是百分数。"""
+    return {
+        "日期": date, "收盘价": 17.50, "涨跌幅": -0.51,
+        "主力净流入-净额": major, "主力净流入-净占比": main_r,
+        "超大单净流入-净额": xl, "超大单净流入-净占比": 0.0,
+        "大单净流入-净额": big, "大单净流入-净占比": 0.0,
+        "中单净流入-净额": mid, "中单净流入-净占比": mid_r,
+        "小单净流入-净额": small, "小单净流入-净占比": small_r,
+    }
+
+
+def test_truth_rows_pass_with_zero_violations():
+    # 2026-07-01 / 2026-06-29 的真值（服务器 curl 实测，页面同值）
+    frame = pd.DataFrame([
+        _row(datetime.date(2026, 7, 1), 54376549.0, 36593445.0, 17783104.0,
+             5592288.0, -59968832.0, 3.64, 0.37, -4.01),
+        _row(datetime.date(2026, 6, 29), 102946830.0, 33707038.0, 69239792.0,
+             -62567200.0, -40379632.0, 6.92, -4.20, -2.71),
+    ])
+    assert ffs.consistency_violations(frame) == []
+
+
+def test_page_roundtrip_tolerances_hold():
+    # 页面兜底两位小数（万）往返的舍入误差在千元级，容差 1 万元必须放行
+    frame = pd.DataFrame([
+        _row(datetime.date(2026, 7, 1), 54376500.0, 36593400.0, 17783100.0,
+             5592300.0, -59968800.0),
+    ])
+    assert ffs.consistency_violations(frame) == []
+
+
+def test_decoy_row_is_caught():
+    # 2026-09-11 基线比对抓到的扰动值：主力 +3.3%、超大 +30.5%、大单 -52.6%。
+    # 这份副本恰好守住了 主力==超大+大（扰动把大单调成了主力-超大），但四档
+    # 之和暴露它：真值小单没跟着动，而原始接口的账恒等于 0。
+    frame = pd.DataFrame([
+        _row(datetime.date(2026, 7, 1), 56175000.0, 47753100.0, 8421900.0,
+             3869700.0, -59968832.0),
+    ])
+    issues = ffs.consistency_violations(frame)
+    assert len(issues) == 1 and "2026-07-01" in issues[0]
+    assert "四档之和" in issues[0]
+
+
+def test_inconsistent_ratio_is_caught_when_amounts_are_self_consistent():
+    # 扰动若把金额也调自洽，占比这套必须咬住（互为备份）
+    frame = pd.DataFrame([
+        _row(datetime.date(2026, 7, 1), 50000000.0, 30000000.0, 20000000.0,
+             5000000.0, -55000000.0, 4.00, 0.50, -3.00),
+    ])
+    issues = ffs.consistency_violations(frame)
+    assert len(issues) == 1 and "占比之和" in issues[0]
+
+
+def test_placeholder_rows_are_skipped():
+    # 停牌/占位符是 None：None 与 0 的区分必须保持原样，不能当成 0 去算账
+    frame = pd.DataFrame([
+        _row(datetime.date(2026, 7, 1), None, None, None, None, None),
+    ])
+    assert ffs.consistency_violations(frame) == []
+
+
+def test_empty_or_odd_frames_pass_silently():
+    assert ffs.consistency_violations(None) == []
+    assert ffs.consistency_violations(pd.DataFrame(columns=COLUMNS)) == []
+    # 缺列的表（比如指数那套带交易所前缀的列名）不做金额检查，别误报
+    frame = pd.DataFrame([{"日期": datetime.date(2026, 7, 1),
+                           "上证-收盘价": 3875.16, "上证-涨跌幅": 0.12}])
+    assert ffs.consistency_violations(frame) == []
+
+
+def test_anomalies_flow_to_raw_data_and_block_cache(monkeypatch):
+    # 咽喉点接线：检测命中 → fund_flow_anomalies 进 StockData → raw_data
+    # → warnings 与缓存守卫
+    from finmcp.datasource.base import FUND_FLOW_ANOMALIES_KEY, StockData
+
+    stock_data = StockData(symbol="SH600489")
+    anomalies = ["2026-07-01: 主力(1) != 超大+大(2)，差 -1 元"]
+    stock_data.fund_flow_anomalies = anomalies
+    raw = stock_data.to_dict()
+    assert raw[FUND_FLOW_ANOMALIES_KEY] == anomalies

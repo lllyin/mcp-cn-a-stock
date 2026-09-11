@@ -8,7 +8,7 @@
 所以本脚本不用 curl，全部用部署环境 venv 里的 requests 按服务的各种身份
 各请求一次，与真值基准逐列比对，量出哪一档身份拿到什么。
 
-用法（在部署机上、用服务的 venv；NID18 从浏览器或既有凭据取）：
+用法（在当前环境的服务 venv 里跑；NID18 从浏览器或既有凭据取）：
 
     NID18=<nid18的值> python scripts/probe_fund_flow_tiers.py 1.600489
     NID18=... python scripts/probe_fund_flow_tiers.py 1.600489 \

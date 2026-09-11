@@ -483,6 +483,11 @@ def restore_channel(monkeypatch):
     monkeypatch.delattr(std_requests, channel._PROXY_PATCH_MARKER, raising=False)
     before = (std_requests.Session, std_requests.get,
               std_requests.post, std_requests.request)
+    # conftest 的 import 链（research → cn_stock_source 模块级 install）在收集阶段
+    # 就把通道装成 direct；带着它进用例，用例里自己的 install 会被
+    # "already installed" 忽略，凭据包装层缺席，Cookie 断言必挂——而且只有
+    # 排到前面的用例踩得到，顺序一变fail 的就是另一批。每个用例都从卸干净开始。
+    channel.uninstall_http_channel()
     yield
     channel.uninstall_http_channel()
     assert (std_requests.Session, std_requests.get,

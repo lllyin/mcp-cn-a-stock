@@ -106,14 +106,76 @@ def _is_impersonated(url) -> bool:
     return not parts.path.lower().endswith((".js", ".html"))
 
 
+#: 要求凭据的那批 API 走 plain requests 时必须自带一套自洽的现代 Chrome 头。
+#: 上游对这批端点按请求身份分档服务（2026-09-11 服务器实测，同一出口 IP 同一凭据）：
+#: curl 的现代 Chrome TLS + Chrome/152 头拿到真值；Chrome/81 的头被直接拒连；而
+#: Python TLS 配 Chrome/81 头**不拒也不给真值**——返回 200 和一份资金流金额扰动过
+#: 的副本（收盘价、涨跌幅正确，主力/超大/大/中/小单偏差 30%-50%），比拒绝更难发现。
+#: AkShare 硬编码的就是 Chrome/81，所以在凭据层**强制覆盖**成与浏览器一致的自洽头。
+#:
+#: 为什么连调用方显式给的 UA 也覆盖：这批主机的分档把"头和 TLS 指纹不自洽"当成
+#: 可疑身份，而最常来的调用方 AkShare 恰恰显式写着 Chrome/81——尊重调用方等于
+#: 给扰动副本开门。别的调用方若真需要另一种身份，这批主机上也没有成立的场景：
+#: 它们只认现代 Chrome。这里改的是出站头，不是调用方的代码。
+_AUTH_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+)
+#: 身份头，**强制覆盖**调用方自带的同名头。上游按这一组判请求身份，self-consistent
+#: 才是真值档；AkShare 硬编码的 Chrome/81 恰恰是扰动档的身份。缺了任何一项都算
+#: 不自洽（老 UA 配新 client-hint、新 UA 缺 client-hint 都是矛盾体）。
+_AUTH_IDENTITY_HEADERS = {
+    "User-Agent": _AUTH_UA,
+    "sec-ch-ua": '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+}
+#: 装饰性头，缺了才补：它们不参与分档，调用方显式给的有自己的语义（测试靠一个
+#: 自定义 Referer 断言"其他头原样保留"），覆盖它没有收益。
+_AUTH_DEFAULT_HEADERS = {
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,image/apng,*/*;q=0.8"),
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Referer": "https://data.eastmoney.com/",
+}
+
+
+def _with_auth_headers(url: str, kwargs: dict) -> dict:
+    """给要求凭据的请求对齐身份：身份头强制覆盖，装饰性头缺了才补。
+
+    只对 needs_auth 的主机生效，普通主机的调用方头原样不动。对这批主机，
+    覆盖身份头就是本函数存在的意义（见上面 _AUTH_IDENTITY_HEADERS 的注释）。
+    Cookie 不在这里，仍由 _with_auth_cookie 按"调用方给就不覆盖"处理。
+    """
+    if not eastmoney_auth.needs_auth(url):
+        return kwargs
+    headers = dict(kwargs.get("headers") or {})
+    changed = False
+    for name, value in {**_AUTH_DEFAULT_HEADERS, **_AUTH_IDENTITY_HEADERS}.items():
+        for key in list(headers):
+            if key.lower() == name.lower():
+                if name in _AUTH_DEFAULT_HEADERS:
+                    continue            # 装饰性头：调用方给的不动
+                del headers[key]        # 身份头：大小写不同的同名头先删掉
+        if not any(key.lower() == name.lower() for key in headers):
+            headers[name] = value
+            changed = True
+    return {**kwargs, "headers": headers} if changed else kwargs
+
+
 def _with_auth_cookie(url, kwargs: dict) -> tuple[dict, bool]:
     """给要求凭据的主机补上 ``Cookie`` 头，并返回是否用了本层凭据。
 
     只在调用方没有自己给 Cookie 时才补：显式传了 Cookie 的调用方知道自己在干什么，
     这一层不该覆盖它。取凭据这条路本身不抛异常，拿不到就原样返回——凭据是可用性
     优化，不能变成新的失败点。
+
+    Cookie 之外同时补一套自洽的现代 Chrome 头（见 ``_with_auth_headers``）：没有
+    这套头时 plain requests + AkShare 的旧 UA 会拿到上游的扰动副本，那是安静的数据
+    质量问题，不能靠源排序或熔断发现。
     """
     header = eastmoney_auth.cookie_header(url)
+    kwargs = _with_auth_headers(url, kwargs)
     if not header:
         return kwargs, False
     headers = dict(kwargs.get("headers") or {})
