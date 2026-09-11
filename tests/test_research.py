@@ -648,3 +648,76 @@ def test_the_heading_carries_no_date():
     src = (pathlib.Path(research.__file__)).read_text(encoding="utf-8")
     assert 'print("## 资金流向", file=fp)' in src
     assert "## 资金流向（" not in src
+
+
+class TestSelectFundFlowRowForQueryDate:
+    """钉日期查询的"当日"资金流选行。
+
+    起因：字段在取数层一律取帧最后一行（今天），钉日期查询展示它会张冠李戴，
+    于是渲染层曾经整段不给。选行之后，钉住日期那一行本来就在历史帧里，直接
+    展示真数据；帧里没有那一天（非交易日等）才退回降级文案。
+    """
+
+    def _date_ns(self, value: str) -> int:
+        dt = datetime.datetime.strptime(value, "%Y-%m-%d")
+        return int(dt.timestamp() * 1e9)
+
+    def _history(self) -> dict:
+        return {
+            "DATE": np.array(
+                [self._date_ns("2026-08-26"), self._date_ns("2026-08-27")],
+                dtype=np.int64,
+            ),
+            "A_A": np.array([-93699300.0, 54376549.0], dtype=np.float64),
+            "A_R": np.array([-0.0596, 0.0364], dtype=np.float64),
+            "S_A": np.array([29752400.0, -59968832.0], dtype=np.float64),
+            "S_R": np.array([0.0199, -0.0401], dtype=np.float64),
+        }
+
+    def test_the_query_dates_row_is_selected(self):
+        data = {"QUERY_DATE": "2026-08-27", "_DS_FUND_FLOW": self._history()}
+        research._select_fund_flow_row_for_query_date(data)
+        assert data["A_A"] == np.array([54376549.0])
+        assert data["A_R"] == np.array([0.0364])
+        assert data["S_A"] == np.array([-59968832.0])
+
+    def test_fields_not_in_the_frame_are_left_absent(self):
+        data = {"QUERY_DATE": "2026-08-27", "_DS_FUND_FLOW": self._history()}
+        research._select_fund_flow_row_for_query_date(data)
+        # 历史帧里没有的键不该被造出来
+        assert "XL_A" not in data and "L_R" not in data
+
+    def test_a_date_outside_the_frame_changes_nothing(self):
+        """非交易日/早于窗口：精确匹配不到就原样保留，渲染层退回降级文案。"""
+        data = {"QUERY_DATE": "2026-08-30", "_DS_FUND_FLOW": self._history(),
+                "A_A": np.array([12345.0])}
+        research._select_fund_flow_row_for_query_date(data)
+        assert data["A_A"] == np.array([12345.0])
+
+    def test_without_fund_flow_data_it_is_a_no_op(self):
+        data = {"QUERY_DATE": "2026-08-27", "A_A": np.array([12345.0])}
+        research._select_fund_flow_row_for_query_date(data)
+        assert data["A_A"] == np.array([12345.0])
+
+    def test_rendered_day_line_matches_the_history_table_row(self):
+        """一致性验证：选行渲染出的"当日"行必须和同报告的历史表格该行逐字同值。
+
+        值取 SH600489 2026-08-27 前后的真实量级；渲染入口和
+        ``build_historical_fund_flow_data`` 是同一个上游帧。
+        """
+        data = {
+            "QUERY_DATE": "2026-08-27",
+            "_DS_FUND_FLOW": self._history(),
+        }
+        research._select_fund_flow_row_for_query_date(data)
+        day_fp = StringIO()
+        assert research._print_fund_flow_lines(day_fp, data) is True
+        day_text = day_fp.getvalue()
+        assert "- 当日主力净流入: 5437.65万  主力净占比: 3.64%" in day_text
+        assert "- 当日小单净流入: -5996.88万  小单净占比: -4.01%" in day_text
+
+        table_fp = StringIO()
+        build_historical_fund_flow_data(table_fp, data)
+        table_text = table_fp.getvalue()
+        assert "| 2026-08-27 |" in table_text and "5437.65万" in table_text
+        assert "-4.01%" in table_text  # 小单占比：当日行与表格行同源同值

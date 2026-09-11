@@ -208,7 +208,48 @@ async def load_raw_data(
     if data and is_historical_query:
         data["QUERY_DATE"] = end_date.strftime("%Y-%m-%d")  # type: ignore
         data["IS_HISTORICAL_QUERY"] = True  # type: ignore
+        _select_fund_flow_row_for_query_date(data)
     return data
+
+
+def _select_fund_flow_row_for_query_date(data: Dict[str, ndarray]) -> None:
+    """钉日期查询：把"当日"资金流字段从帧最后一行换成钉住日期那一行。
+
+    "当日"字段（``A_A``/``XL_A``……）在取数层一律取资金流历史帧的**最后一行**，
+    那是"今天"；钉日期查询若照常展示，报告开头写着 08-27、资金流却是今天的数，
+    比不给更糟——这就是渲染层曾经整段不展示的原因。但钉住日期那一行本来就在
+    历史帧里（同一上游、同一口径），选中它之后渲染层照常工作，报告多出的是
+    真数据而不是降级说明。
+
+    只做**精确匹配**：帧里没有那一天的行（非交易日、早于上市、早于资金流历史
+    窗口起点），就保持原样，渲染层退回降级文案。不要"最近的一天"——那是在
+    悄悄回答另一个问题。
+
+    找不到 ``_DS_FUND_FLOW``（没取到资金流）也原样返回，让缺数据走缺数据的老路。
+    """
+    query_date = data.get("QUERY_DATE")
+    if not query_date:
+        return
+    fund_flow = data.get("_DS_FUND_FLOW")
+    if not fund_flow:
+        return
+    dates = fund_flow.get("DATE", np.array([], dtype=np.int64))
+    if len(dates) == 0:
+        return
+    try:
+        query_ns = int(datetime.datetime.strptime(query_date[:10], "%Y-%m-%d")
+                       .timestamp() * 1e9)
+    except ValueError:
+        return
+    matches = np.nonzero(dates == query_ns)[0]
+    if len(matches) == 0:
+        return
+    index = int(matches[-1])
+    for field in ("A_A", "A_R", "XL_A", "XL_R", "L_A", "L_R",
+                  "M_A", "M_R", "S_A", "S_R"):
+        values = fund_flow.get(field)
+        if values is not None and len(values) > index:
+            data[field] = np.array([values[index]], dtype=np.float64)  # type: ignore
 
 
 def is_stock(symbol: str) -> bool:
@@ -404,6 +445,24 @@ FUND_FLOW_FIELDS = [
     ("中单", "M"),
     ("小单", "S"),
 ]
+
+
+def _print_fund_flow_lines(fp: TextIO, data: Dict[str, ndarray]) -> bool:
+    """把五档"当日资金流"行渲染出来，返回是否有任何一行拿到了值。
+
+    非交易时段分支和钉日期分支共用：两条路的数据来源相同（``A_A``/``XL_A``……
+    那组字段），差别只在取不到时的兜底文案，由调用方自己写。
+    """
+    has_fund_flow = False
+    fields = [
+        ("主力", "A"), ("超大单", "XL"), ("大单", "L"), ("中单", "M"), ("小单", "S"),
+    ]
+    for field_name, field_id in fields:
+        val = build_fund_flow((field_name, field_id), data)
+        if val:
+            print(f"- {val}", file=fp)
+            has_fund_flow = True
+    return has_fund_flow
 
 
 def build_fund_flow(field: tuple[str, str], data: Dict[str, ndarray]) -> str:
@@ -829,7 +888,12 @@ async def build_trading_data(
     print("## 资金流向", file=fp)
 
     if data.get("IS_HISTORICAL_QUERY", False):
-        print("- 指定日期查询暂不展示实时资金流向", file=fp)
+        # 钉日期查询：选行逻辑见 _select_fund_flow_row_for_query_date——字段已是
+        # 钉住日期那一行的值，渲染与非交易时段同一条路。帧里没有那一天的行
+        # （非交易日、早于上市、早于历史窗口），才退回降级文案。
+        has_fund_flow = _print_fund_flow_lines(fp, data)
+        if not has_fund_flow:
+            print("- 指定日期查询暂不展示实时资金流向", file=fp)
         print("", file=fp)
     else:
     
@@ -893,16 +957,7 @@ async def build_trading_data(
                         print(f"- [实时调用异常] {str(e)}", file=fp)
         else:
             # 非交易时段展示详情数据
-            has_fund_flow = False
-            fields = [
-                ("主力", "A"), ("超大单", "XL"), ("大单", "L"), ("中单", "M"), ("小单", "S"),
-            ]
-            for field_name, field_id in fields:
-                val = build_fund_flow((field_name, field_id), data)
-                if val:
-                    print(f"- {val}", file=fp)
-                    has_fund_flow = True
-            if not has_fund_flow:
+            if not _print_fund_flow_lines(fp, data):
                 print("- 暂无资金流向数据", file=fp)
         print("", file=fp)
 
