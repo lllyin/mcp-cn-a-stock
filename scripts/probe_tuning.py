@@ -17,8 +17,13 @@
 
 不量的：熔断阈值与冷却——被拒状态跟着浏览器指纹走、不随时间恢复，冷却是止损加半开探测，
 按"恢复时间"调它无意义；缓存 TTL 与纪元时刻——业务策略；provider 顺序——那是准确度判断，
-这里只报不可达、不重排；FETCH_MAX_WORKERS / BATCH_CONCURRENCY——受上游而不是这台机器的 CPU
-约束，默认值照用。
+这里只报不可达、不重排；FETCH_MAX_WORKERS——受上游而不是这台机器的 CPU 约束，默认值照用。
+
+BATCH_CONCURRENCY 单独有一项（``batch`` 子命令）：回放下游的真实爆发形态（每批 4 个
+标的、同秒并发 3 批，来自 mcporter 73 天调用日志），逐臂量准入排队 p95 和错误率。
+判据：排队 p95 ≤ 1 秒的最小臂；每臂至少 12 次调用；并发更高而错误也更多的臂排除；
+判不出来保持默认 2。它测的是"准入上限和下游负载形态的匹配度"，需要在出站请求能直达
+上游的当前环境跑（上游被代理挡住时结果无意义）。
 
 判据是边际的、带样本量门槛的（AGENTS 第五条：判不出就保持默认）：
 
@@ -78,9 +83,14 @@ import time
 import urllib.error
 import urllib.request
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+import re
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from verify_release import CallSpec, run_call  # noqa: E402  复用 mcporter 调用与判定
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # 以脚本文件形式运行时 sys.path[0] 是 scripts/，仓库根不在搜索路径上；探测量的就是这份检出的代码。
@@ -111,6 +121,7 @@ DEFAULTS = {
     "BROWSER_KEEP_PAGES": "0",
     "CACHE_ENABLED": "1",
     "KLINE_TONGHUASHUN_BUDGET_SECONDS": "45",
+    "BATCH_CONCURRENCY": "2",
 }
 
 # ── 判据阈值 ──────────────────────────────────────────────────────
@@ -1439,6 +1450,14 @@ def run_recommend(args) -> int:
         print(f"{out_dir} 里没有 facts.json 也没有 browser.json，先跑 facts / browser 或 all", file=sys.stderr)
         return 2
     decisions = build_decisions(facts, browser, getattr(args, "service_base_mib", None), tonghuashun)
+    # batch.json 存在时把 BATCH_CONCURRENCY 的实测结论补进推荐（run_batch 写的）
+    batch = read_json(out_dir / "batch.json")
+    if batch:
+        decisions = [d for d in decisions if d.key != "BATCH_CONCURRENCY"]
+        decisions.append(Decision(
+            key="BATCH_CONCURRENCY", value=str(batch.get("value")),
+            status=batch.get("status", "measured"),
+            evidence=str(batch.get("evidence", ""))))
     env_path = Path(args.env)
     values = _dotenv(env_path)
     lint = lint_env(values, {d.key: d for d in decisions})
@@ -1573,6 +1592,152 @@ def run_verify(args) -> int:
         print("[verify] 隔离实例已停止")
 
 
+# ── batch：批次准入并发量化 ─────────────────────────────────────────
+
+
+#: 回放用的下游真实形态（2026-06-12~09-11 的 mcporter 日志实测）：
+#: 每批 4 个标的、同一秒并发 3 批、盘中和盘前都出现。符号池取自下游真实查询。
+BATCH_POOL = (
+    "SH600026,SH600938,SH601975,SH601899",
+    "SZ300308,SZ300502,SH688008,SZ301308",
+    "SH603986,SZ002409,SZ000021,SH688498",
+)
+BATCH_QUEUE_P95_TARGET_S = 1.0
+
+
+def _wait_for_instance(log_path: Path, process, timeout: float) -> Optional[str]:
+    """等隔离实例就绪；失败返回给 stderr 的说明，成功返回 None。"""
+    deadline = time.perf_counter() + timeout
+    while True:
+        if process.poll() is not None:
+            return f"实例启动失败，退出码 {process.returncode}，见 {log_path}"
+        text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+        if "Starting MCP app" in text:
+            return None
+        if time.perf_counter() > deadline:
+            return "实例启动超时"
+        time.sleep(0.5)
+
+
+def _parse_queue_seconds(log_path: Path) -> list:
+    """从服务日志抠出每批的准入排队秒数（"Batch query admitted ... queue=X s"）。"""
+    queues = []
+    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = re.search(r"Batch query admitted .*?queue=([0-9.]+)s", line)
+        if match:
+            queues.append(float(match.group(1)))
+    return queues
+
+
+def run_batch(args) -> int:
+    """量 BATCH_CONCURRENCY：按下游爆发形态回放，逐臂量准入排队。
+
+    回放工作负载是下游 73 天日志的实测形态——每批 4 个标的、同秒并发 3 批——
+    不是拍的。每臂起一个隔离实例（ENV_PREFIX=PROBE_，缓存关掉，不让命中把
+    排队掩盖掉），从服务日志抠每批的 queue= 值。
+
+    判据（AGENTS 第五条）：每臂至少 12 次调用才下结论；取**排队 p95 ≤ 1 秒的
+    最小臂**——准入层的存在理由是保护上游，够快就不该再往上调；并发更高而
+    错误也更多的臂直接排除。判不出来保持默认 2。
+    """
+    if shutil.which("mcporter") is None:
+        print("找不到 mcporter，batch 探测跑不起来", file=sys.stderr)
+        return 2
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dotenv = _dotenv(PROJECT_ROOT / ".env")
+    arms = [int(x) for x in str(args.arms).split(",") if x.strip()]
+    episodes = args.episodes
+    results = {}
+
+    for arm in arms:
+        arm_dir = out_dir / f"arm-{arm}"
+        arm_dir.mkdir(parents=True, exist_ok=True)
+        env = prefixed_environment(
+            os.environ, dotenv, {"BATCH_CONCURRENCY": str(arm), "CACHE_ENABLED": "0"},
+            "PROBE_", arm_dir / "cache")
+        if not env.get("DISPLAY"):
+            xvfb_pid = _pid_alive(XVFB_PID_FILE)
+            if xvfb_pid:
+                env["DISPLAY"] = f":{dotenv.get('XVFB_DISPLAY_NUMBER', '99')}"
+        log_path = arm_dir / "server.log"
+        print(f"[batch] BATCH_CONCURRENCY={arm}：起隔离实例 port={args.port}")
+        with log_path.open("w", encoding="utf-8") as handle:
+            process = subprocess.Popen(
+                [sys.executable, "main.py", "--transport", "http", "--port", str(args.port)],
+                cwd=str(PROJECT_ROOT), env=env, stdout=handle, stderr=subprocess.STDOUT,
+            )
+            try:
+                failure = _wait_for_instance(log_path, process, args.timeout)
+                if failure:
+                    print(f"[batch] {failure}", file=sys.stderr)
+                    return 2
+                config_path = arm_dir / "mcporter.json"
+                config_path.write_text(json.dumps(
+                    {"mcpServers": {"cn-stock": {"baseUrl": f"http://127.0.0.1:{args.port}/cnstock/mcp"}}},
+                    indent=2), encoding="utf-8")
+                walls: list = []
+                errors = 0
+                for episode in range(episodes):
+                    specs = [
+                        CallSpec("brief", {"symbol": BATCH_POOL[(episode + offset) % len(BATCH_POOL)]})
+                        for offset in range(args.burst)
+                    ]
+                    started = time.perf_counter()
+                    with ThreadPoolExecutor(max_workers=args.burst) as pool:
+                        calls = list(pool.map(
+                            lambda spec: run_call(spec, config_path, args.call_timeout_ms),
+                            specs))
+                    for call in calls:
+                        walls.append(call.elapsed)
+                        if not call.ok:
+                            errors += 1
+                    print(f"[batch]   episode {episode + 1}/{episodes}: "
+                          f"{[f'{c.elapsed:.1f}s' for c in calls]}")
+                    time.sleep(args.episode_gap)
+            finally:
+                process.send_signal(signal.SIGTERM)
+                try:
+                    process.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+        queues = _parse_queue_seconds(log_path)
+        results[arm] = {
+            "calls": len(walls), "errors": errors,
+            "wall_p50_s": round(percentile(walls, 50), 2),
+            "wall_p95_s": round(percentile(walls, 95), 2),
+            "wall_max_s": round(max(walls), 2) if walls else None,
+            "queue_n": len(queues),
+            "queue_p50_s": round(percentile(queues, 50), 3) if queues else None,
+            "queue_p95_s": round(percentile(queues, 95), 3) if queues else None,
+            "queue_max_s": round(max(queues), 3) if queues else None,
+        }
+        print(f"[batch]   汇总: {results[arm]}")
+
+    eligible = [arm for arm in arms
+                if results[arm]["calls"] >= 12
+                and results[arm]["queue_p95_s"] is not None
+                and results[arm]["queue_p95_s"] <= BATCH_QUEUE_P95_TARGET_S
+                and results[arm]["errors"] <= min(results[a]["errors"] for a in arms)]
+    if eligible:
+        chosen = min(eligible)
+        status = "measured"
+        reason = (f"排队 p95 {results[chosen]['queue_p95_s']}s ≤ {BATCH_QUEUE_P95_TARGET_S}s 的最小臂"
+                  f"（错误 {results[chosen]['errors']}/{results[chosen]['calls']}）")
+    else:
+        chosen = 2
+        status = "inconclusive"
+        reason = "没有一臂满足排队 p95 ≤ 1s 且错误不增，按默认"
+    recommendation = {"key": "BATCH_CONCURRENCY", "value": str(chosen),
+                      "status": status, "evidence": reason, "arms": results,
+                      "target_queue_p95_s": BATCH_QUEUE_P95_TARGET_S,
+                      "finished": _now_text()}
+    write_json(out_dir / "batch.json", recommendation)
+    print(f"[batch] 推荐 BATCH_CONCURRENCY={chosen}（{status}）：{reason}")
+    print(f"[batch] 证据写入 {out_dir / 'batch.json'}")
+    return 0
+
+
 # ── 入口 ──────────────────────────────────────────────────────────
 
 
@@ -1633,6 +1798,16 @@ def parse_args(argv=None) -> argparse.Namespace:
     p_verify.add_argument("--only", default="brief,medium,full", help="传给 verify_release 的 --only；空串则全部工具")
     p_verify.add_argument("--timeout", type=float, default=60.0, help="等实例就绪的秒数")
 
+    p_batch = sub.add_parser("batch", help="按下游爆发形态回放，量 BATCH_CONCURRENCY 的准入排队")
+    common(p_batch)
+    p_batch.add_argument("--arms", default="2,3,4", help="要量的 BATCH_CONCURRENCY 取值，逗号分隔")
+    p_batch.add_argument("--episodes", type=int, default=4, help="每臂的爆发轮数（每轮并发 --burst 次调用）")
+    p_batch.add_argument("--burst", type=int, default=3, help="每轮同秒并发几批")
+    p_batch.add_argument("--episode-gap", type=float, default=2.0, help="两轮之间的间隔秒数")
+    p_batch.add_argument("--call-timeout-ms", type=int, default=60000, help="单次 mcporter 调用的超时")
+    p_batch.add_argument("--port", type=int, default=8791)
+    p_batch.add_argument("--timeout", type=float, default=60.0, help="等实例就绪的秒数")
+
     p_all = sub.add_parser("all", help="facts → browser → tonghuashun → recommend")
     common(p_all)
     for source in (p_facts, p_browser, p_ths, p_rec):
@@ -1680,7 +1855,8 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     _require_venv()
     handlers = {"facts": run_facts, "browser": run_browser, "recommend": run_recommend,
-                "tonghuashun": run_tonghuashun, "verify": run_verify, "all": run_all}
+                "tonghuashun": run_tonghuashun, "verify": run_verify, "batch": run_batch,
+                "all": run_all}
     return handlers[args.command](args)
 
 
