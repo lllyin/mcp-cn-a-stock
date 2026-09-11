@@ -27,6 +27,7 @@ from ..config import (
     FUND_FLOW_PAGE_TABLE_WAIT_SECONDS,
 )
 from ..observability import log_context
+from . import eastmoney_auth
 from .breaker import SourceBreaker
 from .fund_flow_page import (
     HISTORY_TABLE_ID,
@@ -871,6 +872,11 @@ async def _load_once(page, symbol: str, url: str, *, reload: bool):
             _wait_for_history(page, history_refused),
         )
         content = await page.content()
+        # 这个页面本来就在 .eastmoney.com 上，加载时 JS 已经把 nid18 写好了。顺手
+        # 读一次，纯 API 那条路就不必再单独开一个浏览器去采（见 eastmoney_auth）。
+        # 用 getattr 取 context：这里是取数路径，取凭据这件事不能因为拿不到 context
+        # 就把这次取数搞掉——它是白捡的，不是必需的。
+        await eastmoney_auth.remember_from_context(getattr(page, "context", None))
     finally:
         page.remove_listener("requestfailed", on_request_failed)
 

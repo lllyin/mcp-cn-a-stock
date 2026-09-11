@@ -833,7 +833,7 @@ async def build_trading_data(
         print("", file=fp)
     else:
     
-        # 09:15 - 17:00 uses Playwright because the AkShare fund-flow feed lags.
+        # The configurable warmup-to-final window uses Playwright because the API feed lags.
         is_trading = is_realtime_fund_flow_window()
         
         if is_trading:

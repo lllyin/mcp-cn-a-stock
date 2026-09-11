@@ -31,6 +31,7 @@ from ..config import (
     resolve_http_mode,
 )
 from ..observability import log_context
+from . import eastmoney_auth
 
 logger = logging.getLogger("finmcp")
 
@@ -80,6 +81,11 @@ def describe_installed_channel() -> str:
     parts = [f"mode={_installed_mode}", f"reason={_installed_reason}"]
     parts += [f"{key}={value}" for key, value in _installed_detail.items()]
     parts.append(f"hooked_hosts={len(IMPERSONATED_HOSTS)}")
+    # 网关模式由第三方插件完整接管；其余模式才使用本项目的凭据层。
+    parts.append(
+        "eastmoney_auth=proxy_managed"
+        if _installed_mode == "proxy" else eastmoney_auth.describe()
+    )
     return " ".join(parts)
 
 
@@ -98,6 +104,106 @@ def _is_impersonated(url) -> bool:
         return False
     # Page assets are served normally and gain nothing from impersonation.
     return not parts.path.lower().endswith((".js", ".html"))
+
+
+def _with_auth_cookie(url, kwargs: dict) -> tuple[dict, bool]:
+    """给要求凭据的主机补上 ``Cookie`` 头，并返回是否用了本层凭据。
+
+    只在调用方没有自己给 Cookie 时才补：显式传了 Cookie 的调用方知道自己在干什么，
+    这一层不该覆盖它。取凭据这条路本身不抛异常，拿不到就原样返回——凭据是可用性
+    优化，不能变成新的失败点。
+    """
+    header = eastmoney_auth.cookie_header(url)
+    if not header:
+        return kwargs, False
+    headers = dict(kwargs.get("headers") or {})
+    if any(name.lower() == "cookie" for name in headers):
+        return kwargs, False
+    headers["Cookie"] = header
+    return {**kwargs, "headers": headers}, True
+
+
+def _note_auth_outcome(url, *, success: bool) -> None:
+    """记一次凭据成败，**绝不把异常放回请求路径**。
+
+    这是记账，不是取数。记账把一次本来成功的请求弄崩，是这个项目踩过的形态
+    （维度统计写坏过一份已经渲染好的报告）。所以整段包起来，最坏是这一次没记上。
+    """
+    try:
+        eastmoney_auth.note_outcome(url, success=success)
+    except Exception:
+        logger.debug("eastmoney_auth 记账失败 url=%s", url, exc_info=True)
+
+
+def _plain_with_auth_outcome(
+    base_cls, session, method, url, kwargs: dict, *, track_auth: bool
+):
+    """走原生 requests，并把结果记进凭据的成败账。
+
+    这几个主机拒绝请求的形态是直接断连（curl 报 ``Empty reply from server``），在
+    requests 里是 ``ConnectionError``，不是一个 200 空体——所以按异常和状态码判就够，
+    不去读响应体：读 ``.content`` 会把 ``stream=True`` 的调用方弄坏。
+
+    状态码用 ``getattr`` 取：这一层会包住别人的 Session，而"响应"未必是 requests 的
+    Response（桩、别的通道的返回类型都可能）。取不到就不记这一笔，而不是崩在记账上。
+    """
+    try:
+        response = base_cls.request(session, method, url, **kwargs)
+    except Exception:
+        if track_auth:
+            _note_auth_outcome(url, success=False)
+        raise
+    status = getattr(response, "status_code", None)
+    if track_auth and status is not None:
+        _note_auth_outcome(url, success=status == 200)
+    return response
+
+
+def _install_auth_cookies() -> bool:
+    """在 direct / proxy 模式下补一层只加 Cookie 的包装。
+
+    impersonate 模式**不**走这里：那个模式把 ``requests.get/post/request`` 换成了
+    闭包，闭包里直接 new 出 ImpersonateSession，看不见后装的包装类。所以那个模式的
+    注入放在 ``ImpersonateSession.request`` 内部，一处盖住伪装和裸重放两条分支。
+
+    凭据层关掉时**一个字节都不改** requests。``direct`` 的契约是"原生 requests，
+    不经任何转发"，很多测试正是靠它才能断言业务逻辑而不是通道行为；为一个此刻不会
+    注入任何东西的包装破掉那个契约，是白付一层间接。
+    """
+    if not eastmoney_auth.enabled():
+        return False
+    base_cls = std_requests.Session
+    # setdefault：impersonate 分支已经把原始的那几个存进去了，这里不能覆盖成它的
+    # 替身，否则 uninstall 之后 requests 上留着的是伪装类。
+    _restore.setdefault("Session", base_cls)
+    _restore.setdefault("get", std_requests.get)
+    _restore.setdefault("post", std_requests.post)
+    _restore.setdefault("request", std_requests.request)
+
+    class AuthCookieSession(base_cls):
+        def request(self, method, url, **kwargs):
+            kwargs, track_auth = _with_auth_cookie(url, kwargs)
+            return _plain_with_auth_outcome(
+                base_cls, self, method, url, kwargs, track_auth=track_auth
+            )
+
+    def auth_get(url, params=None, **kwargs):
+        with AuthCookieSession() as session:
+            return session.get(url, params=params, **kwargs)
+
+    def auth_post(url, data=None, json=None, **kwargs):
+        with AuthCookieSession() as session:
+            return session.post(url, data=data, json=json, **kwargs)
+
+    def auth_request(method, url, **kwargs):
+        with AuthCookieSession() as session:
+            return session.request(method, url, **kwargs)
+
+    std_requests.Session = AuthCookieSession
+    std_requests.get = auth_get
+    std_requests.post = auth_post
+    std_requests.request = auth_request
+    return True
 
 
 def _cffi_session(impersonate: str):
@@ -236,9 +342,15 @@ def _install_impersonate(
 
     class ImpersonateSession(original_session_cls):
         def request(self, method, url, **kwargs):
+            # 凭据在最前面补：伪装分支和裸重放分支都要带上。这两条正是同一批主机的
+            # 两条出路，只给一条带等于让另一条继续被拒。
+            kwargs, track_auth = _with_auth_cookie(url, kwargs)
             if not _is_impersonated(url) or _impersonation_suspended():
                 kwargs.pop("impersonate", None)
-                return original_session_cls.request(self, method, url, **kwargs)
+                return _plain_with_auth_outcome(
+                    original_session_cls, self, method, url, kwargs,
+                    track_auth=track_auth,
+                )
 
             attempt_kwargs = dict(kwargs)
             attempt_kwargs["timeout"] = timeout
@@ -254,6 +366,8 @@ def _install_impersonate(
                     )
                     if response.status_code == 200:
                         _record_impersonation(success=True)
+                        if track_auth:
+                            _note_auth_outcome(url, success=True)
                         return response
                     outcome = f"status_{response.status_code}"
                 except Exception as exc:
@@ -284,7 +398,12 @@ def _install_impersonate(
             # to the unpatched build: callers still see requests' own response
             # and exception types, which efinance and AkShare branch on.
             kwargs.pop("impersonate", None)
-            return original_session_cls.request(self, method, url, **kwargs)
+            # 只按最终结果记凭据成败：伪装失败、普通请求成功时凭据显然仍然可用，
+            # 不能因为中间路径失败就触发重采。
+            return _plain_with_auth_outcome(
+                original_session_cls, self, method, url, kwargs,
+                track_auth=track_auth,
+            )
 
     def impersonate_get(url, params=None, **kwargs):
         with ImpersonateSession() as session:
@@ -376,12 +495,26 @@ def install_http_channel(
                 )
                 mode, reason = "direct", "curl_cffi_unavailable"
 
+        if mode == "direct":
+            # impersonate 自己在 ImpersonateSession 里注入；proxy 由第三方插件完整接管。
+            # 两者都不再套一层 requests 包装。
+            _install_auth_cookies()
+
         # The effective channel is reported once by the startup banner via
         # describe_installed_channel(); only degradations are logged here.
         _installed_mode = mode
         _installed_reason = reason
         logger.debug("HTTP channel installed %s", describe_installed_channel())
-        return mode
+
+    # 锁外读盘：盘上有一份没过期的就直接用，省掉一次页面加载。
+    #
+    # 这里**只读盘、不采集**。安装发生在 cn_stock_source 的 import 期，在这里起一次
+    # 采集就等于"import 这个模块会拉起一个 Chromium"——测试和任何只想调个函数的
+    # 脚本都要付。采集改由首次真正打到这几个主机的请求懒触发（cookie_header），
+    # 那时它是后台的，不占请求路径。
+    if mode != "proxy":
+        eastmoney_auth.load_cached()
+    return mode
 
 
 def uninstall_http_channel() -> None:

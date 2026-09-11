@@ -543,6 +543,32 @@ class TestProbeSuite:
         spec = next(s for s in verify.probe_suite({"kline_range"}))
         assert spec.args["start_date"] < spec.args["end_date"]
 
+    def test_new_service_tools_are_part_of_the_release_gate(self):
+        specs = {s.tool: s for s in verify.probe_suite(
+            {"health", "sector_fund_flow", "market_map"}
+        )}
+        assert set(specs) == {"health", "sector_fund_flow", "market_map"}
+        assert specs["health"].args["include_archived"] == "false"
+        assert specs["market_map"].args == {
+            "board": "star", "fmt": "json", "sectors": "3", "stocks_per_sector": "20",
+        }
+
+
+def test_tool_error_text_is_a_failed_call_even_when_mcporter_exits_zero():
+    result = verify.CallResult(
+        verify.CallSpec("market_map", {}), 0,
+        "Error executing tool market_map: 全部源都没给出结果", "", 1.0,
+    )
+    assert result.ok is False
+
+
+def test_plain_payload_with_the_word_error_is_not_misclassified():
+    result = verify.CallResult(
+        verify.CallSpec("health", {}), 0,
+        "# 服务健康\n\n错误率 0%\n", "", 1.0,
+    )
+    assert result.ok is True
+
 
 def test_index_detection_matches_the_service():
     assert verify.is_index("SH000001") and verify.is_index("SZ399006")

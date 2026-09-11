@@ -14,6 +14,11 @@ os.environ.pop("ENV_PREFIX", None)
 # 需要验证通道本身的测试自行调用 install_http_channel。
 os.environ.setdefault("HTTP_CHANNEL", "direct")
 
+# 东财凭据默认关。开着的话通道安装时会去读 .runtime 下真实采到的那份，于是断言
+# 请求头的测试会看到一个来自上一次真实调用的 Cookie；要验这一层的测试自己把
+# eastmoney_auth.EASTMONEY_AUTH_ENABLED 打开。
+os.environ.setdefault("EASTMONEY_AUTH_ENABLED", "0")
+
 # 缓存的磁盘层指到临时目录。不指的话测试会读到 .runtime/cache 下上一次真实调用
 # 落盘的条目——桩掉的上游根本不会被调到，测的就不是这里想测的东西了。
 import tempfile

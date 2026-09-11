@@ -26,6 +26,7 @@ CnStock 是一个面向大模型和 MCP 客户端的 A 股数据服务。
 | `kline_range` | 指定日期区间的 K 线 | Markdown 表格 |
 | `sector_fund_flow` | 行业/概念/地域板块的资金流排行，与东财官网同口径 | Markdown 表格 |
 | `market_breadth` | 全市场涨跌家数、涨跌停和十档分布 | 严格 JSON |
+| `market_map` | 行业资金流入流出与板块内个股强弱，支持按市场筛选 | 严格 JSON 或 Markdown |
 | `market_events` | 指定日期的龙虎榜、涨停池、公告和业绩预告 | 严格 JSON |
 | `health` | 服务自身的可用率、缺失明细、耗时分布和事件；只读日志，不发上游请求 | Markdown |
 
@@ -172,6 +173,23 @@ mcporter call cn-stock kline_range symbol=SH603986 start_date=2026-05-22 end_dat
 mcporter call cn-stock market_breadth
 ```
 
+查询市场云图。`board` 可选 `all`（全部A股）、`sse`（上证主板）、`star`（科创板）、
+`szse`（深证主板）、`chinext`（创业板）、`bse`（北交所）：
+
+```bash
+mcporter call cn-stock market_map board=star fmt=markdown
+mcporter call cn-stock market_map board=all sectors=10 stocks_per_sector=20
+mcporter call cn-stock market_map board=chinext sectors=0 stocks_per_sector=0 weight_by=turnover
+```
+
+`fmt=markdown` 将同一批数据列成表格（默认），`fmt=json` 返回逐股基础数据。
+个股含最新价、涨跌幅、流通市值、成交额、主力净流入与净占比，按涨跌幅降序排列；缺值返回 `null`，表格显示 `—`。
+`rank_by=main_net` 默认按成员主力净流入合计选行业，`rank_by=change_pct` 按加权涨跌选行业。
+`sectors` 保留排序两端各 N 个行业，`0` 返回全部。`weight_by` 指定加权涨跌的权重（`float_cap` 流通市值或 `turnover` 成交额）。
+`stocks_per_sector` 每个行业按涨跌幅最多返回 N 只，默认 `20`，`0` 返回全部成员。
+资金流仅统计所选市场内的成员；缺资金流的行业不参与净流入排名，用 `sectors=0` 查看。
+按板块筛选比 `all` 快一个量级，上游要翻的页数少得多。
+
 查询指定日期的公开事件池：
 
 ```bash
@@ -241,6 +259,11 @@ mcporter call cn-stock market_events \
 | `IMPERSONATE_BROWSER` | 伪装成哪个浏览器 | 浏览器名，如 `chrome`、`safari`（默认 `chrome`） |
 | `IMPERSONATE_SUSPEND_AFTER_FAILURES` | 连续多少次请求打满重试仍失败后暂停伪装通道 | 正整数（默认 `4`） |
 | `IMPERSONATE_SUSPEND_SECONDS` | 暂停时长。期间东财源直接跳过，改用备用源 | 秒（默认 `300`） |
+| `EASTMONEY_AUTH_ENABLED` | 是否自动取得并复用东财访问凭据，提高行情列表、快照和资金流接口的成功率 | `0`<br>`1`<br>（默认 `1`） |
+| `EASTMONEY_AUTH_TTL_SECONDS` | 多久主动刷新一次。到期后后台刷新，新值到手前继续使用旧值；连续被拒也会触发刷新 | 秒（默认 `21600`） |
+| `EASTMONEY_AUTH_PAGE` | 采集凭据的页面，通常不需要修改 | URL（默认 `https://quote.eastmoney.com/center/gridlist.html`） |
+| `EASTMONEY_AUTH_INVALIDATE_AFTER_FAILURES` | 连续多少次被拒后刷新凭据 | 正整数（默认 `3`） |
+| `EASTMONEY_AUTH_HARVEST_TIMEOUT_SECONDS` | 一次采集的总预算，超时后继续走既有请求链路 | 秒（默认 `45`） |
 
 只有少数东方财富行情主机会被接管，其余原样直连；详见[出站 HTTP 通道](docs/technical-details.md#6-出站-http-通道)。
 
@@ -276,6 +299,8 @@ mcporter call cn-stock market_events \
 | `FUND_FLOW_PROVIDERS` | 个股/指数资金流的来源顺序（页面兜底另算，排在这一层之后）：<br>`eastmoney` 给全部历史<br>`eastmoney_delay` 只回当日一行，但主源拒绝当前出口时它还通 | `eastmoney`<br>`eastmoney_delay`<br>`off`<br>（默认 `eastmoney,eastmoney_delay`） |
 | `REALTIME_FUND_FLOW_PROVIDERS` | 没有资金流向页面的标的（科创 50 等）盘中实时资金流的来源，给当日累计的五档净流入；有页面的标的不走这里 | `eastmoney_delay`<br>`off`<br>（默认 `eastmoney_delay`） |
 | `SECTOR_FUND_FLOW_PROVIDERS` | 板块资金流的取数顺序：<br>`eastmoney` 字段全<br>`eastmoney_dataapi` 只有主力净额，但主源连不上时它还通；报告备注里会标出是降级源 | `eastmoney`<br>`eastmoney_dataapi`<br>`off`<br>（默认 `eastmoney,eastmoney_dataapi`） |
+| `MARKET_MAP_PROVIDERS` | 市场云图的来源顺序：<br>`eastmoney` 主集群<br>`eastmoney_delay` 同口径备用集群 | `eastmoney`<br>`eastmoney_delay`<br>`off`<br>（默认 `eastmoney,eastmoney_delay`） |
+| `MARKET_MAP_BUDGET_SECONDS` | 一次市场云图取数的总预算；用尽时返回已取到的页并标注缺页 | 秒（默认 `30`） |
 | `SECTOR_TAXONOMY_PROVIDERS` | 板块分级表的来源，用来只排同一层——东财的行业板块名单把各级混在一起，不分级会让父子板块同时上榜、同一笔钱数两遍。默认排申万二级，和东财官网那张榜一致：<br>`shenwan`、`swsresearch` 是同一套申万分类的两个来源，一个不通时另一个补上，缺的级也会互补<br>`off` 退回全部板块一起排，报告里会标出来 | `shenwan,swsresearch`<br>`shenwan`<br>`off`<br>（默认 `shenwan,swsresearch`） |
 | `KLINE_PROVIDERS` | 东财那一级取不到时，**个股/ETF** 的兜底顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`tonghuashun` 不覆盖北交所<br>`tencent` 个股/ETF/指数都覆盖，北交所大半不认<br>`sina` 覆盖腾讯不认的北交所代码，但不认 ETF 和创业板指<br>三家各补各的洞 | `tonghuashun`<br>`tencent`<br>`sina`<br>`off`<br>（默认 `tencent,sina`） |
 | `KLINE_PROVIDERS_INDEX` | **指数**用的兜底顺序，和 `KLINE_PROVIDERS` 分开配：腾讯/新浪的指数成交量比东财/同花顺低约 3.5%，这个量级不能忽略，所以指数按准确度排而不是按稳定性 | 同上（默认 `tonghuashun,tencent,sina`） |

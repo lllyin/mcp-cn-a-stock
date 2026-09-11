@@ -1240,6 +1240,72 @@ async def health(
 
 
 @mcp_app.tool()
+async def market_map(
+  board: str = "all",
+  fmt: str = "markdown",
+  sectors: int = 10,
+  stocks_per_sector: int = 20,
+  weight_by: str = "float_cap",
+  rank_by: str = "main_net",
+  ctx: Context = None,  # type: ignore
+) -> str:
+  """查看行业资金流入流出及板块内个股强弱，可按市场筛选。
+
+  Args:
+    board: 交易所/板块。``all`` 全部A股（默认）、``sse`` 上证主板、``star`` 科创板、
+           ``szse`` 深证主板、``chinext`` 创业板、``bse`` 北交所。
+           ``sse`` 不含科创板，科创板请用 ``star``。
+    fmt: ``markdown`` 以表格列出同一批基础数据（默认）；``json`` 只给基础数据，自己画图走这一路。
+    sectors: 按 rank_by 取两端各 N 个行业，默认 10。给 0 表示全要。
+           裁剪只减少返回内容，不减少上游请求。
+    stocks_per_sector: 每个行业按涨跌幅降序列出的个股数，默认 20。给 0 表示全列。
+           只裁剪列出的个股；行业资金流合计仍按全部成员计算。
+    weight_by: 加权涨跌排序的权重，``float_cap`` 流通市值、``turnover`` 成交额。
+    rank_by: 行业排序：``main_net`` 成员主力净流入合计（默认）、``change_pct`` 加权涨跌。
+             板块内个股始终按涨跌幅降序。返回价格、流通市值、成交额和主力资金流基础字段。
+
+  Returns:
+    ``fmt`` 决定的字符串：JSON 文本，或一屏 Markdown。
+  """
+  from .datasource import market_map_source as mms
+  from . import market_map_view
+
+  if fmt not in market_map_view.FORMATS:
+    raise ValueError(f"fmt 必须是 {'/'.join(market_map_view.FORMATS)} 之一")
+  if rank_by not in market_map_view.RANK_FIELDS:
+    raise ValueError("rank_by 必须是 main_net/change_pct 之一")
+  if board not in mms.BOARDS:
+    raise ValueError(f"board 必须是 {'/'.join(mms.BOARDS)} 之一")
+  if weight_by not in mms.SIZE_FIELDS:
+    raise ValueError(f"weight_by 必须是 {'/'.join(mms.SIZE_FIELDS)} 之一")
+  if sectors < 0:
+    raise ValueError("sectors 不能是负数；给 0 表示全要")
+  try:
+    stocks_per_sector = int(stocks_per_sector)
+  except (TypeError, ValueError):
+    raise ValueError("stocks_per_sector 必须是整数")
+  if stocks_per_sector < 0:
+    raise ValueError("stocks_per_sector 不能是负数；给 0 表示全列")
+
+  started_at = time.perf_counter()
+  request = mms.MarketMapRequest(board=board, size=weight_by)
+  status: dict = {}
+  data = await asyncio.to_thread(
+    functools.partial(mms.resolve, request, status=status))
+  if data is None:
+    raise RuntimeError(f"云图取不到：{board} 全部源都没给出结果")
+  report = market_map_view.render(
+    data, fmt=fmt, sectors="all" if sectors == 0 else sectors, rank_by=rank_by,
+    stocks_per_sector=stocks_per_sector)
+  logger.info(
+    "Finished market_map board=%s fmt=%s weight_by=%s rank_by=%s stocks=%d/%d complete=%s "
+    "source=%s chars=%d elapsed=%.3fs",
+    board, fmt, weight_by, rank_by, len(data.stocks), data.upstream_total, data.complete,
+    data.source or "-", len(report), time.perf_counter() - started_at)
+  return report
+
+
+@mcp_app.tool()
 async def market_breadth(ctx: Context = None) -> MarketBreadthResponse:  # type: ignore
   """获取全 A 股上涨、下跌、平盘、涨跌停家数和涨跌幅分布。
 

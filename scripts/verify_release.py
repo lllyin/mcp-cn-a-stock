@@ -66,6 +66,9 @@ ALL_TOOLS = (
     "tech",
     "market_breadth",
     "market_events",
+    "sector_fund_flow",
+    "market_map",
+    "health",
 )
 
 
@@ -174,7 +177,15 @@ class CallResult:
 
     @property
     def ok(self) -> bool:
-        return self.exit_code == 0 and bool(self.payload.strip())
+        if self.exit_code != 0 or not self.payload.strip():
+            return False
+        combined = "\n".join((self.payload, self.stderr))
+        # mcporter 对 MCP tool 抛出的异常仍可能退出 0；只看退出码会把
+        # `Error executing tool ...` 记成 OK，让发布闸门给出假绿灯。
+        return not any(
+            line.lstrip().startswith(("Error executing tool ", "MCP error "))
+            for line in combined.splitlines()
+        )
 
 
 def run_call(spec: CallSpec, config: Path, timeout_ms: int) -> CallResult:
@@ -1448,6 +1459,18 @@ def probe_suite(tools: set[str]) -> list[CallSpec]:
     specs.append(
         CallSpec("market_events", {"date": today, "sources": "lhb,limit_up"}, "market_events")
     )
+    specs.append(CallSpec(
+        "sector_fund_flow",
+        {"sector_type": "industry", "period": "today", "top": "3"},
+        "sector_fund_flow",
+    ))
+    specs.append(CallSpec(
+        "market_map", {"board": "star", "fmt": "json", "sectors": "3",
+                       "stocks_per_sector": "20"}, "market_map",
+    ))
+    specs.append(CallSpec(
+        "health", {"since": "30m", "include_archived": "false"}, "health",
+    ))
     return [spec for spec in specs if spec.tool in tools]
 
 

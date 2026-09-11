@@ -272,6 +272,37 @@ FUND_FLOW_PAGE_COOLDOWN_SECONDS = max(
 #     所以省不下任何东西。
 FUND_FLOW_PAGE_MAX_LOADS = max(1, int(env("FUND_FLOW_PAGE_MAX_LOADS", "2")))
 
+
+# --- 东财 nid18 凭据 (finmcp/datasource/eastmoney_auth.py) ---
+# 自动取得并复用东财访问凭据，提高行情列表、快照和资金流接口的成功率。
+# 关闭后继续走既有 HTTP 通道和备用数据源。
+EASTMONEY_AUTH_ENABLED = _parse_bool(env("EASTMONEY_AUTH_ENABLED"), True)
+
+# 多久主动刷新一次。到期后后台刷新，新值到手前继续使用旧值；连续被拒也会触发刷新。
+# 看日志里的刷新原因来调：经常由连续被拒触发就调小，始终按周期刷新可适当调大。
+EASTMONEY_AUTH_TTL_SECONDS = max(
+    60.0,
+    float(env("EASTMONEY_AUTH_TTL_SECONDS", "21600")),
+)
+
+# 采集凭据的页面，通常不需要修改。
+EASTMONEY_AUTH_PAGE = (
+    env("EASTMONEY_AUTH_PAGE") or "https://quote.eastmoney.com/center/gridlist.html"
+)
+
+# 连续多少次被拒后刷新凭据。单次失败不触发，避免上游抖动导致频繁启动浏览器。
+EASTMONEY_AUTH_INVALIDATE_AFTER_FAILURES = max(
+    1,
+    int(env("EASTMONEY_AUTH_INVALIDATE_AFTER_FAILURES", "3")),
+)
+
+# 一次采集的总预算；超时后继续走既有请求链路。
+EASTMONEY_AUTH_HARVEST_TIMEOUT_SECONDS = max(
+    5.0,
+    float(env("EASTMONEY_AUTH_HARVEST_TIMEOUT_SECONDS", "45")),
+)
+
+
 # 把无头浏览器的自报特征改成普通浏览器的样子。
 #
 # 默认关。盘外两次交错 A/B（2026-09-07，每种身份 36 次加载、同一批标的、同一判定）：
@@ -579,6 +610,13 @@ KLINE_MAX_GAP_TRADING_DAYS = max(0, int(env("KLINE_MAX_GAP_TRADING_DAYS", "10"))
 KLINE_TONGHUASHUN_BUDGET_SECONDS = max(
     0.0,
     float(env("KLINE_TONGHUASHUN_BUDGET_SECONDS", "45")),
+)
+
+# 市场云图一次取数的总预算。全市场需要逐页取数，单页超时不能约束整次调用；
+# 预算用尽时返回已取到的页并明确标注缺页。按完整市场健康取数的最大耗时留余量来调。
+MARKET_MAP_BUDGET_SECONDS = max(
+    1.0,
+    float(env("MARKET_MAP_BUDGET_SECONDS", "30")),
 )
 
 

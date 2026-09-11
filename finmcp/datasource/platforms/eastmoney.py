@@ -29,11 +29,14 @@ efinance/AkShare，迁过来是后面的阶段——**先接新能力、再迁�
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
+from ...config import MARKET_MAP_BUDGET_SECONDS
 from .. import platform as pf
 from ..fund_flow_source import FundFlowHistory
 from ..realtime_fund_flow_source import RealtimeFundFlow
+from ..market_map_source import MarketMap, MarketMapStock
 from ..sector_fund_flow import SectorFlow, SectorFundFlowBoard
 
 logger = logging.getLogger("finmcp")
@@ -44,6 +47,23 @@ _SECTOR_T = {"industry": "2", "concept": "3", "region": "1"}
 _AK_SECTOR = {"industry": "行业资金流", "concept": "概念资金流", "region": "地域资金流"}
 #: 本项目的口径 → AkShare 的中文参数
 _AK_PERIOD = {"today": "今日", "5d": "5日", "10d": "10日"}
+
+
+def _number(value):
+    """把上游的一个字段值转成数。
+
+    东财在没有数据时给的是字符串 ``"-"``（停牌、新股上市首日的市值），不是 null——
+    直接 float() 会抛，而抛在翻页循环里会把整页丢掉。取不到就给 None：
+    报告里"没有"和"0"是两回事。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def _f(row, key):
@@ -103,16 +123,66 @@ def _fund_flow_frame(klines: list):
     return frame
 
 
+#: 云图用的字段号。f12 代码 / f13 市场（1 沪 0 深北）/ f14 名称 / f3 涨跌幅 /
+#: f21 流通市值 / f6 成交额 / f100 所属行业。
+#: 加权字段 → 上游字段号。请求和取值共用这张表，避免字段标签与数据错配。
+_MARKET_MAP_SIZE_FIELD = {"float_cap": "f21", "turnover": "f6"}
+#: 上游单页硬上限。2026-09-09 实测 pz 给 200/500/1000/2000/6000 一律只回 100 行，
+#: 所以翻页次数是 ceil(total/100)，没法靠调大 pz 省掉。
+_MARKET_MAP_PAGE_SIZE = 100
+#: 一次取数最多翻几页。全 A 5911 只是 60 页；留到 80 页是给上市家数增长的余量。
+#: 有这个上限是因为翻页的终止条件依赖上游的 total——total 要是回了个荒唐的大数，
+#: 没有上限就会一直翻下去（AGENTS §三：任何 N × 单次超时的结构都要有总预算）。
+_MARKET_MAP_MAX_PAGES = 80
+
+
+#: 补齐一组普通浏览器会带的头。
+#:
+#: **这里刻意不带 Cookie。** push2 要求一个名为 nid18 的 Cookie 而且认值，只有页面
+#: 里的 JS 写出来的那个放行——伪造一个同格式的随机值实测 1/6，和不带（2/8）没有
+#: 区别。而带上它反而有害：出站通道那一层遵守"调用方自己给了 Cookie 就不覆盖"，
+#: 于是一个假值会把真凭据挡在外面。凭据由 datasource/eastmoney_auth 统一采集和注入。
+#:
+#: 这些头保持普通浏览器形状；凭据由 datasource/eastmoney_auth 统一采集和注入。
+_PUSH2_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/152.0.0.0 Safari/537.36"),
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,image/apng,*/*;q=0.8"),
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Connection": "keep-alive",
+}
+
+
+#: 上游在"没有行业"时给过的几种写法。退市股是 "-"，新股偶尔是空串。
+_NO_SECTOR = {"", "-", "--", "null", "None"}
+
+
+def _sector_of(raw) -> str:
+    value = str(raw or "").strip()
+    return "未分类" if value in _NO_SECTOR else value
+
+
+def _prefixed(code: str, market) -> str:
+    """带市场前缀的代码。东财把深市和北交所的 f13 都写成 0，需再看代码段。"""
+    if code.startswith(("4", "8", "92")):
+        return "BJ" + code
+    return ("SH" if str(market) == "1" else "SZ") + code
+
+
 class EastmoneyPlatform(pf.Platform):
     name, label = "eastmoney", "东财"
-    capabilities = frozenset({"sector_fund_flow", "fund_flow"})
+    capabilities = frozenset({"sector_fund_flow", "fund_flow", "market_map"})
+    market_map_url = "https://push2.eastmoney.com/api/qt/clist/get"
 
     def degraded(self) -> bool:
-        # 伪装通道一进冷却，push2 的请求就退回原生 requests，而它被接管的理由正是
-        # 拒绝原生 requests——不用数失败次数也知道必败，直接让位给下一个平台。
+        # 伪装通道冷却时通常跳过东财；有浏览器签发的凭据后，普通请求仍有成功机会。
+        # 这里只覆盖本平台的 push2 / push2his 能力。K 线的独立熔断仍按原判据处理。
+        from .. import eastmoney_auth
         from ..http_channel import impersonated_hosts_degraded
 
-        return impersonated_hosts_degraded()
+        return impersonated_hosts_degraded() and not eastmoney_auth.has_credential()
 
     def fetch_fund_flow(self, request) -> Optional[FundFlowHistory]:
         """push2his 的全部历史，经 AkShare。入参写法和迁移前那次调用完全一样。"""
@@ -122,6 +192,104 @@ class EastmoneyPlatform(pf.Platform):
         if frame is None or frame.empty:
             return None
         return FundFlowHistory(frame=frame, complete=True)
+
+
+    def fetch_market_map(self, request) -> Optional[MarketMap]:
+        """全市场（或某板块）逐只股票，分页取回。
+
+        **取到几页就返回几页**，缺的页号记进 ``missing_pages``。静默丢掉一页就是
+        悄悄给了个小 60 只的池子，而调用方会拿它当全集去算板块占比（AGENTS §一）。
+        第一页就取不到才算整源失败——那时没有"部分"可言。
+        """
+        import json
+
+        import requests
+
+        size_field = _MARKET_MAP_SIZE_FIELD[request.size]
+        fields = "f12,f13,f14,f2,f3,f6,f21,f100,f62,f184"
+        stocks: list = []
+        missing: list = []
+        total = None
+        page = 1
+        deadline = time.monotonic() + MARKET_MAP_BUDGET_SECONDS
+        while page <= _MARKET_MAP_MAX_PAGES:
+            remaining = deadline - time.monotonic()
+            if remaining < 1.0:
+                if page == 1:
+                    return None
+                # total 已知时，把还没尝试的页也列入缺页；调用方才能知道返回的不是全集。
+                last_page = min(
+                    _MARKET_MAP_MAX_PAGES,
+                    max(page, (int(total or 0) + _MARKET_MAP_PAGE_SIZE - 1)
+                        // _MARKET_MAP_PAGE_SIZE),
+                )
+                missing.extend(range(page, last_page + 1))
+                break
+            try:
+                response = requests.get(
+                    self.market_map_url,
+                    timeout=min(15, max(1.0, remaining)),
+                    params={
+                        "pn": page, "pz": _MARKET_MAP_PAGE_SIZE,
+                        "po": 1, "np": 1, "fltt": 2, "invt": 2, "fid": "f12",
+                        "fs": request.selector, "fields": fields,
+                        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                    },
+                    headers=_PUSH2_HEADERS,
+                )
+                payload = ((json.loads(response.text) or {}).get("data") or {})
+                rows = payload.get("diff") or []
+            except Exception:
+                logger.warning("云图第 %s 页取不到 board=%s", page, request.board,
+                               exc_info=True)
+                if page == 1:
+                    return None          # 一页都没有，让位给下一个源
+                missing.append(page)
+                rows = []
+            else:
+                if total is None:
+                    total = payload.get("total") or 0
+                if not rows:
+                    break                # 正常翻完
+            for row in rows:
+                code = str(row.get("f12") or "")
+                if not code:
+                    continue
+                stocks.append(MarketMapStock(
+                    symbol=_prefixed(code, row.get("f13")),
+                    name=str(row.get("f14") or ""),
+                    change_pct=_number(row.get("f3")),
+                    size=_number(row.get(size_field)),
+                    # 行业缺失时不丢这只股票：它照样有涨跌幅和面积，只是归不了组。
+                    # 丢掉会让"全市场"少几只而没人知道。
+                    #
+                    # 上游对退市股给的是字面的 "-"（不是 null，也不是空串），
+                    # 直接用它会在报告里冒出一个叫 "-" 的行业。
+                    sector=_sector_of(row.get("f100")),
+                    last=_number(row.get("f2")),
+                    float_cap=_number(row.get("f21")),
+                    amount_yuan=_number(row.get("f6")),
+                    main_net=_number(row.get("f62")),
+                    main_pct=_number(row.get("f184")),
+                ))
+            if total and len(stocks) + len(missing) * _MARKET_MAP_PAGE_SIZE >= total:
+                break
+            page += 1
+        if not stocks:
+            return None
+        warnings = []
+        if missing:
+            warnings.append(
+                f"第 {'、'.join(str(p) for p in missing)} 页取不到，"
+                f"本次少了约 {len(missing) * _MARKET_MAP_PAGE_SIZE} 只"
+                + (f"（占 {len(missing) * _MARKET_MAP_PAGE_SIZE / total:.1%}）" if total else ""))
+        if page > _MARKET_MAP_MAX_PAGES:
+            warnings.append(f"翻页到达上限 {_MARKET_MAP_MAX_PAGES} 页，后面的没取")
+        return MarketMap(
+            stocks=tuple(stocks), board=request.board, size_field=request.size,
+            upstream_total=total or len(stocks), missing_pages=tuple(missing),
+            warnings=tuple(warnings),
+        )
 
     def fetch_sector_fund_flow(self, request) -> Optional[SectorFundFlowBoard]:
         import akshare as ak
@@ -180,6 +348,7 @@ class EastmoneyDataApiPlatform(pf.Platform):
         return ("https://data.eastmoney.com/dataapi/bkzj/getbkzj"
                 f"?key={_PERIOD_FIELD[period]}&code=m%3A90%2Bt%3A{_SECTOR_T[sector_type]}")
 
+
     def fetch_sector_fund_flow(self, request) -> Optional[SectorFundFlowBoard]:
         import json
 
@@ -217,7 +386,12 @@ class EastmoneyDelayPlatform(pf.Platform):
     """
 
     name, label = "eastmoney_delay", "东财(delay)"
-    capabilities = frozenset({"fund_flow", "realtime_fund_flow"})
+    capabilities = frozenset({"fund_flow", "realtime_fund_flow", "market_map"})
+    market_map_url = "https://push2delay.eastmoney.com/api/qt/clist/get"
+
+    def fetch_market_map(self, request) -> Optional[MarketMap]:
+        """主集群不可用时从 delay 集群取得同口径列表。"""
+        return EastmoneyPlatform.fetch_market_map(self, request)
 
     @staticmethod
     def _get(secid: str) -> dict:

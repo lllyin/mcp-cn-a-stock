@@ -15,7 +15,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from .. import cache
+from .. import cache, market_session
 from ..config import CACHE_INTRADAY_TTL_SECONDS
 from . import platform as pf
 from . import sector_taxonomy, trading_calendar
@@ -109,11 +109,12 @@ def _as_of(now: Optional[datetime.datetime] = None) -> datetime.date:
 
     东财两个端点都不返回日期，只能按交易日历推：开盘之后是今天，否则是上一个交易日。
     这不是"猜"——资金流是按交易日结算的，非交易日拿到的必然是上一个交易日的存量。
-    09:15 这个界和 ``is_realtime_fund_flow_window`` 用的是同一个。
+    边界和 ``is_realtime_fund_flow_window`` 共用 ``MARKET_EPOCH_WARMUP_TIME``。
     """
-    moment = now or datetime.datetime.now()
+    moment = market_session.now_shanghai(now)
     today = moment.date()
-    if trading_calendar.is_trading_day(today) and moment.time() >= datetime.time(9, 15):
+    clock = moment.replace(tzinfo=None).time()
+    if trading_calendar.is_trading_day(today) and clock >= market_session.WARMUP_TIME:
         return today
     return trading_calendar.previous_trading_day(today)
 

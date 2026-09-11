@@ -58,9 +58,17 @@ _HEADERS = {
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
     ),
-    # 这两个都不能省：缺了返回 0 字节，不是报错，是静默的空。
+    # Referer 和 Accept 不能省；其余按普通浏览器导航补齐，减少年份文件间歇 502。
     "Referer": "https://stockpage.10jqka.com.cn/",
-    "Accept": "*/*",
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,image/apng,*/*;q=0.8"),
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Connection": "keep-alive",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 #: 沪市指数的内部码。深市指数和个股都直接用六位码，不进这张表。
