@@ -292,7 +292,7 @@ mcporter call cn-stock market_events \
 | `BASIC_INFO_PROVIDERS` | 基本数据（市值、市盈率、市净率）的尝试顺序，后面的源补前面缺的字段：<br>`eastmoney` 字段最全，需要网关或未被封的出口<br>`tencent` 无需鉴权，没有网关的部署靠它兜住这一组 | `eastmoney`<br>`tencent`<br>`off`<br>（默认 `eastmoney,tencent`） |
 | `INTRADAY_QUOTE_PROVIDERS` | 盘中实时行情的尝试顺序，逗号分隔按序尝试，`off` 关闭整层。**当天那一根 K 线只认这一层**（历史 K 线给的当天数据不作准）：<br>`fund_flow_page` 复用已解析的资金流页面，不发请求但没有开高低<br>`tencent` 字段全<br>`tonghuashun` 字段全 | `fund_flow_page`<br>`tencent`<br>`tonghuashun`<br>`off`<br>（默认 `fund_flow_page,tencent,tonghuashun`） |
 | `INTRADAY_QUOTE_PROVIDERS_INDEX` | **指数**用的顺序，和上一项分开配：指数的成交量各源口径不一致，腾讯/新浪比东财/同花顺低约 3.5%（两家同源，互相校验不了）。东财是基准源，所以指数把同花顺排前面；个股各源逐位一致，不换 | 同上（默认 `fund_flow_page,tonghuashun,tencent`） |
-| `INTRADAY_QUOTE_CROSS_CHECK_PCT` | 拿到第一个可用报价后再问剩下的源一遍，字段相差超过这个值就打 WARNING。每个标的多一次上游请求，只在怀疑某个源口径不对时开 | 百分比，`0` 关闭（默认 `0`） |
+| `INTRADAY_QUOTE_CROSS_CHECK_PCT` | 拿到第一个可用报价后再问剩下的源一遍，字段相差超过这个值就打 WARNING。每个标的多一次上游请求。默认 5%：盖过已裁决的创业板指成交量 3.885% 分歧，仍能咬住单位错档（100 倍）类问题 | 百分比，`0` 关闭（默认 `5`） |
 | `LOG_FILE` | 服务日志文件的路径，`health` 工具读它算可用率和耗时。`start.sh` 启动时会把实际路径传进来，正常不用配 | 路径（默认 `logs/cn-stock-mcp.log`） |
 | `LOG_RETENTION_DAYS` | 归档日志保留几天。每次启动会把上一轮日志存成一份归档，超过这个天数的清掉。`health` 默认把归档一起统计，所以这个值决定它最多能回看多久 | 天数，`0` 表示不留归档（默认 `3`） |
 | `TRADING_CALENDAR_PROVIDERS` | 判「今天开不开市」的日历来源：<br>`sina` 上交所公布的交易日名单，最权威<br>`holiday_cn` [NateScarlet/holiday-cn](https://github.com/NateScarlet/holiday-cn) 的国务院放假安排换算而来，与交易所名单的差异只在个别调休日<br>`weekday` 兜底，周一到周五算交易日——长假会被整段算成交易日，所以放最后 | `sina`<br>`holiday_cn`<br>`weekday`<br>`off`<br>（默认 `sina,holiday_cn,weekday`） |

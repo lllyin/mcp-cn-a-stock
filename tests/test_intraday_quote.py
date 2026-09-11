@@ -4,6 +4,7 @@
 """
 
 import logging
+import requests
 from pathlib import Path
 
 import pytest
@@ -753,3 +754,84 @@ class TestTonghuashunQuoteProvider:
         monkeypatch.setenv("INTRADAY_QUOTE_PROVIDERS_INDEX", "tencent")
         assert iq.configured_order("SZ399006") == ("tencent",)
         assert "tonghuashun" in iq.configured_order("SH600519")
+
+
+class TestSinaQuoteProvider:
+    """hq.sinajs.cn 的包装源：与腾讯同一条数据，角色是可用性兜底。
+
+    一致性是它的入 场券——2026-09-11 收盘后与腾讯逐字段核对过（个股/ETF 五个
+    标的零偏差），fixture 就是那时抓的真实报文。
+    """
+
+    # 2026-09-11 盘后从 hq.sinajs.cn 抓下的真实报文。
+    SINA_PAYLOAD = (
+        'var hq_str_sz300408="三环集团,117.000,117.700,124.360,127.000,115.050,'
+        '124.360,124.370,76563515,9300522442.450,98297,124.360,4900,124.350,400,'
+        '124.340,3500,124.330,4000,124.320,1900,124.370,1400,124.380,10000,'
+        '124.400,5300,124.410,100,124.430,2026-09-11,16:29:30,00,D|18900|'
+        '2350404.000";'
+    )
+
+    def _fetch(self, monkeypatch, symbol="SZ300408", payload=SINA_PAYLOAD):
+        class FakeResponse:
+            text = payload
+            encoding = ""
+
+        monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse())
+        return iq.SinaQuoteProvider().fetch(symbol, iq.QuoteContext())
+
+    def test_fields_parse_and_volume_comes_out_in_lots(self, monkeypatch):
+        quote = self._fetch(monkeypatch)
+        assert quote.source == "sina"
+        assert quote.last == 124.360
+        assert quote.open == 117.000
+        assert quote.high == 127.000
+        assert quote.low == 115.050
+        assert quote.prev_close == 117.700
+        # 新浪 [8] 是股：成交额/收盘 反算 74,818,447 股，76563515/74818447≈1.02
+        # → 判"股" → /100 变手，与腾讯口径对齐。
+        assert quote.volume_lots == pytest.approx(765635.15, rel=0.01)
+        assert quote.amount_yuan == pytest.approx(9300522442.450)
+        assert quote.as_of == "20260911162930"
+        # 新浪这条端点不给换手率，宁缺勿造。
+        assert quote.turnover_pct is None
+
+    def test_matches_tencent_for_the_same_symbol(self, monkeypatch):
+        """同一标的、同一时刻，两个包装源的归一结果必须一致——这是一致性验证。
+
+        两个报文都取自 2026-09-11 盘后：腾讯 [6] 给手、新浪 [8] 给股，归一后
+        必须落在同一双手上。
+        """
+        sina_quote = self._fetch(monkeypatch)
+        tencent_payload = (
+            'v_sz300408="51~三环集团~300408~124.36~117.70~117.00~765635~85000~86026'
+            '~124.36~1~124.35~2~124.34~3~124.33~4~124.32~5~124.37~1~124.38~2~124.40'
+            '~3~124.41~4~124.43~5~~20260911162930~-6.66~-5.10~127.00~115.05~'
+            '124.36/765635/9300522442~765635~930052.24~3.99~66.84~~127.00~115.05"'
+        )
+
+        class FakeResponse:
+            text = tencent_payload
+            encoding = ""
+
+        monkeypatch.setattr(requests, "get", lambda *a, **k: FakeResponse())
+        tencent_quote = iq.TencentQuoteProvider().fetch("SZ300408", iq.QuoteContext())
+        assert tencent_quote is not None
+        assert iq.compare(sina_quote, tencent_quote, tolerance_pct=0.5) == []
+
+    def test_an_unknown_symbol_is_none(self, monkeypatch):
+        assert self._fetch(monkeypatch, symbol="SZ999999", payload='var hq_str_sz999999="";') is None
+
+    def test_an_index_is_refused_without_a_request(self, monkeypatch):
+        """指数成交量单位在新浪端点内部都不一致（sh000001=手、sz399001=100 倍），
+        而指数走不了量纲推断——不接，错一个单位就是 100 倍。"""
+        called = []
+        monkeypatch.setattr(requests, "get", lambda *a, **k: called.append(1))
+        assert iq.SinaQuoteProvider().fetch("SH000001", iq.QuoteContext()) is None
+        assert not called
+
+    def test_sina_is_the_last_availability_fallback(self):
+        """角色是兜底不是校验：排在链尾，且不进指数那条顺序。"""
+        order = iq.configured_order("SZ300408")
+        assert order[-1] == "sina"
+        assert "sina" not in iq.configured_order("SZ399006")

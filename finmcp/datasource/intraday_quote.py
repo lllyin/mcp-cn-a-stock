@@ -36,7 +36,7 @@ logger = logging.getLogger("finmcp")
 
 # 启用哪些 provider、按什么顺序。留空或设为 off 则整层关闭，调用方拿到 None。
 PROVIDER_ORDER_ENV = "INTRADAY_QUOTE_PROVIDERS"
-DEFAULT_PROVIDER_ORDER = ("fund_flow_page", "tencent", "tonghuashun")
+DEFAULT_PROVIDER_ORDER = ("fund_flow_page", "tencent", "tonghuashun", "sina")
 #: **指数单独一条顺序**，判据和历史 K 线那一层一样（``kline_source`` 的常量注释）：
 #: 指数的成交量各源口径差得多，而同花顺与东财一致。2026-09-07 收盘后四方核对
 #: 创业板指当日成交量：
@@ -453,6 +453,84 @@ def tencent_code(symbol: str) -> Optional[str]:
     return "sz" + digits
 
 
+SINA_QUOTE_URL = "https://hq.sinajs.cn/list={code}"
+#: 新浪接口要求 Referer，不带直接 403（2026-09-11 实测）。
+_SINA_HEADERS = {"Referer": "https://finance.sina.com.cn"}
+#: 新浪 A 股串的字段号 → 语义。GBK 编码；[8] 成交量恒为**股**（腾讯 [6] 主板是
+#: 手、科创板是股，新浪不分这些，一律股——600489/000333/300750/512480/688981
+#: 五个标的与腾讯逐一核对过，换算后一致）。指数不给：指数走不了量纲推断，而新浪
+#: 的指数成交量在同一个端点内部都不一致（sh000001 与腾讯一字不差是手，sz399001
+#: 却是腾讯的 100 倍，2026-09-11 收盘后实测）——错一个单位就是 100 倍，不接。
+_SINA_FIELDS = {
+    "name": 0, "open": 1, "prev_close": 2, "last": 3,
+    "high": 4, "low": 5, "volume_shares": 8, "amount_yuan": 9,
+    "date": 30, "time": 31,
+}
+
+
+class SinaQuoteProvider(QuoteProvider):
+    """hq.sinajs.cn 的单标的行情，与腾讯同一份数据的另一个打包。
+
+    **它不是跨源校验的搭档**：2026-09-11 收盘后实测，个股与 ETF 上新浪与腾讯
+    逐字段一字不差（同一条行情源的两种包装），拿它们互校只会永远"一致"，给出
+    假的安心。它在这里的角色是**可用性兜底**——腾讯被拒/限流时多一条包装路径，
+    排在链尾，腾讯正常时一次请求都不发。
+    """
+
+    name = "sina"
+
+    def __init__(self, timeout: float = 5.0):
+        self.timeout = timeout
+
+    def fetch(self, symbol: str, context: QuoteContext) -> Optional[IntradayQuote]:
+        from .kline_frame import _is_index_code
+
+        code = tencent_code(symbol)
+        if code is None or _is_index_code(code):
+            return None
+
+        import requests
+
+        response = requests.get(
+            SINA_QUOTE_URL.format(code=code), headers=_SINA_HEADERS,
+            timeout=self.timeout,
+        )
+        response.encoding = "gbk"
+        payload = response.text.split('"')[1] if '"' in response.text else ""
+        parts = payload.split(",")
+        if len(parts) <= max(_SINA_FIELDS.values()) or not parts[_SINA_FIELDS["last"]]:
+            # 未知代码新浪返回空串，不是错误页；按"没有这只票"处理。
+            return None
+
+        def number(key: str):
+            return parse_price(parts[_SINA_FIELDS[key]])
+
+        last = number("last")
+        if last is None:
+            return None
+        amount_yuan = number("amount_yuan")
+        volume_lots = to_lots(
+            number("volume_shares"), amount_yuan=amount_yuan, last=last,
+            symbol=symbol, source=self.name,
+        )
+        date_text = parts[_SINA_FIELDS["date"]]
+        time_text = parts[_SINA_FIELDS["time"]]
+        as_of = (date_text.replace("-", "") + time_text.replace(":", "")) or None
+        return IntradayQuote(
+            symbol=symbol,
+            source=self.name,
+            last=last,
+            prev_close=number("prev_close"),
+            open=number("open"),
+            high=number("high"),
+            low=number("low"),
+            volume_lots=volume_lots,
+            amount_yuan=amount_yuan,
+            turnover_pct=None,
+            as_of=as_of,
+        )
+
+
 #: 同花顺 realhead 的字段号 → 语义。全部用已知值反查确认过（2026-09-07 收盘后，
 #: 上证指数 最新 3932.70 / 昨收 3930.12 / 开 3942.51 / 高 3948.42 / 低 3916.49）。
 #:
@@ -566,3 +644,4 @@ def _compact_timestamp(raw) -> Optional[str]:
 register(FundFlowPageQuoteProvider())
 register(TencentQuoteProvider())
 register(TonghuashunQuoteProvider())
+register(SinaQuoteProvider())
