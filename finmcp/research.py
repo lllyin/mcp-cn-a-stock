@@ -222,14 +222,19 @@ def _select_fund_flow_row_for_query_date(data: Dict[str, ndarray]) -> None:
     真数据而不是降级说明。
 
     只做**精确匹配**：帧里没有那一天的行（非交易日、早于上市、早于资金流历史
-    窗口起点），就保持原样，渲染层退回降级文案。不要"最近的一天"——那是在
+    窗口起点），就清除最新资金流字段，渲染层退回降级文案。不要"最近的一天"——那是在
     悄悄回答另一个问题。
 
-    找不到 ``_DS_FUND_FLOW``（没取到资金流）也原样返回，让缺数据走缺数据的老路。
+    先清除取数层写入的最新值，再填入精确匹配的历史值；缺失的历史字段不能沿用
+    最新值，否则同一行的净额与占比也可能来自不同日期。历史帧本身不变。
     """
     query_date = data.get("QUERY_DATE")
     if not query_date:
         return
+    fields = ("A_A", "A_R", "XL_A", "XL_R", "L_A", "L_R",
+              "M_A", "M_R", "S_A", "S_R")
+    for field in fields:
+        data.pop(field, None)
     fund_flow = data.get("_DS_FUND_FLOW")
     if not fund_flow:
         return
@@ -245,8 +250,7 @@ def _select_fund_flow_row_for_query_date(data: Dict[str, ndarray]) -> None:
     if len(matches) == 0:
         return
     index = int(matches[-1])
-    for field in ("A_A", "A_R", "XL_A", "XL_R", "L_A", "L_R",
-                  "M_A", "M_R", "S_A", "S_R"):
+    for field in fields:
         values = fund_flow.get(field)
         if values is not None and len(values) > index:
             data[field] = np.array([values[index]], dtype=np.float64)  # type: ignore

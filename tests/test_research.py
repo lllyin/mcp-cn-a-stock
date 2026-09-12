@@ -687,17 +687,62 @@ class TestSelectFundFlowRowForQueryDate:
         # 历史帧里没有的键不该被造出来
         assert "XL_A" not in data and "L_R" not in data
 
-    def test_a_date_outside_the_frame_changes_nothing(self):
-        """非交易日/早于窗口：精确匹配不到就原样保留，渲染层退回降级文案。"""
+    def test_a_date_outside_the_frame_clears_latest_values(self):
+        """精确匹配不到时不能留下最新资金流冒充历史数据。"""
         data = {"QUERY_DATE": "2026-08-30", "_DS_FUND_FLOW": self._history(),
                 "A_A": np.array([12345.0])}
         research._select_fund_flow_row_for_query_date(data)
-        assert data["A_A"] == np.array([12345.0])
+        assert "A_A" not in data
 
-    def test_without_fund_flow_data_it_is_a_no_op(self):
+    def test_without_fund_flow_history_clears_latest_values(self):
         data = {"QUERY_DATE": "2026-08-27", "A_A": np.array([12345.0])}
         research._select_fund_flow_row_for_query_date(data)
-        assert data["A_A"] == np.array([12345.0])
+        assert "A_A" not in data
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("case", ["outside", "missing", "empty", "partial", "matched", "realtime"])
+    async def test_load_and_render_do_not_mix_fund_flow_dates(self, monkeypatch, case):
+        history = self._history()
+        data = {
+            "DATE": np.array([self._date_ns("2026-08-27")]),
+            "CLOSE": np.array([10.0]),
+            "_DS_FUND_FLOW": history,
+        }
+        # 模拟取数层已经写入五档最新资金流，检验整个加载到渲染路径。
+        for prefix in ("A", "XL", "L", "M", "S"):
+            data[prefix + "_A"] = np.array([123450000.0])
+            data[prefix + "_R"] = np.array([0.12])
+        if case == "missing":
+            data.pop("_DS_FUND_FLOW")
+        elif case == "empty":
+            history["DATE"] = np.array([], dtype=np.int64)
+        elif case == "partial":
+            # 金额有历史行，但占比只有前一行，不能混用最新占比。
+            history["A_R"] = history["A_R"][:1]
+
+        async def fake_load(*args, **kwargs):
+            return data
+
+        monkeypatch.setattr(research, "load_data_msd", fake_load)
+        query = None if case == "realtime" else "2026-08-30" if case == "outside" else "2026-08-27"
+        loaded = await research.load_raw_data("SH600000", query)
+        fp = StringIO()
+        await build_trading_data(fp, "SH600000", loaded)
+        text = fp.getvalue()
+        if case == "realtime":
+            assert "当日主力净流入: 1.23亿  主力净占比: 12.00%" in text
+        else:
+            assert "1.23亿" not in text
+            assert "12.00%" not in text
+            if case in {"outside", "missing", "empty"}:
+                assert "指定日期查询暂不展示实时资金流向" in text
+                assert "当日主力净流入" not in text
+            else:
+                assert "当日小单净流入: -5996.88万  小单净占比: -4.01%" in text
+                if case == "partial":
+                    assert "当日主力净流入" not in text
+                else:
+                    assert "当日主力净流入: 5437.65万  主力净占比: 3.64%" in text
 
     def test_rendered_day_line_matches_the_history_table_row(self):
         """一致性验证：选行渲染出的"当日"行必须和同报告的历史表格该行逐字同值。
