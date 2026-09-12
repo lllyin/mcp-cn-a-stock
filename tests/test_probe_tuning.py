@@ -24,6 +24,46 @@ sys.modules["probe_tuning"] = probe
 _SPEC.loader.exec_module(probe)
 
 
+@pytest.mark.parametrize("fault", ["errors", "missing_symbol", "empty", "incomplete", "broken", None])
+def test_batch_recommendation_checks_report_content(monkeypatch, tmp_path, fault):
+    from verify_release import CallResult, CONTRACT
+
+    class Process:
+        pid = 123
+
+        def send_signal(self, *args): pass
+        def wait(self, **kwargs): return 0
+
+    def call(spec, *args):
+        document = "\n\n".join(d.marker + "\n- 1" for d in CONTRACT["brief"])
+        reports = {symbol: document for symbol in spec.args["symbol"].split(",")}
+        payload = {"reports": reports, "errors": {}}
+        symbol = next(iter(reports))
+        if fault == "errors":
+            payload["errors"][symbol] = "upstream unavailable"
+        elif fault == "missing_symbol":
+            reports.pop(symbol)
+        elif fault == "empty":
+            reports[symbol] = ""
+        elif fault == "incomplete":
+            reports[symbol] = "# 基本数据\n- 股票代码: " + symbol
+        text = "{broken" if fault == "broken" else json.dumps(payload)
+        return CallResult(spec, 0, text, "", 0.1)
+
+    monkeypatch.setattr(probe.shutil, "which", lambda name: "/fake/mcporter")
+    monkeypatch.setattr(probe, "_dotenv", lambda path: {})
+    monkeypatch.setattr(probe, "prefixed_environment", lambda *a: {"DISPLAY": ":99"})
+    monkeypatch.setattr(probe.subprocess, "Popen", lambda *a, **k: Process())
+    monkeypatch.setattr(probe, "_wait_for_instance", lambda *a: None)
+    monkeypatch.setattr(probe, "_parse_queue_seconds", lambda path: [0.0] * 12)
+    monkeypatch.setattr(probe, "run_call", call)
+    args = probe.parse_args(["batch", "--out-dir", str(tmp_path), "--arms", "2", "--episode-gap", "0"])
+    assert probe.run_batch(args) == 0
+    result = json.loads((tmp_path / "batch.json").read_text())
+    assert result["arms"]["2"]["errors"] == (0 if fault is None else 12)
+    assert result["status"] == ("measured" if fault is None else "inconclusive")
+
+
 # ── 造样例 ─────────────────────────────────────────────────────────
 
 

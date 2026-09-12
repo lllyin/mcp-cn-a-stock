@@ -21,7 +21,7 @@
 
 BATCH_CONCURRENCY 单独有一项（``batch`` 子命令）：回放下游的真实爆发形态（每批 4 个
 标的、同秒并发 3 批，来自 mcporter 73 天调用日志），逐臂量准入排队 p95 和错误率。
-判据：排队 p95 ≤ 1 秒的最小臂；每臂至少 12 次调用；并发更高而错误也更多的臂排除；
+判据：排队 p95 ≤ 1 秒的最小臂；每臂至少 12 次调用，报告完整且无错误；
 判不出来保持默认 2。它测的是"准入上限和下游负载形态的匹配度"，需要在出站请求能直达
 上游的当前环境跑（上游被代理挡住时结果无意义）。
 
@@ -90,7 +90,7 @@ from typing import Callable, Optional
 import re
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from verify_release import CallSpec, run_call  # noqa: E402  复用 mcporter 调用与判定
+from verify_release import CallSpec, run_call, parse_payload, check_completeness  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # 以脚本文件形式运行时 sys.path[0] 是 scripts/，仓库根不在搜索路径上；探测量的就是这份检出的代码。
@@ -1629,6 +1629,20 @@ def _parse_queue_seconds(log_path: Path) -> list:
     return queues
 
 
+def _batch_call_ok(call) -> bool:
+    """传输成功还不够：每个请求标的都必须返回完整报告。"""
+    if not call.ok:
+        return False
+    payload = parse_payload(call.payload)
+    expected = set(call.spec.args["symbol"].split(","))
+    return (
+        not payload.broken_json and not payload.errors
+        and expected <= payload.documents.keys()
+        and all(payload.documents[symbol].strip() for symbol in expected)
+        and not check_completeness(call.spec.tool, payload).bad
+    )
+
+
 def run_batch(args) -> int:
     """量 BATCH_CONCURRENCY：按下游爆发形态回放，逐臂量准入排队。
 
@@ -1637,8 +1651,8 @@ def run_batch(args) -> int:
     排队掩盖掉），从服务日志抠每批的 queue= 值。
 
     判据（AGENTS 第五条）：每臂至少 12 次调用才下结论；取**排队 p95 ≤ 1 秒的
-    最小臂**——准入层的存在理由是保护上游，够快就不该再往上调；并发更高而
-    错误也更多的臂直接排除。判不出来保持默认 2。
+    最小臂**——准入层的存在理由是保护上游，够快就不该再往上调；报告不完整或
+    有业务错误的臂直接排除。判不出来保持默认 2。
     """
     if shutil.which("mcporter") is None:
         print("找不到 mcporter，batch 探测跑不起来", file=sys.stderr)
@@ -1690,7 +1704,7 @@ def run_batch(args) -> int:
                             specs))
                     for call in calls:
                         walls.append(call.elapsed)
-                        if not call.ok:
+                        if not _batch_call_ok(call):
                             errors += 1
                     print(f"[batch]   episode {episode + 1}/{episodes}: "
                           f"{[f'{c.elapsed:.1f}s' for c in calls]}")
@@ -1718,7 +1732,7 @@ def run_batch(args) -> int:
                 if results[arm]["calls"] >= 12
                 and results[arm]["queue_p95_s"] is not None
                 and results[arm]["queue_p95_s"] <= BATCH_QUEUE_P95_TARGET_S
-                and results[arm]["errors"] <= min(results[a]["errors"] for a in arms)]
+                and results[arm]["errors"] == 0]
     if eligible:
         chosen = min(eligible)
         status = "measured"
@@ -1727,7 +1741,7 @@ def run_batch(args) -> int:
     else:
         chosen = 2
         status = "inconclusive"
-        reason = "没有一臂满足排队 p95 ≤ 1s 且错误不增，按默认"
+        reason = "没有一臂满足排队 p95 ≤ 1s 且报告完整无错误，按默认"
     recommendation = {"key": "BATCH_CONCURRENCY", "value": str(chosen),
                       "status": status, "evidence": reason, "arms": results,
                       "target_queue_p95_s": BATCH_QUEUE_P95_TARGET_S,
