@@ -2320,14 +2320,14 @@ class TreeSample(NamedTuple):
     pss_processes: int = 0
 
 
-def tree_rss(pid: int) -> TreeSample:
+def tree_rss(pid: int, *, extra_pids: tuple[int, ...] = ()) -> TreeSample:
     """采一次服务进程树。
 
     浏览器那部分单列，因为它是峰值的主要来源，也是 BROWSER_MAX_PAGES
     这个旋钮直接作用的地方——两个数放在一起才看得出上调的代价落在哪。
     """
     procs, kids = _process_table()
-    if pid not in procs:
+    if pid not in procs or any(extra not in procs for extra in extra_pids):
         return TreeSample(0.0, 0, 0.0, 0, 0.0)
     total = browser = 0
     count = browser_count = 0
@@ -2335,7 +2335,8 @@ def tree_rss(pid: int) -> TreeSample:
     pss_count = 0
     cpu = 0.0
     seen: set[int] = set()
-    stack = [pid]
+    # Xvfb 可由启动脚本单独管理，不一定是服务的子进程；同一 PID 只计一次。
+    stack = [pid, *extra_pids]
     while stack:
         current = stack.pop()
         if current in seen or current not in procs:

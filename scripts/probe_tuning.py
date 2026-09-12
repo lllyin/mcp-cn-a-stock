@@ -21,7 +21,8 @@
 
 BATCH_CONCURRENCY 单独有一项（``batch`` 子命令）：回放下游的真实爆发形态（每批 4 个
 标的、同秒并发 3 批，来自 mcporter 73 天调用日志），逐臂量准入排队 p95 和错误率。
-判据：排队 p95 ≤ 1 秒的最小臂；每臂至少 12 次调用，报告完整且无错误；
+判据：排队 p95 ≤ 1 秒的最小臂；每臂至少 12 次调用，报告完整且无错误、
+服务与浏览器及关联 Xvfb 的合计峰值内存 ≤ 500 MiB；
 判不出来保持默认 2。它测的是"准入上限和下游负载形态的匹配度"，需要在出站请求能直达
 上游的当前环境跑（上游被代理挡住时结果无意义）。
 
@@ -90,7 +91,7 @@ from typing import Callable, Optional
 import re
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from verify_release import CallSpec, run_call, parse_payload, check_completeness  # noqa: E402
+from verify_release import CallSpec, run_call, parse_payload, check_completeness, tree_rss  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # 以脚本文件形式运行时 sys.path[0] 是 scripts/，仓库根不在搜索路径上；探测量的就是这份检出的代码。
@@ -1453,6 +1454,10 @@ def run_recommend(args) -> int:
     # batch.json 存在时把 BATCH_CONCURRENCY 的实测结论补进推荐（run_batch 写的）
     batch = read_json(out_dir / "batch.json")
     if batch:
+        measured_arm = batch.get("arms", {}).get(str(batch.get("value")), {})
+        if batch.get("status") == "measured" and not _batch_memory_ok(measured_arm):
+            batch = {"value": "2", "status": "inconclusive",
+                     "evidence": "batch 推荐缺少完整且未超限的内存证据，保留默认（未经验证）"}
         decisions = [d for d in decisions if d.key != "BATCH_CONCURRENCY"]
         decisions.append(Decision(
             key="BATCH_CONCURRENCY", value=str(batch.get("value")),
@@ -1605,6 +1610,77 @@ BATCH_POOL = (
 BATCH_QUEUE_P95_TARGET_S = 1.0
 
 
+def _batch_xvfb() -> tuple:
+    """只读启动脚本管理的 Xvfb PID 和实际显示号。"""
+    try:
+        pid_text, display = XVFB_PID_FILE.read_text().split()
+        pid = int(pid_text)
+        process = _ps_table().get(pid)
+        if process and "xvfb" in process[2].lower():
+            return pid, display
+    except (OSError, ValueError):
+        pass
+    return None, None
+
+
+class _BatchMemoryWatch:
+    """每臂一个可停止的采样线程；仅保存峰值，不积累样本列表。"""
+
+    def __init__(self, pid, *, extra_pids=(), coverage_known=True):
+        self.pid, self.extra_pids = pid, extra_pids
+        self.complete = coverage_known
+        self.samples = 0
+        self.rss_peak = self.pss_peak = 0.0
+        self.pss_complete = True
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def sample(self):
+        try:
+            sample = tree_rss(self.pid, extra_pids=self.extra_pids)
+            if not sample.processes:
+                self.complete = False
+                return
+            self.samples += 1
+            self.rss_peak = max(self.rss_peak, sample.rss_mib)
+            self.pss_peak = max(self.pss_peak, sample.pss_mib)
+            self.pss_complete &= sample.pss_processes == sample.processes
+        except Exception as error:
+            self.complete = False
+            print(f"[batch] 内存采样失败：{error}", file=sys.stderr)
+
+    def _run(self):
+        while not self.stop_event.wait(1.0):
+            self.sample()
+
+    def start(self):
+        self.sample()
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join()
+        self.sample()
+
+    def summary(self):
+        metric = "pss" if self.pss_complete else "rss"
+        if not self.samples:
+            metric = "unavailable"
+        value = self.pss_peak if self.pss_complete else self.rss_peak
+        complete = self.complete and self.samples > 0
+        return {"metric": metric, "peak_mib": value, "samples": self.samples,
+                "complete": complete, "budget_mib": MEMORY_BUDGET_MIB,
+                "within_budget": complete and 0 < value <= MEMORY_BUDGET_MIB}
+
+
+def _batch_memory_ok(result) -> bool:
+    """旧报告或缺少完整采样的报告不能作为内存合格证据。"""
+    memory = result.get("memory") or {}
+    peak = memory.get("peak_mib")
+    return bool(memory.get("complete") and memory.get("samples", 0) > 0
+                and isinstance(peak, (int, float)) and 0 < peak <= MEMORY_BUDGET_MIB)
+
+
 def _wait_for_instance(log_path: Path, process, timeout: float) -> Optional[str]:
     """等隔离实例就绪；失败返回给 stderr 的说明，成功返回 None。"""
     deadline = time.perf_counter() + timeout
@@ -1652,7 +1728,8 @@ def run_batch(args) -> int:
 
     判据（AGENTS 第五条）：每臂至少 12 次调用才下结论；取**排队 p95 ≤ 1 秒的
     最小臂**——准入层的存在理由是保护上游，够快就不该再往上调；报告不完整或
-    有业务错误的臂直接排除。判不出来保持默认 2。
+    有业务错误、峰值内存超过 500 MiB 或内存无法完整测量的臂直接排除。
+    判不出来保持默认 2，但不能视为已经验证。
     """
     if shutil.which("mcporter") is None:
         print("找不到 mcporter，batch 探测跑不起来", file=sys.stderr)
@@ -1670,10 +1747,10 @@ def run_batch(args) -> int:
         env = prefixed_environment(
             os.environ, dotenv, {"BATCH_CONCURRENCY": str(arm), "CACHE_ENABLED": "0"},
             "PROBE_", arm_dir / "cache")
-        if not env.get("DISPLAY"):
-            xvfb_pid = _pid_alive(XVFB_PID_FILE)
-            if xvfb_pid:
-                env["DISPLAY"] = f":{dotenv.get('XVFB_DISPLAY_NUMBER', '99')}"
+        xvfb_pid, xvfb_display = _batch_xvfb()
+        if not env.get("DISPLAY") and xvfb_pid:
+            env["DISPLAY"] = xvfb_display
+        using_xvfb = bool(xvfb_pid and env.get("DISPLAY") in (xvfb_display, f"{xvfb_display}.0"))
         log_path = arm_dir / "server.log"
         print(f"[batch] BATCH_CONCURRENCY={arm}：起隔离实例 port={args.port}")
         with log_path.open("w", encoding="utf-8") as handle:
@@ -1681,6 +1758,11 @@ def run_batch(args) -> int:
                 [sys.executable, "main.py", "--transport", "http", "--port", str(args.port)],
                 cwd=str(PROJECT_ROOT), env=env, stdout=handle, stderr=subprocess.STDOUT,
             )
+            memory = _BatchMemoryWatch(
+                process.pid, extra_pids=(xvfb_pid,) if using_xvfb else (),
+                coverage_known=not env.get("DISPLAY") or using_xvfb,
+            )
+            memory.start()
             try:
                 failure = _wait_for_instance(log_path, process, args.timeout)
                 if failure:
@@ -1710,6 +1792,7 @@ def run_batch(args) -> int:
                           f"{[f'{c.elapsed:.1f}s' for c in calls]}")
                     time.sleep(args.episode_gap)
             finally:
+                memory.stop()
                 process.send_signal(signal.SIGTERM)
                 try:
                     process.wait(timeout=20)
@@ -1718,6 +1801,7 @@ def run_batch(args) -> int:
         queues = _parse_queue_seconds(log_path)
         results[arm] = {
             "calls": len(walls), "errors": errors,
+            "memory": memory.summary(),
             "wall_p50_s": round(percentile(walls, 50), 2),
             "wall_p95_s": round(percentile(walls, 95), 2),
             "wall_max_s": round(max(walls), 2) if walls else None,
@@ -1732,7 +1816,8 @@ def run_batch(args) -> int:
                 if results[arm]["calls"] >= 12
                 and results[arm]["queue_p95_s"] is not None
                 and results[arm]["queue_p95_s"] <= BATCH_QUEUE_P95_TARGET_S
-                and results[arm]["errors"] == 0]
+                and results[arm]["errors"] == 0
+                and _batch_memory_ok(results[arm])]
     if eligible:
         chosen = min(eligible)
         status = "measured"
@@ -1741,7 +1826,7 @@ def run_batch(args) -> int:
     else:
         chosen = 2
         status = "inconclusive"
-        reason = "没有一臂满足排队 p95 ≤ 1s 且报告完整无错误，按默认"
+        reason = "没有一臂同时满足排队 p95 ≤ 1s、报告完整无错误和内存峰值 ≤ 500 MiB，按默认（未经验证）"
     recommendation = {"key": "BATCH_CONCURRENCY", "value": str(chosen),
                       "status": status, "evidence": reason, "arms": results,
                       "target_queue_p95_s": BATCH_QUEUE_P95_TARGET_S,

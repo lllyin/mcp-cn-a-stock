@@ -24,9 +24,10 @@ sys.modules["probe_tuning"] = probe
 _SPEC.loader.exec_module(probe)
 
 
-@pytest.mark.parametrize("fault", ["errors", "missing_symbol", "empty", "incomplete", "broken", None])
-def test_batch_recommendation_checks_report_content(monkeypatch, tmp_path, fault):
-    from verify_release import CallResult, CONTRACT
+@pytest.mark.parametrize("fault", ["errors", "missing_symbol", "empty", "incomplete", "broken",
+                                   "memory_over", "memory_unknown", None])
+def test_batch_recommendation_checks_reports_and_memory(monkeypatch, tmp_path, fault):
+    from verify_release import CallResult, CONTRACT, TreeSample
 
     class Process:
         pid = 123
@@ -53,6 +54,11 @@ def test_batch_recommendation_checks_report_content(monkeypatch, tmp_path, fault
     monkeypatch.setattr(probe.shutil, "which", lambda name: "/fake/mcporter")
     monkeypatch.setattr(probe, "_dotenv", lambda path: {})
     monkeypatch.setattr(probe, "prefixed_environment", lambda *a: {"DISPLAY": ":99"})
+    monkeypatch.setattr(probe, "_batch_xvfb", lambda: (456, ":99"))
+    sample = (TreeSample(600, 2, 500, 1, 0, 501, 2) if fault == "memory_over"
+              else TreeSample(0, 0, 0, 0, 0) if fault == "memory_unknown"
+              else TreeSample(200, 2, 100, 1, 0, 150, 2))
+    monkeypatch.setattr(probe, "tree_rss", lambda *a, **k: sample)
     monkeypatch.setattr(probe.subprocess, "Popen", lambda *a, **k: Process())
     monkeypatch.setattr(probe, "_wait_for_instance", lambda *a: None)
     monkeypatch.setattr(probe, "_parse_queue_seconds", lambda path: [0.0] * 12)
@@ -60,8 +66,85 @@ def test_batch_recommendation_checks_report_content(monkeypatch, tmp_path, fault
     args = probe.parse_args(["batch", "--out-dir", str(tmp_path), "--arms", "2", "--episode-gap", "0"])
     assert probe.run_batch(args) == 0
     result = json.loads((tmp_path / "batch.json").read_text())
-    assert result["arms"]["2"]["errors"] == (0 if fault is None else 12)
+    assert result["arms"]["2"]["errors"] == (0 if fault in {None, "memory_over", "memory_unknown"} else 12)
     assert result["status"] == ("measured" if fault is None else "inconclusive")
+
+
+@pytest.mark.parametrize("values,coverage,expected", [
+    ([200, 501, 200], True, False),
+    ([200, 500, 200], True, True),
+    ([0], True, False),
+    ([200], False, False),
+])
+def test_batch_memory_gate_uses_peak_and_requires_coverage(monkeypatch, values, coverage, expected):
+    from verify_release import TreeSample
+    samples = iter(TreeSample(value, 2 if value else 0, 0, 0, 0) for value in values)
+    monkeypatch.setattr(probe, "tree_rss", lambda *a, **k: next(samples))
+    watch = probe._BatchMemoryWatch(123, coverage_known=coverage)
+    for _ in values:
+        watch.sample()
+    result = watch.summary()
+    assert result["metric"] == ("rss" if max(values) else "unavailable")
+    assert result["peak_mib"] == max(values)
+    assert probe._batch_memory_ok({"memory": result}) is expected
+    assert not probe._batch_memory_ok({})
+
+
+def test_batch_memory_pss_must_cover_every_process(monkeypatch):
+    from verify_release import TreeSample
+    samples = iter([TreeSample(600, 2, 0, 0, 0, 300, 2),
+                    TreeSample(650, 2, 0, 0, 0, 200, 1)])
+    monkeypatch.setattr(probe, "tree_rss", lambda *a, **k: next(samples))
+    watch = probe._BatchMemoryWatch(123)
+    watch.sample()
+    assert probe._batch_memory_ok({"memory": watch.summary()})
+    watch.sample()
+    assert watch.summary()["metric"] == "rss"
+    assert not probe._batch_memory_ok({"memory": watch.summary()})
+
+
+def test_batch_memory_thread_stops_and_retains_no_sample_list(monkeypatch):
+    from verify_release import TreeSample
+    monkeypatch.setattr(probe, "tree_rss", lambda *a, **k: TreeSample(100, 1, 0, 0, 0))
+    watch = probe._BatchMemoryWatch(123)
+    watch.start()
+    watch.stop()
+    assert not watch.thread.is_alive()
+    assert watch.samples >= 2
+    assert probe._batch_memory_ok({"memory": watch.summary()})
+
+
+def test_batch_memory_counts_shared_xvfb_once(monkeypatch):
+    import verify_release as verify
+    table = {1: (0, 100 * 1024, "python", 0),
+             2: (1, 200 * 1024, "chromium", 0),
+             3: (0, 50 * 1024, "Xvfb", 0)}
+    monkeypatch.setattr(verify, "_process_table", lambda: (table, {1: [2]}))
+    monkeypatch.setattr(verify, "_pss_kib", lambda pid: None)
+    sample = verify.tree_rss(1, extra_pids=(2, 3))
+    assert sample.processes == 3 and sample.rss_mib == 350
+    assert verify.tree_rss(1, extra_pids=(99,)).processes == 0
+
+
+def test_recommend_rejects_old_batch_result_without_memory(monkeypatch, tmp_path):
+    probe.write_json(tmp_path / "facts.json", {})
+    probe.write_json(tmp_path / "batch.json", {
+        "value": "4", "status": "measured", "arms": {"4": {"calls": 12, "errors": 0}}})
+    monkeypatch.setattr(probe, "build_decisions", lambda *a: [])
+    args = probe.parse_args(["recommend", "--out-dir", str(tmp_path), "--env", str(tmp_path / ".env")])
+    assert probe.run_recommend(args) == 0
+    decisions = json.loads((tmp_path / "decisions.json").read_text())["decisions"]
+    decision = next(d for d in decisions if d["key"] == "BATCH_CONCURRENCY")
+    assert decision["status"] == "inconclusive"
+    assert decision["value"] == "2"
+
+
+def test_batch_reads_managed_xvfb_display(monkeypatch, tmp_path):
+    pidfile = tmp_path / "xvfb.pid"
+    pidfile.write_text("321 :101\n")
+    monkeypatch.setattr(probe, "XVFB_PID_FILE", pidfile)
+    monkeypatch.setattr(probe, "_ps_table", lambda: {321: (1, 50, "Xvfb")})
+    assert probe._batch_xvfb() == (321, ":101")
 
 
 # ── 造样例 ─────────────────────────────────────────────────────────
