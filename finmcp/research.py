@@ -206,13 +206,15 @@ async def load_raw_data(
         requirements=requirements,
     )
     if data and is_historical_query:
-        data["QUERY_DATE"] = end_date.strftime("%Y-%m-%d")  # type: ignore
+        query_date = end_date.strftime("%Y-%m-%d")
+        data["QUERY_DATE"] = query_date  # type: ignore
         data["IS_HISTORICAL_QUERY"] = True  # type: ignore
-        _select_fund_flow_row_for_query_date(data)
+        _select_fund_flow_row_for_query_date(data, query_date)
     return data
 
 
-def _select_fund_flow_row_for_query_date(data: Dict[str, ndarray]) -> None:
+def _select_fund_flow_row_for_query_date(data: Dict[str, ndarray],
+                                         query_date: str) -> None:
     """钉日期查询：把"当日"资金流字段从帧最后一行换成钉住日期那一行。
 
     "当日"字段（``A_A``/``XL_A``……）在取数层一律取资金流历史帧的**最后一行**，
@@ -227,14 +229,18 @@ def _select_fund_flow_row_for_query_date(data: Dict[str, ndarray]) -> None:
 
     先清除取数层写入的最新值，再填入精确匹配的历史值；缺失的历史字段不能沿用
     最新值，否则同一行的净额与占比也可能来自不同日期。历史帧本身不变。
+
+    ``query_date`` 由调用方传入而不是从 ``data`` 里掏：掏的话就必然有一条"掏不到
+    就返回"的路，而那条路会**在清除之前**返回，于是又把最新值留在了钉日期的报告
+    里——正是这个函数要消灭的那个 bug 的形状。作为必填参数，"只有钉日期查询才能
+    调我"就从注释变成了签名事实，而且下面**没有任何一条路径在清除之前返回**。
     """
-    query_date = data.get("QUERY_DATE")
-    if not query_date:
-        return
     fields = ("A_A", "A_R", "XL_A", "XL_R", "L_A", "L_R",
               "M_A", "M_R", "S_A", "S_R")
     for field in fields:
         data.pop(field, None)
+    if not query_date:
+        return
     fund_flow = data.get("_DS_FUND_FLOW")
     if not fund_flow:
         return

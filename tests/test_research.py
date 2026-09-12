@@ -676,14 +676,14 @@ class TestSelectFundFlowRowForQueryDate:
 
     def test_the_query_dates_row_is_selected(self):
         data = {"QUERY_DATE": "2026-08-27", "_DS_FUND_FLOW": self._history()}
-        research._select_fund_flow_row_for_query_date(data)
+        research._select_fund_flow_row_for_query_date(data, data["QUERY_DATE"])
         assert data["A_A"] == np.array([54376549.0])
         assert data["A_R"] == np.array([0.0364])
         assert data["S_A"] == np.array([-59968832.0])
 
     def test_fields_not_in_the_frame_are_left_absent(self):
         data = {"QUERY_DATE": "2026-08-27", "_DS_FUND_FLOW": self._history()}
-        research._select_fund_flow_row_for_query_date(data)
+        research._select_fund_flow_row_for_query_date(data, data["QUERY_DATE"])
         # 历史帧里没有的键不该被造出来
         assert "XL_A" not in data and "L_R" not in data
 
@@ -691,13 +691,27 @@ class TestSelectFundFlowRowForQueryDate:
         """精确匹配不到时不能留下最新资金流冒充历史数据。"""
         data = {"QUERY_DATE": "2026-08-30", "_DS_FUND_FLOW": self._history(),
                 "A_A": np.array([12345.0])}
-        research._select_fund_flow_row_for_query_date(data)
+        research._select_fund_flow_row_for_query_date(data, data["QUERY_DATE"])
         assert "A_A" not in data
 
     def test_without_fund_flow_history_clears_latest_values(self):
         data = {"QUERY_DATE": "2026-08-27", "A_A": np.array([12345.0])}
-        research._select_fund_flow_row_for_query_date(data)
+        research._select_fund_flow_row_for_query_date(data, data["QUERY_DATE"])
         assert "A_A" not in data
+
+    @pytest.mark.parametrize("query_date", ["", None, "不是日期", "2026-13-45"])
+    def test_no_path_returns_before_clearing(self, query_date):
+        """清除必须发生在**任何**提前返回之前。
+
+        这一条守的是这个函数的形状而不是某个场景：原来的 bug 就是"掏不到日期就
+        原样返回"，把取数层写入的最新资金流留在了钉日期的报告里。只要还有一条
+        路径能在清除之前返回，那个 bug 就能从别的入口复活。
+        """
+        data = {"A_A": np.array([12345.0]), "A_R": np.array([9.9]),
+                "S_A": np.array([1.0]), "S_R": np.array([1.0]),
+                "_DS_FUND_FLOW": self._history()}
+        research._select_fund_flow_row_for_query_date(data, query_date)
+        assert not any(field in data for field in ("A_A", "A_R", "S_A", "S_R"))
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("case", ["outside", "missing", "empty", "partial", "matched", "realtime"])
@@ -754,7 +768,7 @@ class TestSelectFundFlowRowForQueryDate:
             "QUERY_DATE": "2026-08-27",
             "_DS_FUND_FLOW": self._history(),
         }
-        research._select_fund_flow_row_for_query_date(data)
+        research._select_fund_flow_row_for_query_date(data, data["QUERY_DATE"])
         day_fp = StringIO()
         assert research._print_fund_flow_lines(day_fp, data) is True
         day_text = day_fp.getvalue()
