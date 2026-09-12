@@ -1110,3 +1110,94 @@ class TestRateTextNeverRoundsUp:
         offenders = [line.strip() for line in body.splitlines()
                      if re.search(r"(rate|overall|available)[^\"']*:\.0f\}%", line)]
         assert not offenders, offenders
+
+
+# --- 市净率自洽 -------------------------------------------------------------
+#
+# 判据是恒等式 市净率 × 每股净资产 = 现价，三个数都在同一份报告里，不问外部源。
+# 它只筛不判、不进可用率——所以这里守的是"该筛的筛出来、不该筛的别烦人"。
+
+
+def _pb_doc(pb, price, bvps) -> str:
+    return (f"# 基本数据\n- 市净率: {pb}\n\n# 交易数据\n\n## 价格\n- 当日: {price}\n\n"
+            f"# 财务数据\n\n| 指标 | 2025年度 |\n| --- | --- |\n"
+            f"| 每股净资产 | {bvps} |\n")
+
+
+class _PbPayload:
+    def __init__(self, documents):
+        self.documents = documents
+
+
+def _pb_probes(documents):
+    return [(None, _PbPayload(documents), None)]
+
+
+def test_a_wrong_pb_is_flagged():
+    """2026-09-12 真实踩到的那一处：基线冻着 7.21，正确值是 4.57。
+
+    两者共用同一个现价和每股净资产，所以这条恒等式当场就能分开它们——不必去翻网页。
+    """
+    suspects = verify._pb_consistency(_pb_probes({
+        "SZ300373": _pb_doc(7.21, 84.36, 17.56),
+    }))
+    assert [s[0] for s in suspects] == ["SZ300373"]
+    assert suspects[0][4] == pytest.approx(50.1, abs=0.5)
+
+
+def test_the_right_pb_is_not_flagged():
+    """负面对照：正确值必须**不**被筛出来，否则这一节每次都在喊狼来了。"""
+    assert verify._pb_consistency(_pb_probes({
+        "SZ300373": _pb_doc(4.57, 84.36, 17.56),   # 实测偏差 4.9%
+        "SH600519": _pb_doc(6.34, 1275.16, 195.36),  # 实测偏差 2.9%
+        "SZ300750": _pb_doc(4.10, 330.51, 73.87),   # 实测偏差 8.4%，正常簇里最大的
+    })) == []
+
+
+def test_the_structural_residual_stays_under_the_threshold():
+    """阈值必须盖过结构性残差的上沿。
+
+    财务表给的是**年度**每股净资产，市净率用的是最新一期，所以推算价通常略低于
+    现价。2026-09-12 实测 28 个标的，正常簇最大 14.6%——阈值低于它就会天天报。
+    """
+    assert verify.PB_CONSISTENCY_TOLERANCE_PCT > 14.6
+    # 也不能高到把实测的离群（最小 36.1%）放过去。
+    assert verify.PB_CONSISTENCY_TOLERANCE_PCT < 36.1
+
+
+@pytest.mark.parametrize("body", [
+    "- 市净率: 1.2\n## 价格\n- 当日: 3.0\n",             # ETF：没有每股净资产
+    "## 价格\n- 当日: 3.0\n| 每股净资产 | 2.0 |\n",       # 指数：没有市净率
+    "- 市净率: 1.2\n| 每股净资产 | 2.0 |\n",              # 没有价格
+])
+def test_a_symbol_missing_any_of_the_three_is_skipped(body):
+    """三个字段缺一个就跳过。ETF 和指数本来就没有净资产，报它们只是噪声。"""
+    assert verify._pb_consistency(_pb_probes({"X": body})) == []
+
+
+@pytest.mark.parametrize("pb,price,bvps", [
+    (0, 84.36, 17.56),      # 市净率为 0
+    (4.57, 0, 17.56),       # 价格为 0
+    (4.57, 84.36, 0),       # 每股净资产为 0（会除零）
+    (4.57, 84.36, -3.2),    # 资不抵债，负净资产
+])
+def test_degenerate_numbers_do_not_crash_or_flag(pb, price, bvps):
+    assert verify._pb_consistency(_pb_probes({"X": _pb_doc(pb, price, bvps)})) == []
+
+
+def test_suspects_come_back_worst_first():
+    suspects = verify._pb_consistency(_pb_probes({
+        "小偏差": _pb_doc(7.21, 84.36, 17.56),    # +50.1%
+        "大偏差": _pb_doc(20.0, 84.36, 17.56),    # +316%
+    }))
+    assert [s[0] for s in suspects] == ["大偏差", "小偏差"]
+
+
+def test_the_check_never_touches_availability():
+    """这一项不进可用率——它筛的是"值得看一眼"，不是"数据缺了"。
+
+    真把它接进分数，人就会为了绿去草率裁决，那正好反了。
+    """
+    import inspect
+    source = inspect.getsource(verify._pb_consistency)
+    assert "score" not in source and "可用率" not in source

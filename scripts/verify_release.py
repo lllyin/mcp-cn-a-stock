@@ -681,6 +681,40 @@ class PendingDisagreement:
 #: 得拿券商行情或第三方去核对。
 PENDING_DISAGREEMENTS = (
     PendingDisagreement(
+        what="东财历史资金流 · 已收盘日期的值会随时间翻转",
+        values="SH600362 2026-07-01 主力净流入在 -4342.94万(-1.93%) 与 -3982.64万(-1.77%) "
+               "两个值之间来回；对应的超大单 -8130.39万/-6551.70万、大单 3787.45万/2569.06万。"
+               "**两组各自都满足 主力 = 超大单 + 大单**，所以结构不变量分不出谁对。"
+               "SH600489 同日同样有两组值。不是节点差异——20 次请求落在 16 个不同 svr 上，"
+               "同一时刻全部一致；也不是传输差异——原生 requests 与页面内 fetch 同刻同值。"
+               "翻转是分钟级的：2026-09-12 21:41 与 21:46 两次取到 -3982.64，21:47 起连续 "
+               "24 次（4 分钟）全是 -4342.94",
+        gap="主力 9.1%",
+        found="2026-09-12",
+    ),
+    PendingDisagreement(
+        what="钉日期报告 · 估值字段仍是「今天」，与同一份报告里的价格不同基准",
+        values="SZ300373 钉 2026-06-23：当日价 132.96、市盈率(静) 57.38 都是钉住那天的，"
+               "而总市值 458.37亿、流通市值、市净率 4.57、市盈率(动)、净资产收益率 与不钉日期"
+               "查询**逐位相同**（都是今天的）。后果是同一份报告里的字段不能互推："
+               "总市值/市盈率(静) 在实时报告里 = 12.59亿，与财务表的 2025 年度净利润逐位相符；"
+               "在钉日期报告里 = 7.99亿，差 37%。机制：总股本 5.433亿股 × 钉日价 132.96 "
+               "= 722.4亿，722.4/12.59 = 57.38 正是报告里的市盈率(静)——它按钉日价算对了，"
+               "总市值没有。要让总市值跟着钉的日期走需要历史总股本，属于产品决定",
+        gap="派生值 37%",
+        found="2026-09-12",
+    ),
+    PendingDisagreement(
+        what="SZ300475 / SH603986 / SH688008 · 市净率与每股净资产对不上",
+        values="按 市净率 × 每股净资产 = 现价 推算：SZ300475 推算 84.82 对现价 167.65、"
+               "SH603986 推算 198.65 对 371.32、SH688008 推算 110.46 对 191.96。"
+               "同批 28 个标的里其余 25 个偏差都在 14.6% 以内。要么净资产自年报以来真的"
+               "涨了一倍（增发或大额盈利），要么市净率取错了——只有东财供这个字段，"
+               "腾讯对这几个标的返回 None，没有第二个源可以对照",
+        gap="36% ~ 49%",
+        found="2026-09-12",
+    ),
+    PendingDisagreement(
         what="SZ399006 创业板指 · 成交量/成交额（全部周期）",
         values="东财/同花顺 200,462,510 手 · 5036.48亿；腾讯/新浪 193,413,042 手 · 4998.09亿",
         gap="量 3.52%，额 0.76%",
@@ -1230,7 +1264,54 @@ def _env_number(name: str, default: float) -> float:
         return default
 
 
-def _render_disagreements(scan: "LogScan") -> list[str]:
+#: 市净率自洽检查的告警阈值（百分比）。
+#:
+#: 判据是恒等式 ``市净率 × 每股净资产 = 现价``——三个数都在同一份报告里，算它一分钱
+#: 不花，也不依赖任何外部口径。**不用 ``PE(静) × ROE``**：那两个比率在本项目里不同源
+#: 也不同周期（PE 用上年净利润，ROE 取财务表最新报告期），乘出来 28 个标的中位偏差
+#: 48.8%，没有判别力。
+#:
+#: 残差是结构性的、有方向：财务表里的每股净资产是**年度**值，而东财的市净率用的是
+#: 最新一期（含中报）。净资产在增长，所以推算价通常略低于现价——2026-09-12 实测 28 个
+#: 标的里 22 个偏低，与这个解释一致。
+#:
+#: 25% 的来历（按**最大值**定，不按分位数）：同批实测正常簇最大 14.6%，第一个离群
+#: 36.1%，中间空了 21.4 个百分点；25% 落在空档中部。怎么为自己的环境重取：跑一批
+#: 标的把偏差排序，找正常簇和离群之间那个空档，取中部。年报刚出时残差最小、年末最大，
+#: 所以要在年内偏晚的时候量，别在年报季量完就当全年的值。
+PB_CONSISTENCY_TOLERANCE_PCT = 25.0
+
+_PB_RE = re.compile(r"- 市净率: ([\d.]+)")
+_PRICE_RE = re.compile(r"## 价格\n- 当日(?:\(实时\))?: ([\d.]+)")
+_BVPS_RE = re.compile(r"\| 每股净资产 \| ([\d.-]+)")
+
+
+def _pb_consistency(probes) -> list[tuple[str, float, float, float, float]]:
+    """从本次探活的报告里挑出市净率对不上的标的。
+
+    返回 ``(标的, 市净率, 每股净资产, 现价, 相对差%)``，只含超阈值的。
+
+    三个字段缺一个就跳过：ETF 和指数没有每股净资产，那不是问题，是这一维本来就
+    不适用；把它们算进来只会让这一节每次都在报同一批不适用的标的。
+    """
+    out = []
+    for _, payload, _ in probes:
+        for symbol, body in payload.documents.items():
+            pb_m, price_m, bvps_m = (_PB_RE.search(body), _PRICE_RE.search(body),
+                                     _BVPS_RE.search(body))
+            if not (pb_m and price_m and bvps_m):
+                continue
+            pb, price, bvps = (float(pb_m.group(1)), float(price_m.group(1)),
+                               float(bvps_m.group(1)))
+            if pb <= 0 or price <= 0 or bvps <= 0:
+                continue
+            gap = (pb * bvps - price) / price * 100.0
+            if abs(gap) > PB_CONSISTENCY_TOLERANCE_PCT:
+                out.append((symbol, pb, bvps, price, gap))
+    return sorted(out, key=lambda row: -abs(row[4]))
+
+
+def _render_disagreements(scan: "LogScan", probes=()) -> list[str]:
     """跨源分歧待裁决。
 
     两个来源：登记在 ``PENDING_DISAGREEMENTS`` 里的（人工发现、等裁决），以及本次
@@ -1277,6 +1358,29 @@ def _render_disagreements(scan: "LogScan") -> list[str]:
     else:
         lines.append(f"- 本次运行开着跨源校验（容差 {tolerance}%），"
                      "没有超出容差的字段。")
+
+    # 市净率自洽：不问任何外部源，只拿同一份报告里的三个数互验。
+    suspects = _pb_consistency(probes)
+    lines.append("")
+    lines.append(f"**市净率自洽**（`市净率 × 每股净资产 = 现价`，容差 "
+                 f"{PB_CONSISTENCY_TOLERANCE_PCT:.0f}%）")
+    lines.append("")
+    if not suspects:
+        lines.append("- 本次探活的标的都在容差内。")
+    else:
+        lines.append(f"- {len(suspects)} 个标的对不上，**请人工裁决**："
+                     "要么净资产自年报以来真的变了（增发、大额盈利），"
+                     "要么市净率取错了。")
+        lines.append("")
+        lines.append("| 标的 | 市净率 | 每股净资产(年度) | 现价 | 推算价 | 相对差 |")
+        lines.append("| --- | ---: | ---: | ---: | ---: | ---: |")
+        for symbol, pb, bvps, price, gap in suspects:
+            lines.append(f"| {symbol} | {pb:.2f} | {bvps:.2f} | {price:.2f} "
+                         f"| {pb * bvps:.2f} | {gap:+.1f}% |")
+    lines.append("")
+    lines.append("> 这一项**只筛不判**，也不进可用率。残差本身是结构性的——财务表给的是"
+                 "年度每股净资产，而市净率用的是最新一期，所以推算价通常略低于现价。"
+                 "超阈值只说明「这个标的值得看一眼」，不说明哪个数错了。")
     lines.append("")
     return lines
 
@@ -2064,7 +2168,7 @@ def render_report(
         section[0] = "## 六、性能：耗时与内存"
         lines.extend(section)
 
-    disagreements = _render_disagreements(scan)
+    disagreements = _render_disagreements(scan, probes)
     disagreements[0] = f"## {'七' if watch is not None else '五'}、跨源分歧待裁决"
     lines.extend(disagreements)
 
