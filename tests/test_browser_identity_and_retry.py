@@ -9,6 +9,9 @@ private/priorities-2026-09-07.md 与 docs/technical-details.md 页面兜底一�
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -106,14 +109,30 @@ async def test_the_disguise_is_opt_in_and_brings_the_flag_with_it(monkeypatch):
     assert browser.context.init_scripts == [realtime_ff._HEADLESS_GAPS_SCRIPT]
 
 
-def test_disguise_defaults_off_in_config(monkeypatch):
-    """默认值就是 main 的身份；要对照才显式打开。不 reload 模块：那会把 http_channel 等
-    在导入时抓住的常量换掉，让别的测试文件按顺序失败。"""
-    from finmcp import config
+def test_disguise_defaults_off_in_config(tmp_path):
+    """开箱默认是 main 的身份；要对照才显式打开。
 
-    monkeypatch.delenv("BROWSER_DISGUISE", raising=False)
-    assert config._parse_bool(config.env("BROWSER_DISGUISE"), False) is False
-    assert config.BROWSER_DISGUISE is False
+    **必须在子进程里、且在一个没有 .env 的目录下问这件事。** 两个理由：
+
+    - ``config`` 在导入期就把常量算定了，而它顶上的 ``load_dotenv()`` 已经把仓库
+      根的 .env 灌进了 ``os.environ``。在本进程里 ``monkeypatch.delenv`` 发生在导入
+      之后，改不动那个常量——原先这里断言 ``config.BROWSER_DISGUISE is False``，
+      于是任何一个按文档把 ``BROWSER_DISGUISE=1`` 写进 .env 的环境，跑测试都会红。
+      而那是**受支持的配置**：这一项该取什么值本来就要在目标出口上实测决定。
+    - 本进程里 reload ``config`` 也不行：http_channel 这些模块在导入时抓住了它的
+      常量，换掉会让别的测试文件按顺序失败。
+
+    所以起一个干净子进程，问的是"一份全新部署拿到的默认值"，而不是"这台机器现在
+    配成了什么"。
+    """
+    program = "from finmcp import config; print(config.BROWSER_DISGUISE)"
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("PYTHONPATH", "BROWSER_DISGUISE", "ENV_PREFIX")}
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+    proc = subprocess.run([sys.executable, "-c", program],
+                          cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "False"
 
 
 # --- 被拒后的等待 -----------------------------------------------------------

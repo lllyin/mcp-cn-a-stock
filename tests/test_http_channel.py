@@ -32,6 +32,15 @@ def restore_requests(monkeypatch):
     两次改动按相反顺序退栈，先退用例的、再退这里的，才是对的。
     """
     monkeypatch.delattr(std_requests, channel._PROXY_PATCH_MARKER, raising=False)
+    # 进来时也要卸一次，不只是出去时。
+    #
+    # ``install_http_channel`` 在 ``cn_stock_source`` 的**导入期**就跑过一次了（那是
+    # 它必须早于 ``import efinance`` 的代价），所以进程里 ``_installed_mode`` 一开始
+    # 就是 conftest 钉的 direct。本文件里第一个调 install 的用例会撞上"already
+    # installed"直接拿到 direct，断言自己装的那个模式就会失败——而它究竟是哪个用例
+    # 取决于执行顺序，表现为"单跑这条红、整包跑可能绿"。先卸干净，每个用例都从
+    # 没有通道的状态开始。
+    channel.uninstall_http_channel()
     before = (
         std_requests.Session,
         std_requests.get,
@@ -342,6 +351,14 @@ def test_startup_line_before_any_install():
 
 def test_impersonated_request_inherits_the_environment_proxy(monkeypatch):
     """curl_cffi has no trust_env, so the channel must pass proxies explicitly."""
+    # 先把环境里所有代理变量清掉，再设自己的那个。
+    #
+    # ``getproxies_environment()`` 是把变量名统一成小写之后遍历 ``os.environ`` 的，
+    # 所以只设 ``HTTPS_PROXY`` 盖不住开发机上常见的小写 ``https_proxy``——那边的值
+    # 多一个结尾斜杠，这里就断言失败。测试不该因为跑它的人配了系统代理而变红。
+    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
+                 "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
     calls = _install_impersonate_with_fake_cffi(monkeypatch, [200])
 
