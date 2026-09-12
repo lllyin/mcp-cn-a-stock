@@ -16,6 +16,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from . import report_contract, research
 from . import market_session
 from .cache import build_key, get_report_cache, is_cacheable_report
+from .datasource import get_datasource
 from .datasource import trading_calendar as trading_calendar_layer
 from .datasource.base import (FETCH_FAILURES_KEY, FUND_FLOW_ANOMALIES_KEY,
                               FetchRequirements)
