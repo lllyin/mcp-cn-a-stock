@@ -71,6 +71,18 @@ class TestSingleMode:
 
 
 class TestRangeMode:
+    @pytest.mark.parametrize("end,expected", [
+        ("2026-08-31", ["2026-08-31"]),
+        ("2026-09-02", ["2026-08-31", "2026-09-01", "2026-09-02"]),
+    ])
+    def test_range_before_coverage_uses_announced_weekday_fallback(self, end, expected):
+        r = build_trading_calendar_response(
+            None, "2026-08-29", end, 0, 0, False, calendar=_calendar())
+        assert r.trading_days == expected
+        assert r.trading_day_count == len(expected)
+        assert r.knows is False
+        assert any("按星期推断" in warning for warning in r.warnings)
+
     def test_lists_trading_days_with_counts(self):
         r = build_trading_calendar_response(None, "2026-09-07", "2026-09-11", 0, 0, False, calendar=_calendar())
         assert r.trading_days == ["2026-09-07", "2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11"]

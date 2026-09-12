@@ -245,9 +245,14 @@ def trading_days(start: datetime.date, end: datetime.date,
                  calendar: Optional[Calendar] = None) -> list:
     """闭区间 ``[start, end]`` 内的交易日。"""
     cal = calendar if calendar is not None else load()
+    covers_from = cal.covers_from if cal is not None else None
     out, cursor = [], start
     while cursor <= end:
-        if is_trading_day(cursor, cal):
+        # 区间下边界与上边界一样：日历未覆盖的日期按星期推断。
+        # 起点只计算一次，避免对区间内每一天重复扫描整个日历。
+        trading = (_fallback(cursor) if covers_from is not None and cursor < covers_from
+                   else is_trading_day(cursor, cal))
+        if trading:
             out.append(cursor)
         cursor += datetime.timedelta(days=1)
     return out
