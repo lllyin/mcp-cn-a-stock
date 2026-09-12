@@ -293,7 +293,8 @@ mcporter call cn-stock market_events \
 | `BASIC_INFO_PROVIDERS` | 基本数据（市值、市盈率、市净率）的尝试顺序，后面的源补前面缺的字段：<br>`eastmoney` 字段最全，需要网关或未被封的出口<br>`tencent` 无需鉴权，没有网关的部署靠它兜住这一组 | `eastmoney`<br>`tencent`<br>`off`<br>（默认 `eastmoney,tencent`） |
 | `INTRADAY_QUOTE_PROVIDERS` | 盘中实时行情的尝试顺序，逗号分隔按序尝试，`off` 关闭整层。**当天那一根 K 线只认这一层**（历史 K 线给的当天数据不作准）：<br>`fund_flow_page` 复用已解析的资金流页面，不发请求但没有开高低<br>`tencent` 字段全<br>`tonghuashun` 字段全<br>`sina` 个股/ETF 的末级兜底，不提供指数报价和换手率 | `fund_flow_page`<br>`tencent`<br>`tonghuashun`<br>`sina`<br>`off`<br>（默认 `fund_flow_page,tencent,tonghuashun,sina`） |
 | `INTRADAY_QUOTE_PROVIDERS_INDEX` | **指数**用的顺序，和上一项分开配：指数的成交量各源口径不一致，腾讯/新浪比东财/同花顺低约 3.5%（两家同源，互相校验不了）。东财是基准源，所以指数把同花顺排前面；个股各源逐位一致，不换 | `fund_flow_page`、`tonghuashun`、`tencent`、`off`（默认 `fund_flow_page,tonghuashun,tencent`） |
-| `INTRADAY_QUOTE_CROSS_CHECK_PCT` | 报价字段相对偏差的告警阈值。排查时按当前环境设置；开启会串行请求所有剩余来源，增加延迟和上游请求数 | 百分比，`0` 关闭（默认 `0`） |
+| `INTRADAY_QUOTE_CROSS_CHECK_PCT` | 报价字段相对偏差的告警阈值。排查时按当前环境设置；这一段挡在报价返回之前，开启会串行请求所有剩余来源，每个标的多付一份下面的预算 | 百分比，`0` 关闭（默认 `0`） |
+| `INTRADAY_QUOTE_CROSS_CHECK_BUDGET_SECONDS` | 上面那轮校验的总预算。预算会穿给各来源压缩其超时，所以是真正的总上限而非单次超时。按最大值定不按分位数：各源单次最大耗时 × 源个数再留余量 | 秒，`0` 不限（默认 `2`） |
 | `LOG_FILE` | 服务日志文件的路径，`health` 工具读它算可用率和耗时。`start.sh` 启动时会把实际路径传进来，正常不用配 | 路径（默认 `logs/cn-stock-mcp.log`） |
 | `LOG_RETENTION_DAYS` | 归档日志保留几天。每次启动会把上一轮日志存成一份归档，超过这个天数的清掉。`health` 默认把归档一起统计，所以这个值决定它最多能回看多久 | 天数，`0` 表示不留归档（默认 `3`） |
 | `TRADING_CALENDAR_PROVIDERS` | 判「今天开不开市」的日历来源：<br>`sina` 上交所公布的交易日名单，最权威<br>`holiday_cn` [NateScarlet/holiday-cn](https://github.com/NateScarlet/holiday-cn) 的国务院放假安排换算而来，与交易所名单的差异只在个别调休日<br>`weekday` 兜底，周一到周五算交易日——长假会被整段算成交易日，所以放最后 | `sina`<br>`holiday_cn`<br>`weekday`<br>`off`<br>（默认 `sina,holiday_cn,weekday`） |

@@ -24,12 +24,18 @@
 from __future__ import annotations
 
 import abc
+import dataclasses
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import Optional
 
-from ..config import INTRADAY_QUOTE_CROSS_CHECK_PCT, env
+from ..config import (
+    INTRADAY_QUOTE_CROSS_CHECK_BUDGET_SECONDS,
+    INTRADAY_QUOTE_CROSS_CHECK_PCT,
+    env,
+)
 from .fund_flow_page import FundFlowPage, parse_amount, parse_percent, parse_price
 
 logger = logging.getLogger("finmcp")
@@ -98,6 +104,19 @@ class QuoteContext:
     """
 
     fund_flow_page: Optional[FundFlowPage] = None
+    #: 这一整轮取数的截止时刻（``time.monotonic()`` 的刻度），None 表示不限。
+    #:
+    #: 只有跨源校验会设它：那一层要问完剩下的**所有**源，是个天然的「N × 单次超时」
+    #: 结构，只卡源与源之间的时间点不够——一个挂住的源照样吃满自己的 5 秒。把截止
+    #: 时刻交给 provider，让它把自己的超时压到剩余预算以内，总耗时才真的有上限
+    #: （AGENTS §三）。主链路 ``resolve`` 不设，行为一个字不变。
+    deadline: Optional[float] = None
+
+    def remaining(self) -> Optional[float]:
+        """还剩多少秒。没有预算返回 None；已经超了返回 0.0。"""
+        if self.deadline is None:
+            return None
+        return max(0.0, self.deadline - time.monotonic())
 
 
 def to_lots(raw, *, amount_yuan, last, symbol: str, source: str):
@@ -166,6 +185,18 @@ class QuoteProvider(abc.ABC):
     @abc.abstractmethod
     def fetch(self, symbol: str, context: QuoteContext) -> Optional[IntradayQuote]:
         """取一次报价；取不到返回 None，不要抛异常给调用方。"""
+
+    def _timeout_for(self, context: QuoteContext) -> float:
+        """这一次请求能用多久：自己的超时和剩余预算取小。
+
+        没有预算（主链路）就用自己的超时，行为不变。留 0.05s 的下限是因为
+        ``requests`` 收到 0 会立刻抛，那样一次"预算刚好用完"会被记成取数失败，
+        而它其实只是不该再问了——真正的"别再问"由调用方在发起之前判。
+        """
+        remaining = context.remaining()
+        if remaining is None:
+            return self.timeout
+        return max(0.05, min(self.timeout, remaining))
 
 
 _PROVIDERS: dict[str, QuoteProvider] = {}
@@ -257,13 +288,22 @@ def collect(
     *,
     order: Optional[tuple] = None,
 ) -> list:
-    """把所有能拿到的报价都取回来，用于交叉验证。"""
+    """把所有能拿到的报价都取回来，用于交叉验证。
+
+    ``context.deadline`` 设了就按它收口：每问下一个源之前先看还有没有预算，没有就
+    停。provider 那边还会把自己的超时压到剩余预算以内（``_timeout_for``），所以
+    "问 N 个源"的总耗时有上限，而不是 N 份单次超时叠加（AGENTS §三）。
+    """
     context = context or QuoteContext()
     quotes = []
     for name in order if order is not None else configured_order(symbol):
         provider = _PROVIDERS.get(name)
         if provider is None:
             continue
+        remaining = context.remaining()
+        if remaining is not None and remaining <= 0:
+            logger.debug("盘中行情取数预算用尽，剩余源不再问 symbol=%s 停在=%s", symbol, name)
+            break
         try:
             quote = provider.fetch(symbol, context)
         except Exception as e:
@@ -308,11 +348,21 @@ def _cross_check(symbol, chosen, context, names, *, after: int) -> None:
 
     只问 ``after`` 之后的源：前面的已经试过且没给出结果，再问一遍纯属浪费。
     整段包在 try 里——校验只是个观察点，它自己炸了不能把取数带下水。
+
+    **这一段是挡在 ``resolve`` 返回之前的。** 报价已经拿到了，却要等问完剩下的源
+    才交出去，所以它必须有总预算：没有的话，一个挂住的源就能给每个标的加满一份
+    超时，而这只是个观察点。预算由 ``INTRADAY_QUOTE_CROSS_CHECK_BUDGET_SECONDS``
+    定，穿给 provider 让它们各自压缩超时（见 ``collect``）。
     """
     if INTRADAY_QUOTE_CROSS_CHECK_PCT <= 0:
         return
+    probe = context
+    if INTRADAY_QUOTE_CROSS_CHECK_BUDGET_SECONDS > 0:
+        # 复制一份再设截止时刻：context 是调用方的，主链路不该因为开了校验而被限时。
+        probe = dataclasses.replace(
+            context, deadline=time.monotonic() + INTRADAY_QUOTE_CROSS_CHECK_BUDGET_SECONDS)
     try:
-        for other in collect(symbol, context, order=tuple(names[after + 1:])):
+        for other in collect(symbol, probe, order=tuple(names[after + 1:])):
             issues = compare(chosen, other, tolerance_pct=INTRADAY_QUOTE_CROSS_CHECK_PCT)
             if issues:
                 logger.warning(
@@ -393,7 +443,8 @@ class TencentQuoteProvider(QuoteProvider):
 
         import requests
 
-        response = requests.get(TENCENT_URL.format(code=code), timeout=self.timeout)
+        response = requests.get(TENCENT_URL.format(code=code),
+                                timeout=self._timeout_for(context))
         response.encoding = "gbk"
         parts = response.text.split("~")
         if len(parts) <= max(TENCENT_FIELDS.values()):
@@ -493,7 +544,7 @@ class SinaQuoteProvider(QuoteProvider):
 
         response = requests.get(
             SINA_QUOTE_URL.format(code=code), headers=_SINA_HEADERS,
-            timeout=self.timeout,
+            timeout=self._timeout_for(context),
         )
         response.encoding = "gbk"
         payload = response.text.split('"')[1] if '"' in response.text else ""
@@ -578,7 +629,7 @@ class TonghuashunQuoteProvider(QuoteProvider):
         import requests
 
         response = requests.get(TONGHUASHUN_QUOTE_URL.format(code=code),
-                                headers=_HEADERS, timeout=self.timeout)
+                                headers=_HEADERS, timeout=self._timeout_for(context))
         body = response.text
         if response.status_code != 200 or "(" not in body:
             return None

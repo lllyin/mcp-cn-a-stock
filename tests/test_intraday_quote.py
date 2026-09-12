@@ -408,6 +408,154 @@ def test_a_broken_cross_check_never_takes_down_the_fetch(two_disagreeing_sources
     assert iq.resolve("SH600000").source == "a"
 
 
+class TestCrossCheckHasATotalBudget:
+    """校验挡在报价返回之前，所以"问完剩下的源"必须有总上限。
+
+    没有预算时它是个「N × 单次超时」结构：一个挂住的源就给每个标的加满一份超时，
+    而这只是个观察点（AGENTS §三）。
+    """
+
+    def test_a_hung_source_cannot_outlast_the_budget(self, monkeypatch):
+        """注入一个永远挂住的源：整轮必须在预算附近结束，而不是等它的单次超时。"""
+        import time
+
+        saved = dict(iq._PROVIDERS)
+        iq._PROVIDERS.clear()
+        try:
+            iq.register(_FixedQuote("a", last=10.0, volume_lots=100.0))
+
+            class Hung(iq.QuoteProvider):
+                name = "hung"
+
+                def __init__(self):
+                    self.timeout = 30.0
+                    self.seen = None
+
+                def fetch(self, symbol, context):
+                    # 真去睡"这次请求被允许的时长"，模拟一个不应答的端点。
+                    self.seen = self._timeout_for(context)
+                    time.sleep(self.seen)
+                    return None
+
+            hung = Hung()
+            iq.register(hung)
+            monkeypatch.setenv("INTRADAY_QUOTE_PROVIDERS", "a,hung")
+            monkeypatch.setattr(iq, "INTRADAY_QUOTE_CROSS_CHECK_PCT", 1.0)
+            monkeypatch.setattr(iq, "INTRADAY_QUOTE_CROSS_CHECK_BUDGET_SECONDS", 0.3)
+
+            start = time.monotonic()
+            assert iq.resolve("SH600000").source == "a"
+            elapsed = time.monotonic() - start
+
+            # 预算把这个源自己的 30 秒压到了剩余量以内。
+            assert hung.seen is not None and hung.seen <= 0.3
+            assert elapsed < 1.0, f"整轮用了 {elapsed:.2f}s，预算没生效"
+        finally:
+            iq._PROVIDERS.clear()
+            iq._PROVIDERS.update(saved)
+
+    def test_remaining_budget_stops_the_next_source(self, monkeypatch):
+        """预算用完之后，后面的源一个都不该再问——省的是请求数，不只是时间。"""
+        saved = dict(iq._PROVIDERS)
+        iq._PROVIDERS.clear()
+        try:
+            iq.register(_FixedQuote("a", last=10.0, volume_lots=100.0))
+            b = _FixedQuote("b", last=10.0, volume_lots=200.0)
+            c = _FixedQuote("c", last=10.0, volume_lots=300.0)
+            iq.register(b)
+            iq.register(c)
+            monkeypatch.setenv("INTRADAY_QUOTE_PROVIDERS", "a,b,c")
+            monkeypatch.setattr(iq, "INTRADAY_QUOTE_CROSS_CHECK_PCT", 1.0)
+            # 预算小到一发起就已经用完：一个对照源都不该被问到。
+            monkeypatch.setattr(iq, "INTRADAY_QUOTE_CROSS_CHECK_BUDGET_SECONDS", 1e-9)
+
+            assert iq.resolve("SH600000").source == "a"
+            assert (b.calls, c.calls) == (0, 0)
+        finally:
+            iq._PROVIDERS.clear()
+            iq._PROVIDERS.update(saved)
+
+    def test_zero_budget_means_unlimited(self, two_disagreeing_sources, monkeypatch):
+        """0 是"不限"而不是"不问"——不然关掉预算就等于悄悄关掉了校验。"""
+        a, b = two_disagreeing_sources
+        monkeypatch.setattr(iq, "INTRADAY_QUOTE_CROSS_CHECK_PCT", 1.0)
+        monkeypatch.setattr(iq, "INTRADAY_QUOTE_CROSS_CHECK_BUDGET_SECONDS", 0.0)
+
+        assert iq.resolve("SH600000").source == "a"
+        assert b.calls == 1
+
+    def test_the_main_path_is_never_time_limited(self, monkeypatch):
+        """预算只属于校验那一轮。主链路取数不能因为开了校验就被限时。"""
+        saved = dict(iq._PROVIDERS)
+        iq._PROVIDERS.clear()
+        try:
+            seen = {}
+
+            class Recorder(iq.QuoteProvider):
+                name = "rec"
+
+                def __init__(self):
+                    self.timeout = 5.0
+
+                def fetch(self, symbol, context):
+                    seen["deadline"] = context.deadline
+                    seen["timeout"] = self._timeout_for(context)
+                    return iq.IntradayQuote(symbol=symbol, source="rec", last=10.0)
+
+            iq.register(Recorder())
+            monkeypatch.setenv("INTRADAY_QUOTE_PROVIDERS", "rec")
+            monkeypatch.setattr(iq, "INTRADAY_QUOTE_CROSS_CHECK_PCT", 1.0)
+            monkeypatch.setattr(iq, "INTRADAY_QUOTE_CROSS_CHECK_BUDGET_SECONDS", 0.3)
+
+            assert iq.resolve("SH600000").source == "rec"
+            assert seen["deadline"] is None          # 主链路没有被设截止时刻
+            assert seen["timeout"] == 5.0            # 也没有被压缩超时
+        finally:
+            iq._PROVIDERS.clear()
+            iq._PROVIDERS.update(saved)
+
+    def test_a_reused_context_is_not_poisoned_by_an_earlier_budget(self, monkeypatch):
+        """截止时刻必须设在副本上，不能写回调用方的 context。
+
+        写回去的话，同一个 context 被复用于下一个标的时会带着**已经过期**的截止
+        时刻进主链路，``_timeout_for`` 把超时压到下限 0.05s——于是开了个诊断开关，
+        代价是主链路开始超时。这个后果比它要诊断的问题严重得多。
+        """
+        saved = dict(iq._PROVIDERS)
+        iq._PROVIDERS.clear()
+        try:
+            seen = []
+
+            class Recorder(iq.QuoteProvider):
+                name = "a"
+
+                def __init__(self):
+                    self.timeout = 5.0
+
+                def fetch(self, symbol, context):
+                    seen.append((context.deadline, self._timeout_for(context)))
+                    return iq.IntradayQuote(symbol=symbol, source="a", last=10.0,
+                                            volume_lots=100.0)
+
+            iq.register(Recorder())
+            iq.register(_FixedQuote("b", last=10.0, volume_lots=200.0))
+            monkeypatch.setenv("INTRADAY_QUOTE_PROVIDERS", "a,b")
+            monkeypatch.setattr(iq, "INTRADAY_QUOTE_CROSS_CHECK_PCT", 1.0)
+            monkeypatch.setattr(iq, "INTRADAY_QUOTE_CROSS_CHECK_BUDGET_SECONDS", 0.3)
+
+            # 同一个 context 连用两次——编排层复用 context 是常态（页面产物就挂在上面）。
+            context = iq.QuoteContext()
+            iq.resolve("SH600000", context)
+            iq.resolve("SH600001", context)
+
+            assert context.deadline is None, "校验把截止时刻写回了调用方的 context"
+            for deadline, timeout in seen:
+                assert deadline is None and timeout == 5.0
+        finally:
+            iq._PROVIDERS.clear()
+            iq._PROVIDERS.update(saved)
+
+
 class TestTodaysBarOverridesTheDailyEndpoint:
     """当天那一根只认实时端点，日线端点给的当天行一律不作准。
 
