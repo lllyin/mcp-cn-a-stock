@@ -28,6 +28,7 @@ CnStock 是一个面向大模型和 MCP 客户端的 A 股数据服务。
 | `market_breadth` | 全市场涨跌家数、涨跌停和十档分布 | 严格 JSON |
 | `market_map` | 行业资金流入流出与板块内个股强弱，支持按市场筛选 | 严格 JSON 或 Markdown |
 | `market_events` | 指定日期的龙虎榜、涨停池、公告和业绩预告 | 严格 JSON |
+| `trading_calendar` | 某天是否开市（三态，日历未覆盖给 null）、前后交易日、区间交易日列表；零上游请求 | 严格 JSON |
 | `health` | 服务自身的可用率、缺失明细、耗时分布和事件；只读日志，不发上游请求 | Markdown |
 
 完整报告示例：[兆易创新 SH603986](docs/SH603986-full.md)。

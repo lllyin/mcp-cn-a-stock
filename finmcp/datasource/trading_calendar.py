@@ -77,11 +77,26 @@ class Calendar:
     ``covers_through`` 是这个契约里最关键的字段：没有它，"2027-01-05 不在名单里"
     会被误读成"那天不开市"，而真相是"日历还没发布到那天"。所有查询超出这个边界时
     都必须显式说不知道，不能猜。
+
+    ``covers_from`` 是同一个道理的下边界：一份只覆盖今年的名单，拿 ``knows()`` 去问
+    去年的日子会答"知道"，然后 ``contains()`` 答假——去年被静默判成整年休市。
+    对外的三态判断（交易日历工具）上下边界都必须查。
     """
 
     days: frozenset
     covers_through: datetime.date
     source: str = ""
+
+    @property
+    def covers_from(self) -> Optional[datetime.date]:
+        """名单覆盖的第一天。空名单返回 None（等于什么都不知道）。
+
+        用 ``min`` 而不是走 ``_sorted_days``：那个带 lru_cache，要求参数可哈希，
+        而测试里手搓 ``set`` 的场景会在这里炸——property 的调用频率撑得起 O(n)。
+        """
+        if not self.days:
+            return None
+        return min(self.days)
 
     def contains(self, day: datetime.date) -> bool:
         return day in self.days

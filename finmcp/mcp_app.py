@@ -14,8 +14,9 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import report_contract, research
+from . import market_session
 from .cache import build_key, get_report_cache, is_cacheable_report
-from .datasource import get_datasource
+from .datasource import trading_calendar as trading_calendar_layer
 from .datasource.base import (FETCH_FAILURES_KEY, FUND_FLOW_ANOMALIES_KEY,
                               FetchRequirements)
 from .datasource.market_breadth import get_market_breadth
@@ -157,6 +158,35 @@ class MarketBreadthResponse(BaseModel):
     limit_down_count: Optional[int] = Field(None, description="Number of limit-down stocks")
     distribution: List[MarketBreadthBucketResponse] = Field(..., description="Ten percentage-change ranges")
     warnings: List[str] = Field(default_factory=list, description="Fallback or partial-data warnings")
+
+
+class TradingCalendarPhase(BaseModel):
+    """市场相位（仅当查询日是今天时给出）。"""
+    phase: str = Field(..., description="live | lunch | postclose | closed")
+    epoch: str = Field(..., description="报告缓存纪元锚点，如 closed-2026-09-11")
+
+
+class TradingCalendarResponse(BaseModel):
+    """交易日历查询结果。
+
+    ``is_trading_day`` 是三态：``true``/``false`` 是日历给的答案；``null`` 表示
+    日历没覆盖到这天（没发布到、或早于名单起点）——"不知道"不能渲染成"不开市"。
+    """
+    query: Dict[str, str] = Field(..., description="本次查询的归一参数（mode/date 或 start_date/end_date）")
+    mode: Literal["single", "range"] = Field(..., description="single=单日判定；range=区间交易日列表")
+    is_trading_day: Optional[bool] = Field(None, description="该日是否开市；日历未覆盖时为 null（single 模式）")
+    knows: bool = Field(..., description="日历是否覆盖该日；false 时 is_trading_day 必为 null")
+    source: str = Field(..., description="实际生效的日历来源：sina | holiday_cn | weekday")
+    calendar_coverage: Dict[str, Optional[str]] = Field(..., description="日历覆盖范围 from/through")
+    previous_trading_day: Optional[str] = Field(None, description="前一个交易日；无法确证时为 null")
+    next_trading_day: Optional[str] = Field(None, description="后一个交易日；超出日历覆盖时为 null")
+    market_phase: Optional[TradingCalendarPhase] = Field(None, description="市场相位，仅查询日为今天时给出")
+    nearby_trading_days: Optional[Dict[str, List[str]]] = Field(
+        None, description="single 模式：back/forward 请求的前后交易日列表")
+    trading_days: Optional[List[str]] = Field(None, description="range 模式：闭区间内的交易日列表")
+    natural_days: Optional[int] = Field(None, description="range 模式：区间自然日数")
+    trading_day_count: Optional[int] = Field(None, description="range 模式：区间交易日数")
+    warnings: List[str] = Field(default_factory=list, description="降级与未覆盖提示")
 
 # -----------------------------------------------
 
@@ -1352,6 +1382,209 @@ async def market_breadth(ctx: Context = None) -> MarketBreadthResponse:  # type:
       for bucket in data.distribution
     ],
     warnings=list(data.warnings),
+  )
+
+
+def _parse_calendar_date(value: Optional[str], name: str) -> Optional[datetime.date]:
+    """YYYY-MM-DD → date。空值原样放行；格式错按纠错风格给措辞，不抛堆栈。"""
+    if value is None or not str(value).strip():
+        return None
+    try:
+        return datetime.datetime.strptime(str(value).strip()[:10], "%Y-%m-%d").date()
+    except ValueError:
+        raise ValueError(f"{name} 格式应为 YYYY-MM-DD，收到 {value!r}")
+
+
+def _nearby_trading_days(target: datetime.date, cal, count: int, *, backward: bool) -> List[str]:
+    """target 前/后 count 个交易日（不含 target）。只在日历可确证的范围内取。"""
+    if count <= 0 or cal is None or not cal.days:
+        return []
+    window = count * 2 + 15  # 交易日 ≈ 5/7 自然日，余量给长假
+    if backward:
+        start, end = target - datetime.timedelta(days=window), target - datetime.timedelta(days=1)
+    else:
+        start, end = target + datetime.timedelta(days=1), target + datetime.timedelta(days=window)
+    days = trading_calendar_layer.trading_days(start, end, cal)
+    # 超出日历覆盖的部分是按星期猜的，不能往外给：截到覆盖边界内。
+    if backward and cal.covers_from is not None:
+        days = [d for d in days if d >= cal.covers_from]
+    if not backward:
+        days = [d for d in days if d <= cal.covers_through]
+    return [d.isoformat() for d in (days[-count:] if backward else days[:count])]
+
+
+def build_trading_calendar_response(
+    date: Optional[str],
+    start_date: Optional[str],
+    end_date: Optional[str],
+    back: int,
+    forward: int,
+    include_market_phase: bool,
+    *,
+    now: Optional[datetime.datetime] = None,
+    calendar=None,
+) -> TradingCalendarResponse:
+    """交易日历工具的主体。纯同步、纯本地缓存，测试直接调它。
+
+    ``calendar`` 参数给测试注入假名单；生产传 None，由公共层自己 load()。
+    """
+    now = now or market_session.now_shanghai()
+    single_date = _parse_calendar_date(date, "date")
+    range_start = _parse_calendar_date(start_date, "start_date")
+    range_end = _parse_calendar_date(end_date, "end_date")
+
+    if date is not None and (start_date is not None or end_date is not None):
+        raise ValueError("date 与 start_date/end_date 二选一：单日判定给 date，区间列表给 start_date+end_date")
+    if (start_date is None) != (end_date is None):
+        raise ValueError("区间模式需要同时给 start_date 和 end_date")
+    back = max(0, min(30, int(back or 0)))
+    forward = max(0, min(30, int(forward or 0)))
+
+    warnings: List[str] = []
+    cal = calendar if calendar is not None else trading_calendar_layer.load()
+    source = cal.source if cal is not None else "weekday-fallback"
+    coverage = {
+        "from": cal.covers_from.isoformat() if cal is not None and cal.covers_from else None,
+        "through": cal.covers_through.isoformat() if cal is not None else None,
+    }
+    if cal is None or not cal.days:
+        warnings.append("交易日历取不到，全部按周一到周五推断；长假会被误判，检查日历源的可用性")
+    elif source == "weekday":
+        warnings.append("日历来源已降级到 weekday（按星期推断）：长假会被误判， holiday_cn/sina 两级都失败了")
+
+    if range_start is not None and range_end is not None:
+        if range_start > range_end:
+            raise ValueError(f"start_date({range_start}) 晚于 end_date({range_end})，调换后再查")
+        days = trading_calendar_layer.trading_days(range_start, range_end, cal)
+        out_of_cover = (
+            (cal is None or not cal.days)
+            or range_start < (cal.covers_from or range_start)
+            or range_end > cal.covers_through
+        )
+        if out_of_cover:
+            warnings.append(
+                f"区间 {range_start}..{range_end} 部分或全部超出日历覆盖 "
+                f"({coverage['from']}..{coverage['through']})，超出的日子按星期推断，长假可能误判")
+        return TradingCalendarResponse(
+            query={"start_date": range_start.isoformat(), "end_date": range_end.isoformat()},
+            mode="range",
+            is_trading_day=None,
+            knows=bool(cal is not None and cal.days and range_end <= cal.covers_through
+                       and (cal.covers_from is None or range_start >= cal.covers_from)),
+            source=source,
+            calendar_coverage=coverage,
+            previous_trading_day=None,
+            next_trading_day=None,
+            market_phase=None,
+            nearby_trading_days=None,
+            trading_days=[d.isoformat() for d in days],
+            natural_days=(range_end - range_start).days + 1,
+            trading_day_count=len(days),
+            warnings=warnings,
+        )
+
+    target = single_date or now.date()
+    # 三态的核心，但"两种不知道"要分开：
+    #   - 日历存在而没覆盖（未来没发布、早于名单起点）→ null。"日历没发布到"
+    #     渲染成 "不开市" 是这个领域最经典的错误。
+    #   - 日历整层取不到 → 公共层的契约是退回按星期判断（"永远不比现在差"），
+    #     工具把这个答案如实给出，knows=False 标明它未经日历确证。
+    if cal is None or not cal.days:
+        knows = False
+        is_trading = trading_calendar_layer.is_trading_day(target, None)
+    else:
+        knows = bool(
+            cal.knows(target)
+            and (cal.covers_from is None or target >= cal.covers_from)
+        )
+        if knows:
+            is_trading = cal.contains(target)
+        else:
+            is_trading = None
+            warnings.append(
+                f"日历未覆盖 {target}（覆盖范围 {coverage['from']}..{coverage['through']}），"
+                "无法判断该日是否开市，is_trading_day 为 null")
+
+    previous_day = next_day = None
+    if knows:
+        candidate = trading_calendar_layer.previous_trading_day(target, cal)
+        if cal.covers_from is None or candidate >= cal.covers_from:
+            previous_day = candidate.isoformat()
+        candidate = trading_calendar_layer.next_trading_day(target, cal)
+        if candidate <= cal.covers_through:
+            next_day = candidate.isoformat()
+        else:
+            warnings.append(f"{target} 之后的日历尚未发布，next_trading_day 无法给出")
+    else:
+        previous_day = next_day = None
+
+    today = now.date()
+    phase = None
+    if include_market_phase and target == today:
+        market_phase, epoch = market_session.phase_and_epoch(now)
+        phase = TradingCalendarPhase(phase=market_phase, epoch=epoch)
+
+    nearby = None
+    if (back or forward) and knows:
+        nearby = {
+            "back": _nearby_trading_days(target, cal, back, backward=True),
+            "forward": _nearby_trading_days(target, cal, forward, backward=False),
+        }
+
+    return TradingCalendarResponse(
+        query={"date": target.isoformat()},
+        mode="single",
+        is_trading_day=is_trading,
+        knows=knows,
+        source=source,
+        calendar_coverage=coverage,
+        previous_trading_day=previous_day,
+        next_trading_day=next_day,
+        market_phase=phase,
+        nearby_trading_days=nearby,
+        trading_days=None,
+        natural_days=None,
+        trading_day_count=None,
+        warnings=warnings,
+    )
+
+
+@mcp_app.tool()
+async def trading_calendar(
+  date: Optional[str] = None,
+  start_date: Optional[str] = None,
+  end_date: Optional[str] = None,
+  back: int = 0,
+  forward: int = 0,
+  include_market_phase: bool = True,
+  ctx: Context = None,
+) -> TradingCalendarResponse:  # type: ignore
+  """A股交易日历：查某天开不开市、前后交易日、区间内的交易日列表。
+
+  Single mode: pass `date` (defaults to today, Asia/Shanghai) to learn whether
+  it is a trading day, plus previous/next trading days and optional `back`/
+  `forward` nearby trading-day lists. Range mode: pass `start_date`+`end_date`
+  to list all trading days in the closed interval.
+
+  The answer is three-state: `is_trading_day` is `null` (not `false`) when the
+  calendar does not cover the date yet — "unknown" must not be rendered as
+  "closed". `warnings` reports degraded sources and uncovered ranges.
+
+  Args:
+    date (str, optional): Single-day mode, YYYY-MM-DD. Mutually exclusive with start_date/end_date.
+    start_date (str, optional): Range mode start, YYYY-MM-DD. Requires end_date.
+    end_date (str, optional): Range mode end, YYYY-MM-DD. Requires start_date.
+    back (int, optional): Nearby trading days before `date` (0-30). Single mode only.
+    forward (int, optional): Nearby trading days after `date` (0-30). Single mode only.
+    include_market_phase (bool, optional): Attach market phase when `date` is today. Defaults to true.
+
+  Returns:
+    A TradingCalendarResponse. `source` names the effective calendar provider
+    (sina > holiday_cn > weekday); `warnings` carries degraded/uncovered notes.
+  """
+  return await asyncio.to_thread(
+    build_trading_calendar_response,
+    date, start_date, end_date, back, forward, include_market_phase,
   )
 
 
