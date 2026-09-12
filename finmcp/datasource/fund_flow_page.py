@@ -109,6 +109,60 @@ class FundFlowRow:
         return record
 
 
+#: ``fflow/daykline/get`` 的 ``klines`` 每行按逗号分隔后的字段下标。
+#:
+#: 上游给的顺序是「主力、小单、中单、大单、超大单」，而 ``FundFlowRow`` 用的是
+#: 「主力、超大单、大单、中单、小单」——两者**不同**，照抄下标就会把小单的钱记到
+#: 超大单头上。这种错不报异常、不缺字段，只是每一档都对不上，所以下标写成常量，
+#: 并由 ``rows_from_klines`` 的用例用 ``主力 == 超大单 + 大单`` 这条结构不变量守住。
+#:
+#: 2026-09-12 用 SH600519 实测确认：主力与超大+大逐位相等，主力+中单+小单 ≈ 0
+#: （差几元的取整），收盘价与涨跌幅同当日报告逐位一致。
+_KLINE_AMOUNT_INDEX = (1, 5, 4, 3, 2)    # 主力、超大单、大单、中单、小单
+_KLINE_RATIO_INDEX = (6, 10, 9, 8, 7)    # 同上，净占比
+_KLINE_CLOSE_INDEX = 11
+_KLINE_PCT_INDEX = 12
+_KLINE_MIN_FIELDS = 13
+
+
+def _kline_number(parts: list, index: int) -> Optional[float]:
+    """取一个字段并转成数。取不到给 None——"没有"和"0"是两回事。"""
+    if index >= len(parts):
+        return None
+    try:
+        return float(parts[index])
+    except (TypeError, ValueError):
+        return None
+
+
+def rows_from_klines(klines) -> list:
+    """``fflow/daykline/get`` 的 ``klines`` → ``FundFlowRow`` 列表，按日期升序。
+
+    页面上那张历史表是页面自己用 JSONP 去取同一个接口填的，而东财会拒 JSONP
+    （``<script src>``）放行 XHR——所以表可能是空的，而在同一个页面里用 ``fetch``
+    重发一次却拿得到。这个函数就是给那条路用的，产出与页面解析完全相同的结构，
+    下游一行不用改。
+
+    解析不了的行**跳过而不是补零**：一行坏数据混进历史表，比少一行危险得多。
+    """
+    rows: list = []
+    for item in klines or ():
+        parts = str(item).split(",")
+        if len(parts) < _KLINE_MIN_FIELDS or not parts[0]:
+            continue
+        amounts = tuple(_kline_number(parts, i) for i in _KLINE_AMOUNT_INDEX)
+        if all(value is None for value in amounts):
+            continue
+        rows.append(FundFlowRow(
+            date=parts[0],
+            close=_kline_number(parts, _KLINE_CLOSE_INDEX),
+            pct_chg=_kline_number(parts, _KLINE_PCT_INDEX),
+            amounts=amounts,
+            ratios=tuple(_kline_number(parts, i) for i in _KLINE_RATIO_INDEX),
+        ))
+    return rows
+
+
 @dataclass
 class FundFlowPage:
     """一次页面解析的结果。"""

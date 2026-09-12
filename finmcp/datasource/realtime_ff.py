@@ -35,6 +35,7 @@ from .fund_flow_page import (
     FundFlowPageError,
     parse_fund_flow_page,
     parse_percent,
+    rows_from_klines,
 )
 
 logger = logging.getLogger("finmcp")
@@ -839,6 +840,86 @@ class _PageRefusal(FundFlowPageRefused):
         self.captcha = captcha
 
 
+#: 历史表的来源接口。页面自己也调它，只是用的 JSONP。
+_HISTORY_API = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+_HISTORY_FIELDS2 = ",".join(f"f{i}" for i in range(51, 66))
+#: 在页面里取一次历史的上限。页面已经在手上，这只是一次同域 XHR。
+_HISTORY_FETCH_TIMEOUT_MS = 8000
+
+
+def _history_api_url(symbol: str) -> str | None:
+    """这个标的的历史资金流接口地址。算不出 secid 就返回 None。
+
+    secid 一律问 ``FundFlowRequest``，**不在这里自己拼**：按纯代码猜市场是有洞的，
+    沪市 5 开头的基金会被判成深市，``SH512480`` 算出 ``0.512480`` 后东财回 0 行——
+    那是线上发生过的事（见 ``FundFlowRequest.exchange`` 的注释）。两处各拼一套
+    正是那个 bug 的成因，所以这里只负责把参数摆对：第一个位置参数是**纯六位码**，
+    带前缀的写法要放进 ``symbol``，它才是判市场的权威依据。
+    """
+    from .fund_flow_source import FundFlowRequest
+
+    # 必须**正好**六位。只判非空不够：``沪深300`` 这种写法能抠出 ``300``，拼成
+    # ``secid=0.300`` 照样是个格式合法的请求，上游回 0 行——静默取错比取不到糟。
+    pure_code = "".join(filter(str.isdigit, symbol))
+    if len(pure_code) != 6:
+        return None
+    try:
+        secid = FundFlowRequest(pure_code, symbol=symbol).secid
+    except Exception:
+        return None
+    return (f"{_HISTORY_API}?lmt=0&klt=101&secid={secid}"
+            f"&fields1=f1,f2,f3,f7&fields2={_HISTORY_FIELDS2}"
+            f"&ut=b2884a393a59ad64002292a3e90d46a5")
+
+
+async def _fetch_history_in_page(page, symbol: str) -> list:
+    """在已经打开的资金流页面里，自己把历史表取回来。
+
+    **为什么页面自己取不到而这样取得到**：页面填那张表用的是 JSONP——
+    ``<script src="...fflow/daykline/get?cb=jQuery...">``。东财会拒掉这种请求
+    （浏览器侧表现为 ``net::ERR_EMPTY_RESPONSE``），却放行同一个 URL 的 XHR。
+    2026-09-12 在同一个页面、同一时刻、用页面自己那个 URL 实测：页面的 JSONP 失败，
+    ``fetch()`` 连续三次都是 HTTP 200、120 行。同期服务端直连该接口是 0/15。
+
+    所以这不是重试——重试同一条 JSONP 只会再被拒一次，页面自己已经试过了。
+
+    取不到一律返回空列表：这是给空表补数的一条额外路径，它自己失败只能回到
+    "没有历史"，不能把这次页面加载的其余成果（今日块、页头行情）带下水。
+    """
+    url = _history_api_url(symbol)
+    if url is None:
+        return []
+    try:
+        payload = await page.evaluate(
+            """async ([u, ms]) => {
+                const ctrl = new AbortController();
+                const timer = setTimeout(() => ctrl.abort(), ms);
+                try {
+                    const r = await fetch(u, {credentials: 'include', signal: ctrl.signal});
+                    if (!r.ok) return null;
+                    return await r.json();
+                } catch (e) {
+                    return null;
+                } finally {
+                    clearTimeout(timer);
+                }
+            }""",
+            [url, _HISTORY_FETCH_TIMEOUT_MS],
+        )
+    except Exception as error:
+        logger.debug("页面内取历史资金流失败 %s: %s", symbol, error)
+        return []
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    klines = data.get("klines") if isinstance(data, dict) else None
+    rows = rows_from_klines(klines)
+    if rows:
+        logger.info("页面内取回历史资金流 %s rows=%d（页面自己那次 JSONP 是空的）",
+                    symbol, len(rows))
+    return rows
+
+
 async def _load_once(page, symbol: str, url: str, *, reload: bool):
     """在给定页面上跑一次加载。
 
@@ -884,6 +965,14 @@ async def _load_once(page, symbol: str, url: str, *, reload: bool):
         parsed = parse_fund_flow_page(content)
     except FundFlowPageError:
         parsed = None
+
+    # 页面那张历史表是空的，就在同一个页面里自己把它取回来。理由见
+    # _fetch_history_in_page：页面用 JSONP，东财拒 JSONP 放行 XHR。
+    if parsed is not None and not parsed.history:
+        rows = await _fetch_history_in_page(page, symbol)
+        if rows:
+            parsed.history = rows
+            history_refused.clear()
 
     # 页面渲染成功但两块都没值，同时相关请求被拒。停牌和开盘前也会得到空值，
     # 但那时不会有请求失败，所以两个条件必须同时成立才算"被拒"。

@@ -225,8 +225,15 @@ async def fetch_batch_reports(
     date_label = f", date={date}" if date else ""
     requirements = FetchRequirements(
         fund_flow_rows=max(1, int(fund_flow_limit or 15)),
-        # 只有 full 渲染历史资金流向表，其余模式不为它去打浏览器页面
-        fund_flow_page=(mode == "full"),
+        # full 渲染历史资金流向表，所以要；**钉了日期的查询同样要**——它展示的那一行
+        # 就在历史里（见 research._select_fund_flow_row_for_query_date），拿不到历史
+        # 就只能打降级提示，而那一行是已收盘的确定值，不是"取不到就算了"的实时量。
+        #
+        # 当初 brief/medium 关掉它的理由是"为一张不渲染的表去打页面，代价落在同一个
+        # 浏览器上的实时那条路"。钉日期查询不适用那个理由：它根本不取实时资金流
+        # （research.py 里 IS_HISTORICAL_QUERY 那个分支会跳过），所以不存在把实时
+        # 挤掉的问题，页面加载也就不是白付。
+        fund_flow_page=(mode == "full" or bool(date)),
     )
     report_cache = get_report_cache()
 
