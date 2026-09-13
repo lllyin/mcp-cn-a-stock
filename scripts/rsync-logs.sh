@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# 把部署机上的服务日志和发布验证报告同步到本地，供 health / 排查 / 回放使用。
+# 把远端环境的服务日志和发布验证报告同步到当前环境，供 health / 排查 / 回放使用。
 #
 #     bash scripts/rsync-logs.sh --server root@HOST
 #     bash scripts/rsync-logs.sh --server root@HOST --mirror     # 与远端完全一致
@@ -8,14 +8,14 @@
 #
 # ## 为什么落到 .server-logs/ 而不是仓库自己的 logs/
 #
-# 仓库根的 logs/ 是**本机服务正在写**的目录：当前日志、start.sh 归档的历次日志，
-# health 工具直接读它算可用率和耗时。把远端同步到那里，本机的运行记录就被远端的
+# 仓库根的 logs/ 是**当前环境的服务正在写**的目录：当前日志、start.sh 归档的历次日志，
+# health 工具直接读它算可用率和耗时。把远端同步到那里，当前环境的运行记录就被远端的
 # 覆盖了，而两者是不同机器的数据——混在一起之后 health 算出来的东西没有意义。
-# 所以远端的东西一律进 .server-logs/，和本机的分开放。
+# 所以远端的东西一律进 .server-logs/，和当前环境的分开放。
 #
 # ## 为什么默认不删（和参考脚本不同）
 #
-# 部署机的 LOG_RETENTION_DAYS 默认 3 天，超过就清掉。用 --delete 做镜像的话，
+# 远端的 LOG_RETENTION_DAYS 默认 3 天，超过就清掉。用 --delete 做镜像的话，
 # 每同步一次就把本地攒下的、远端已经轮转掉的旧日志一起删了——那正好抵消了
 # "把日志同步下来分析"这件事本身。所以默认只增不删；确实要一份和远端逐字相同的
 # 快照时再加 --mirror。
@@ -43,7 +43,7 @@ usage() {
   bash scripts/rsync-logs.sh --server root@HOST [--remote-dir PATH] [--mirror] [--dry-run]
 
 参数:
-  --server SERVER      部署机地址，形如 root@10.0.0.1 或 ssh config 里的别名
+  --server SERVER      远端地址，形如 root@10.0.0.1 或 ssh config 里的别名
   --remote-dir PATH    远端仓库根目录（含 logs/ 和 verification/reports/）
   --mirror             与远端保持一致：远端没有的本地也删。默认只增不删
   --dry-run            只列出会传哪些文件，不真的传
@@ -131,7 +131,7 @@ sync_directory() {
 }
 
 echo "=========================================="
-echo "同步部署机的日志与验证报告"
+echo "同步远端的日志与验证报告"
 echo "=========================================="
 echo "服务器:   $SERVER"
 echo "远端仓库: $REMOTE_DIR"
@@ -152,7 +152,7 @@ if [ "$failed" -gt 0 ]; then
 fi
 echo "全部同步完成：$LOCAL_ROOT/"
 echo ""
-echo "拿远端日志渲染一份 health 报告（health 工具读的是本机日志，这里显式指过去）："
+echo "拿远端日志渲染一份 health 报告（health 默认读当前环境的日志，这里显式指过去）："
 cat <<EOF
   ./.venv/bin/python -c "
 from finmcp import health_report, log_digest
