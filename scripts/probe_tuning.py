@@ -1203,6 +1203,15 @@ def decide_max_pages(memory: Optional[dict], service_base_mib: Optional[float], 
         return Decision(pages_key, DEFAULTS[pages_key], "inconclusive", why), Decision(conc_key, DEFAULTS[conc_key], "inconclusive", "与 BROWSER_MAX_PAGES 同值")
     headroom = MEMORY_BUDGET_MIB - base - one
     fit = 1 + int(math.floor(headroom / marginal)) if headroom > 0 else 0
+    if fit < 1:
+        # 预算连 1 页都装不下时，夹到 1 并标 measured 是在假装达标——
+        # 实测 2026-09-13：基座 239 + 1 页 654 PSS，预算 500。如实报告，
+        # 由人决定接受超预算还是减基座，而不是给一个"看似合规"的推荐值。
+        why = (f"预算装不下任何页数：服务不含浏览器 {base:.0f} MiB（{base_source}），"
+               f"浏览器开 1 页 {one:.0f} MiB PSS 已超 {MEMORY_BUDGET_MIB:g} MiB 预算。"
+               f"保持默认 1 页并接受超预算，或先减服务基座/换更省的浏览器参数")
+        return (Decision(pages_key, DEFAULTS[pages_key], "inconclusive", why),
+                Decision(conc_key, DEFAULTS[conc_key], "inconclusive", "与 BROWSER_MAX_PAGES 同值"))
     value = max(1, min(3, fit))
     why = (f"服务不含浏览器 {base:.0f} MiB（{base_source}），浏览器开 1 页 {one:.0f} MiB PSS，每多一页 {marginal:.0f} MiB；"
            f"预算 {MEMORY_BUDGET_MIB:g} 内放得下 {fit} 页，夹到 [1, 3] 取 {value}")
@@ -1225,7 +1234,8 @@ def channel_notes(facts: Optional[dict]) -> list:
     direct_ok = {h for h in ("push2.eastmoney.com", "push2his.eastmoney.com") if c(h) == "ok"}
     imp_ok = {h for h in ("push2.eastmoney.com", "push2his.eastmoney.com") if c(h, "impersonate") == "ok"}
     if facts.get("proxy_configured"):
-        notes.append("网关已配置：HTTP_CHANNEL=auto 会走 proxy，下面直连/伪装的结果只在网关不可用时才起作用")
+        notes.append("网关已配置：auto 模式下东财请求失败会经网关按请求回退（不是整条链路走 proxy）；"
+                     "下面的直连/伪装可达性是网关不可用时的兜底事实。浏览器页面路径不走网关，伪装身份的结论独立成立")
     if len(direct_ok) == 2:
         notes.append("push2/push2his 直连可达：HTTP_CHANNEL=auto 在网关关闭时走伪装通道，direct 在这台机器上也能用")
     elif len(imp_ok) == 2:

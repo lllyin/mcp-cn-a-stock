@@ -76,11 +76,23 @@ _auto_proxy_auth_at = 0.0
 _auto_proxy_states = {}
 
 
+#: 网关回退只对东财行情 API 主机生效。``d.10jqka.com.cn`` 也在伪装主机名单里，
+#: 它偶发失败时不该把积分花在非东财的 host 上（2026-09-13 实测发生过 2 次）。
+_AUTO_PROXY_SCOPED_HOSTS = frozenset({
+    "push2.eastmoney.com", "push2his.eastmoney.com",
+})
+
+
 def _auto_proxy_state(host):
     return _auto_proxy_states.setdefault(
         host, {"failures": 0, "active": False, "cooldown_until": 0.0,
-               "local_successes": 0, "last_probe_at": 0.0}
+               "local_successes": 0, "last_probe_at": 0.0,
+               "last_failed_proxy": None}
     )
+
+
+def _in_auto_proxy_scope(host) -> bool:
+    return host in _AUTO_PROXY_SCOPED_HOSTS
 
 
 def installed_mode() -> Optional[str]:
@@ -251,6 +263,8 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
     host = (urlsplit(url).hostname or "?").lower()
     if not _auto_proxy or not _auto_proxy_gateway or not _auto_proxy_token:
         return None
+    if not _in_auto_proxy_scope(host):
+        return None
     with _auto_proxy_lock:
         now = time.monotonic()
         state = _auto_proxy_state(host)
@@ -258,6 +272,8 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
             return None
         if not state["active"]:
             return None
+    started = time.perf_counter()
+    used_auth = None
     try:
         import akshare_proxy_patch
         now = time.monotonic()
@@ -272,6 +288,13 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
                 if auth:
                     _auto_proxy_auth = auth
                     _auto_proxy_auth_at = now
+        used_auth = auth
+        # 上一次这个出口刚失败过、而认证层又把同一个出口吐回来（插件的缓存
+        # 在重新认证失败时会原样返回旧数据），等于没有新出口可用——这不能
+        # 记成"刚获取的认证"，按认证不可用走长冷却。
+        if auth and state["last_failed_proxy"] and \
+                auth.get("proxy") == state["last_failed_proxy"]:
+            auth = None
         if not auth or not auth.get("proxy"):
             with _auto_proxy_lock:
                 state = _auto_proxy_state(host)
@@ -290,29 +313,49 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
         retry_kwargs.pop("impersonate", None)
         request_id, tool, symbol = log_context()
         logger.warning(
-            "auto_proxy_attempt host=%s request_id=%s tool=%s symbol=%s",
-            host, request_id, tool, symbol,
+            "auto_proxy_attempt host=%s path=%s request_id=%s tool=%s symbol=%s",
+            host, urlsplit(url).path, request_id, tool, symbol,
         )
         response = base_cls.request(session, method, url, **retry_kwargs)
+        elapsed = time.perf_counter() - started
         if getattr(response, "status_code", None) == 200:
             with _auto_proxy_lock:
                 state = _auto_proxy_state(host)
                 state["failures"] = 0
-            logger.info("Eastmoney request recovered through proxy host=%s", host)
+                state["last_failed_proxy"] = None
+            logger.info(
+                "Eastmoney request recovered through proxy host=%s path=%s "
+                "elapsed=%.2fs request_id=%s",
+                host, urlsplit(url).path, elapsed, request_id,
+            )
             return response
-        # 非 200 说明出口能连但请求没成：多半是这个出口本身待遇差，作废缓存的
-        # 认证让下一次换新出口，冷却也用短的——等 300 秒没有意义。
+        # 非 200 说明出口能连但请求没成：多半是这个出口本身待遇差。作废**这一代**
+        # 认证（另一请求刚拿到的新出口不受牵连）并失效插件的二级缓存，下一次
+        # 换新出口；冷却用短的——等 300 秒没有意义。
         logger.warning(
-            "auto_proxy_failure host=%s status=%s", host, getattr(response, "status_code", None)
+            "auto_proxy_failure host=%s path=%s status=%s elapsed=%.2fs",
+            host, urlsplit(url).path, getattr(response, "status_code", None), elapsed,
         )
     except Exception as exc:  # pragma: no cover - provider/network dependent
-        logger.warning("auto_proxy_failure host=%s error=%s", host, str(exc)[:160])
+        logger.warning(
+            "auto_proxy_failure host=%s path=%s error=%s",
+            host, urlsplit(url).path, _sanitize_proxy_error(exc, used_auth),
+        )
     with _auto_proxy_lock:
         state = _auto_proxy_state(host)
         state["cooldown_until"] = time.monotonic() + AUTO_PROXY_DATA_COOLDOWN_SECONDS
         state["failures"] = 0
-        _auto_proxy_auth = None  # 坏出口轮换：下一次重新认证，大概率换一个出口
-        _auto_proxy_auth_at = 0.0
+        # 坏出口轮换：只作废本次失败用掉的那一代凭据——并发下另一请求刚拿到的
+        # 新出口不受牵连。插件的二级缓存一并失效，否则换汤不换药。
+        if used_auth is not None and _auto_proxy_auth is used_auth:
+            _auto_proxy_auth = None
+            _auto_proxy_auth_at = 0.0
+        state["last_failed_proxy"] = (used_auth or {}).get("proxy")
+    try:
+        import akshare_proxy_patch
+        akshare_proxy_patch._cache.expire_at = 0
+    except Exception:  # noqa: BLE001 - 插件不在时没有二级缓存可失效
+        pass
     logger.warning(
         "auto_proxy_state host=%s state=cooldown seconds=%s reason=data_failure",
         host, AUTO_PROXY_DATA_COOLDOWN_SECONDS,
@@ -320,11 +363,22 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
     return None
 
 
+def _sanitize_proxy_error(exc: Exception, used_auth) -> str:
+    """异常原文里的出口地址带凭据（user:pass@host），进日志前抹掉。"""
+    text = str(exc)[:200]
+    proxy = (used_auth or {}).get("proxy")
+    if proxy:
+        text = text.replace(proxy, "<proxy>")
+    return text
+
+
 def _record_auto_proxy_local_failure(url) -> None:
     if not _auto_proxy:
         return
+    host = (urlsplit(url).hostname or "?").lower()
+    if not _in_auto_proxy_scope(host):
+        return
     with _auto_proxy_lock:
-        host = (urlsplit(url).hostname or "?").lower()
         state = _auto_proxy_state(host)
         state["failures"] += 1
         if state["active"]:
@@ -361,6 +415,9 @@ def _record_auto_proxy_local_success(url) -> None:
             state["active"] = False
             state["local_successes"] = 0
             state["cooldown_until"] = 0.0
+            # 失败计数一并清零：留着它，恢复后第一次失败就会立即重新激活
+            # （failures 已经 ≥ 阈值），"三次连续失败"的门槛形同虚设。
+            state["failures"] = 0
         else:
             logger.info(
                 "auto_proxy_state host=%s state=recovery_probe successes=%s/%s",
@@ -562,7 +619,7 @@ def _install_impersonate(
                         track_auth=track_auth,
                     )
                 except Exception:
-                    _record_auto_proxy_local_failure()
+                    _record_auto_proxy_local_failure(url)
                     proxy_response = _auto_proxy_request(
                         original_session_cls, self, method, url, kwargs
                     )
@@ -768,13 +825,13 @@ def uninstall_http_channel() -> None:
         _installed_reason = None
     with _breaker_lock:
         _breaker.update(failures=0, suspended_until=0.0)
-    global _auto_proxy_auth, _auto_proxy_auth_at, _auto_proxy, _auto_proxy_fallback_active, _auto_proxy_failures, _auto_proxy_cooldown_until
+    global _auto_proxy_auth, _auto_proxy_auth_at, _auto_proxy
     _auto_proxy = False
     _auto_proxy_auth = None
     _auto_proxy_auth_at = 0.0
-    _auto_proxy_fallback_active = False
-    _auto_proxy_failures = 0
-    _auto_proxy_cooldown_until = 0.0
+    # per-host 状态一并清空：残留会让重装后的通道继承上一轮的激活/冷却，
+    # 测试里也靠它保证隔离。旧版的三个全局计数已废弃，不再存在。
+    _auto_proxy_states.clear()
 
 
 __all__ = [

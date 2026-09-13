@@ -367,25 +367,25 @@ def test_auto_proxy_state_is_per_host(monkeypatch):
     channel._auto_proxy = True
     channel._auto_proxy_states.clear()
     url_his = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
-    url_delay = "https://push2delay.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    url_p2 = "https://push2.eastmoney.com/api/qt/stock/get"
     for _ in range(channel.AUTO_PROXY_AFTER_FAILURES - 1):
         channel._record_auto_proxy_local_failure(url_his)
-    channel._record_auto_proxy_local_failure(url_delay)  # 另一个 host 的失败
+    channel._record_auto_proxy_local_failure(url_p2)  # 另一个 host 的失败
 
     state_his = channel._auto_proxy_states["push2his.eastmoney.com"]
-    state_delay = channel._auto_proxy_states["push2delay.eastmoney.com"]
+    state_p2 = channel._auto_proxy_states["push2.eastmoney.com"]
     assert state_his["failures"] == channel.AUTO_PROXY_AFTER_FAILURES - 1
-    assert state_delay["failures"] == 1
+    assert state_p2["failures"] == 1
 
-    # push2delay 的本地成功只清它自己，push2his 攒的计数还在
-    channel._record_auto_proxy_local_success(url_delay)
-    assert state_delay["active"] is False and state_delay["failures"] == 0
+    # push2 的本地成功只清它自己，push2his 攒的计数还在
+    channel._record_auto_proxy_local_success(url_p2)
+    assert state_p2["active"] is False and state_p2["failures"] == 0
     assert state_his["failures"] == channel.AUTO_PROXY_AFTER_FAILURES - 1
 
-    # push2his 攒满阈值激活；push2delay 不会被连带激活
+    # push2his 攒满阈值激活；push2 不会被连带激活
     channel._record_auto_proxy_local_failure(url_his)
     assert state_his["active"] is True
-    assert state_delay["active"] is False
+    assert state_p2["active"] is False
 
 
 def test_broken_cffi_session_is_not_reused(monkeypatch):
@@ -887,3 +887,88 @@ class TestAutoProxyRecoveryAndRotation:
         response = std_requests.Session().request("GET", self.URL)
         assert response.status_code == 200
         assert len(calls) == 1  # 一次成功，不重试
+
+    def test_recovery_clears_the_failure_count(self):
+        """恢复后 failures 必须归零：留着它，恢复后第一次失败就会立即重新激活，
+        "三次连续失败"的门槛形同虚设。"""
+        state = self._activate()
+        for _ in range(channel.AUTO_PROXY_RECOVERY_PROBES):
+            channel._record_auto_proxy_local_success(self.URL)
+            state["last_probe_at"] -= channel.AUTO_PROXY_RECOVERY_INTERVAL_SECONDS + 1
+        assert state["active"] is False
+        assert state["failures"] == 0
+        channel._record_auto_proxy_local_failure(self.URL)
+        assert state["active"] is False  # 一次失败不该立刻重新激活
+        assert state["failures"] == 1
+
+    def test_uninstall_clears_the_per_host_states(self):
+        self._activate()
+        assert channel._auto_proxy_states
+        channel.uninstall_http_channel()
+        assert channel._auto_proxy_states == {}
+
+    def test_gateway_is_scoped_to_eastmoney_api_hosts(self):
+        """同花顺主机的失败不进网关：积分只花在东财上（09-13 实测漏过 2 次）。"""
+        channel._auto_proxy = True
+        channel._auto_proxy_states.clear()
+        channel._record_auto_proxy_local_failure("https://d.10jqka.com.cn/v6/realhead/hs_600519/last.js")
+        assert "d.10jqka.com.cn" not in channel._auto_proxy_states
+        for _ in range(10):
+            channel._record_auto_proxy_local_failure("https://d.10jqka.com.cn/x")
+        assert channel._auto_proxy_states == {}
+
+    def test_a_repeated_bad_exit_is_treated_as_auth_unavailable(self, monkeypatch):
+        """重新认证仍吐回同一个坏出口（插件缓存在重认证失败时原样返回旧数据），
+        不能记成"刚获取的认证"，要走认证不可用的长冷却。"""
+        stale = {"proxy": "http://stale-exit", "cookie": "nid18=stale"}
+        channel._auto_proxy = True
+        channel._auto_proxy_gateway = "gateway"
+        channel._auto_proxy_token = "token"
+        channel._auto_proxy_states.clear()
+        state = channel._auto_proxy_state("push2his.eastmoney.com")
+        state["active"] = True
+        state["last_failed_proxy"] = "http://stale-exit"
+        channel._auto_proxy_auth = stale
+        channel._auto_proxy_auth_at = 0.0  # 缓存过期，强制重新认证
+        reauth = []
+        fake_patch = types.SimpleNamespace(
+            get_auth_config_with_cache=lambda *args: reauth.append(args) or stale
+        )
+        monkeypatch.setitem(__import__("sys").modules, "akshare_proxy_patch", fake_patch)
+        original = getattr(std_requests, "_qtf_original_session", std_requests.Session)
+        monkeypatch.setattr(
+            original, "request",
+            lambda *args, **kwargs: pytest.fail("同一个坏出口不该再发数据请求"),
+        )
+        assert channel._auto_proxy_request(
+            original, object(), "GET", self.URL, {}
+        ) is None
+        assert len(reauth) == 1  # 重新认证过，但吐回的还是坏出口
+        assert state["cooldown_until"] > channel.time.monotonic() + channel.AUTO_PROXY_DATA_COOLDOWN_SECONDS
+
+    def test_the_failure_log_masks_proxy_credentials(self, monkeypatch, caplog):
+        """出口地址带 user:pass@host，异常原文进日志前必须抹掉。"""
+        secret = "http://user:secret-pass@exit-gw:8080"
+        channel._auto_proxy = True
+        channel._auto_proxy_gateway = "gateway"
+        channel._auto_proxy_token = "token"
+        channel._auto_proxy_states.clear()
+        state = channel._auto_proxy_state("push2his.eastmoney.com")
+        state["active"] = True
+        channel._auto_proxy_auth = {"proxy": secret, "cookie": "c"}
+        channel._auto_proxy_auth_at = channel.time.monotonic()
+        fake_patch = types.SimpleNamespace(
+            get_auth_config_with_cache=lambda *args: {"proxy": secret, "cookie": "c"}
+        )
+        monkeypatch.setitem(__import__("sys").modules, "akshare_proxy_patch", fake_patch)
+        original = getattr(std_requests, "_qtf_original_session", std_requests.Session)
+        monkeypatch.setattr(
+            original, "request",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                ConnectionError(f"proxy connect failed at {secret}")),
+        )
+        with caplog.at_level(logging.WARNING, logger="finmcp"):
+            channel._auto_proxy_request(original, object(), "GET", self.URL, {})
+        joined = "\n".join(r.getMessage() for r in caplog.records)
+        assert "secret-pass" not in joined and "<proxy>" in joined
+        assert channel._auto_proxy_auth is None  # 本代凭据已作废
