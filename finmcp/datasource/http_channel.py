@@ -70,9 +70,13 @@ _auto_proxy_token = None
 _auto_proxy_lock = threading.Lock()
 _auto_proxy_auth = None
 _auto_proxy_auth_at = 0.0
-_auto_proxy_failures = 0
-_auto_proxy_cooldown_until = 0.0
-_auto_proxy_fallback_active = False
+_auto_proxy_states = {}
+
+
+def _auto_proxy_state(host):
+    return _auto_proxy_states.setdefault(
+        host, {"failures": 0, "active": False, "cooldown_until": 0.0}
+    )
 
 
 def installed_mode() -> Optional[str]:
@@ -240,14 +244,15 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
     impersonated request naturally returns the service to its normal path.
     """
     global _auto_proxy_auth, _auto_proxy_auth_at
-    global _auto_proxy_failures, _auto_proxy_cooldown_until
+    host = (urlsplit(url).hostname or "?").lower()
     if not _auto_proxy or not _auto_proxy_gateway or not _auto_proxy_token:
         return None
     with _auto_proxy_lock:
         now = time.monotonic()
-        if _auto_proxy_cooldown_until > now:
+        state = _auto_proxy_state(host)
+        if state["cooldown_until"] > now:
             return None
-        if not _auto_proxy_fallback_active:
+        if not state["active"]:
             return None
     try:
         import akshare_proxy_patch
@@ -265,9 +270,10 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
                     _auto_proxy_auth_at = now
         if not auth or not auth.get("proxy"):
             with _auto_proxy_lock:
-                _auto_proxy_cooldown_until = time.monotonic() + AUTO_PROXY_COOLDOWN_SECONDS
-                _auto_proxy_failures = 0
-            logger.debug("Eastmoney proxy authentication unavailable; fallback cooled down")
+                state = _auto_proxy_state(host)
+                state["cooldown_until"] = time.monotonic() + AUTO_PROXY_COOLDOWN_SECONDS
+                state["failures"] = 0
+            logger.warning("auto_proxy_state host=%s state=cooldown reason=authentication_unavailable", host)
             return None
         retry_kwargs = dict(kwargs)
         headers = dict(retry_kwargs.get("headers") or {})
@@ -281,35 +287,43 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
         response = base_cls.request(session, method, url, **retry_kwargs)
         if getattr(response, "status_code", None) == 200:
             with _auto_proxy_lock:
-                _auto_proxy_failures = 0
-            logger.info("Eastmoney request recovered through proxy host=%s", urlsplit(url).hostname)
+                state = _auto_proxy_state(host)
+                state["failures"] = 0
+            logger.info("Eastmoney request recovered through proxy host=%s", host)
             return response
     except Exception as exc:  # pragma: no cover - provider/network dependent
-        logger.debug("Eastmoney proxy fallback failed host=%s error=%s", urlsplit(url).hostname, str(exc)[:160])
+        logger.warning("auto_proxy_failure host=%s error=%s", host, str(exc)[:160])
     with _auto_proxy_lock:
-        _auto_proxy_cooldown_until = time.monotonic() + AUTO_PROXY_COOLDOWN_SECONDS
-        _auto_proxy_failures = 0
+        state = _auto_proxy_state(host)
+        state["cooldown_until"] = time.monotonic() + AUTO_PROXY_COOLDOWN_SECONDS
+        state["failures"] = 0
+    logger.warning("auto_proxy_state host=%s state=cooldown seconds=%s", host, AUTO_PROXY_COOLDOWN_SECONDS)
     return None
 
 
-def _record_auto_proxy_local_failure() -> None:
-    global _auto_proxy_failures, _auto_proxy_fallback_active
+def _record_auto_proxy_local_failure(url) -> None:
     if not _auto_proxy:
         return
     with _auto_proxy_lock:
-        _auto_proxy_failures += 1
-        if _auto_proxy_failures >= AUTO_PROXY_AFTER_FAILURES:
-            _auto_proxy_fallback_active = True
+        host = (urlsplit(url).hostname or "?").lower()
+        state = _auto_proxy_state(host)
+        state["failures"] += 1
+        if state["failures"] >= AUTO_PROXY_AFTER_FAILURES and not state["active"]:
+            state["active"] = True
+            logger.warning("auto_proxy_state host=%s state=active failures=%s", host, state["failures"])
 
 
-def _record_auto_proxy_local_success() -> None:
-    global _auto_proxy_failures, _auto_proxy_cooldown_until, _auto_proxy_fallback_active
+def _record_auto_proxy_local_success(url) -> None:
     if not _auto_proxy:
         return
     with _auto_proxy_lock:
-        _auto_proxy_failures = 0
-        _auto_proxy_cooldown_until = 0.0
-        _auto_proxy_fallback_active = False
+        host = (urlsplit(url).hostname or "?").lower()
+        state = _auto_proxy_state(host)
+        if state["active"]:
+            logger.info("auto_proxy_state host=%s state=local_recovered", host)
+        state["failures"] = 0
+        state["cooldown_until"] = 0.0
+        state["active"] = False
 
 
 def _install_auth_cookies() -> bool:
@@ -569,7 +583,7 @@ def _install_impersonate(
                     track_auth=track_auth,
                 )
             except Exception:
-                _record_auto_proxy_local_failure()
+                _record_auto_proxy_local_failure(url)
                 proxy_response = _auto_proxy_request(
                     original_session_cls, self, method, url, kwargs
                 )

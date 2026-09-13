@@ -331,9 +331,7 @@ def test_auto_proxy_is_bounded_by_failure_threshold_and_cooldown(monkeypatch):
     channel._auto_proxy = True
     channel._auto_proxy_gateway = "gateway"
     channel._auto_proxy_token = "token"
-    channel._auto_proxy_failures = 0
-    channel._auto_proxy_cooldown_until = 0.0
-    channel._auto_proxy_fallback_active = False
+    channel._auto_proxy_states.clear()
     auth_calls = []
 
     fake_patch = types.SimpleNamespace(
@@ -344,16 +342,49 @@ def test_auto_proxy_is_bounded_by_failure_threshold_and_cooldown(monkeypatch):
     original = getattr(std_requests, "_qtf_original_session", std_requests.Session)
     monkeypatch.setattr(original, "request", lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionError("blocked")))
 
-    assert channel._auto_proxy_request(original, object(), "GET", "https://push2his.eastmoney.com/x", {}) is None
+    url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    assert channel._auto_proxy_request(original, object(), "GET", url, {}) is None
     assert auth_calls == []
     for _ in range(channel.AUTO_PROXY_AFTER_FAILURES):
-        channel._record_auto_proxy_local_failure()
-    assert channel._auto_proxy_fallback_active is True
-    assert channel._auto_proxy_request(original, object(), "GET", "https://push2his.eastmoney.com/x", {}) is None
+        channel._record_auto_proxy_local_failure(url)
+    state = channel._auto_proxy_states["push2his.eastmoney.com"]
+    assert state["active"] is True
+    assert channel._auto_proxy_request(original, object(), "GET", url, {}) is None
     assert len(auth_calls) == 1
-    assert channel._auto_proxy_cooldown_until > channel.time.monotonic()
-    assert channel._auto_proxy_request(original, object(), "GET", "https://push2his.eastmoney.com/x", {}) is None
+    assert state["cooldown_until"] > channel.time.monotonic()
+    assert channel._auto_proxy_request(original, object(), "GET", url, {}) is None
     assert len(auth_calls) == 1
+
+
+def test_auto_proxy_state_is_per_host(monkeypatch):
+    """per-host 状态机的核心：一个 host 的失败/恢复不影响另一个。
+
+    起因是全局版本的实测：push2delay 的本地成功把 push2his 刚攒出来的
+    网关回退状态清掉，fflow 的失败计数永远攒不到阈值，38 次主源失败
+    一次都没走到网关。
+    """
+    channel._auto_proxy = True
+    channel._auto_proxy_states.clear()
+    url_his = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    url_delay = "https://push2delay.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    for _ in range(channel.AUTO_PROXY_AFTER_FAILURES - 1):
+        channel._record_auto_proxy_local_failure(url_his)
+    channel._record_auto_proxy_local_failure(url_delay)  # 另一个 host 的失败
+
+    state_his = channel._auto_proxy_states["push2his.eastmoney.com"]
+    state_delay = channel._auto_proxy_states["push2delay.eastmoney.com"]
+    assert state_his["failures"] == channel.AUTO_PROXY_AFTER_FAILURES - 1
+    assert state_delay["failures"] == 1
+
+    # push2delay 的本地成功只清它自己，push2his 攒的计数还在
+    channel._record_auto_proxy_local_success(url_delay)
+    assert state_delay["active"] is False and state_delay["failures"] == 0
+    assert state_his["failures"] == channel.AUTO_PROXY_AFTER_FAILURES - 1
+
+    # push2his 攒满阈值激活；push2delay 不会被连带激活
+    channel._record_auto_proxy_local_failure(url_his)
+    assert state_his["active"] is True
+    assert state_delay["active"] is False
 
 
 def test_broken_cffi_session_is_not_reused(monkeypatch):
