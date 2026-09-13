@@ -46,11 +46,16 @@ FUND_FLOW_COLUMNS = (
 )
 
 #: 一致性检测的容差。原始接口的金额是精确值，四档之和恒为 0、主力恒等于超大+大；
-#: 页面兜底的金额经两位小数（万）渲染再解析回来，误差上限在千元级。1 万元远高于
-#: 舍入、远低于「扰动副本」档 30%-50% 的偏差（2026-09-11 实测主力 +3.3%、
-#: 超大 +30.5%、大单 -52.6%，收盘价和涨跌幅是真值）。占比是两位小数的舍入值，
-#: 主力+中+小三项之和恒为 0，每列 ±0.005 的舍入给 0.05 的和容差。
-_AMOUNT_TOLERANCE = 1e4      # 元
+#: 页面兜底的金额经两位小数渲染再解析回来，误差随显示单位缩放：万粒度每格
+#: ±50 元（四桶之和 ≤ 几百元），亿粒度每格 ±0.005 亿 = ±50 万元（四桶之和
+#: 可达 ±200 万——2026-09-13 实测 3 月老日期整批误报的根源，当时容差按
+#: 万粒度定为 1 万元）。所以页面路径的容差按行内最大金额的显示单位放宽，
+#: API 路径维持严格；「扰动副本」档的偏差在 30%-50%，远高于两者。
+#: 占比是两位小数的舍入值，主力+中+小三项之和恒为 0，每列 ±0.005 的舍入
+#: 给 0.05 的和容差（与量级无关）。
+_AMOUNT_TOLERANCE = 1e4      # 元（API 路径；页面万粒度同值）
+_PAGE_YI_TOLERANCE = 2.1e6   # 元（页面亿粒度：0.01 亿步进的四桶舍入上界）
+_PAGE_YI_SCALE = 1e8         # 行内最大金额到这个量级，页面按亿显示
 _RATIO_TOLERANCE = 0.05      # 百分点
 
 
@@ -166,7 +171,7 @@ def _longer(accumulated, value):
     return value if value.rows > accumulated.rows else accumulated
 
 
-def consistency_violations(frame) -> list:
+def consistency_violations(frame, *, rendered: bool = False) -> list:
     """一行一格地报出违反资金流内部恒等式的行。
 
     恒等式来自分桶的定义本身：主力 = 超大单 + 大单，主力+大+中+小 = 0，
@@ -177,6 +182,9 @@ def consistency_violations(frame) -> list:
     被扰动过的副本——HTTP 200、行数齐全、收盘价和涨跌幅是真值，只有各单净额
     偏 30%-50%，任何可用性指标都看不见它。这项检测是唯一一道能当场咬住的
     闸门；调用方按返回的 violations 决定记 warnings 还是换源重取。
+
+    ``rendered=True`` 表示这批行来自页面兜底，金额经两位小数的"万/亿"渲染，
+    金额容差按行内显示单位放宽（见 _PAGE_YI_TOLERANCE）；占比容差不变。
 
     只做算术，不发请求、不比 K 线。金额列有 NaN 的行跳过——那是页面占位符
     （停牌之类），让 None 与 0 的区分保持原样。
@@ -199,15 +207,20 @@ def consistency_violations(frame) -> list:
             ("主力净流入-净额", "超大单净流入-净额", "大单净流入-净额",
              "中单净流入-净额", "小单净流入-净额"))
         row_issues = []
+        amounts_known = [v for v in (major, xl, big, mid, small)
+                         if isinstance(v, (int, float))]
+        amount_tol = _AMOUNT_TOLERANCE
+        if rendered and amounts_known and max(map(abs, amounts_known)) >= _PAGE_YI_SCALE:
+            amount_tol = _PAGE_YI_TOLERANCE
         if None not in (major, xl, big) and all(
                 isinstance(v, (int, float)) for v in (major, xl, big)):
             drift = major - (xl + big)
-            if abs(drift) > _AMOUNT_TOLERANCE:
+            if abs(drift) > amount_tol:
                 row_issues.append(f"主力({major:.0f}) != 超大+大({xl + big:.0f})，差 {drift:+.0f} 元")
         if None not in (xl, big, mid, small) and all(
                 isinstance(v, (int, float)) for v in (xl, big, mid, small)):
             total = xl + big + mid + small
-            if abs(total) > _AMOUNT_TOLERANCE:
+            if abs(total) > amount_tol:
                 row_issues.append(f"四档之和={total:+.0f} 元，应为 0")
         mratio, mratio_mid, mratio_small = (row.get(name) for name in
             ("主力净流入-净占比", "中单净流入-净占比", "小单净流入-净占比"))

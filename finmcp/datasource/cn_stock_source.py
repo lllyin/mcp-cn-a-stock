@@ -1456,7 +1456,8 @@ class CNStockDataSource(DataSource):
                     # 检测不过不丢弃——丢一行用户就少一行（AGENTS §一）——记成
                     # 数据可疑，进 warnings 和 degraded，让读者和缓存守卫知道。
                     # 每条记录前缀上游端点：事后排查"这份坏数据是谁给的"不用再猜。
-                    violations = fund_flow_source.consistency_violations(df)
+                    violations = fund_flow_source.consistency_violations(
+                        df, rendered=fund_flow_data.get("provider") == "page_fallback")
                     if violations:
                         endpoint = fund_flow_source.provider_endpoint(
                             fund_flow_data.get("provider"))

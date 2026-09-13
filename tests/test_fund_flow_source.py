@@ -403,3 +403,45 @@ def test_anomalies_flow_to_raw_data_and_block_cache(monkeypatch):
     stock_data.fund_flow_anomalies = anomalies
     raw = stock_data.to_dict()
     assert raw[FUND_FLOW_ANOMALIES_KEY] == anomalies
+
+
+def test_page_yi_scale_rounding_is_not_a_violation():
+    """页面兜底把大额行渲染成两位小数的"亿"（步进 100 万元），四桶各有
+    ±50 万的舍入——这是显示粒度，不是扰动。2026-09-13 曾整批误报。"""
+    frame = pd.DataFrame([
+        # 页面上是 主力-2.17亿 超大-1.63亿 大-0.54亿 中+0.24亿 小+1.93亿：
+        # 解析后各带 ±0.005 亿 的舍入，四桶和偏 -100 万仍在容差内
+        _row(datetime.date(2026, 3, 23), -217000000.0, -163000000.0,
+             -54000000.0, 24000000.0, 193000000.0, -7.91, 0.89, 7.02),
+    ])
+    assert ffs.consistency_violations(frame, rendered=True) == []
+    # 页面行的小单改成 +192,900,000（四桶和 = -100,000）：渲染舍入量级内页面
+    # 放行，但同样的数若来自 API（精确值）就必须报——API 没有渲染舍入
+    frame_api = pd.DataFrame([
+        _row(datetime.date(2026, 3, 23), -217000000.0, -163000000.0,
+             -54000000.0, 24000000.0, 192900000.0, -7.91, 0.89, 7.02),
+    ])
+    issues = ffs.consistency_violations(frame_api)
+    assert len(issues) == 1 and "四档之和" in issues[0]
+    assert ffs.consistency_violations(frame_api, rendered=True) == []
+
+
+def test_page_genuine_decoy_still_caught_at_wan_scale():
+    # 万粒度的行（金额 < 1 亿）容差仍是 1 万：09-11 那种扰动（主力 5617 万）
+    # 走页面路径也一样要被咬住
+    frame = pd.DataFrame([
+        _row(datetime.date(2026, 7, 1), 56175000.0, 47753100.0, 8421900.0,
+             3869700.0, -59968832.0),
+    ])
+    issues = ffs.consistency_violations(frame, rendered=True)
+    assert len(issues) == 1 and "四档之和" in issues[0]
+
+
+def test_page_ratio_violation_is_scale_independent():
+    # 占比只有两位小数舍入，与金额量级无关：亿级行的占比扰动照样咬
+    frame = pd.DataFrame([
+        _row(datetime.date(2026, 3, 23), -217000000.0, -163000000.0,
+             -54000000.0, 24000000.0, 193000000.0, 4.00, 0.50, -3.00),
+    ])
+    issues = ffs.consistency_violations(frame, rendered=True)
+    assert any("占比之和" in i for i in issues)
