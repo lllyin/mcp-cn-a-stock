@@ -62,6 +62,12 @@ _installed_detail: dict = {}
 # Cooldown state for the impersonated path; see _record_impersonation.
 _breaker_lock = threading.Lock()
 _breaker = {"failures": 0, "suspended_until": 0.0}
+_auto_proxy = False
+_auto_proxy_gateway = None
+_auto_proxy_token = None
+_auto_proxy_lock = threading.Lock()
+_auto_proxy_auth = None
+_auto_proxy_auth_at = 0.0
 
 
 def installed_mode() -> Optional[str]:
@@ -219,6 +225,50 @@ def _plain_with_auth_outcome(
     if track_auth and status is not None:
         _note_auth_outcome(url, success=status == 200)
     return response
+
+
+def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
+    """Retry one failed Eastmoney request through the paid gateway.
+
+    This is deliberately request-scoped. It does not install akshare-proxy-patch
+    and never rewrites the process-wide requests module, so a later successful
+    impersonated request naturally returns the service to its normal path.
+    """
+    global _auto_proxy_auth, _auto_proxy_auth_at
+    if not _auto_proxy or not _auto_proxy_gateway or not _auto_proxy_token:
+        return None
+    try:
+        import akshare_proxy_patch
+        now = time.monotonic()
+        with _auto_proxy_lock:
+            if _auto_proxy_auth and now - _auto_proxy_auth_at < 28:
+                auth = _auto_proxy_auth
+            else:
+                auth = akshare_proxy_patch.get_auth_config_with_cache(
+                    f"http://{_auto_proxy_gateway}:47001/api/akshare-auth",
+                    _auto_proxy_token,
+                )
+                if auth:
+                    _auto_proxy_auth = auth
+                    _auto_proxy_auth_at = now
+        if not auth or not auth.get("proxy"):
+            return None
+        retry_kwargs = dict(kwargs)
+        headers = dict(retry_kwargs.get("headers") or {})
+        headers.update(_AUTH_DEFAULT_HEADERS)
+        headers.update(_AUTH_IDENTITY_HEADERS)
+        if auth.get("cookie"):
+            headers["Cookie"] = auth["cookie"]
+        retry_kwargs["headers"] = headers
+        retry_kwargs["proxies"] = {"http": auth["proxy"], "https": auth["proxy"]}
+        retry_kwargs.pop("impersonate", None)
+        response = base_cls.request(session, method, url, **retry_kwargs)
+        if getattr(response, "status_code", None) == 200:
+            logger.info("Eastmoney request recovered through proxy host=%s", urlsplit(url).hostname)
+            return response
+    except Exception as exc:  # pragma: no cover - provider/network dependent
+        logger.debug("Eastmoney proxy fallback failed host=%s error=%s", urlsplit(url).hostname, str(exc)[:160])
+    return None
 
 
 def _install_auth_cookies() -> bool:
@@ -409,10 +459,18 @@ def _install_impersonate(
             kwargs, track_auth = _with_auth_cookie(url, kwargs)
             if not _is_impersonated(url) or _impersonation_suspended():
                 kwargs.pop("impersonate", None)
-                return _plain_with_auth_outcome(
-                    original_session_cls, self, method, url, kwargs,
-                    track_auth=track_auth,
-                )
+                try:
+                    return _plain_with_auth_outcome(
+                        original_session_cls, self, method, url, kwargs,
+                        track_auth=track_auth,
+                    )
+                except Exception:
+                    proxy_response = _auto_proxy_request(
+                        original_session_cls, self, method, url, kwargs
+                    )
+                    if proxy_response is not None:
+                        return proxy_response
+                    raise
 
             attempt_kwargs = dict(kwargs)
             attempt_kwargs["timeout"] = timeout
@@ -462,10 +520,18 @@ def _install_impersonate(
             kwargs.pop("impersonate", None)
             # 只按最终结果记凭据成败：伪装失败、普通请求成功时凭据显然仍然可用，
             # 不能因为中间路径失败就触发重采。
-            return _plain_with_auth_outcome(
-                original_session_cls, self, method, url, kwargs,
-                track_auth=track_auth,
-            )
+            try:
+                return _plain_with_auth_outcome(
+                    original_session_cls, self, method, url, kwargs,
+                    track_auth=track_auth,
+                )
+            except Exception:
+                proxy_response = _auto_proxy_request(
+                    original_session_cls, self, method, url, kwargs
+                )
+                if proxy_response is not None:
+                    return proxy_response
+                raise
 
     def impersonate_get(url, params=None, **kwargs):
         with ImpersonateSession() as session:
@@ -516,7 +582,7 @@ def install_http_channel(
     Raises HttpModeError only for an explicit ``proxy`` request without a
     gateway; every automatic resolution degrades instead of stopping startup.
     """
-    global _installed_mode, _installed_reason
+    global _installed_mode, _installed_reason, _auto_proxy, _auto_proxy_gateway, _auto_proxy_token
 
     mode, reason = resolve_http_mode(requested, proxy_enabled, proxy_gateway)
     with _state_lock:
@@ -541,6 +607,9 @@ def install_http_channel(
             _installed_reason = "requests_already_patched"
             return _installed_mode
 
+        _auto_proxy = str(proxy_enabled).strip().lower() == "auto" and mode == "impersonate"
+        _auto_proxy_gateway = proxy_gateway
+        _auto_proxy_token = proxy_token
         if mode == "proxy":
             _install_proxy(proxy_gateway, proxy_token, proxy_retry)
         elif mode == "impersonate":
@@ -599,6 +668,10 @@ def uninstall_http_channel() -> None:
         _installed_reason = None
     with _breaker_lock:
         _breaker.update(failures=0, suspended_until=0.0)
+    global _auto_proxy_auth, _auto_proxy_auth_at, _auto_proxy
+    _auto_proxy = False
+    _auto_proxy_auth = None
+    _auto_proxy_auth_at = 0.0
 
 
 __all__ = [

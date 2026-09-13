@@ -254,7 +254,7 @@ mcporter call cn-stock market_events \
 
 | 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
-| `HTTP_CHANNEL` | 访问东财行情主机的方式：<br>`auto` 网关可用时走 `proxy`，否则降级 `impersonate`<br>`proxy` 经授权网关和代理出口，按积分计费<br>`impersonate` 本机直连，伪装成浏览器<br>`direct` 本机直连，不做伪装，可写作 `off` | `auto`<br>`proxy`<br>`impersonate`<br>`direct`<br>（默认 `auto`） |
+| `HTTP_CHANNEL` | 访问东财行情主机的方式：<br>`auto` 按 `AKSHARE_PROXY_ENABLED` 选择，并在运行中按请求回退<br>`proxy` 经授权网关和代理出口，按积分计费<br>`impersonate` 本机直连，伪装成浏览器<br>`direct` 本机直连，不做伪装，可写作 `off` | `auto`<br>`proxy`<br>`impersonate`<br>`direct`<br>（默认 `auto`） |
 | `IMPERSONATE_RETRY` | 单个请求的伪装尝试次数，用尽后不带伪装再试一次 | 正整数（默认 `3`） |
 | `IMPERSONATE_TIMEOUT_SECONDS` | 单次伪装请求的超时 | 秒（默认 `8`） |
 | `IMPERSONATE_BROWSER` | 伪装成哪个浏览器 | 浏览器名，如 `chrome`、`safari`（默认 `chrome`） |
@@ -275,7 +275,7 @@ mcporter call cn-stock market_events \
 
 | 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
-| `AKSHARE_PROXY_ENABLED` | 是否启用网关。只作为 `HTTP_CHANNEL=auto` 的判定输入 | `0`<br>`1`<br>（默认 `0`） |
+| `AKSHARE_PROXY_ENABLED` | 网关使用方式；`auto` 仅在东财本地请求失败后按请求回退 | `0`<br>`1`<br>`auto`<br>（默认 `0`） |
 | `AKSHARE_PROXY_GATEWAY` | 授权网关地址，不含协议和端口 | 主机名或 IP（默认空） |
 | `AKSHARE_PROXY_TOKEN` | 网关访问令牌 | 字符串（默认空） |
 | `AKSHARE_PROXY_RETRY` | 网关请求的失败重试次数（旧名 `AKSHARE_PROXY_PORT` 仍然认） | 正整数（默认 `30`） |

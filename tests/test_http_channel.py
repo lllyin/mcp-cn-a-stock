@@ -119,6 +119,17 @@ def test_auto_never_raises_on_partial_proxy_config():
     assert resolve_http_mode("auto", True, "")[0] == "impersonate"
 
 
+def test_proxy_enabled_auto_keeps_local_channel_for_request_fallback():
+    assert resolve_http_mode("auto", "auto", "gateway") == (
+        "impersonate", "auto:request_fallback"
+    )
+
+
+@pytest.mark.parametrize("value", ["0", "false", "off", "disabled", ""])
+def test_proxy_enabled_string_false_values_keep_local_channel(value):
+    assert resolve_http_mode("auto", value, "gateway")[0] == "impersonate"
+
+
 # --- installation ----------------------------------------------------------
 
 
@@ -264,6 +275,56 @@ def test_retries_then_replays_through_plain_requests(monkeypatch):
     assert len(calls) == channel.IMPERSONATE_RETRY
     # The replay keeps the caller's kwargs, without curl_cffi-only additions.
     assert replayed == [{"params": {"secid": "1.600000"}}]
+
+
+def test_auto_uses_gateway_only_after_local_request_fails(monkeypatch):
+    calls = _install_impersonate_with_fake_cffi(
+        monkeypatch, [RuntimeError("blocked")] * channel.IMPERSONATE_RETRY
+    )
+    original = getattr(std_requests, "_qtf_original_session")
+    local_calls = []
+    proxy_calls = []
+
+    monkeypatch.setattr(
+        original,
+        "request",
+        lambda self, method, url, **kwargs: local_calls.append(kwargs)
+        or (_ for _ in ()).throw(ConnectionError("blocked")),
+    )
+    monkeypatch.setattr(channel, "_auto_proxy", True)
+    monkeypatch.setattr(channel, "_auto_proxy_gateway", "gateway")
+    monkeypatch.setattr(channel, "_auto_proxy_token", "token")
+    monkeypatch.setattr(
+        channel,
+        "_auto_proxy_request",
+        lambda *args: proxy_calls.append(args) or types.SimpleNamespace(status_code=200),
+    )
+
+    response = std_requests.Session().request(
+        "GET", "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    )
+
+    assert response.status_code == 200
+    assert len(local_calls) == 1
+    assert len(proxy_calls) == 1
+
+
+def test_auto_does_not_use_gateway_when_local_request_succeeds(monkeypatch):
+    calls = _install_impersonate_with_fake_cffi(
+        monkeypatch, [RuntimeError("blocked")] * channel.IMPERSONATE_RETRY
+    )
+    original = getattr(std_requests, "_qtf_original_session")
+    monkeypatch.setattr(original, "request", lambda *args, **kwargs: "local")
+    proxy_calls = []
+    monkeypatch.setattr(channel, "_auto_proxy", True)
+    monkeypatch.setattr(
+        channel, "_auto_proxy_request", lambda *args: proxy_calls.append(args)
+    )
+
+    assert std_requests.Session().request(
+        "GET", "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    ) == "local"
+    assert proxy_calls == []
 
 
 def test_broken_cffi_session_is_not_reused(monkeypatch):

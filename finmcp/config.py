@@ -54,7 +54,7 @@ def _parse_bool(raw, default: bool) -> bool:
 # 上已经能独立取到数据。没有显式开启的部署不应该在第一次调用时就开始扣费。
 # 这一组保留 AKSHARE_PROXY_ 前缀：它们配的是第三方插件 akshare-proxy-patch，
 # 前缀就是插件的身份，去掉之后看不出这几项跟哪个组件走。
-AKSHARE_PROXY_ENABLED = _parse_bool(env("AKSHARE_PROXY_ENABLED"), False)
+AKSHARE_PROXY_ENABLED = str(env("AKSHARE_PROXY_ENABLED", "0")).strip().lower()
 AKSHARE_PROXY_IP = env("AKSHARE_PROXY_GATEWAY") or env("AKSHARE_PROXY_IP")
 AKSHARE_PROXY_PASSWORD = env("AKSHARE_PROXY_TOKEN") or env("AKSHARE_PROXY_PASSWORD")
 AKSHARE_PROXY_RETRY = int(env("AKSHARE_PROXY_RETRY", env("AKSHARE_PROXY_PORT", "30")))
@@ -485,7 +485,10 @@ def resolve_http_mode(
     if mode in ("impersonate", "direct"):
         return mode, "requested"
 
-    if not proxy_enabled:
+    proxy_value = str(proxy_enabled).strip().lower()
+    if proxy_value == "auto":
+        return "impersonate", "auto:request_fallback"
+    if proxy_value in _FALSEY:
         return "impersonate", "auto:proxy_disabled"
     if not proxy_gateway:
         return "impersonate", "auto:proxy_gateway_missing"
