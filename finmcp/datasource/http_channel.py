@@ -72,6 +72,7 @@ _auto_proxy_auth = None
 _auto_proxy_auth_at = 0.0
 _auto_proxy_failures = 0
 _auto_proxy_cooldown_until = 0.0
+_auto_proxy_active = False
 
 
 def installed_mode() -> Optional[str]:
@@ -246,7 +247,7 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
         now = time.monotonic()
         if _auto_proxy_cooldown_until > now:
             return None
-        if _auto_proxy_failures < AUTO_PROXY_AFTER_FAILURES:
+        if not _auto_proxy_active:
             return None
     try:
         import akshare_proxy_patch
@@ -292,20 +293,23 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
 
 
 def _record_auto_proxy_local_failure() -> None:
-    global _auto_proxy_failures
+    global _auto_proxy_failures, _auto_proxy_active
     if not _auto_proxy:
         return
     with _auto_proxy_lock:
         _auto_proxy_failures += 1
+        if _auto_proxy_failures >= AUTO_PROXY_AFTER_FAILURES:
+            _auto_proxy_active = True
 
 
 def _record_auto_proxy_local_success() -> None:
-    global _auto_proxy_failures, _auto_proxy_cooldown_until
+    global _auto_proxy_failures, _auto_proxy_cooldown_until, _auto_proxy_active
     if not _auto_proxy:
         return
     with _auto_proxy_lock:
         _auto_proxy_failures = 0
         _auto_proxy_cooldown_until = 0.0
+        _auto_proxy_active = False
 
 
 def _install_auth_cookies() -> bool:
@@ -708,10 +712,13 @@ def uninstall_http_channel() -> None:
         _installed_reason = None
     with _breaker_lock:
         _breaker.update(failures=0, suspended_until=0.0)
-    global _auto_proxy_auth, _auto_proxy_auth_at, _auto_proxy
+    global _auto_proxy_auth, _auto_proxy_auth_at, _auto_proxy, _auto_proxy_active, _auto_proxy_failures, _auto_proxy_cooldown_until
     _auto_proxy = False
     _auto_proxy_auth = None
     _auto_proxy_auth_at = 0.0
+    _auto_proxy_active = False
+    _auto_proxy_failures = 0
+    _auto_proxy_cooldown_until = 0.0
 
 
 __all__ = [
