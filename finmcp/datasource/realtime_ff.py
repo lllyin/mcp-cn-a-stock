@@ -888,6 +888,7 @@ async def _fetch_history_in_page(page, symbol: str) -> list:
     """
     url = _history_api_url(symbol)
     if url is None:
+        logger.debug("页面内取历史资金流跳过 %s：拼不出 secid", symbol)
         return []
     try:
         payload = await page.evaluate(
@@ -907,16 +908,35 @@ async def _fetch_history_in_page(page, symbol: str) -> list:
             [url, _HISTORY_FETCH_TIMEOUT_MS],
         )
     except Exception as error:
-        logger.debug("页面内取历史资金流失败 %s: %s", symbol, error)
+        # 这一族日志都在 DEBUG：结果本身已经由调用方的 ``outcome=...history=N``
+        # 在 INFO 记着了，这里补的是**为什么**。main.py 把 finmcp 这个 logger 固定设成
+        # DEBUG，所以它们在任何部署上都会落盘，不存在"调了级别就看不见"。
+        #
+        # 关键是**一条都不能少**：原先只有这一条打 DEBUG、另外三条直接静默 return，
+        # 于是 history=0 时查不出是"没进来补"还是"补了没补上"，而这两件事的排查方向
+        # 正好相反（AGENTS §二：每一级失败留下能定位到源的日志）。
+        logger.debug("页面内取历史资金流失败 %s: %s: %s",
+                    symbol, type(error).__name__, error)
+        return []
+    if payload is None:
+        # 页面里的 fetch 自己 catch 掉了：被拒、超时、或响应不是 2xx。
+        logger.debug("页面内取历史资金流没拿到 %s：页面里的 fetch 返回 null"
+                    "（被拒、超时或非 2xx）", symbol)
         return []
     if not isinstance(payload, dict):
+        logger.debug("页面内取历史资金流返回了意料之外的类型 %s: %s",
+                    symbol, type(payload).__name__)
         return []
     data = payload.get("data")
     klines = data.get("klines") if isinstance(data, dict) else None
     rows = rows_from_klines(klines)
-    if rows:
-        logger.info("页面内取回历史资金流 %s rows=%d（页面自己那次 JSONP 是空的）",
-                    symbol, len(rows))
+    if not rows:
+        logger.debug("页面内取历史资金流拿到空表 %s：rc=%s klines=%s",
+                    symbol, payload.get("rc"),
+                    "None" if klines is None else len(klines))
+        return []
+    logger.debug("页面内取回历史资金流 %s rows=%d（页面自己那次 JSONP 是空的）",
+                symbol, len(rows))
     return rows
 
 
@@ -968,7 +988,11 @@ async def _load_once(page, symbol: str, url: str, *, reload: bool):
 
     # 页面那张历史表是空的，就在同一个页面里自己把它取回来。理由见
     # _fetch_history_in_page：页面用 JSONP，东财拒 JSONP 放行 XHR。
+    #
+    # 进不进这个分支要留一行：``outcome=today=True history=0`` 只说得出结果，
+    # 说不出是"没进来补"还是"补了没补上"，而这两件事的排查方向完全不同。
     if parsed is not None and not parsed.history:
+        logger.debug("页面历史表为空，尝试在页面内取回 %s", symbol)
         rows = await _fetch_history_in_page(page, symbol)
         if rows:
             parsed.history = rows

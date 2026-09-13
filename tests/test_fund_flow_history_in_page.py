@@ -21,6 +21,7 @@ XHR。2026-09-12 在同一个页面、同一时刻、用页面自己那个 URL �
 
 import asyncio
 import json
+import logging
 
 import pytest
 
@@ -331,3 +332,67 @@ def test_a_pinned_date_query_is_allowed_to_use_the_page(mode, date, expected):
         fund_flow_page=(mode == "full" or bool(date)),
     )
     assert requirements.fund_flow_page is expected
+
+
+# --- 失败必须留痕 -----------------------------------------------------------
+#
+# 2026-09-13 线上踩到：页面历史表空了 10 次，而这条补空表的路一条日志都没留，
+# 于是查不出是"没进来补"还是"补了没补上"——两者排查方向完全相反。
+# 原因是这个函数有三条静默 return 加一条只打 DEBUG 的。AGENTS §二：每一级失败
+# 都要留下能定位到源的日志。
+#
+# 级别是 DEBUG：结果由调用方的 outcome=...history=N 在 INFO 记着，这里补的是
+# **为什么**。main.py 把 finmcp 这个 logger 固定设成 DEBUG，所以照样会落盘。
+
+
+class _EvalPage:
+    """按给定值回应 page.evaluate；给异常就抛。"""
+
+    def __init__(self, result):
+        self.result = result
+        self.evaluated = 0
+
+    async def evaluate(self, *_args, **_kwargs):
+        self.evaluated += 1
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+@pytest.mark.parametrize("symbol,result,marker", [
+    ("ABC",       None,                          "拼不出 secid"),
+    ("SH600519",  RuntimeError("注入：页面没了"), "失败"),
+    ("SH600519",  None,                          "fetch 返回 null"),
+    ("SH600519",  "一个字符串",                   "意料之外的类型"),
+    ("SH600519",  {"rc": 1, "data": None},       "空表"),
+])
+def test_every_failure_path_says_why(symbol, result, marker, caplog):
+    with caplog.at_level(logging.DEBUG, logger="finmcp"):
+        rows = asyncio.run(
+            realtime_ff._fetch_history_in_page(_EvalPage(result), symbol))
+    assert rows == []
+    assert marker in caplog.text, f"这条失败路径没留痕：{marker}"
+
+
+def test_the_success_path_says_how_many(caplog):
+    page = _EvalPage(_payload(REAL_KLINES))
+    with caplog.at_level(logging.DEBUG, logger="finmcp"):
+        rows = asyncio.run(realtime_ff._fetch_history_in_page(page, "SH600519"))
+    assert rows
+    assert "页面内取回历史资金流" in caplog.text and f"rows={len(rows)}" in caplog.text
+
+
+def test_entering_the_rescue_branch_is_visible(quiet_waits, caplog):
+    """光看 outcome=history=0 分不出"没进来补"和"补了没补上"，所以入口也要留一行。"""
+    page = _LoadPage(_page_html(with_history=False), _payload(REAL_KLINES))
+    with caplog.at_level(logging.DEBUG, logger="finmcp"):
+        asyncio.run(realtime_ff._load_once(page, "SZ300408", "https://x/", reload=False))
+    assert "页面历史表为空，尝试在页面内取回" in caplog.text
+
+
+def test_a_filled_table_stays_silent(quiet_waits, caplog):
+    """页面自己填上了就别喊——这条日志只在真的走了补救路径时才该出现。"""
+    page = _LoadPage(_page_html(with_history=True), _payload(REAL_KLINES))
+    with caplog.at_level(logging.DEBUG, logger="finmcp"):
+        asyncio.run(realtime_ff._load_once(page, "SZ300408", "https://x/", reload=False))
+    assert "页面历史表为空" not in caplog.text
