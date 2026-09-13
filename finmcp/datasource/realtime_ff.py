@@ -892,15 +892,26 @@ async def _fetch_history_in_page(page, symbol: str) -> list:
         return []
     try:
         payload = await page.evaluate(
+            # 失败要带着**原因**回来，不能塌成 null。三种失败的处置完全不同：
+            #   TypeError: Failed to fetch  连接被拒或缺 CORS 头 —— 这一维没救，换源
+            #   AbortError                  超时 —— 预算给小了，调 _HISTORY_FETCH_TIMEOUT_MS
+            #   SyntaxError: Unexpected '<' 回的是 HTML 不是 JSON —— 多半是滑块/拦截页
+            #   HTTP 4xx/5xx                请求到了但被拒 —— 看状态码和 ut/secid
+            # 塌成 null 的代价是实测过的：线上 10/10 失败，日志只说得出"没拿到"。
+            # 顺带带上 ms：区分"立刻被拒"和"耗到超时"，光看状态码看不出来。
             """async ([u, ms]) => {
                 const ctrl = new AbortController();
                 const timer = setTimeout(() => ctrl.abort(), ms);
+                const t0 = Date.now();
                 try {
                     const r = await fetch(u, {credentials: 'include', signal: ctrl.signal});
-                    if (!r.ok) return null;
+                    if (!r.ok) {
+                        return {__fail: 'http', status: r.status, ms: Date.now() - t0};
+                    }
                     return await r.json();
                 } catch (e) {
-                    return null;
+                    return {__fail: 'throw', name: e && e.name ? e.name : 'Error',
+                            message: String((e && e.message) || e), ms: Date.now() - t0};
                 } finally {
                     clearTimeout(timer);
                 }
@@ -919,9 +930,18 @@ async def _fetch_history_in_page(page, symbol: str) -> list:
                     symbol, type(error).__name__, error)
         return []
     if payload is None:
-        # 页面里的 fetch 自己 catch 掉了：被拒、超时、或响应不是 2xx。
-        logger.debug("页面内取历史资金流没拿到 %s：页面里的 fetch 返回 null"
-                    "（被拒、超时或非 2xx）", symbol)
+        # 理论上到不了这里（JS 的每条路径都带原因返回），留着是因为
+        # page.evaluate 的返回值经过一次 JSON 通道，塞进来个 null 也不该崩。
+        logger.debug("页面内取历史资金流没拿到 %s：页面返回 null", symbol)
+        return []
+    if isinstance(payload, dict) and payload.get("__fail"):
+        if payload["__fail"] == "http":
+            logger.debug("页面内取历史资金流被拒 %s：HTTP %s，耗时 %sms",
+                        symbol, payload.get("status"), payload.get("ms"))
+        else:
+            logger.debug("页面内取历史资金流报错 %s：%s: %s，耗时 %sms",
+                        symbol, payload.get("name"), payload.get("message"),
+                        payload.get("ms"))
         return []
     if not isinstance(payload, dict):
         logger.debug("页面内取历史资金流返回了意料之外的类型 %s: %s",

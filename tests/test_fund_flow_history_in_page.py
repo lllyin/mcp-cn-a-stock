@@ -22,6 +22,7 @@ XHR。2026-09-12 在同一个页面、同一时刻、用页面自己那个 URL �
 import asyncio
 import json
 import logging
+import re
 
 import pytest
 
@@ -362,9 +363,15 @@ class _EvalPage:
 @pytest.mark.parametrize("symbol,result,marker", [
     ("ABC",       None,                          "拼不出 secid"),
     ("SH600519",  RuntimeError("注入：页面没了"), "失败"),
-    ("SH600519",  None,                          "fetch 返回 null"),
+    ("SH600519",  None,                          "页面返回 null"),
     ("SH600519",  "一个字符串",                   "意料之外的类型"),
     ("SH600519",  {"rc": 1, "data": None},       "空表"),
+    # 三种失败原因必须各自可辨：处置完全不同（换源 / 调预算 / 查 ut 和 secid）。
+    ("SH600519",  {"__fail": "http", "status": 403, "ms": 12},       "HTTP 403"),
+    ("SH600519",  {"__fail": "throw", "name": "TypeError",
+                   "message": "Failed to fetch", "ms": 47},          "TypeError"),
+    ("SH600519",  {"__fail": "throw", "name": "AbortError",
+                   "message": "aborted", "ms": 8001},                "AbortError"),
 ])
 def test_every_failure_path_says_why(symbol, result, marker, caplog):
     with caplog.at_level(logging.DEBUG, logger="finmcp"):
@@ -396,3 +403,34 @@ def test_a_filled_table_stays_silent(quiet_waits, caplog):
     with caplog.at_level(logging.DEBUG, logger="finmcp"):
         asyncio.run(realtime_ff._load_once(page, "SZ300408", "https://x/", reload=False))
     assert "页面历史表为空" not in caplog.text
+
+
+def test_the_browser_side_script_always_returns_a_reason():
+    """守那段 JS 的契约：失败路径必须带原因回来，不能 return null。
+
+    上面那些用例都是直接喂 Python 侧结构、从不执行 JS，所以 JS 里悄悄改回
+    ``return null`` 它们一条都发现不了——而 JS 恰恰是会静默退化的那半。这里退而
+    求其次断言源码形态；**运行时行为在真浏览器里验过一次**（2026-09-13）：
+    连不上的主机给 ``TypeError: Failed to fetch``、404 给 ``{__fail:'http',status:404}``、
+    响应是 HTML 时给 ``SyntaxError: Unexpected token '<'``（滑块/拦截页就是这形状）。
+    """
+    import inspect
+
+    source = inspect.getsource(realtime_ff._fetch_history_in_page)
+    script = source.split('"""async ([u, ms]) => {', 1)[1].split('}"""', 1)[0]
+
+    assert "__fail: 'http'" in script and "status: r.status" in script
+    assert "__fail: 'throw'" in script and "e.name" in script
+    assert "ms: Date.now() - t0" in script, "要带耗时，才分得出立刻被拒和耗到超时"
+    # 失败路径一个 bare null 都不许留——那正是这次线上查不出原因的成因。
+    assert "return null" not in script
+
+
+def test_the_python_side_understands_every_reason_the_script_can_send():
+    """JS 能发出的每一种 __fail，Python 侧都要有对应的日志分支。"""
+    import inspect
+
+    source = inspect.getsource(realtime_ff._fetch_history_in_page)
+    script = source.split('"""async ([u, ms]) => {', 1)[1].split('}"""', 1)[0]
+    kinds = set(re.findall(r"__fail: '([a-z]+)'", script))
+    assert kinds == {"http", "throw"}, f"JS 多出了没人处理的失败种类：{kinds}"
