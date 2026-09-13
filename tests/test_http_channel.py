@@ -333,7 +333,7 @@ def test_auto_proxy_is_bounded_by_failure_threshold_and_cooldown(monkeypatch):
     channel._auto_proxy_token = "token"
     channel._auto_proxy_failures = 0
     channel._auto_proxy_cooldown_until = 0.0
-    channel._auto_proxy_active = False
+    channel._auto_proxy_fallback_active = False
     auth_calls = []
 
     fake_patch = types.SimpleNamespace(
@@ -348,7 +348,7 @@ def test_auto_proxy_is_bounded_by_failure_threshold_and_cooldown(monkeypatch):
     assert auth_calls == []
     for _ in range(channel.AUTO_PROXY_AFTER_FAILURES):
         channel._record_auto_proxy_local_failure()
-    assert channel._auto_proxy_active is True
+    assert channel._auto_proxy_fallback_active is True
     assert channel._auto_proxy_request(original, object(), "GET", "https://push2his.eastmoney.com/x", {}) is None
     assert len(auth_calls) == 1
     assert channel._auto_proxy_cooldown_until > channel.time.monotonic()
