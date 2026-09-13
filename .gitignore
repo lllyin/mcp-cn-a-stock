@@ -16,6 +16,10 @@ wheels/
 log.txt
 /logs/
 /.runtime/
+# scripts/rsync-logs.sh 从部署机同步下来的日志和验证报告。
+# 和 /logs/ 分开放：那个是本机服务正在写的，两台机器的记录混在一起之后
+# health 算出来的可用率和耗时就没有意义了。
+/.server-logs/
 # 基线（verification/baseline/）要跟着代码走，每次跑出来的报告不用
 /verification/reports/
 /benchmarks/
