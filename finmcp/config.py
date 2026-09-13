@@ -63,6 +63,14 @@ AKSHARE_PROXY_RETRY = int(env("AKSHARE_PROXY_RETRY", env("AKSHARE_PROXY_PORT", "
 AKSHARE_PROXY_PORT = AKSHARE_PROXY_RETRY
 AUTO_PROXY_AFTER_FAILURES = max(1, int(env("AUTO_PROXY_AFTER_FAILURES", "3")))
 AUTO_PROXY_COOLDOWN_SECONDS = max(1.0, float(env("AUTO_PROXY_COOLDOWN_SECONDS", "300")))
+# 网关数据失败（拿到出口但请求没成）大多坏在出口本身，换一个出口常就好了：
+# 失败时作废缓存的认证让下一次立刻换出口，冷却也只用短的。认证失败（网关本身
+# 没出口可给）才用长的 AUTO_PROXY_COOLDOWN_SECONDS。
+AUTO_PROXY_DATA_COOLDOWN_SECONDS = max(1.0, float(env("AUTO_PROXY_DATA_COOLDOWN_SECONDS", "30")))
+# 恢复迟滞：active 期间本地成功要按间隔攒够 N 次才退出网关回退。一次偶然成功
+# 立即退出，会让状态在"激活/恢复"之间来回抖，抖回去的代价是再攒一轮失败。
+AUTO_PROXY_RECOVERY_PROBES = max(1, int(env("AUTO_PROXY_RECOVERY_PROBES", "3")))
+AUTO_PROXY_RECOVERY_INTERVAL_SECONDS = max(1.0, float(env("AUTO_PROXY_RECOVERY_INTERVAL_SECONDS", "60")))
 
 # --- Outbound HTTP channel (finmcp/datasource/http_channel.py) ---
 # Some upstream quote hosts drop connections from plain HTTP clients, so requests

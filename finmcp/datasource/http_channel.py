@@ -29,6 +29,9 @@ from ..config import (
     IMPERSONATE_TIMEOUT_SECONDS,
     AUTO_PROXY_AFTER_FAILURES,
     AUTO_PROXY_COOLDOWN_SECONDS,
+    AUTO_PROXY_DATA_COOLDOWN_SECONDS,
+    AUTO_PROXY_RECOVERY_INTERVAL_SECONDS,
+    AUTO_PROXY_RECOVERY_PROBES,
     HttpModeError,
     resolve_http_mode,
 )
@@ -75,7 +78,8 @@ _auto_proxy_states = {}
 
 def _auto_proxy_state(host):
     return _auto_proxy_states.setdefault(
-        host, {"failures": 0, "active": False, "cooldown_until": 0.0}
+        host, {"failures": 0, "active": False, "cooldown_until": 0.0,
+               "local_successes": 0, "last_probe_at": 0.0}
     )
 
 
@@ -284,6 +288,11 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
         retry_kwargs["headers"] = headers
         retry_kwargs["proxies"] = {"http": auth["proxy"], "https": auth["proxy"]}
         retry_kwargs.pop("impersonate", None)
+        request_id, tool, symbol = log_context()
+        logger.warning(
+            "auto_proxy_attempt host=%s request_id=%s tool=%s symbol=%s",
+            host, request_id, tool, symbol,
+        )
         response = base_cls.request(session, method, url, **retry_kwargs)
         if getattr(response, "status_code", None) == 200:
             with _auto_proxy_lock:
@@ -291,13 +300,23 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
                 state["failures"] = 0
             logger.info("Eastmoney request recovered through proxy host=%s", host)
             return response
+        # 非 200 说明出口能连但请求没成：多半是这个出口本身待遇差，作废缓存的
+        # 认证让下一次换新出口，冷却也用短的——等 300 秒没有意义。
+        logger.warning(
+            "auto_proxy_failure host=%s status=%s", host, getattr(response, "status_code", None)
+        )
     except Exception as exc:  # pragma: no cover - provider/network dependent
         logger.warning("auto_proxy_failure host=%s error=%s", host, str(exc)[:160])
     with _auto_proxy_lock:
         state = _auto_proxy_state(host)
-        state["cooldown_until"] = time.monotonic() + AUTO_PROXY_COOLDOWN_SECONDS
+        state["cooldown_until"] = time.monotonic() + AUTO_PROXY_DATA_COOLDOWN_SECONDS
         state["failures"] = 0
-    logger.warning("auto_proxy_state host=%s state=cooldown seconds=%s", host, AUTO_PROXY_COOLDOWN_SECONDS)
+        _auto_proxy_auth = None  # 坏出口轮换：下一次重新认证，大概率换一个出口
+        _auto_proxy_auth_at = 0.0
+    logger.warning(
+        "auto_proxy_state host=%s state=cooldown seconds=%s reason=data_failure",
+        host, AUTO_PROXY_DATA_COOLDOWN_SECONDS,
+    )
     return None
 
 
@@ -308,6 +327,9 @@ def _record_auto_proxy_local_failure(url) -> None:
         host = (urlsplit(url).hostname or "?").lower()
         state = _auto_proxy_state(host)
         state["failures"] += 1
+        if state["active"]:
+            # 本地还在失败：恢复探测的进度作废，从头再攒
+            state["local_successes"] = 0
         if state["failures"] >= AUTO_PROXY_AFTER_FAILURES and not state["active"]:
             state["active"] = True
             logger.warning("auto_proxy_state host=%s state=active failures=%s", host, state["failures"])
@@ -319,11 +341,31 @@ def _record_auto_proxy_local_success(url) -> None:
     with _auto_proxy_lock:
         host = (urlsplit(url).hostname or "?").lower()
         state = _auto_proxy_state(host)
-        if state["active"]:
-            logger.info("auto_proxy_state host=%s state=local_recovered", host)
-        state["failures"] = 0
-        state["cooldown_until"] = 0.0
-        state["active"] = False
+        if not state["active"]:
+            state["failures"] = 0
+            state["cooldown_until"] = 0.0
+            return
+        # 迟滞恢复：active 期间本地成功要按间隔攒够 N 次才退出网关回退。
+        # 一次偶然成功立即退出，会让状态在"激活/恢复"之间来回抖，抖回去的
+        # 代价是再攒一轮失败。间隔内的成功不累计。
+        now = time.monotonic()
+        if now - state["last_probe_at"] < AUTO_PROXY_RECOVERY_INTERVAL_SECONDS:
+            return
+        state["last_probe_at"] = now
+        state["local_successes"] += 1
+        if state["local_successes"] >= AUTO_PROXY_RECOVERY_PROBES:
+            logger.info(
+                "auto_proxy_state host=%s state=recovered successes=%s",
+                host, state["local_successes"],
+            )
+            state["active"] = False
+            state["local_successes"] = 0
+            state["cooldown_until"] = 0.0
+        else:
+            logger.info(
+                "auto_proxy_state host=%s state=recovery_probe successes=%s/%s",
+                host, state["local_successes"], AUTO_PROXY_RECOVERY_PROBES,
+            )
 
 
 def _install_auth_cookies() -> bool:
@@ -541,7 +583,7 @@ def _install_impersonate(
                         method, url, **attempt_kwargs
                     )
                     if response.status_code == 200:
-                        _record_auto_proxy_local_success()
+                        _record_auto_proxy_local_success(url)
                         _record_impersonation(success=True)
                         if track_auth:
                             _note_auth_outcome(url, success=True)

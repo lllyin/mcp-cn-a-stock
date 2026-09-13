@@ -281,6 +281,9 @@ mcporter call cn-stock market_events \
 | `AKSHARE_PROXY_RETRY` | 网关请求的失败重试次数（旧名 `AKSHARE_PROXY_PORT` 仍然认） | 正整数（默认 `30`） |
 | `AUTO_PROXY_AFTER_FAILURES` | `AKSHARE_PROXY_ENABLED=auto` 时，触发网关回退前的连续本地失败次数 | 正整数（默认 `3`） |
 | `AUTO_PROXY_COOLDOWN_SECONDS` | `auto` 模式网关回退失败后的暂停时长 | 秒（默认 `300`） |
+| `AUTO_PROXY_DATA_COOLDOWN_SECONDS` | 网关数据失败（出口已拿到、请求没成）后的暂停秒数；失败同时作废缓存的认证，下一次尝试换新出口 | 秒（默认 `30`） |
+| `AUTO_PROXY_RECOVERY_PROBES` | 网关回退激活期间，本地成功要按间隔攒够多少次才退出回退（防一次偶然成功来回抖动） | 次数（默认 `3`） |
+| `AUTO_PROXY_RECOVERY_INTERVAL_SECONDS` | 相邻两次恢复探测的最小间隔秒数；间隔内的本地成功不累计 | 秒（默认 `60`） |
 
 从旧版本升级时注意：这个开关以前默认开启，现在需要显式写 `AKSHARE_PROXY_ENABLED=1`
 才会继续走网关，否则自动降级到 `impersonate`。

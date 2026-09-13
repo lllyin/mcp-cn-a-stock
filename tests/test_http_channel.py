@@ -2,6 +2,7 @@
 
 import builtins
 import importlib
+import logging
 import types
 
 import pytest
@@ -762,3 +763,127 @@ def test_auth_host_preserves_decorative_headers(monkeypatch):
     assert sent["User-Agent"] == channel._AUTH_UA
     assert sent["Referer"] == "https://x/"
     assert sent["Accept"] == "application/json"
+
+
+class TestAutoProxyRecoveryAndRotation:
+    """恢复迟滞与坏出口轮换。
+
+    2026-09-13 上游环境实测：网关能救 kline（10 次恢复），但坏出口会让请求
+    白付一次认证；而旧版"一次本地成功立即退出回退"会让状态来回抖。
+    """
+
+    URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+
+    def _activate(self):
+        channel._auto_proxy = True
+        channel._auto_proxy_states.clear()
+        for _ in range(channel.AUTO_PROXY_AFTER_FAILURES):
+            channel._record_auto_proxy_local_failure(self.URL)
+        return channel._auto_proxy_states["push2his.eastmoney.com"]
+
+    def test_recovery_needs_spaced_consecutive_successes(self):
+        state = self._activate()
+        channel._record_auto_proxy_local_success(self.URL)
+        assert state["active"] is True and state["local_successes"] == 1
+        channel._record_auto_proxy_local_success(self.URL)  # 间隔内：不累计
+        assert state["local_successes"] == 1
+        state["last_probe_at"] -= channel.AUTO_PROXY_RECOVERY_INTERVAL_SECONDS + 1
+        channel._record_auto_proxy_local_success(self.URL)
+        assert state["local_successes"] == 2
+        state["last_probe_at"] -= channel.AUTO_PROXY_RECOVERY_INTERVAL_SECONDS + 1
+        channel._record_auto_proxy_local_success(self.URL)
+        assert state["active"] is False and state["local_successes"] == 0
+
+    def test_a_local_failure_during_active_resets_progress(self):
+        state = self._activate()
+        channel._record_auto_proxy_local_success(self.URL)
+        assert state["local_successes"] == 1
+        channel._record_auto_proxy_local_failure(self.URL)
+        assert state["local_successes"] == 0 and state["active"] is True
+
+    def test_a_gateway_data_failure_rotates_the_exit(self, monkeypatch):
+        """出口拿到了但请求没成 → 作废认证换新出口 + 短冷却，不是 300 秒。"""
+        channel._auto_proxy = True
+        channel._auto_proxy_gateway = "gateway"
+        channel._auto_proxy_token = "token"
+        channel._auto_proxy_states.clear()
+        channel._auto_proxy_state("push2his.eastmoney.com")["active"] = True
+        channel._auto_proxy_auth = {"proxy": "http://stale", "cookie": "nid18=stale"}
+        channel._auto_proxy_auth_at = channel.time.monotonic()
+        auth_calls = []
+        fake_patch = types.SimpleNamespace(
+            get_auth_config_with_cache=lambda *args: auth_calls.append(args)
+            or {"proxy": "http://fresh", "cookie": "nid18=fresh"}
+        )
+        monkeypatch.setitem(__import__("sys").modules, "akshare_proxy_patch", fake_patch)
+        original = getattr(std_requests, "_qtf_original_session", std_requests.Session)
+        monkeypatch.setattr(
+            original, "request",
+            lambda *args, **kwargs: types.SimpleNamespace(status_code=503),
+        )
+        assert channel._auto_proxy_request(
+            original, object(), "GET", self.URL, {}
+        ) is None
+        assert channel._auto_proxy_auth is None  # 坏出口已作废
+        state = channel._auto_proxy_states["push2his.eastmoney.com"]
+        assert state["cooldown_until"] <= channel.time.monotonic() + channel.AUTO_PROXY_DATA_COOLDOWN_SECONDS + 1
+
+    def test_a_gateway_success_keeps_the_cached_auth(self, monkeypatch):
+        channel._auto_proxy = True
+        channel._auto_proxy_gateway = "gateway"
+        channel._auto_proxy_token = "token"
+        channel._auto_proxy_states.clear()
+        channel._auto_proxy_state("push2his.eastmoney.com")["active"] = True
+        good_auth = {"proxy": "http://good", "cookie": "nid18=good"}
+        channel._auto_proxy_auth = good_auth
+        channel._auto_proxy_auth_at = channel.time.monotonic()
+        fake_patch = types.SimpleNamespace(
+            get_auth_config_with_cache=lambda *args: pytest.fail("好出口不该重新认证")
+        )
+        monkeypatch.setitem(__import__("sys").modules, "akshare_proxy_patch", fake_patch)
+        original = getattr(std_requests, "_qtf_original_session", std_requests.Session)
+        monkeypatch.setattr(
+            original, "request",
+            lambda *args, **kwargs: types.SimpleNamespace(status_code=200),
+        )
+        response = channel._auto_proxy_request(original, object(), "GET", self.URL, {})
+        assert response.status_code == 200
+        assert channel._auto_proxy_auth is good_auth  # 好出口继续复用
+
+    def test_an_attempt_is_logged_with_request_context(self, monkeypatch, caplog):
+        channel._auto_proxy = True
+        channel._auto_proxy_gateway = "gateway"
+        channel._auto_proxy_token = "token"
+        channel._auto_proxy_states.clear()
+        state = channel._auto_proxy_state("push2his.eastmoney.com")
+        state["active"] = True
+        fake_patch = types.SimpleNamespace(
+            get_auth_config_with_cache=lambda *args: {"proxy": "http://p", "cookie": "c"}
+        )
+        monkeypatch.setitem(__import__("sys").modules, "akshare_proxy_patch", fake_patch)
+        original = getattr(std_requests, "_qtf_original_session", std_requests.Session)
+        monkeypatch.setattr(
+            original, "request",
+            lambda *args, **kwargs: types.SimpleNamespace(status_code=200),
+        )
+        with caplog.at_level(logging.WARNING, logger="finmcp"):
+            channel._auto_proxy_request(original, object(), "GET", self.URL, {})
+        assert any(
+            "auto_proxy_attempt host=push2his.eastmoney.com" in r.message
+            for r in caplog.records
+        )
+
+    def test_auto_proxy_enabled_does_not_break_a_local_success(self, monkeypatch):
+        """回归钉子：per-host 重构曾漏改成功路径的无参调用，_auto_proxy=True 时
+        每次伪装成功都 TypeError，被重试循环吞掉后整条链降级。"""
+        channel._auto_proxy = True
+        channel._auto_proxy_states.clear()
+        calls = _install_impersonate_with_fake_cffi(monkeypatch, [200])
+        original = getattr(std_requests, "_qtf_original_session")
+        monkeypatch.setattr(
+            original, "request",
+            lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionError("blocked")),
+        )
+        response = std_requests.Session().request("GET", self.URL)
+        assert response.status_code == 200
+        assert len(calls) == 1  # 一次成功，不重试
