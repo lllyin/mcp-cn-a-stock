@@ -960,12 +960,23 @@ def _classify(document: str, diffs: list[LineDiff]) -> None:
             diff.note = reason
 
 
+_DEGRADED_MARKER_TEXTS = frozenset(_contract.DEGRADED_MARKERS) | frozenset(
+    _contract.NOT_APPLICABLE_MARKERS
+)
+
+
 def _collapse_lost_sections(diffs: list[LineDiff]) -> list[LineDiff]:
     """整段消失是一条事实，不是 N 行差异。
 
     full 的历史资金流向是一张 60 行的表：拿不到时逐行列出来就是 62 行"缺失"，
     把同一份报告里别的差异全挤出视野，而要知道的只是"这一段没了"。
     段落里只要有一行是新增或值变化，就不折叠——那说明段落还在，是内容变了。
+
+    一个例外：段落丢了行、但新增的内容只是已知的降级提示（如钉日期重放时
+    资金流历史没取到、退回"暂不展示"一行）——这是**重放环境没取到数据**，
+    不是数字漂了，整段归"缺数据"。2026-09-13 夜间实测：当前环境 push2his 被持续
+    拒绝，两份 brief 基线的 8 个标的文档全部因此误判成漂移，回归分从 100%
+    掉到 72.4%，而数据本身一字没错。
     """
     by_section: dict[str, list[LineDiff]] = {}
     for diff in diffs:
@@ -977,8 +988,20 @@ def _collapse_lost_sections(diffs: list[LineDiff]) -> list[LineDiff]:
                 LineDiff("缺失", f"{section} › 整段不见了（{len(members)} 行）",
                          old=members[0].old)
             )
-        else:
-            collapsed.extend(members)
+            continue
+        lost = [d for d in members if d.kind == "缺失"]
+        gained = [d for d in members if d.kind == "新增"]
+        if len(lost) >= 5 and gained and all(
+            any(marker in d.key for marker in _DEGRADED_MARKER_TEXTS)
+            for d in gained
+        ):
+            collapsed.append(
+                LineDiff("缺失", f"{section} › 整段没取到（{len(lost)} 行，"
+                                 "重放环境未取到该源，退回降级提示）",
+                         old=lost[0].old)
+            )
+            continue
+        collapsed.extend(members)
     return collapsed
 
 
