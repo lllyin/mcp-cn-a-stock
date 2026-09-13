@@ -53,8 +53,13 @@ usage() {
   CN_STOCK_REMOTE_DIR  --remote-dir 的默认值
 
 同步到:
-  <仓库根>/.server-logs/logs/      远端的服务日志（含 start.sh 的历次归档）
-  <仓库根>/.server-logs/reports/   远端的 verification/reports/
+  <仓库根>/.server-logs/logs/           远端的服务日志（含 start.sh 的历次归档）
+  <仓库根>/.server-logs/reports/        远端的 verification/reports/
+  <仓库根>/.server-logs/probe-tuning/   远端的探针调优结果（facts/browser/推荐值）
+
+  probe-tuning 只同步分析产物，缓存目录（arm-*/cache、verify-cache）与凭据文件
+  （.runtime/eastmoney-auth.json）明确排除：前者大且离开那台机器无意义，后者
+  是可用凭据，不该离开它所属的环境。
 EOF
 }
 
@@ -100,10 +105,12 @@ cleanup() {
 trap cleanup EXIT
 
 sync_directory() {
-    local label="$1" remote_dir="$2" local_dir="$3"
+    local label="$1" remote_dir="$2" local_dir="$3" excludes="${4:-}"
     mkdir -p "$local_dir"
 
     local -a opts=(-avz --human-readable --partial)
+    local ex
+    for ex in $excludes; do opts+=(--exclude="$ex"); done
     [ "$DELETE" -eq 1 ] && opts+=(--delete)
     [ "$DRY_RUN" -eq 1 ] && opts+=(--dry-run)
 
@@ -144,6 +151,9 @@ failed=0
 sync_directory "服务日志" "$REMOTE_DIR/logs/" "$LOCAL_ROOT/logs/" || failed=$((failed + 1))
 echo ""
 sync_directory "验证报告" "$REMOTE_DIR/verification/reports/" "$LOCAL_ROOT/reports/" || failed=$((failed + 1))
+echo ""
+sync_directory "探针调优结果" "$REMOTE_DIR/.runtime/probe-tuning/" "$LOCAL_ROOT/probe-tuning/" \
+    "cache verify-cache *.lock" || failed=$((failed + 1))
 
 echo ""
 if [ "$failed" -gt 0 ]; then
