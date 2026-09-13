@@ -219,6 +219,26 @@ def _tonghuashun_browser_args() -> list[str]:
     return args
 
 
+async def _goto_with_retry(page, url: str, *, attempts: int = 2,
+                           timeout: int = 30000, gap_ms: int = 1000):
+    """带一次即时重试的导航。
+
+    同花顺的反爬挑战对冷启动 profile 偶发直接中止导航（net::ERR_ABORTED，
+    2026-09-13 实测：一次中止 → 300 秒冷却 → market_breadth 停摆整个验证
+    窗口）。瞬时中止当场重试一次就能消化，不该直接进冷却；连续两次失败
+    才视为真实拒绝，交给调用方的冷却。
+    """
+    last_error: Exception = RuntimeError("导航未执行")
+    for attempt in range(attempts):
+        try:
+            return await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - Playwright 各类导航错误形态不一
+            last_error = exc
+            if attempt + 1 < attempts:
+                await page.wait_for_timeout(gap_ms)
+    raise last_error
+
+
 class TonghuashunPlaywrightProvider:
     name = "tonghuashun_web"
     page_url = "https://q.10jqka.com.cn/"
@@ -345,11 +365,7 @@ class TonghuashunPlaywrightProvider:
             try:
                 context = await browser.new_context(java_script_enabled=True, bypass_csp=True)
                 page = await context.new_page()
-                navigation = await page.goto(
-                    self.page_url,
-                    wait_until="domcontentloaded",
-                    timeout=30000,
-                )
+                navigation = await _goto_with_retry(page, self.page_url)
                 if navigation is None or navigation.status != 200:
                     status = navigation.status if navigation else "unknown"
                     raise RuntimeError(f"同花顺页面返回 HTTP {status}")
