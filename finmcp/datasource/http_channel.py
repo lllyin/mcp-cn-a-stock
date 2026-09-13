@@ -27,6 +27,8 @@ from ..config import (
     IMPERSONATE_SUSPEND_AFTER_FAILURES,
     IMPERSONATE_SUSPEND_SECONDS,
     IMPERSONATE_TIMEOUT_SECONDS,
+    AUTO_PROXY_AFTER_FAILURES,
+    AUTO_PROXY_COOLDOWN_SECONDS,
     HttpModeError,
     resolve_http_mode,
 )
@@ -68,6 +70,8 @@ _auto_proxy_token = None
 _auto_proxy_lock = threading.Lock()
 _auto_proxy_auth = None
 _auto_proxy_auth_at = 0.0
+_auto_proxy_failures = 0
+_auto_proxy_cooldown_until = 0.0
 
 
 def installed_mode() -> Optional[str]:
@@ -235,8 +239,15 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
     impersonated request naturally returns the service to its normal path.
     """
     global _auto_proxy_auth, _auto_proxy_auth_at
+    global _auto_proxy_failures, _auto_proxy_cooldown_until
     if not _auto_proxy or not _auto_proxy_gateway or not _auto_proxy_token:
         return None
+    with _auto_proxy_lock:
+        now = time.monotonic()
+        if _auto_proxy_cooldown_until > now:
+            return None
+        if _auto_proxy_failures < AUTO_PROXY_AFTER_FAILURES:
+            return None
     try:
         import akshare_proxy_patch
         now = time.monotonic()
@@ -264,11 +275,33 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
         retry_kwargs.pop("impersonate", None)
         response = base_cls.request(session, method, url, **retry_kwargs)
         if getattr(response, "status_code", None) == 200:
+            with _auto_proxy_lock:
+                _auto_proxy_failures = 0
             logger.info("Eastmoney request recovered through proxy host=%s", urlsplit(url).hostname)
             return response
     except Exception as exc:  # pragma: no cover - provider/network dependent
         logger.debug("Eastmoney proxy fallback failed host=%s error=%s", urlsplit(url).hostname, str(exc)[:160])
+    with _auto_proxy_lock:
+        _auto_proxy_cooldown_until = time.monotonic() + AUTO_PROXY_COOLDOWN_SECONDS
+        _auto_proxy_failures = 0
     return None
+
+
+def _record_auto_proxy_local_failure() -> None:
+    global _auto_proxy_failures
+    if not _auto_proxy:
+        return
+    with _auto_proxy_lock:
+        _auto_proxy_failures += 1
+
+
+def _record_auto_proxy_local_success() -> None:
+    global _auto_proxy_failures, _auto_proxy_cooldown_until
+    if not _auto_proxy:
+        return
+    with _auto_proxy_lock:
+        _auto_proxy_failures = 0
+        _auto_proxy_cooldown_until = 0.0
 
 
 def _install_auth_cookies() -> bool:
@@ -465,6 +498,7 @@ def _install_impersonate(
                         track_auth=track_auth,
                     )
                 except Exception:
+                    _record_auto_proxy_local_failure()
                     proxy_response = _auto_proxy_request(
                         original_session_cls, self, method, url, kwargs
                     )
@@ -485,6 +519,7 @@ def _install_impersonate(
                         method, url, **attempt_kwargs
                     )
                     if response.status_code == 200:
+                        _record_auto_proxy_local_success()
                         _record_impersonation(success=True)
                         if track_auth:
                             _note_auth_outcome(url, success=True)
@@ -526,6 +561,7 @@ def _install_impersonate(
                     track_auth=track_auth,
                 )
             except Exception:
+                _record_auto_proxy_local_failure()
                 proxy_response = _auto_proxy_request(
                     original_session_cls, self, method, url, kwargs
                 )

@@ -279,6 +279,8 @@ mcporter call cn-stock market_events \
 | `AKSHARE_PROXY_GATEWAY` | 授权网关地址，不含协议和端口 | 主机名或 IP（默认空） |
 | `AKSHARE_PROXY_TOKEN` | 网关访问令牌 | 字符串（默认空） |
 | `AKSHARE_PROXY_RETRY` | 网关请求的失败重试次数（旧名 `AKSHARE_PROXY_PORT` 仍然认） | 正整数（默认 `30`） |
+| `AUTO_PROXY_AFTER_FAILURES` | `AKSHARE_PROXY_ENABLED=auto` 时，触发网关回退前的连续本地失败次数 | 正整数（默认 `3`） |
+| `AUTO_PROXY_COOLDOWN_SECONDS` | `auto` 模式网关回退失败后的暂停时长 | 秒（默认 `300`） |
 
 从旧版本升级时注意：这个开关以前默认开启，现在需要显式写 `AKSHARE_PROXY_ENABLED=1`
 才会继续走网关，否则自动降级到 `impersonate`。

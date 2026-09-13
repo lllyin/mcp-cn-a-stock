@@ -61,6 +61,8 @@ AKSHARE_PROXY_RETRY = int(env("AKSHARE_PROXY_RETRY", env("AKSHARE_PROXY_PORT", "
 # Backward-compatible alias. Historically this variable was named PORT, but
 # akshare-proxy-patch treats the third argument as retry count.
 AKSHARE_PROXY_PORT = AKSHARE_PROXY_RETRY
+AUTO_PROXY_AFTER_FAILURES = max(1, int(env("AUTO_PROXY_AFTER_FAILURES", "3")))
+AUTO_PROXY_COOLDOWN_SECONDS = max(1.0, float(env("AUTO_PROXY_COOLDOWN_SECONDS", "300")))
 
 # --- Outbound HTTP channel (finmcp/datasource/http_channel.py) ---
 # Some upstream quote hosts drop connections from plain HTTP clients, so requests
