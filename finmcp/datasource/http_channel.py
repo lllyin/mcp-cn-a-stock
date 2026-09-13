@@ -263,6 +263,10 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
                     _auto_proxy_auth = auth
                     _auto_proxy_auth_at = now
         if not auth or not auth.get("proxy"):
+            with _auto_proxy_lock:
+                _auto_proxy_cooldown_until = time.monotonic() + AUTO_PROXY_COOLDOWN_SECONDS
+                _auto_proxy_failures = 0
+            logger.debug("Eastmoney proxy authentication unavailable; fallback cooled down")
             return None
         retry_kwargs = dict(kwargs)
         headers = dict(retry_kwargs.get("headers") or {})

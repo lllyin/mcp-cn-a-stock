@@ -327,6 +327,32 @@ def test_auto_does_not_use_gateway_when_local_request_succeeds(monkeypatch):
     assert proxy_calls == []
 
 
+def test_auto_proxy_is_bounded_by_failure_threshold_and_cooldown(monkeypatch):
+    channel._auto_proxy = True
+    channel._auto_proxy_gateway = "gateway"
+    channel._auto_proxy_token = "token"
+    channel._auto_proxy_failures = 0
+    channel._auto_proxy_cooldown_until = 0.0
+    auth_calls = []
+
+    fake_patch = types.SimpleNamespace(
+        get_auth_config_with_cache=lambda *args: auth_calls.append(args)
+        or {"proxy": "http://proxy", "cookie": "nid18=value"}
+    )
+    monkeypatch.setitem(__import__("sys").modules, "akshare_proxy_patch", fake_patch)
+    original = getattr(std_requests, "_qtf_original_session", std_requests.Session)
+    monkeypatch.setattr(original, "request", lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionError("blocked")))
+
+    assert channel._auto_proxy_request(original, object(), "GET", "https://push2his.eastmoney.com/x", {}) is None
+    assert auth_calls == []
+    channel._auto_proxy_failures = channel.AUTO_PROXY_AFTER_FAILURES
+    assert channel._auto_proxy_request(original, object(), "GET", "https://push2his.eastmoney.com/x", {}) is None
+    assert len(auth_calls) == 1
+    assert channel._auto_proxy_cooldown_until > channel.time.monotonic()
+    assert channel._auto_proxy_request(original, object(), "GET", "https://push2his.eastmoney.com/x", {}) is None
+    assert len(auth_calls) == 1
+
+
 def test_broken_cffi_session_is_not_reused(monkeypatch):
     channel._thread_local.cffi_session = object()
     _install_impersonate_with_fake_cffi(monkeypatch, [RuntimeError("reset"), 200])
