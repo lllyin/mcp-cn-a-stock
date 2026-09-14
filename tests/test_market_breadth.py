@@ -472,7 +472,7 @@ async def test_get_market_breadth_sanitizes_playwright_blobs():
     blob = (
         "BrowserType.launch: Target page, context or browser has been closed\n"
         "Browser logs:\n"
-        "<launching> /root/.cache/ms-playwright/chromium-1208/chrome ...\n"
+        "<launching> /home/user/.cache/ms-playwright/chromium-1208/chrome ...\n"
         "  - [pid=783093][err] Missing X server or $DISPLAY\n"
     )
 

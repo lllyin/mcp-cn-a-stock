@@ -217,7 +217,7 @@ async def test_default_requirements_keep_complete_fetch_plan(monkeypatch):
         calls.append(("finance", symbol))
         return None
 
-    def fake_fund_flow(code, symbol):
+    def fake_fund_flow(code, symbol, *args):
         calls.append(("fund_flow", symbol))
         return None
 
@@ -255,7 +255,7 @@ async def test_source_failure_is_propagated_for_cache_safety(monkeypatch):
         "_fetch_finance_sync",
         lambda code, symbol: source_module._fetch_failure("finance"),
     )
-    monkeypatch.setattr(datasource, "_fetch_fund_flow_sync", lambda code, symbol: None)
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_sync", lambda code, symbol, *args: None)
     monkeypatch.setattr(
         datasource,
         "_fetch_realtime_sync",
@@ -277,7 +277,7 @@ async def test_etf_unsupported_finance_is_not_a_fetch_failure(monkeypatch):
         return {"adjusted": frame, "unadj": frame, "adjust_type": adjust}
 
     monkeypatch.setattr(datasource, "_fetch_kline_sync", fake_kline)
-    monkeypatch.setattr(datasource, "_fetch_fund_flow_sync", lambda code, symbol: None)
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_sync", lambda code, symbol, *args: None)
     monkeypatch.setattr(
         datasource,
         "_fetch_realtime_sync",
@@ -1296,7 +1296,7 @@ def _page_fallback_datasource(monkeypatch, fund_flow_result):
         lambda code, symbol: {"info": {"股票简称": "三环集团", "最新价": 110.91}},
     )
     monkeypatch.setattr(
-        datasource, "_fetch_fund_flow_sync", lambda code, symbol: fund_flow_result
+        datasource, "_fetch_fund_flow_sync", lambda code, symbol, *args: fund_flow_result
     )
     return datasource
 
@@ -2036,3 +2036,98 @@ async def test_brief_never_pays_for_the_page_history(monkeypatch):
     )
 
     assert result.fetch_failures == ["fund_flow"]
+
+
+# --- 资金流编排：页面与网关按配置顺序执行 -----------------------------------------
+
+
+def _fund_flow_frame_of(rows: int):
+    from finmcp.datasource.platforms import eastmoney
+
+    start = datetime.date(2026, 1, 1)
+    klines = [
+        f"{start + datetime.timedelta(days=i)},"
+        "-100.0,50.0,25.0,15.0,10.0,-1.43,1.73,-0.30,-0.73,-0.70,"
+        "3286.55,-0.78,0.00,0.00"
+        for i in range(rows)
+    ]
+    return eastmoney._fund_flow_frame(klines)
+
+
+def _fund_flow_orchestration_stubs(monkeypatch, datasource):
+    """kline/realtime 打桩，只留资金流这条链路可变。"""
+    frame = _sample_kline_frame()
+
+    def fake_kline(code, start_date, end_date, adjust, symbol, include_unadjusted, *args):
+        return {"adjusted": frame, "unadj": frame, "adjust_type": adjust}
+
+    monkeypatch.setattr(datasource, "_fetch_kline_sync", fake_kline)
+    monkeypatch.setattr(
+        datasource, "_fetch_realtime_sync",
+        lambda code, symbol: {"info": {"股票简称": "测试", "最新价": 10.2}},
+    )
+    monkeypatch.setattr(datasource, "_fetch_finance_sync", lambda *a: None)
+
+
+@pytest.mark.asyncio
+async def test_gateway_runs_only_after_the_page_also_fails(monkeypatch):
+    """目标顺序 eastmoney → delay → 页面 → 网关：页面也没满足需求才付费。"""
+    datasource = CNStockDataSource()
+    _fund_flow_orchestration_stubs(monkeypatch, datasource)
+    monkeypatch.setattr(
+        source_module.fund_flow_source, "configured_order",
+        lambda: ("eastmoney", "eastmoney_delay", "fund_flow_page", "eastmoney_gateway"),
+    )
+    calls = []
+
+    def fake_fetch(code, symbol, need=None, order=None):
+        calls.append(order)
+        if order == ("eastmoney_gateway",):
+            return {"fund_flow": _fund_flow_frame_of(99), "is_market": False,
+                    "complete": True, "provider": "eastmoney_gateway"}
+        return source_module._fetch_failure("fund_flow")
+
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_sync", fake_fetch)
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_from_page", lambda symbol: asyncio.sleep(0))
+    stored = []
+    monkeypatch.setattr(source_module, "store_fund_flow", lambda s, v: stored.append(v))
+
+    result = await datasource.fetch_stock_data_with_requirements(
+        "SH600519", "2024-01-01", "2026-06-17",
+        requirements=FetchRequirements(fund_flow_page=True, fund_flow_rows=60),
+    )
+
+    # 页面前段失败 → 页面失败 → 网关给全量历史
+    assert calls == [("eastmoney", "eastmoney_delay"), ("eastmoney_gateway",)]
+    assert result is not None and len(stored) == 1
+
+
+@pytest.mark.asyncio
+async def test_gateway_is_not_paid_when_the_page_satisfies(monkeypatch):
+    """页面补上了 120 行、满足 full 的 60 行需求：网关一次都不调。"""
+    datasource = CNStockDataSource()
+    _fund_flow_orchestration_stubs(monkeypatch, datasource)
+    monkeypatch.setattr(
+        source_module.fund_flow_source, "configured_order",
+        lambda: ("eastmoney", "eastmoney_delay", "fund_flow_page", "eastmoney_gateway"),
+    )
+    calls = []
+
+    def fake_fetch(code, symbol, need=None, order=None):
+        calls.append(order)
+        return source_module._fetch_failure("fund_flow")
+
+    async def fake_page(symbol):
+        return {"fund_flow": _fund_flow_frame_of(120), "is_market": False,
+                "provider": "page_fallback"}
+
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_sync", fake_fetch)
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_from_page", fake_page)
+    monkeypatch.setattr(source_module, "store_fund_flow", lambda s, v: None)
+
+    await datasource.fetch_stock_data_with_requirements(
+        "SH600519", "2024-01-01", "2026-06-17",
+        requirements=FetchRequirements(fund_flow_page=True, fund_flow_rows=60),
+    )
+
+    assert calls == [("eastmoney", "eastmoney_delay")]  # 网关一次都没被调到

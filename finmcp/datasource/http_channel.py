@@ -295,6 +295,16 @@ def _plain_then_gateway(base_cls, session, method, url, kwargs, track_auth):
     return response
 
 
+def _fflow_gateway_in_chain() -> bool:
+    """资金流编排链里有没有配网关级。lazy import：http_channel 在数据源导入期
+    就装好，不能在这里提前拖起 provider 注册链。"""
+    try:
+        from . import fund_flow_source
+        return "eastmoney_gateway" in fund_flow_source.configured_order()
+    except Exception:  # noqa: BLE001 - 读不到配置就不让位，维持通道层语义
+        return False
+
+
 def _gateway_send_with(base_cls, session):
     def send(method, url, **kwargs):
         return base_cls.request(session, method, url, **kwargs)
@@ -312,6 +322,10 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
         return None
     host = (urlsplit(url).hostname or "?").lower()
     if not _in_auto_proxy_scope(host):
+        return None
+    if gateway.path_family(url) == "fflow" and _fflow_gateway_in_chain():
+        # 资金流编排链接了网关级时，fflow 路径让位给它——通道层在这里再拦一次
+        # 就是同一请求付两次费。K 线/base_info 没有编排层链，继续走通道层。
         return None
     with _auto_proxy_lock:
         if not _auto_proxy_state(host)["active"]:

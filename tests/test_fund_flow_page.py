@@ -411,6 +411,64 @@ class TestPageIdentityAcrossCallers:
         assert first is second
         assert len(first.history) == 121
 
+    @pytest.mark.asyncio
+    async def test_the_page_task_is_cancelled_when_its_last_consumer_leaves(self, monkeypatch):
+        """shield 保护的是"还有别人在等"；没人等了任务还白跑就是资源泄漏。"""
+        import asyncio
+
+        from finmcp.datasource import realtime_ff
+
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def fake_load(symbol, **kwargs):
+            started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        monkeypatch.setattr(realtime_ff, "_load_page_shared", fake_load)
+        realtime_ff._page_inflight.clear()
+        realtime_ff._page_inflight_waiters.clear()
+
+        consumer = asyncio.create_task(realtime_ff.fetch_page_shared("300408"))
+        await started.wait()
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+
+        assert cancelled.is_set()  # 页面任务被取消，不是继续白跑
+        assert realtime_ff._page_inflight == {}
+
+    @pytest.mark.asyncio
+    async def test_one_cancelled_consumer_does_not_interrupt_the_other(self, monkeypatch):
+        """消费者隔离：一个等待者断开，另一个照样拿到结果。"""
+        import asyncio
+
+        from finmcp.datasource import realtime_ff
+
+        release = asyncio.Event()
+
+        async def fake_load(symbol, **kwargs):
+            await release.wait()
+            return parse_fund_flow_page(FULL_PAGE.read_text(encoding="utf-8"))
+
+        monkeypatch.setattr(realtime_ff, "_load_page_shared", fake_load)
+        realtime_ff._page_inflight.clear()
+        realtime_ff._page_inflight_waiters.clear()
+
+        first = asyncio.create_task(realtime_ff.fetch_page_shared("300408"))
+        second = asyncio.create_task(realtime_ff.fetch_page_shared("SZ300408"))
+        await asyncio.sleep(0.05)  # 两个消费者都挂上
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        release.set()
+        page = await second
+        assert len(page.history) == 121
+
 
 class TestRefusalSignals:
     """哪些请求失败才算"这块数据取不到"。

@@ -1030,7 +1030,9 @@ async def _load_once(page, symbol: str, url: str, *, reload: bool):
     if got_nothing and refused:
         captcha = parsed is not None and parsed.captcha_present
         reason = (
-            "东财风控要求滑块验证（页面已弹出验证框），过验证前接口不会返回数据"
+            # 只写观察事实，不写机制推断：实测存在"弹了滑块但数据加载成功"，
+            # "过验证前接口不会返回数据"是过强的推断。
+            "检测到滑块验证且资金流接口请求失败，未取得有效数据"
             if captcha
             else "页面数据区为空"
         )
@@ -1083,6 +1085,9 @@ def _page_to_realtime_dict(symbol: str, page: FundFlowPage) -> dict:
 # 不要为今日和历史各加载一次"。两者时间上会重叠：实时预取在 process_item 开头就
 # 启动，而资金流兜底在数据 gather 之后才决定要不要走。
 _page_inflight: dict[str, asyncio.Task] = {}
+#: 每个在飞页面任务的等待者数。fetch_page_shared 用它决定最后一个消费者离开时
+#: 要不要取消任务——shield 只保护"还有别人在等"的情形。
+_page_inflight_waiters: dict[str, int] = {}
 # 已解析结果的短期复用：key -> (完成时刻, 结果)。单飞只覆盖并发，这一层覆盖
 # "一次请求里两个用途先后要同一个页面"。
 _page_cache: dict[str, tuple[float, FundFlowPage]] = {}
@@ -1127,6 +1132,7 @@ def _remember_page(key: str, page: FundFlowPage) -> None:
 def _complete_page_inflight(symbol: str, task: asyncio.Task) -> None:
     if _page_inflight.get(symbol) is task:
         _page_inflight.pop(symbol, None)
+        _page_inflight_waiters.pop(symbol, None)
     if not task.cancelled():
         task.exception()  # 取一次异常，避免"never retrieved"告警
 
@@ -1243,6 +1249,11 @@ async def fetch_page_shared(
 
     require_* 声明调用方要哪一块：只影响能否复用既有结果，不影响并发合并——同一
     时刻的两个等待者拿到的本来就是同一次加载，再加载一遍不会有不同结果。
+
+    等待者计数：shield 保证一个等待者被取消不打断另一个；但**最后一个**消费者
+    离开时任务还在白跑（一次页面加载 ~120 MiB 内存加十几秒事件循环），所以
+    没人等了就把任务取消。取消前先从登记表摘掉，新请求不会附到一个正在取消的
+    任务上。
     """
     key = page_key(symbol)
     cached = _cached_page(
@@ -1262,10 +1273,24 @@ async def fetch_page_shared(
         task.add_done_callback(
             lambda completed, k=key: _complete_page_inflight(k, completed)
         )
-    # shield：一个等待者被取消不能中断另一个等待者需要的加载。
-    page = await asyncio.shield(task)
-    _remember_page(key, page)
-    return page
+    _page_inflight_waiters[key] = _page_inflight_waiters.get(key, 0) + 1
+    try:
+        # shield：一个等待者被取消不能中断另一个等待者需要的加载。
+        page = await asyncio.shield(task)
+        _remember_page(key, page)
+        return page
+    finally:
+        if _page_inflight.get(key) is task:
+            remaining = max(0, _page_inflight_waiters.get(key, 1) - 1)
+            if remaining > 0:
+                _page_inflight_waiters[key] = remaining
+            else:
+                _page_inflight_waiters.pop(key, None)
+                if not task.done():
+                    # 没有消费者了：取消前先从登记表摘掉，新请求不会附到一个
+                    # 正在取消的任务上。
+                    _page_inflight.pop(key, None)
+                    task.cancel()
 
 
 # ── 单个 Symbol 抓取 ──────────────────────────────────────

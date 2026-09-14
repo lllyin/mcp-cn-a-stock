@@ -1222,3 +1222,29 @@ def test_gateway_request_returns_none_without_a_client(monkeypatch):
     assert channel.gateway_request(
         "GET", "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
     ) is None
+
+
+def test_channel_yields_fflow_when_the_orchestration_has_a_gateway(monkeypatch):
+    """资金流编排链接了网关级时，通道层对 fflow 路径不再自动回退——
+    否则同一请求付两次费。K 线/base_info 没有编排层链，不受影响。"""
+    client, transport = _enable_auto_proxy(monkeypatch)
+    channel._auto_proxy_state("push2his.eastmoney.com")["active"] = True
+    calls = []
+
+    class Original:
+        @staticmethod
+        def request(session, method, request_url, **kwargs):
+            calls.append(1)
+            return types.SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(
+        channel, "_fflow_gateway_in_chain", lambda: True)
+    fflow = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    kline = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+
+    assert channel._auto_proxy_request(Original, object(), "GET", fflow, {}) is None
+    assert transport.auth_calls == 0  # 让位：不认证不付费
+
+    # kline 路径不受让位影响
+    assert channel._auto_proxy_request(Original, object(), "GET", kline, {}) is not None
+    assert len(calls) == 1

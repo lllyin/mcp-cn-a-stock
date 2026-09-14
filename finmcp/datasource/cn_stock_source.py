@@ -342,6 +342,26 @@ def _fund_flow_rows(value) -> int:
     return 0 if frame is None else len(frame)
 
 
+def _fund_flow_satisfies(value, need) -> bool:
+    """编排层手上的资金流结果（dict）满足这次查询的需求吗。复用链上的同一判定。
+
+    页面兜底最多 120 行，不是全量历史：钉日期超出窗口时不能算满足，所以页面
+    给的结果在这里按"非全量"判——哪怕它没标 complete。
+    """
+    if value is None:
+        # 这一维根本没取（requirements 没要）。生产里不会出现在这里——外层已按
+        # requirements.fund_flow 拦过——保持和 needs_page(None) 一致的"不缺"。
+        return True
+    if _is_fetch_failure(value):
+        return False
+    frame = value.get("fund_flow")
+    if frame is None or len(frame) == 0:
+        return False
+    complete = value.get("complete", True) and value.get("provider") != "page_fallback"
+    history = fund_flow_source.FundFlowHistory(frame=frame, complete=complete)
+    return fund_flow_source.satisfies(history, need)
+
+
 def _fund_flow_needs_page(value) -> bool:
     """HTTP 那一层的结果还要不要去页面补。
 
@@ -956,7 +976,8 @@ class CNStockDataSource(DataSource):
         return {"finance": result["finance"].copy(deep=True)}
     
     def _fetch_fund_flow_sync(self, code: str, symbol: str = None,
-                              need: "fund_flow_source.FundFlowNeed | None" = None) -> Optional[Dict]:
+                              need: "fund_flow_source.FundFlowNeed | None" = None,
+                              order: Optional[tuple] = None) -> Optional[Dict]:
         """同步获取资金流向数据。
 
         源在平台层：``FUND_FLOW_PROVIDERS`` 决定问谁、按什么顺序（默认 eastmoney →
@@ -978,7 +999,7 @@ class CNStockDataSource(DataSource):
         request = fund_flow_source.FundFlowRequest(code=code, symbol=symbol, is_index=is_index)
         status: dict = {}
         try:
-            result = fund_flow_source.resolve(request, status=status, need=need)
+            result = fund_flow_source.resolve(request, status=status, need=need, order=order)
         except Exception as e:
             logger.warning(f"获取资金流向数据失败 {code}: {e}")
             return _fetch_failure("fund_flow")
@@ -1000,6 +1021,7 @@ class CNStockDataSource(DataSource):
     def _fetch_fund_flow_cached(
         self, code: str, symbol: str, rows_needed: int,
         need: "fund_flow_source.FundFlowNeed | None" = None,
+        order: Optional[tuple] = None,
     ) -> Optional[Dict]:
         """带缓存的资金流取数。同步，仍然跑在线程池里。
 
@@ -1020,7 +1042,7 @@ class CNStockDataSource(DataSource):
         return _fund_flow_from_cache(
             symbol,
             rows_needed,
-            lambda: self._fetch_fund_flow_sync(code, symbol, need),
+            lambda: self._fetch_fund_flow_sync(code, symbol, need, order),
         )
 
     def _build_fund_flow_history(self, df, symbol: str, is_market: bool) -> Optional[Dict[str, np.ndarray]]:
@@ -1308,6 +1330,11 @@ class CNStockDataSource(DataSource):
                 ),
                 pinned_date=requirements.fund_flow_pinned_date,
             )
+            # 页面走浏览器、进不了线程池，配置顺序在它处切开：同步链只跑页面
+            # 之前的段，之后的段（链尾付费网关）留给 gather 之后按序执行。
+            fund_flow_pre_order, fund_flow_post_order = fund_flow_source.split_order(
+                fund_flow_source.configured_order()
+            )
             task_specs.append(
                 (
                     "fund_flow",
@@ -1317,6 +1344,7 @@ class CNStockDataSource(DataSource):
                         canonical_symbol,
                         requirements.fund_flow_rows,
                         fund_flow_need,
+                        fund_flow_pre_order,
                     ),
                 )
             )
@@ -1338,7 +1366,7 @@ class CNStockDataSource(DataSource):
         if (
             requirements.fund_flow
             and requirements.fund_flow_page
-            and _fund_flow_needs_page(fetched.get("fund_flow"))
+            and not _fund_flow_satisfies(fetched.get("fund_flow"), fund_flow_need)
         ):
             # 页面兜底挂在 gather 之后：只有主源真的失败、或只拿到 delay 那一行时才付
             # 这一次页面加载，正常情况下这条路一次都不会走。必须在下面统计
@@ -1354,6 +1382,47 @@ class CNStockDataSource(DataSource):
                 # 写回缓存：兜底不走 get_or_load（它挂在 gather 之后，包进去会改
                 # 触发时机），不显式写回的话下一次同标的又是一次 6.4 秒的页面加载。
                 store_fund_flow(canonical_symbol, page_result)
+        # 页面之后的同步段（配置里排在 fund_flow_page 后面的级，比如付费网关
+        # eastmoney_gateway）：页面也没满足需求才轮到它。默认配置这一段是空的，
+        # 一次都不会走。
+        if (
+            requirements.fund_flow
+            and fund_flow_post_order
+            and not _fund_flow_satisfies(fetched.get("fund_flow"), fund_flow_need)
+        ):
+            post_result = await _run_in_executor(
+                self._fetch_fund_flow_sync,
+                code,
+                canonical_symbol,
+                fund_flow_need,
+                fund_flow_post_order,
+            )
+            if (
+                post_result is not None
+                and not _is_fetch_failure(post_result)
+                and _fund_flow_rows(post_result) > _fund_flow_rows(fetched.get("fund_flow"))
+            ):
+                fetched["fund_flow"] = post_result
+                store_fund_flow(canonical_symbol, post_result)
+        if requirements.fund_flow:
+            # 每次资金流查询的最终落点：哪个源给的、多少行、是否全量。
+            # "网关补齐率"和"恢复后是否停止付费"都靠这行算。
+            final = fetched.get("fund_flow")
+            final_failed = final is None or _is_fetch_failure(final)
+            request_id, _, _ = log_context()
+            logger.info(
+                "fund_flow_outcome request_id=%s symbol=%s need=%s final_source=%s "
+                "rows=%s complete=%s",
+                request_id or "-",
+                canonical_symbol,
+                f"pinned:{fund_flow_need.pinned_date}"
+                if fund_flow_need.pinned_date
+                else (f"history:{fund_flow_need.history_rows}"
+                      if fund_flow_need.history_rows else "today"),
+                "-" if final_failed else final.get("provider", "-"),
+                0 if final_failed else _fund_flow_rows(final),
+                "-" if final_failed else final.get("complete", "-"),
+            )
         # 页面也没补上、手里仍是 delay 那一行：报告照常渲染，但它是降级结果，不能进
         # 跨请求缓存——下一次页面可能就成功了，缓存住等于把一行历史冻进整个纪元
         # （cache-design §七 不变量 4）。用 fetch_failures 表达，它唯一的用途就是拦缓存。

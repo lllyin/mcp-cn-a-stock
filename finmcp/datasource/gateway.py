@@ -87,7 +87,7 @@ class AkshareProxyTransport:
             pass
 
 
-def _path_family(url: str) -> str:
+def path_family(url: str) -> str:
     """同一主机上的不同接口族分开记账：K 线成功不能误恢复资金流的状态。"""
     path = urlsplit(url).path
     if "/fflow/" in path:
@@ -253,7 +253,7 @@ class GatewayClient:
         兼容 requests 的对象。
         """
         host = (urlsplit(url).hostname or "?").lower()
-        key = (host, _path_family(url))
+        key = (host, path_family(url))
         with self._lock:
             state = self._state(key)
             if state.cooldown_until > time.monotonic():
