@@ -132,6 +132,19 @@ class TestDatePinning:
         baseline = verify.load_baseline(path)
         assert baseline.replay_spec is None
 
+    def test_market_events_is_checked_live_instead_of_replayed(self, tmp_path):
+        path = tmp_path / "events.md"
+        path.write_text(
+            _archive(
+                "market_events date=2026-08-24 sources=limit_up",
+                '{"events": [{"symbol": "SH600001"}]}',
+            ),
+            encoding="utf-8",
+        )
+        baseline = verify.load_baseline(path)
+        assert baseline.replay_spec is None
+        assert "实时非空搜索" in baseline.skip_reason
+
     def test_an_intraday_capture_is_flagged(self, tmp_path):
         """盘中抓的归档，当日 bar 还没定盘，数值差异说明不了任何事。"""
         path = tmp_path / "a.md"
@@ -467,6 +480,25 @@ class TestDriftNote:
 
 
 class TestCompleteness:
+    def test_market_events_live_search_must_return_at_least_one_event(self):
+        payload = verify.parse_payload(
+            '{"source_statuses": [{"source": "limit_up", "status": "SUCCESS"}],'
+            ' "events": []}'
+        )
+        result = verify.check_completeness("market_events", payload)
+        assert result.available == 0
+        assert result.graded == 1
+        assert result.findings[0].dimension.name == "事件搜索结果"
+
+    def test_market_events_live_search_accepts_a_non_empty_result(self):
+        payload = verify.parse_payload(
+            '{"source_statuses": [{"source": "limit_up", "status": "SUCCESS"}],'
+            ' "events": [{"symbol": "SH600001"}]}'
+        )
+        result = verify.check_completeness("market_events", payload)
+        assert result.findings == []
+        assert result.available == result.graded == 1
+
     def test_a_missing_dimension_names_its_upstream_source(self):
         payload = verify.Payload(documents={"SH600519": "# 基本数据\n- 股票代码: SH600519\n"})
         result = verify.check_completeness("brief", payload)

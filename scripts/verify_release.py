@@ -344,8 +344,22 @@ def check_completeness(tool: str, payload: Payload) -> Completeness:
     指数连市值都没有，科创50 没有资金流向页面——那不是缺失，是这个标的本来就没有
     这一维。前者按类别判，后者按标的判。
     """
-    dimensions = CONTRACT.get(tool)
     result = Completeness()
+    if tool == "market_events":
+        # 事件/新闻池会修订，也有很短的历史保留窗口，不能拿旧归档逐字段比。
+        # 实时探活真正要回答的是“现在还能不能搜到事件”，所以把非空结果作为
+        # 这一工具唯一的完整性维度。调用成功但 events=[] 不能冒充可用。
+        result.expected = 1
+        document = payload.structures.get("（整份）")
+        events = document.get("events") if isinstance(document, dict) else None
+        if not isinstance(events, list) or not events:
+            result.findings.append(MissingDimension(
+                "（搜索结果）",
+                Dimension("事件搜索结果", "events", "market_events"),
+            ))
+        return result
+
+    dimensions = CONTRACT.get(tool)
     if not dimensions:
         return result
     for symbol, document in payload.documents.items():
@@ -457,7 +471,9 @@ def _pin_date(spec: CallSpec, payload: Payload) -> tuple[CallSpec | None, str]:
     """把重放的日期钉死。钉不住的就不比，避免拿今天的行情去对昨天的账。"""
     if payload.broken_json:
         return None, "归档的 JSON 不完整（归档时被截断），比不了"
-    if spec.tool in ("kline_daily", "kline_range", "market_events"):
+    if spec.tool == "market_events":
+        return None, "事件和新闻会修订且历史保留窗口有限，改由实时非空搜索探活"
+    if spec.tool in ("kline_daily", "kline_range"):
         if any(key in spec.args for key in ("date", "end_date")):
             return spec, ""
         return None, "归档命令没有日期参数，重放结果会随行情变动"

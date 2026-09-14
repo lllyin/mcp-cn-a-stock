@@ -50,7 +50,7 @@
 | `20260828083036_full_SH600362_…` | full | 4 个个股 | 次日 08:30 抓的，数据日期是前一交易日；带 `fund_flow_limit=60` |
 | `20260828200112_kline_daily_SH600362.md` 等 **4 份** | kline_daily | SH600362 / SH600489 / SH601138 / SH601899 | 20:01 抓的，与上面那份 full 同一批标的 |
 | `20260903174457_kline_range_SH600118.md` 等 **4 份** | kline_range | SH600118 / SH600362（个股）<br>SZ159995 / SH588000（ETF） | 全部取自 09-03 17:44 之后，也就是成交量单位修复之后 |
-| `20260903183039_market_events_date-2026-08-24_…` | market_events | `sources=limit_up` 的整个事件池 | 18:30 抓的，`date=2026-08-24` |
+| `20260903183039_market_events_date-2026-08-24_…` | market_events | 仅保留为历史样本，不参与发布基线比对 | 事件会修订且上游只保留短期历史；发布验证改查实时搜索是否非空 |
 | `20260828163113_market_breadth_.md` | market_breadth | —— | 16:31 抓的。没有日期参数，天然不可重放，留着只当形状参考 |
 
 kline_daily 和 kline_range 的 4 个标的是拆成 4 份归档的：这两个工具在生产上从来
