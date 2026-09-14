@@ -89,6 +89,12 @@ HTTP_MODE_ALIASES = {"off": "direct"}
 # Requests per target host before giving up and replaying through plain requests.
 IMPERSONATE_RETRY = max(1, int(env("IMPERSONATE_RETRY", "3")))
 IMPERSONATE_TIMEOUT_SECONDS = max(1.0, float(env("IMPERSONATE_TIMEOUT_SECONDS", "8")))
+# 东财 API 在伪装失败后的原生重放及 auto 网关回退的单次超时。调用方显式传 timeout
+# 时保持调用方的值；不传时用这个上限，避免第三方库的无 timeout 请求长期占住批次名额。
+EASTMONEY_FALLBACK_TIMEOUT_SECONDS = max(
+    1.0,
+    float(env("EASTMONEY_FALLBACK_TIMEOUT_SECONDS", "8")),
+)
 # curl_cffi browser profile to impersonate. Fixed rather than random so a
 # per-thread session can keep reusing its TLS connection.
 IMPERSONATE_BROWSER = env("IMPERSONATE_BROWSER") or "chrome"

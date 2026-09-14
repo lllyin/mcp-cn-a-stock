@@ -27,6 +27,7 @@ from ..config import (
     IMPERSONATE_SUSPEND_AFTER_FAILURES,
     IMPERSONATE_SUSPEND_SECONDS,
     IMPERSONATE_TIMEOUT_SECONDS,
+    EASTMONEY_FALLBACK_TIMEOUT_SECONDS,
     AUTO_PROXY_AFTER_FAILURES,
     AUTO_PROXY_COOLDOWN_SECONDS,
     AUTO_PROXY_DATA_COOLDOWN_SECONDS,
@@ -240,6 +241,12 @@ def _plain_with_auth_outcome(
     状态码用 ``getattr`` 取：这一层会包住别人的 Session，而"响应"未必是 requests 的
     Response（桩、别的通道的返回类型都可能）。取不到就不记这一笔，而不是崩在记账上。
     """
+    if eastmoney_auth.needs_auth(url):
+        # AkShare 的 stock_individual_fund_flow 没有传 timeout。伪装失败后的
+        # 原生重放若沿用它，会无限阻塞 worker，客户端超时后仍占批次名额。
+        # 调用方显式指定的 timeout 优先，避免改变已有的精细调用约束。
+        kwargs = dict(kwargs)
+        kwargs.setdefault("timeout", EASTMONEY_FALLBACK_TIMEOUT_SECONDS)
     try:
         response = base_cls.request(session, method, url, **kwargs)
     except Exception:
@@ -311,6 +318,7 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
         retry_kwargs["headers"] = headers
         retry_kwargs["proxies"] = {"http": auth["proxy"], "https": auth["proxy"]}
         retry_kwargs.pop("impersonate", None)
+        retry_kwargs.setdefault("timeout", EASTMONEY_FALLBACK_TIMEOUT_SECONDS)
         request_id, tool, symbol = log_context()
         logger.warning(
             "auto_proxy_attempt host=%s path=%s request_id=%s tool=%s symbol=%s",

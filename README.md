@@ -257,6 +257,7 @@ mcporter call cn-stock market_events \
 | `HTTP_CHANNEL` | 访问东财行情主机的方式：<br>`auto` 按 `AKSHARE_PROXY_ENABLED` 选择，并在运行中按请求回退<br>`proxy` 经授权网关和代理出口，按积分计费<br>`impersonate` 本机直连，伪装成浏览器<br>`direct` 本机直连，不做伪装，可写作 `off` | `auto`<br>`proxy`<br>`impersonate`<br>`direct`<br>（默认 `auto`） |
 | `IMPERSONATE_RETRY` | 单个请求的伪装尝试次数，用尽后不带伪装再试一次 | 正整数（默认 `3`） |
 | `IMPERSONATE_TIMEOUT_SECONDS` | 单次伪装请求的超时 | 秒（默认 `8`） |
+| `EASTMONEY_FALLBACK_TIMEOUT_SECONDS` | 东财 API 在伪装失败后重放、或 `auto` 网关回退时的单次超时；调用方显式 timeout 优先 | 秒（默认 `8`） |
 | `IMPERSONATE_BROWSER` | 伪装成哪个浏览器 | 浏览器名，如 `chrome`、`safari`（默认 `chrome`） |
 | `IMPERSONATE_SUSPEND_AFTER_FAILURES` | 连续多少次请求打满重试仍失败后暂停伪装通道 | 正整数（默认 `4`） |
 | `IMPERSONATE_SUSPEND_SECONDS` | 暂停时长。期间东财源直接跳过，改用备用源 | 秒（默认 `300`） |

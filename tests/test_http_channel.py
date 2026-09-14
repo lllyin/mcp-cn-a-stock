@@ -278,6 +278,85 @@ def test_retries_then_replays_through_plain_requests(monkeypatch):
     assert replayed == [{"params": {"secid": "1.600000"}}]
 
 
+def test_plain_eastmoney_replay_gets_a_bounded_default_timeout(monkeypatch):
+    seen = []
+
+    class Original:
+        @staticmethod
+        def request(session, method, url, **kwargs):
+            seen.append(kwargs)
+            return types.SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(channel.eastmoney_auth, "needs_auth", lambda url: True)
+    channel._plain_with_auth_outcome(
+        Original, object(), "GET", "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get", {}, track_auth=False
+    )
+    assert seen == [{"timeout": channel.EASTMONEY_FALLBACK_TIMEOUT_SECONDS}]
+
+
+def test_explicit_eastmoney_timeout_is_preserved(monkeypatch):
+    seen = []
+
+    class Original:
+        @staticmethod
+        def request(session, method, url, **kwargs):
+            seen.append(kwargs)
+            return types.SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(channel.eastmoney_auth, "needs_auth", lambda url: True)
+    channel._plain_with_auth_outcome(
+        Original, object(), "GET", "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get", {"timeout": 2.5}, track_auth=False
+    )
+    assert seen == [{"timeout": 2.5}]
+
+
+def test_failed_impersonation_replay_is_bounded(monkeypatch):
+    _install_impersonate_with_fake_cffi(
+        monkeypatch, [RuntimeError("blocked")] * channel.IMPERSONATE_RETRY
+    )
+    original = getattr(std_requests, "_qtf_original_session")
+    replayed = []
+    monkeypatch.setattr(channel.eastmoney_auth, "needs_auth", lambda url: True)
+    monkeypatch.setattr(channel.eastmoney_auth, "cookie_header", lambda url: "")
+    monkeypatch.setattr(
+        original,
+        "request",
+        lambda self, method, url, **kwargs: replayed.append(kwargs)
+        or types.SimpleNamespace(status_code=200),
+    )
+
+    response = std_requests.Session().request(
+        "GET", "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    )
+
+    assert response.status_code == 200
+    assert replayed[0]["timeout"] == channel.EASTMONEY_FALLBACK_TIMEOUT_SECONDS
+
+
+def test_auto_proxy_request_gets_the_same_timeout(monkeypatch):
+    channel._auto_proxy = True
+    channel._auto_proxy_gateway = "gateway"
+    channel._auto_proxy_token = "token"
+    channel._auto_proxy_states.clear()
+    url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    channel._auto_proxy_state("push2his.eastmoney.com")["active"] = True
+    fake_patch = types.SimpleNamespace(
+        get_auth_config_with_cache=lambda *args: {"proxy": "http://proxy", "cookie": "nid18=value"}
+    )
+    monkeypatch.setitem(__import__("sys").modules, "akshare_proxy_patch", fake_patch)
+    seen = []
+
+    class Original:
+        @staticmethod
+        def request(session, method, request_url, **kwargs):
+            seen.append(kwargs)
+            return types.SimpleNamespace(status_code=200)
+
+    response = channel._auto_proxy_request(Original, object(), "GET", url, {})
+    assert response.status_code == 200
+    assert seen[0]["timeout"] == channel.EASTMONEY_FALLBACK_TIMEOUT_SECONDS
+
+
 def test_auto_uses_gateway_only_after_local_request_fails(monkeypatch):
     calls = _install_impersonate_with_fake_cffi(
         monkeypatch, [RuntimeError("blocked")] * channel.IMPERSONATE_RETRY
