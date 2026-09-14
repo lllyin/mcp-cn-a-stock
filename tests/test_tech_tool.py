@@ -387,3 +387,100 @@ async def test_cancelled_report_releases_batch_permit(monkeypatch):
     assert admission.active == 0
     await asyncio.wait_for(admission.acquire(), timeout=0.1)
     admission.release()
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_cancels_running_batch_and_siblings(monkeypatch):
+    admission = app_module.BatchQueryAdmission(1)
+    started = set()
+    cancelled = set()
+    disconnect = asyncio.Event()
+
+    async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
+        started.add(symbol)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.add(symbol)
+            raise
+
+    monkeypatch.setattr(app_module, "_get_batch_query_admission", lambda: admission)
+    monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
+
+    request = asyncio.create_task(
+        app_module.fetch_batch_reports(
+            "SZ990001,SZ990002",
+            "brief",
+            "",
+            request_id="disconnect-test",
+            client_disconnect_event=disconnect,
+        )
+    )
+    while started != {"SZ990001", "SZ990002"}:
+        await asyncio.sleep(0)
+
+    disconnect.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    assert cancelled == started
+    assert admission.active == 0
+    assert admission.waiting == 0
+    await asyncio.wait_for(admission.acquire(), timeout=0.1)
+    admission.release()
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_while_queued_does_not_take_batch_permit(monkeypatch):
+    admission = app_module.BatchQueryAdmission(1)
+    await admission.acquire()
+    disconnect = asyncio.Event()
+
+    async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
+        return _make_raw_data(symbol)
+
+    monkeypatch.setattr(app_module, "_get_batch_query_admission", lambda: admission)
+    monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
+
+    request = asyncio.create_task(
+        app_module.fetch_batch_reports(
+            "SZ990003",
+            "brief",
+            "",
+            request_id="queued-disconnect-test",
+            client_disconnect_event=disconnect,
+        )
+    )
+    while admission.waiting == 0:
+        await asyncio.sleep(0)
+
+    disconnect.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    assert admission.active == 1
+    assert admission.waiting == 0
+    admission.release()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_disconnect_waiter_cancels_wrapped_operation():
+    disconnect = asyncio.Event()
+    operation_cancelled = asyncio.Event()
+
+    async def operation():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            operation_cancelled.set()
+            raise
+
+    waiter = asyncio.create_task(
+        app_module._await_with_client_disconnect(operation(), disconnect)
+    )
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    assert operation_cancelled.is_set()

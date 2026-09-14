@@ -5,7 +5,7 @@ import logging
 import time
 import uuid
 from io import StringIO
-from typing import Literal, Dict, List, Optional
+from typing import Awaitable, Literal, Dict, List, Optional, TypeVar
 
 from pydantic import BaseModel, Field
 from mcp.server.fastmcp import Context, FastMCP
@@ -28,6 +28,58 @@ from .observability import bind_log_context, http_trace_id_var
 logger = logging.getLogger("finmcp")
 _active_report_requests = 0
 _BATCH_QUERY_ADMISSION_ATTR = "_cn_stock_batch_query_admission"
+_CLIENT_DISCONNECT_EVENT_SCOPE_KEY = "cn_stock_client_disconnect_event"
+_AwaitableResult = TypeVar("_AwaitableResult")
+
+
+async def _await_with_client_disconnect(
+    awaitable: Awaitable[_AwaitableResult],
+    disconnect_event: asyncio.Event | None,
+) -> _AwaitableResult:
+    """Await an operation until it completes or the HTTP client disconnects."""
+    if disconnect_event is None:
+        return await awaitable
+
+    operation = asyncio.ensure_future(awaitable)
+
+    if disconnect_event.is_set():
+        operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
+        raise asyncio.CancelledError
+
+    disconnect = asyncio.create_task(disconnect_event.wait())
+    try:
+        done, _ = await asyncio.wait(
+            (operation, disconnect),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if disconnect in done:
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+            raise asyncio.CancelledError
+        return operation.result()
+    except BaseException:
+        if not operation.done():
+            operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
+        raise
+    finally:
+        if not disconnect.done():
+            disconnect.cancel()
+        await asyncio.gather(disconnect, return_exceptions=True)
+
+
+def _client_disconnect_event(ctx: Context | None) -> asyncio.Event | None:
+    """Return the disconnect signal attached by RequestLifecycleLogMiddleware."""
+    if ctx is None:
+        return None
+    try:
+        request = ctx.request_context.request
+        scope = getattr(request, "scope", None)
+        event = scope.get(_CLIENT_DISCONNECT_EVENT_SCOPE_KEY) if scope else None
+    except (AttributeError, LookupError, ValueError):
+        return None
+    return event if isinstance(event, asyncio.Event) else None
 
 
 class BatchQueryAdmission:
@@ -208,6 +260,7 @@ async def fetch_batch_reports(
     date: Optional[str] = None,
     fund_flow_limit: int = 15,
     request_id: str = "",
+    client_disconnect_event: asyncio.Event | None = None,
 ) -> BatchReportResponse:
     """批量获取并生成报告的核心驱动程序"""
     # 1. 预处理：分拆并限流（上限4个）
@@ -323,7 +376,26 @@ async def fetch_batch_reports(
             waiting_before + 1,
             admission.limit,
         )
-    queue_seconds = await admission.acquire()
+    try:
+        queue_seconds = await _await_with_client_disconnect(
+            admission.acquire(), client_disconnect_event
+        )
+    except asyncio.CancelledError:
+        logger.info(
+            "Batch query cancelled request_id=%s tool=%s symbols=%s%s "
+            "stage=admission reason=%s active=%s waiting=%s limit=%s",
+            request_id or "-",
+            mode,
+            symbols_label,
+            date_label,
+            "client_disconnected"
+            if client_disconnect_event is not None and client_disconnect_event.is_set()
+            else "task_cancelled",
+            admission.active,
+            admission.waiting,
+            admission.limit,
+        )
+        raise
     service_started_at = time.perf_counter()
     logger.info(
         "Batch query admitted request_id=%s tool=%s symbols=%s "
@@ -368,6 +440,8 @@ async def fetch_batch_reports(
     async def process_item(symbol: str):
         with bind_log_context(request_id=request_id or "-", tool=mode, symbol=symbol):
             symbol_started_at = time.perf_counter()
+            if client_disconnect_event is not None and client_disconnect_event.is_set():
+                raise asyncio.CancelledError
             # 拿到准入之后重新探测：命中判定必须反映真正开始干活的时刻，
             # 否则盘中条目会带着排队时长一起变旧。命中不得再付出一次 Chromium 抓取。
             cache_key, cached_report, probe_started_at = _probe_cache(symbol)
@@ -381,11 +455,14 @@ async def fetch_batch_reports(
             try:
                 # 并行拉取基础行情
                 raw_started_at = time.perf_counter()
-                raw_data = await research.load_raw_data(
-                    symbol,
-                    date,
-                    host,
-                    requirements=requirements,
+                raw_data = await _await_with_client_disconnect(
+                    research.load_raw_data(
+                        symbol,
+                        date,
+                        host,
+                        requirements=requirements,
+                    ),
+                    client_disconnect_event,
                 )
                 raw_elapsed = time.perf_counter() - raw_started_at
                 if not raw_data:
@@ -399,20 +476,26 @@ async def fetch_batch_reports(
                 # 根据模式按需构建
                 research.build_basic_data(buf, symbol, raw_data)
                 if mode == "full":
-                    await research.build_trading_data(
-                        buf,
-                        symbol,
-                        raw_data,
-                        include_historical_fund_flow=True,
-                        historical_fund_flow_limit=fund_flow_limit,
-                        realtime_fund_flow=prefetch,
+                    await _await_with_client_disconnect(
+                        research.build_trading_data(
+                            buf,
+                            symbol,
+                            raw_data,
+                            include_historical_fund_flow=True,
+                            historical_fund_flow_limit=fund_flow_limit,
+                            realtime_fund_flow=prefetch,
+                        ),
+                        client_disconnect_event,
                     )
                 else:
-                    await research.build_trading_data(
-                        buf,
-                        symbol,
-                        raw_data,
-                        realtime_fund_flow=prefetch,
+                    await _await_with_client_disconnect(
+                        research.build_trading_data(
+                            buf,
+                            symbol,
+                            raw_data,
+                            realtime_fund_flow=prefetch,
+                        ),
+                        client_disconnect_event,
                     )
 
                 if mode in ["medium", "full"]:
@@ -521,10 +604,35 @@ async def fetch_batch_reports(
                     prefetch.discard()
 
     # 并发执行所有标的的任务
+    tasks = [asyncio.create_task(process_item(s)) for s in raw_symbols]
     try:
         with bind_log_context(request_id=request_id or "-", tool=mode):
-            await asyncio.gather(*[process_item(s) for s in raw_symbols])
+            await asyncio.gather(*tasks)
         return BatchReportResponse(**output)
+    except asyncio.CancelledError:
+        reason = (
+            "client_disconnected"
+            if client_disconnect_event is not None and client_disconnect_event.is_set()
+            else "task_cancelled"
+        )
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info(
+            "Batch query cancelled request_id=%s tool=%s symbols=%s%s "
+            "stage=service reason=%s queue=%.3fs active=%s waiting=%s limit=%s",
+            request_id or "-",
+            mode,
+            symbols_label,
+            date_label,
+            reason,
+            queue_seconds,
+            admission.active,
+            admission.waiting,
+            admission.limit,
+        )
+        raise
     finally:
         elapsed = time.time() - start_time
         _active_report_requests -= 1
@@ -690,6 +798,8 @@ class RequestLifecycleLogMiddleware:
       await self.app(scope, receive, send)
       return
 
+    client_disconnect_event = asyncio.Event()
+    scope[_CLIENT_DISCONNECT_EVENT_SCOPE_KEY] = client_disconnect_event
     http_trace_id = uuid.uuid4().hex[:12]
     started_at = time.perf_counter()
     disconnected = False
@@ -703,6 +813,7 @@ class RequestLifecycleLogMiddleware:
       message = await receive()
       if message["type"] == "http.disconnect" and not disconnected:
         disconnected = True
+        client_disconnect_event.set()
         if not response_finished:
           # GET 是 Streamable HTTP 的 SSE 通道：它的响应永远不会正常结束，
           # 客户端断开就是其正常终结方式。若一律告警，每个正常的客户端生命
@@ -802,6 +913,7 @@ async def brief(
     "brief",
     who,
     date,
+    client_disconnect_event=_client_disconnect_event(ctx),
     request_id=_new_trace_id(ctx),
   )
 
@@ -833,6 +945,7 @@ async def medium(
     "medium",
     who,
     date,
+    client_disconnect_event=_client_disconnect_event(ctx),
     request_id=_new_trace_id(ctx),
   )
 
@@ -866,6 +979,7 @@ async def full(
     who,
     date,
     fund_flow_limit=fund_flow_limit,
+    client_disconnect_event=_client_disconnect_event(ctx),
     request_id=_new_trace_id(ctx),
   )
 

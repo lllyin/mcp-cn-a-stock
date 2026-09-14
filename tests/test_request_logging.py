@@ -4,7 +4,10 @@ import logging
 
 import pytest
 
-from finmcp.mcp_app import RequestLifecycleLogMiddleware
+from finmcp.mcp_app import (
+    RequestLifecycleLogMiddleware,
+    _CLIENT_DISCONNECT_EVENT_SCOPE_KEY,
+)
 
 
 def _scope(method: str = "POST"):
@@ -100,6 +103,30 @@ async def test_request_lifecycle_logs_client_disconnect(caplog):
     assert "HTTP client disconnected before response finished" in caplog.text
     assert "outcome=client_disconnected" in caplog.text
     assert "response_started=False" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_request_lifecycle_exposes_disconnect_event_to_request_scope():
+    messages = iter(
+        [
+            {"type": "http.request", "body": b"", "more_body": False},
+            {"type": "http.disconnect"},
+        ]
+    )
+
+    async def receive():
+        return next(messages)
+
+    async def send(message):
+        raise AssertionError(f"unexpected response: {message}")
+
+    async def app(scope, receive, send):
+        await receive()
+        assert not scope[_CLIENT_DISCONNECT_EVENT_SCOPE_KEY].is_set()
+        await receive()
+        assert scope[_CLIENT_DISCONNECT_EVENT_SCOPE_KEY].is_set()
+
+    await RequestLifecycleLogMiddleware(app)(_scope(), receive, send)
 
 
 @pytest.mark.asyncio
