@@ -432,6 +432,7 @@ class TestPageIdentityAcrossCallers:
         monkeypatch.setattr(realtime_ff, "_load_page_shared", fake_load)
         realtime_ff._page_inflight.clear()
         realtime_ff._page_inflight_waiters.clear()
+        realtime_ff._page_cache.clear()  # 前一条测试的缓存残留会让这里直接命中，不再调 _load_page_shared
 
         consumer = asyncio.create_task(realtime_ff.fetch_page_shared("300408"))
         await started.wait()
@@ -458,6 +459,7 @@ class TestPageIdentityAcrossCallers:
         monkeypatch.setattr(realtime_ff, "_load_page_shared", fake_load)
         realtime_ff._page_inflight.clear()
         realtime_ff._page_inflight_waiters.clear()
+        realtime_ff._page_cache.clear()  # 前一条测试的缓存残留会让这里直接命中，不再调 _load_page_shared
 
         first = asyncio.create_task(realtime_ff.fetch_page_shared("300408"))
         second = asyncio.create_task(realtime_ff.fetch_page_shared("SZ300408"))
