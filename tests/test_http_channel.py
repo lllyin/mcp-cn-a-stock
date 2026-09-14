@@ -11,6 +11,7 @@ import requests as std_requests
 from finmcp.config import HttpModeError, resolve_http_mode
 
 channel = importlib.import_module("finmcp.datasource.http_channel")
+gateway = importlib.import_module("finmcp.datasource.gateway")
 
 
 @pytest.fixture(autouse=True)
@@ -334,16 +335,9 @@ def test_failed_impersonation_replay_is_bounded(monkeypatch):
 
 
 def test_auto_proxy_request_gets_the_same_timeout(monkeypatch):
-    channel._auto_proxy = True
-    channel._auto_proxy_gateway = "gateway"
-    channel._auto_proxy_token = "token"
-    channel._auto_proxy_states.clear()
+    client, transport = _enable_auto_proxy(monkeypatch)
     url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
     channel._auto_proxy_state("push2his.eastmoney.com")["active"] = True
-    fake_patch = types.SimpleNamespace(
-        get_auth_config_with_cache=lambda *args: {"proxy": "http://proxy", "cookie": "nid18=value"}
-    )
-    monkeypatch.setitem(__import__("sys").modules, "akshare_proxy_patch", fake_patch)
     seen = []
 
     class Original:
@@ -408,32 +402,24 @@ def test_auto_does_not_use_gateway_when_local_request_succeeds(monkeypatch):
 
 
 def test_auto_proxy_is_bounded_by_failure_threshold_and_cooldown(monkeypatch):
-    channel._auto_proxy = True
-    channel._auto_proxy_gateway = "gateway"
-    channel._auto_proxy_token = "token"
-    channel._auto_proxy_states.clear()
-    auth_calls = []
-
-    fake_patch = types.SimpleNamespace(
-        get_auth_config_with_cache=lambda *args: auth_calls.append(args)
-        or {"proxy": "http://proxy", "cookie": "nid18=value"}
-    )
-    monkeypatch.setitem(__import__("sys").modules, "akshare_proxy_patch", fake_patch)
+    client, transport = _enable_auto_proxy(monkeypatch)
     original = getattr(std_requests, "_qtf_original_session", std_requests.Session)
     monkeypatch.setattr(original, "request", lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionError("blocked")))
 
     url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
     assert channel._auto_proxy_request(original, object(), "GET", url, {}) is None
-    assert auth_calls == []
+    assert transport.auth_calls == 0
     for _ in range(channel.AUTO_PROXY_AFTER_FAILURES):
         channel._record_auto_proxy_local_failure(url)
     state = channel._auto_proxy_states["push2his.eastmoney.com"]
     assert state["active"] is True
     assert channel._auto_proxy_request(original, object(), "GET", url, {}) is None
-    assert len(auth_calls) == 1
-    assert state["cooldown_until"] > channel.time.monotonic()
+    assert transport.auth_calls == 1
+    # 冷却在传输层（GatewayClient），按 (host, 接口族) 记
+    client_state = client._states[("push2his.eastmoney.com", "fflow")]
+    assert client_state.cooldown_until > channel.time.monotonic()
     assert channel._auto_proxy_request(original, object(), "GET", url, {}) is None
-    assert len(auth_calls) == 1
+    assert transport.auth_calls == 1
 
 
 def test_auto_proxy_state_is_per_host(monkeypatch):
@@ -467,25 +453,50 @@ def test_auto_proxy_state_is_per_host(monkeypatch):
     assert state_p2["active"] is False
 
 
-def _enable_auto_proxy(monkeypatch, *, auth=None):
+class _FakeGatewayTransport:
+    """不碰真实网关的传输：按队列给出出口，记录认证和作废。"""
+
+    name = "fake"
+
+    def __init__(self, auths):
+        self._auths = list(auths)
+        self.auth_calls = 0
+        self.invalidated = []
+
+    def authenticate(self):
+        self.auth_calls += 1
+        if not self._auths:
+            return None
+        proxy = self._auths.pop(0) if len(self._auths) > 1 else self._auths[0]
+        return gateway.GatewayAuth(proxy=proxy, cookie="nid18=x", user_agent="")
+
+    def invalidate(self, auth):
+        self.invalidated.append(auth.proxy)
+
+
+def _enable_auto_proxy(monkeypatch, auths=None, **client_kwargs):
+    """通道层激活 auto，并让网关客户端用假传输（不碰真实网关）。"""
     channel._auto_proxy = True
     channel._auto_proxy_gateway = "gateway"
     channel._auto_proxy_token = "token"
     channel._auto_proxy_states.clear()
-    fake_patch = types.SimpleNamespace(
-        get_auth_config_with_cache=lambda *args: auth
-        or {"proxy": "http://proxy", "cookie": "nid18=value"},
-        _cache=types.SimpleNamespace(expire_at=0),
-    )
-    monkeypatch.setitem(__import__("sys").modules, "akshare_proxy_patch", fake_patch)
+    transport = _FakeGatewayTransport(auths or ["http://proxy-a:1"])
+    client = gateway.GatewayClient(transport, **client_kwargs)
+    monkeypatch.setattr(gateway, "get_gateway_client", lambda: client)
+    return client, transport
 
 
 def test_auto_proxy_singleflight_per_host(monkeypatch):
-    """同一 host 同时只允许一次网关尝试在飞，并发的直接走原有回退链。"""
-    _enable_auto_proxy(monkeypatch)
+    """同一 (host, 接口族) 同时只允许一次网关尝试在飞；leader 失败时
+    并发的 follower 直接走原有回退链，不再付一次费。"""
+    client, transport = _enable_auto_proxy(monkeypatch)
     url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
     channel._auto_proxy_state("push2his.eastmoney.com")["active"] = True
-    channel._auto_proxy_state("push2his.eastmoney.com")["in_flight"] = True
+    key = ("push2his.eastmoney.com", "fflow")
+    client_state = client._state(key)
+    client_state.in_flight = True
+    client_state.leader_ok = False
+    client_state.leader_done.set()  # leader 刚失败完：follower 立即走回退链
     gateway_calls = []
 
     class Original:
@@ -500,10 +511,10 @@ def test_auto_proxy_singleflight_per_host(monkeypatch):
 
 def test_auto_proxy_clears_in_flight_after_an_attempt(monkeypatch):
     """在飞标志必须在结束后复位，否则一次尝试会永久挡住后续回退。"""
-    _enable_auto_proxy(monkeypatch)
+    client, transport = _enable_auto_proxy(monkeypatch)
     url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
-    state = channel._auto_proxy_state("push2his.eastmoney.com")
-    state["active"] = True
+    channel._auto_proxy_state("push2his.eastmoney.com")["active"] = True
+    key = ("push2his.eastmoney.com", "fflow")
 
     class Original:
         @staticmethod
@@ -511,15 +522,14 @@ def test_auto_proxy_clears_in_flight_after_an_attempt(monkeypatch):
             return types.SimpleNamespace(status_code=200)
 
     channel._auto_proxy_request(Original, object(), "GET", url, {})
-    assert state["in_flight"] is False
+    assert client._state(key).in_flight is False
 
 
 def test_gateway_200_with_html_body_is_not_a_recovery(monkeypatch):
     """200 但正文是拦截页：不能记成恢复，否则状态机会持续付费。"""
-    _enable_auto_proxy(monkeypatch)
+    client, transport = _enable_auto_proxy(monkeypatch)
     url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
-    state = channel._auto_proxy_state("push2his.eastmoney.com")
-    state["active"] = True
+    channel._auto_proxy_state("push2his.eastmoney.com")["active"] = True
 
     class Original:
         @staticmethod
@@ -529,15 +539,15 @@ def test_gateway_200_with_html_body_is_not_a_recovery(monkeypatch):
             )
 
     assert channel._auto_proxy_request(Original, object(), "GET", url, {}) is None
-    assert state["cooldown_until"] > channel.time.monotonic()
-    assert state["in_flight"] is False
+    state = client._states[("push2his.eastmoney.com", "fflow")]
+    assert state.cooldown_until > channel.time.monotonic()
+    assert state.in_flight is False
 
 
 def test_gateway_200_with_valid_json_is_a_recovery(monkeypatch):
-    _enable_auto_proxy(monkeypatch)
+    client, transport = _enable_auto_proxy(monkeypatch)
     url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
-    state = channel._auto_proxy_state("push2his.eastmoney.com")
-    state["active"] = True
+    channel._auto_proxy_state("push2his.eastmoney.com")["active"] = True
 
     class FakeResponse:
         status_code = 200
@@ -554,14 +564,13 @@ def test_gateway_200_with_valid_json_is_a_recovery(monkeypatch):
 
     response = channel._auto_proxy_request(Original, object(), "GET", url, {})
     assert response is not None and response.status_code == 200
-    assert state["cooldown_until"] == 0.0
+    assert client._state(("push2his.eastmoney.com", "fflow")).cooldown_until == 0.0
 
 
 def test_gateway_200_with_broken_json_is_not_a_recovery(monkeypatch):
-    _enable_auto_proxy(monkeypatch)
+    client, transport = _enable_auto_proxy(monkeypatch)
     url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
-    state = channel._auto_proxy_state("push2his.eastmoney.com")
-    state["active"] = True
+    channel._auto_proxy_state("push2his.eastmoney.com")["active"] = True
 
     class FakeResponse:
         status_code = 200
@@ -577,7 +586,8 @@ def test_gateway_200_with_broken_json_is_not_a_recovery(monkeypatch):
             return FakeResponse()
 
     assert channel._auto_proxy_request(Original, object(), "GET", url, {}) is None
-    assert state["cooldown_until"] > channel.time.monotonic()
+    state = client._states[("push2his.eastmoney.com", "fflow")]
+    assert state.cooldown_until > channel.time.monotonic()
 
 
 def test_retryable_status_from_plain_replay_goes_to_gateway(monkeypatch):
@@ -1046,19 +1056,9 @@ class TestAutoProxyRecoveryAndRotation:
 
     def test_a_gateway_data_failure_rotates_the_exit(self, monkeypatch):
         """出口拿到了但请求没成 → 作废认证换新出口 + 短冷却，不是 300 秒。"""
-        channel._auto_proxy = True
-        channel._auto_proxy_gateway = "gateway"
-        channel._auto_proxy_token = "token"
-        channel._auto_proxy_states.clear()
+        client, transport = _enable_auto_proxy(
+            monkeypatch, auths=["http://proxy-a:1", "http://proxy-b:1"])
         channel._auto_proxy_state("push2his.eastmoney.com")["active"] = True
-        channel._auto_proxy_auth = {"proxy": "http://stale", "cookie": "nid18=stale"}
-        channel._auto_proxy_auth_at = channel.time.monotonic()
-        auth_calls = []
-        fake_patch = types.SimpleNamespace(
-            get_auth_config_with_cache=lambda *args: auth_calls.append(args)
-            or {"proxy": "http://fresh", "cookie": "nid18=fresh"}
-        )
-        monkeypatch.setitem(__import__("sys").modules, "akshare_proxy_patch", fake_patch)
         original = getattr(std_requests, "_qtf_original_session", std_requests.Session)
         monkeypatch.setattr(
             original, "request",
@@ -1067,31 +1067,21 @@ class TestAutoProxyRecoveryAndRotation:
         assert channel._auto_proxy_request(
             original, object(), "GET", self.URL, {}
         ) is None
-        assert channel._auto_proxy_auth is None  # 坏出口已作废
-        state = channel._auto_proxy_states["push2his.eastmoney.com"]
-        assert state["cooldown_until"] <= channel.time.monotonic() + channel.AUTO_PROXY_DATA_COOLDOWN_SECONDS + 1
+        assert transport.invalidated == ["http://proxy-a:1"]  # 坏出口已作废
+        state = client._states[("push2his.eastmoney.com", "fflow")]
+        assert state.cooldown_until <= channel.time.monotonic() + gateway.AUTO_PROXY_DATA_COOLDOWN_SECONDS + 1
 
     def test_a_gateway_success_keeps_the_cached_auth(self, monkeypatch):
-        channel._auto_proxy = True
-        channel._auto_proxy_gateway = "gateway"
-        channel._auto_proxy_token = "token"
-        channel._auto_proxy_states.clear()
+        client, transport = _enable_auto_proxy(monkeypatch)
         channel._auto_proxy_state("push2his.eastmoney.com")["active"] = True
-        good_auth = {"proxy": "http://good", "cookie": "nid18=good"}
-        channel._auto_proxy_auth = good_auth
-        channel._auto_proxy_auth_at = channel.time.monotonic()
-        fake_patch = types.SimpleNamespace(
-            get_auth_config_with_cache=lambda *args: pytest.fail("好出口不该重新认证")
-        )
-        monkeypatch.setitem(__import__("sys").modules, "akshare_proxy_patch", fake_patch)
         original = getattr(std_requests, "_qtf_original_session", std_requests.Session)
         monkeypatch.setattr(
             original, "request",
             lambda *args, **kwargs: types.SimpleNamespace(status_code=200),
         )
-        response = channel._auto_proxy_request(original, object(), "GET", self.URL, {})
-        assert response.status_code == 200
-        assert channel._auto_proxy_auth is good_auth  # 好出口继续复用
+        assert channel._auto_proxy_request(original, object(), "GET", self.URL, {}) is not None
+        assert channel._auto_proxy_request(original, object(), "GET", self.URL, {}) is not None
+        assert transport.auth_calls == 1  # 好出口继续复用，不重新认证
 
     def test_an_attempt_is_logged_with_request_context(self, monkeypatch, caplog):
         channel._auto_proxy = True
@@ -1163,47 +1153,32 @@ class TestAutoProxyRecoveryAndRotation:
     def test_a_repeated_bad_exit_is_treated_as_auth_unavailable(self, monkeypatch):
         """重新认证仍吐回同一个坏出口（插件缓存在重认证失败时原样返回旧数据），
         不能记成"刚获取的认证"，要走认证不可用的长冷却。"""
-        stale = {"proxy": "http://stale-exit", "cookie": "nid18=stale"}
-        channel._auto_proxy = True
-        channel._auto_proxy_gateway = "gateway"
-        channel._auto_proxy_token = "token"
-        channel._auto_proxy_states.clear()
-        state = channel._auto_proxy_state("push2his.eastmoney.com")
-        state["active"] = True
-        state["last_failed_proxy"] = "http://stale-exit"
-        channel._auto_proxy_auth = stale
-        channel._auto_proxy_auth_at = 0.0  # 缓存过期，强制重新认证
-        reauth = []
-        fake_patch = types.SimpleNamespace(
-            get_auth_config_with_cache=lambda *args: reauth.append(args) or stale
+        client, transport = _enable_auto_proxy(
+            monkeypatch,
+            auths=["http://stale-exit"],  # 永远给同一个
+            data_cooldown_seconds=0.01,
         )
-        monkeypatch.setitem(__import__("sys").modules, "akshare_proxy_patch", fake_patch)
+        channel._auto_proxy_state("push2his.eastmoney.com")["active"] = True
         original = getattr(std_requests, "_qtf_original_session", std_requests.Session)
+        sends = []
         monkeypatch.setattr(
             original, "request",
-            lambda *args, **kwargs: pytest.fail("同一个坏出口不该再发数据请求"),
+            lambda *args, **kwargs: sends.append(1) or (_ for _ in ()).throw(
+                ConnectionError("refused")),
         )
-        assert channel._auto_proxy_request(
-            original, object(), "GET", self.URL, {}
-        ) is None
-        assert len(reauth) == 1  # 重新认证过，但吐回的还是坏出口
-        assert state["cooldown_until"] > channel.time.monotonic() + channel.AUTO_PROXY_DATA_COOLDOWN_SECONDS
+        assert channel._auto_proxy_request(original, object(), "GET", self.URL, {}) is None
+        channel.time.sleep(0.02)  # 过数据冷却
+        assert channel._auto_proxy_request(original, object(), "GET", self.URL, {}) is None
+        assert transport.auth_calls == 2  # 重新认证过，但吐回的还是坏出口
+        assert len(sends) == 1  # 第二次没发数据请求
+        state = client._states[("push2his.eastmoney.com", "fflow")]
+        assert state.cooldown_until > channel.time.monotonic() + gateway.AUTO_PROXY_COOLDOWN_SECONDS - 5
 
     def test_the_failure_log_masks_proxy_credentials(self, monkeypatch, caplog):
         """出口地址带 user:pass@host，异常原文进日志前必须抹掉。"""
         secret = "http://user:secret-pass@exit-gw:8080"
-        channel._auto_proxy = True
-        channel._auto_proxy_gateway = "gateway"
-        channel._auto_proxy_token = "token"
-        channel._auto_proxy_states.clear()
-        state = channel._auto_proxy_state("push2his.eastmoney.com")
-        state["active"] = True
-        channel._auto_proxy_auth = {"proxy": secret, "cookie": "c"}
-        channel._auto_proxy_auth_at = channel.time.monotonic()
-        fake_patch = types.SimpleNamespace(
-            get_auth_config_with_cache=lambda *args: {"proxy": secret, "cookie": "c"}
-        )
-        monkeypatch.setitem(__import__("sys").modules, "akshare_proxy_patch", fake_patch)
+        client, transport = _enable_auto_proxy(monkeypatch, auths=[secret])
+        channel._auto_proxy_state("push2his.eastmoney.com")["active"] = True
         original = getattr(std_requests, "_qtf_original_session", std_requests.Session)
         monkeypatch.setattr(
             original, "request",
@@ -1214,4 +1189,36 @@ class TestAutoProxyRecoveryAndRotation:
             channel._auto_proxy_request(original, object(), "GET", self.URL, {})
         joined = "\n".join(r.getMessage() for r in caplog.records)
         assert "secret-pass" not in joined and "<proxy>" in joined
-        assert channel._auto_proxy_auth is None  # 本代凭据已作废
+        assert client._auth is None  # 本代凭据已作废
+
+
+def test_gateway_request_is_the_explicit_entry(monkeypatch):
+    """编排层显式调用：不依赖失败计数，链走到这一级就试。"""
+    transport = _FakeGatewayTransport(["http://proxy-a:1"])
+    client = gateway.GatewayClient(transport)
+    # 注意：通道层没有任何激活状态——显式入口不看失败计数
+    seen = {}
+
+    def spy_request(method, url, send, **kwargs):
+        seen.update(kwargs)
+        # 不调 send（那会发真实请求）；传输行为本身由 test_gateway.py 覆盖
+        return types.SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(client, "request", spy_request)
+    monkeypatch.setattr(gateway, "get_gateway_client", lambda: client)
+    url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+
+    response = channel.gateway_request("GET", url)
+
+    assert response is not None and response.status_code == 200
+    assert seen["timeout"] == channel.EASTMONEY_FALLBACK_TIMEOUT_SECONDS
+    # 东财身份头在这里补齐，调用方不用各自重复
+    assert seen["headers"]["User-Agent"] == channel._AUTH_UA
+    assert seen["headers"]["Referer"] == "https://data.eastmoney.com/"
+
+
+def test_gateway_request_returns_none_without_a_client(monkeypatch):
+    monkeypatch.setattr(gateway, "get_gateway_client", lambda: None)
+    assert channel.gateway_request(
+        "GET", "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    ) is None

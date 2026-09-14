@@ -29,15 +29,13 @@ from ..config import (
     IMPERSONATE_TIMEOUT_SECONDS,
     EASTMONEY_FALLBACK_TIMEOUT_SECONDS,
     AUTO_PROXY_AFTER_FAILURES,
-    AUTO_PROXY_COOLDOWN_SECONDS,
-    AUTO_PROXY_DATA_COOLDOWN_SECONDS,
     AUTO_PROXY_RECOVERY_INTERVAL_SECONDS,
     AUTO_PROXY_RECOVERY_PROBES,
     HttpModeError,
     resolve_http_mode,
 )
 from ..observability import log_context
-from . import eastmoney_auth
+from . import eastmoney_auth, gateway
 
 logger = logging.getLogger("finmcp")
 
@@ -72,8 +70,6 @@ _auto_proxy = False
 _auto_proxy_gateway = None
 _auto_proxy_token = None
 _auto_proxy_lock = threading.Lock()
-_auto_proxy_auth = None
-_auto_proxy_auth_at = 0.0
 _auto_proxy_states = {}
 
 
@@ -85,10 +81,11 @@ _AUTO_PROXY_SCOPED_HOSTS = frozenset({
 
 
 def _auto_proxy_state(host):
+    # 通道层只记"要不要回退"（激活与恢复探测）；传输层状态（冷却、并发闸、
+    # 凭据）都在 gateway.GatewayClient 里，和编排层的显式调用共用同一份。
     return _auto_proxy_states.setdefault(
-        host, {"failures": 0, "active": False, "cooldown_until": 0.0,
-               "local_successes": 0, "last_probe_at": 0.0,
-               "last_failed_proxy": None, "in_flight": False}
+        host, {"failures": 0, "active": False,
+               "local_successes": 0, "last_probe_at": 0.0}
     )
 
 
@@ -265,34 +262,6 @@ def _plain_with_auth_outcome(
     return response
 
 
-def _gateway_response_ok(response) -> bool:
-    """HTTP 200 不等于拿到了数据。
-
-    东财风控的另一种形态是返回 200 但正文是验证码/拦截页（HTML）或空体，
-    直接记成"恢复"会让状态机误以为网关有效、持续付费，还污染日志。这里
-    只看响应头和已下载完的正文，**不主动读流**：``stream=True`` 的响应体
-    还没下载，读了会破坏调用方（见 _plain_with_auth_outcome 的注释）。
-    """
-    if getattr(response, "status_code", None) != 200:
-        return False
-    try:
-        content_type = str(getattr(response, "headers", {}).get("Content-Type", "")).lower()
-    except Exception:  # noqa: BLE001 - 桩/别的通道的响应类型不进校验
-        return True
-    if "html" in content_type:
-        return False
-    if "json" not in content_type:
-        # 取不到头、或 JSONP（text/javascript，正文不是合法 JSON）都不在这里
-        # 加码判断，交给调用方的解析兜底。
-        return True
-    if not getattr(response, "_content_consumed", True):
-        return True  # 流式响应体未下载，不在这里读
-    try:
-        return isinstance(response.json(), dict)
-    except Exception:  # noqa: BLE001 - JSON 接口解析失败即无效
-        return False
-
-
 def _plain_then_gateway(base_cls, session, method, url, kwargs, track_auth):
     """原生重放；本地没拿到有效结果就记账并尝试网关。
 
@@ -313,7 +282,10 @@ def _plain_then_gateway(base_cls, session, method, url, kwargs, track_auth):
     status = getattr(response, "status_code", None)
     if status == 200:
         # 原生路径也是本地路径：它能成功，说明不需要网关，恢复记账同样认它。
-        _record_auto_proxy_local_success(url)
+        # 但 200 不等于有效——拦截页/业务拒绝不能记成"本地恢复"，否则无效 200
+        # 会把失败计数清掉、让状态机误判恢复。
+        if gateway.response_ok(url, response):
+            _record_auto_proxy_local_success(url)
         return response
     if status in _RETRYABLE_STATUSES:
         _record_auto_proxy_local_failure(url)
@@ -323,147 +295,73 @@ def _plain_then_gateway(base_cls, session, method, url, kwargs, track_auth):
     return response
 
 
+def _gateway_send_with(base_cls, session):
+    def send(method, url, **kwargs):
+        return base_cls.request(session, method, url, **kwargs)
+    return send
+
+
 def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
     """Retry one failed Eastmoney request through the paid gateway.
 
-    This is deliberately request-scoped. It does not install akshare-proxy-patch
-    and never rewrites the process-wide requests module, so a later successful
-    impersonated request naturally returns the service to its normal path.
+    通道层只决定"要不要"（本地连续失败攒够阈值、状态激活）；"怎么发"全部交给
+    gateway.GatewayClient——认证复用、并发闸、冷却、响应校验都在那里，和编排层
+    的显式调用（``gateway_request``）共用同一份传输状态，不会一边冷却一边另付。
     """
-    global _auto_proxy_auth, _auto_proxy_auth_at
-    host = (urlsplit(url).hostname or "?").lower()
     if not _auto_proxy or not _auto_proxy_gateway or not _auto_proxy_token:
         return None
+    host = (urlsplit(url).hostname or "?").lower()
     if not _in_auto_proxy_scope(host):
         return None
     with _auto_proxy_lock:
-        now = time.monotonic()
-        state = _auto_proxy_state(host)
-        if state["cooldown_until"] > now or not state["active"]:
+        if not _auto_proxy_state(host)["active"]:
             return None
-        if state["in_flight"]:
-            # 同一 host 一次只允许一个网关尝试在飞。并发下 N 个失败同时冲进来，
-            # 冷却要等请求返回才设置，不设这道闸就是 N 次付费调用叠在一起。
-            # 没抢到的不等：等待会占住取数线程，它们走原有回退链。
-            logger.debug("auto_proxy_skip host=%s reason=in_flight", host)
-            return None
-        state["in_flight"] = True
-    try:
-        return _auto_proxy_request_locked(base_cls, session, method, url, kwargs, host)
-    finally:
-        with _auto_proxy_lock:
-            _auto_proxy_state(host)["in_flight"] = False
-
-
-def _auto_proxy_request_locked(base_cls, session, method, url, kwargs: dict, host: str):
-    global _auto_proxy_auth, _auto_proxy_auth_at
-    started = time.perf_counter()
-    used_auth = None
-    try:
-        import akshare_proxy_patch
-        now = time.monotonic()
-        with _auto_proxy_lock:
-            if _auto_proxy_auth and now - _auto_proxy_auth_at < 28:
-                auth = _auto_proxy_auth
-            else:
-                auth = None
-        if auth is None:
-            # 认证是网络调用，不能捏着 _auto_proxy_lock 做——它会同时挡住另一个
-            # host 的状态操作和本地成败记账。插件自带的 28s 缓存+锁已经保证了
-            # 认证本身不会并发打两次，这里只负责把结果记进自己的账。
-            auth = akshare_proxy_patch.get_auth_config_with_cache(
-                f"http://{_auto_proxy_gateway}:47001/api/akshare-auth",
-                _auto_proxy_token,
-            )
-            if auth:
-                with _auto_proxy_lock:
-                    _auto_proxy_auth = auth
-                    _auto_proxy_auth_at = now
-        used_auth = auth
-        with _auto_proxy_lock:
-            state = _auto_proxy_state(host)
-            last_failed = state["last_failed_proxy"]
-        # 上一次这个出口刚失败过、而认证层又把同一个出口吐回来（插件的缓存
-        # 在重新认证失败时会原样返回旧数据），等于没有新出口可用——这不能
-        # 记成"刚获取的认证"，按认证不可用走长冷却。
-        if auth and last_failed and auth.get("proxy") == last_failed:
-            auth = None
-        if not auth or not auth.get("proxy"):
-            with _auto_proxy_lock:
-                state = _auto_proxy_state(host)
-                state["cooldown_until"] = time.monotonic() + AUTO_PROXY_COOLDOWN_SECONDS
-                state["failures"] = 0
-            logger.warning("auto_proxy_state host=%s state=cooldown reason=authentication_unavailable", host)
-            return None
-        retry_kwargs = dict(kwargs)
-        headers = dict(retry_kwargs.get("headers") or {})
-        headers.update(_AUTH_DEFAULT_HEADERS)
-        headers.update(_AUTH_IDENTITY_HEADERS)
-        if auth.get("cookie"):
-            headers["Cookie"] = auth["cookie"]
-        retry_kwargs["headers"] = headers
-        retry_kwargs["proxies"] = {"http": auth["proxy"], "https": auth["proxy"]}
-        retry_kwargs.pop("impersonate", None)
-        retry_kwargs.setdefault("timeout", EASTMONEY_FALLBACK_TIMEOUT_SECONDS)
-        request_id, tool, symbol = log_context()
-        logger.warning(
-            "auto_proxy_attempt host=%s path=%s request_id=%s tool=%s symbol=%s",
-            host, urlsplit(url).path, request_id, tool, symbol,
-        )
-        response = base_cls.request(session, method, url, **retry_kwargs)
-        elapsed = time.perf_counter() - started
-        if _gateway_response_ok(response):
-            with _auto_proxy_lock:
-                state = _auto_proxy_state(host)
-                state["failures"] = 0
-                state["last_failed_proxy"] = None
-            logger.info(
-                "Eastmoney request recovered through proxy host=%s path=%s "
-                "elapsed=%.2fs request_id=%s",
-                host, urlsplit(url).path, elapsed, request_id,
-            )
-            return response
-        # 200 但正文无效（验证码页/空体）和直接断连同等处理：作废这一代认证，
-        # 短冷却后换出口再试。
-        logger.warning(
-            "auto_proxy_failure host=%s path=%s status=%s elapsed=%.2fs",
-            host, urlsplit(url).path, getattr(response, "status_code", None), elapsed,
-        )
-    except Exception as exc:  # pragma: no cover - provider/network dependent
-        logger.warning(
-            "auto_proxy_failure host=%s path=%s error=%s",
-            host, urlsplit(url).path, _sanitize_proxy_error(exc, used_auth),
-        )
-    with _auto_proxy_lock:
-        state = _auto_proxy_state(host)
-        state["cooldown_until"] = time.monotonic() + AUTO_PROXY_DATA_COOLDOWN_SECONDS
-        state["failures"] = 0
-        # 坏出口轮换：只作废本次失败用掉的那一代凭据——并发下另一请求刚拿到的
-        # 新出口不受牵连。插件的二级缓存一并失效，否则换汤不换药。
-        if used_auth is not None and _auto_proxy_auth is used_auth:
-            _auto_proxy_auth = None
-            _auto_proxy_auth_at = 0.0
-        state["last_failed_proxy"] = (used_auth or {}).get("proxy")
-    try:
-        import akshare_proxy_patch
-        akshare_proxy_patch._cache.expire_at = 0
-    except Exception:  # noqa: BLE001 - 插件不在时没有二级缓存可失效
-        pass
+    client = gateway.get_gateway_client()
+    if client is None:
+        return None
+    kwargs = dict(kwargs)
+    kwargs.setdefault("timeout", EASTMONEY_FALLBACK_TIMEOUT_SECONDS)
+    request_id, tool, symbol = log_context()
     logger.warning(
-        "auto_proxy_state host=%s state=cooldown seconds=%s reason=data_failure",
-        host, AUTO_PROXY_DATA_COOLDOWN_SECONDS,
+        "auto_proxy_attempt host=%s path=%s request_id=%s tool=%s symbol=%s",
+        host, urlsplit(url).path, request_id, tool, symbol,
     )
-    return None
+    response = client.request(
+        method, url, _gateway_send_with(base_cls, session), **kwargs
+    )
+    if response is not None:
+        with _auto_proxy_lock:
+            _auto_proxy_state(host)["failures"] = 0
+        logger.info(
+            "Eastmoney request recovered through proxy host=%s path=%s request_id=%s",
+            host, urlsplit(url).path, request_id,
+        )
+    return response
 
 
-def _sanitize_proxy_error(exc: Exception, used_auth) -> str:
-    """异常原文里的出口地址带凭据（user:pass@host），进日志前抹掉。"""
-    text = str(exc)[:200]
-    proxy = (used_auth or {}).get("proxy")
-    if proxy:
-        text = text.replace(proxy, "<proxy>")
-    return text
+def gateway_request(method: str, url: str, **kwargs):
+    """编排层显式调用的网关传输：provider 链走到这一级就试，不依赖失败计数。
 
+    没配置网关或网关不可用（冷却中/认证不可用/并发闸）时返回 None，调用方按
+    既有回退链继续。东财的身份头在这里补齐，调用方不用各自重复。
+    """
+    client = gateway.get_gateway_client()
+    if client is None:
+        return None
+    base = _restore.get("Session") or std_requests.Session
+    headers = dict(kwargs.pop("headers", None) or {})
+    for key, value in _AUTH_DEFAULT_HEADERS.items():
+        headers.setdefault(key, value)
+    for key, value in _AUTH_IDENTITY_HEADERS.items():
+        headers.setdefault(key, value)
+    kwargs["headers"] = headers
+    kwargs.setdefault("timeout", EASTMONEY_FALLBACK_TIMEOUT_SECONDS)
+
+    def send(method, url, **kw):
+        with base() as session:
+            return session.request(method, url, **kw)
+
+    return client.request(method, url, send, **kwargs)
 
 def _record_auto_proxy_local_failure(url) -> None:
     if not _auto_proxy:
@@ -492,7 +390,6 @@ def _record_auto_proxy_local_success(url) -> None:
         state = _auto_proxy_state(host)
         if not state["active"]:
             state["failures"] = 0
-            state["cooldown_until"] = 0.0
             return
         # 迟滞恢复：active 期间本地成功要按间隔攒够 N 次才退出网关回退。
         # 一次偶然成功立即退出，会让状态在"激活/恢复"之间来回抖，抖回去的
@@ -509,7 +406,6 @@ def _record_auto_proxy_local_success(url) -> None:
             )
             state["active"] = False
             state["local_successes"] = 0
-            state["cooldown_until"] = 0.0
             # 失败计数一并清零：留着它，恢复后第一次失败就会立即重新激活
             # （failures 已经 ≥ 阈值），"三次连续失败"的门槛形同虚设。
             state["failures"] = 0
@@ -726,7 +622,11 @@ def _install_impersonate(
                         method, url, **attempt_kwargs
                     )
                     if response.status_code == 200:
-                        _record_auto_proxy_local_success(url)
+                        # 200 不等于有效：拦截页/业务拒绝不能记成"本地恢复"，
+                        # 否则无效 200 会把失败计数清掉、让状态机误判恢复。
+                        # 响应仍原样返回——内容对不对由调用方的解析判。
+                        if gateway.response_ok(url, response):
+                            _record_auto_proxy_local_success(url)
                         _record_impersonation(success=True)
                         if track_auth:
                             _note_auth_outcome(url, success=True)
@@ -902,13 +802,12 @@ def uninstall_http_channel() -> None:
         _installed_reason = None
     with _breaker_lock:
         _breaker.update(failures=0, suspended_until=0.0)
-    global _auto_proxy_auth, _auto_proxy_auth_at, _auto_proxy
+    global _auto_proxy
     _auto_proxy = False
-    _auto_proxy_auth = None
-    _auto_proxy_auth_at = 0.0
     # per-host 状态一并清空：残留会让重装后的通道继承上一轮的激活/冷却，
     # 测试里也靠它保证隔离。旧版的三个全局计数已废弃，不再存在。
     _auto_proxy_states.clear()
+    gateway.reset_gateway_client()
 
 
 __all__ = [
