@@ -1917,6 +1917,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     p_batch.add_argument("--port", type=int, default=8791)
     p_batch.add_argument("--timeout", type=float, default=60.0, help="等实例就绪的秒数")
 
+    p_gw = sub.add_parser("gateway-lifetime",
+                          help="认证后按间隔复用同一份出口凭据打 fflow，量出口寿命，定 GATEWAY_AUTH_REUSE_SECONDS")
+    common(p_gw)
+    p_gw.add_argument("--exits", type=int, default=3, help="量几份出口凭据")
+    p_gw.add_argument("--interval", type=float, default=15.0, help="每出口轮询间隔秒数")
+    p_gw.add_argument("--max-minutes", type=float, default=20.0, help="单出口观测上限（分钟）")
+
     p_all = sub.add_parser("all", help="facts → browser → tonghuashun → recommend")
     common(p_all)
     for source in (p_facts, p_browser, p_ths, p_rec):
@@ -1960,11 +1967,92 @@ def _require_venv() -> None:
     raise SystemExit(2)
 
 
+def run_gateway_lifetime(args) -> int:
+    """量网关出口凭据的寿命，定 GATEWAY_AUTH_REUSE_SECONDS。
+
+    插件按 28s 固定轮换，但实测一份凭据能稳定服务数分钟——轮换周期是插件的
+    保守值，不是出口的物理寿命。这里认证一次拿到出口，按间隔复用同一份凭据
+    打 fflow 接口直到它失败，逐出口记寿命。按 AGENTS 第五条：复用上限是预算
+    类参数，按**最大值**定（分位数会砍掉长尾，而长尾正是要保住的部分）。
+
+    注意成本：每出口按 interval 轮询直到失败或 --max-minutes，请求都经过付费
+    出口。出口死亡是静默的，表现为请求失败。
+    """
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dotenv = _dotenv(PROJECT_ROOT / ".env")
+    gateway_addr = dotenv.get("AKSHARE_PROXY_GATEWAY") or dotenv.get("AKSHARE_PROXY_IP")
+    token = dotenv.get("AKSHARE_PROXY_TOKEN") or dotenv.get("AKSHARE_PROXY_PASSWORD")
+    if not gateway_addr or not token:
+        print("[gateway-lifetime] .env 里没有网关配置，跑不了", file=sys.stderr)
+        return 2
+
+    from finmcp.datasource.gateway import AkshareProxyTransport
+
+    import requests
+
+    transport = AkshareProxyTransport(gateway_addr, token)
+    url = ("https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+           "?lmt=5&klt=101&secid=1.600519&fields1=f1,f2,f3,f7"
+           "&fields2=f51,f52&ut=b2884a393a59ad64002292a3e90d46a5")
+    lifetimes = []
+    for index in range(args.exits):
+        auth = transport.authenticate()
+        if auth is None:
+            print(f"[gateway-lifetime] 出口 {index + 1}：认证失败，停")
+            break
+        print(f"[gateway-lifetime] 出口 {index + 1}：{auth.proxy.split('@')[-1]}")
+        headers = {"User-Agent": auth.user_agent or None, "Cookie": auth.cookie}
+        headers = {k: v for k, v in headers.items() if v}
+        proxies = {"http": auth.proxy, "https": auth.proxy}
+        acquired_at = time.monotonic()
+        died_at = None
+        polls = 0
+        while time.monotonic() - acquired_at < args.max_minutes * 60:
+            try:
+                response = requests.get(url, headers=headers, proxies=proxies, timeout=10)
+                ok = response.status_code == 200 and '"klines"' in response.text
+            except Exception:
+                ok = False
+            polls += 1
+            if not ok:
+                died_at = time.monotonic()
+                break
+            time.sleep(args.interval)
+        lifetime = (died_at or time.monotonic()) - acquired_at
+        lifetimes.append({
+            "exit": auth.proxy.split("@")[-1],
+            "lifetime_seconds": round(lifetime, 1),
+            "polls": polls,
+            "died": died_at is not None,
+        })
+        print(f"[gateway-lifetime]   寿命 {lifetime:.0f}s（{'失败' if died_at else '到观测上限'}，{polls} 次轮询）")
+
+    result = {
+        "started": _now_text(),
+        "lifetimes": lifetimes,
+        "interval": args.interval,
+        "max_minutes": args.max_minutes,
+    }
+    (out_dir / "gateway-lifetime.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2))
+    observed = [x["lifetime_seconds"] for x in lifetimes if x["died"]]
+    if not observed:
+        print("[gateway-lifetime] 没有出口在观测窗内死亡——复用上限定不出来，"
+              "说明寿命超过观测上限，维持默认或加长 --max-minutes 再量")
+        return 1
+    recommended = max(observed)
+    print(f"[gateway-lifetime] 观测寿命 {observed}，按最大值取 "
+          f"GATEWAY_AUTH_REUSE_SECONDS={recommended:.0f}")
+    return 0
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     _require_venv()
     handlers = {"facts": run_facts, "browser": run_browser, "recommend": run_recommend,
                 "tonghuashun": run_tonghuashun, "verify": run_verify, "batch": run_batch,
+                "gateway-lifetime": run_gateway_lifetime,
                 "all": run_all}
     return handlers[args.command](args)
 
