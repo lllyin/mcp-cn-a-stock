@@ -451,7 +451,7 @@ async def test_get_market_breadth_falls_back_to_next_provider():
     result = await get_market_breadth([FailedProvider(), WorkingProvider()])
 
     assert result.source == "working"
-    assert result.warnings == ("failed 不可用: upstream failed",)
+    assert result.warnings == ("failed 不可用：upstream failed，已回退到 working",)
 
 
 @pytest.mark.asyncio
@@ -463,8 +463,34 @@ async def test_get_market_breadth_raises_when_all_providers_fail():
         async def fetch(self):
             raise RuntimeError("upstream failed")
 
-    with pytest.raises(MarketBreadthUnavailable, match="first 不可用"):
+    with pytest.raises(MarketBreadthUnavailable, match="first 不可用：upstream failed"):
         await get_market_breadth([FailedProvider("first"), FailedProvider("second")])
+
+
+@pytest.mark.asyncio
+async def test_get_market_breadth_sanitizes_playwright_blobs():
+    blob = (
+        "BrowserType.launch: Target page, context or browser has been closed\n"
+        "Browser logs:\n"
+        "<launching> /root/.cache/ms-playwright/chromium-1208/chrome ...\n"
+        "  - [pid=783093][err] Missing X server or $DISPLAY\n"
+    )
+
+    class PlaywrightProvider:
+        name = "tonghuashun_web"
+
+        async def fetch(self):
+            raise RuntimeError(blob)
+
+    class WorkingProvider:
+        name = "efinance"
+
+        async def fetch(self):
+            return make_data("efinance")
+
+    result = await get_market_breadth([PlaywrightProvider(), WorkingProvider()])
+
+    assert result.warnings == ("tonghuashun_web 不可用：浏览器环境不可用，已回退到 efinance",)
 
 
 @pytest.mark.asyncio

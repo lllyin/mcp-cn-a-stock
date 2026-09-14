@@ -472,7 +472,9 @@ class TonghuashunPlaywrightProvider:
                     auth = await self._ensure_auth()
             raise AssertionError("unreachable")
         except Exception as exc:
-            self._last_failure = str(exc)
+            # 只存分类后的短句：完整异常（含 Playwright 启动日志）留在服务日志，
+            # 否则会顺着冷却期文案再次漏给调用方。
+            self._last_failure = _short_failure_reason(exc)
             self._cooldown_until = time.monotonic() + self._cooldown_seconds
             raise
 
@@ -560,6 +562,30 @@ cache.register_namespace(cache.Namespace(
 ))
 
 
+# Playwright 启动/会话失败的标志串。它的异常文本带浏览器 PID、启动参数、
+# 临时目录和整段 Call log，只能给用户一个分类，原文留在服务日志里。
+_BROWSER_ENV_MARKERS = (
+    "Missing X server",
+    "Target page, context or browser has been closed",
+    "BrowserType.launch",
+    "Executable doesn't exist",
+    "browser has been closed",
+)
+
+
+def _short_failure_reason(exc: Exception) -> str:
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return "请求超时"
+    text = str(exc)
+    if any(marker in text for marker in _BROWSER_ENV_MARKERS):
+        return "浏览器环境不可用"
+    if text and "\n" not in text and len(text) <= 120:
+        # 各 provider 自己抛的异常文案本来就是对外可读的短句，原样保留。
+        return text
+    first_line = text.splitlines()[0].strip() if text else ""
+    return first_line[:120] or type(exc).__name__
+
+
 async def _fetch_from_providers(
     providers: Sequence[MarketBreadthProvider],
 ) -> MarketBreadthData:
@@ -568,10 +594,14 @@ async def _fetch_from_providers(
         try:
             result = await provider.fetch()
             if failures:
-                result = replace(result, warnings=result.warnings + tuple(failures))
+                recovered = tuple(
+                    f"{failure}，已回退到 {result.source}" for failure in failures
+                )
+                result = replace(result, warnings=result.warnings + recovered)
             return result
         except Exception as exc:
-            failures.append(f"{provider.name} 不可用: {exc}")
+            logger.warning("%s 取涨跌分布失败", provider.name, exc_info=exc)
+            failures.append(f"{provider.name} 不可用：{_short_failure_reason(exc)}")
     raise MarketBreadthUnavailable("; ".join(failures) or "没有可用的涨跌分布数据源")
 
 
