@@ -285,6 +285,9 @@ mcporter call cn-stock market_events \
 | `AUTO_PROXY_DATA_COOLDOWN_SECONDS` | 网关数据失败（出口已拿到、请求没成）后的暂停秒数；失败同时作废缓存的认证，下一次尝试换新出口 | 秒（默认 `30`） |
 | `AUTO_PROXY_RECOVERY_PROBES` | 网关回退激活期间，本地成功要按间隔攒够多少次才退出回退（防一次偶然成功来回抖动） | 次数（默认 `3`） |
 | `AUTO_PROXY_RECOVERY_INTERVAL_SECONDS` | 相邻两次恢复探测的最小间隔秒数；间隔内的本地成功不累计 | 秒（默认 `60`） |
+| `GATEWAY_TRANSPORT` | 网关传输实现；接新的代理库时在 `gateway.py` 写一个 `GatewayTransport` 实现再加一个可选值 | 默认 `akshare_proxy_patch` |
+| `GATEWAY_AUTH_REUSE_SECONDS` | 一份网关出口凭据的复用上限；出口死亡是静默的，由失败即作废兜住 | 秒（默认 `600`） |
+| `GATEWAY_SINGLEFLIGHT_WAIT_SECONDS` | 同一主机同一接口族已有网关请求在飞时，其余请求等它出结果的上限 | 秒（默认 `5`） |
 
 从旧版本升级时注意：这个开关以前默认开启，现在需要显式写 `AKSHARE_PROXY_ENABLED=1`
 才会继续走网关，否则自动降级到 `impersonate`。

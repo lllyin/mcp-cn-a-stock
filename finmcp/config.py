@@ -71,6 +71,17 @@ AUTO_PROXY_DATA_COOLDOWN_SECONDS = max(1.0, float(env("AUTO_PROXY_DATA_COOLDOWN_
 # 立即退出，会让状态在"激活/恢复"之间来回抖，抖回去的代价是再攒一轮失败。
 AUTO_PROXY_RECOVERY_PROBES = max(1, int(env("AUTO_PROXY_RECOVERY_PROBES", "3")))
 AUTO_PROXY_RECOVERY_INTERVAL_SECONDS = max(1.0, float(env("AUTO_PROXY_RECOVERY_INTERVAL_SECONDS", "60")))
+# 网关传输实现（finmcp/datasource/gateway.py 的 GatewayTransport）。默认
+# akshare_proxy_patch；接新的代理库就是写一个实现类再加一个可选值。
+GATEWAY_TRANSPORT = str(env("GATEWAY_TRANSPORT", "akshare_proxy_patch")).strip()
+# 一份出口凭据的复用上限。插件按 28s 固定轮换，但实测一份凭据能稳定服务数分钟
+# （2026-09-14 实测 13/13 横跨 2.5 分钟），按寿命轮换能省约 4/5 的认证消耗。
+# 出口死亡是静默的（表现为请求失败），由失败即作废兜住。占位值，待 probe 量出
+# 寿命分布后按最大值调整。
+GATEWAY_AUTH_REUSE_SECONDS = max(1.0, float(env("GATEWAY_AUTH_REUSE_SECONDS", "600")))
+# 同一 (host, 接口族) 已有网关请求在飞时，其余请求等它出结果的上限。超时或
+# leader 失败就走原回退链，不无限排队。
+GATEWAY_SINGLEFLIGHT_WAIT_SECONDS = max(0.5, float(env("GATEWAY_SINGLEFLIGHT_WAIT_SECONDS", "5")))
 
 # --- Outbound HTTP channel (finmcp/datasource/http_channel.py) ---
 # Some upstream quote hosts drop connections from plain HTTP clients, so requests
