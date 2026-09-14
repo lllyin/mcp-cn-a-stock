@@ -461,6 +461,40 @@ class EastmoneyDelayPlatform(pf.Platform):
         )
 
 
+class EastmoneyGatewayPlatform(pf.Platform):
+    """同一个 push2his 资金流接口，但强制走付费网关传输。
+
+    与 ``EastmoneyPlatform`` 的差别只在传输：URL、参数、解析、契约完全一致——
+    网关只是传输，不产生第二种数据形态。排在链尾，前面任何一级满足了需求
+    就轮不到它（不花积分）。``degraded()`` 保持默认的 False：网关可不可用
+    由 ``GatewayClient`` 自己的冷却表达，不跟伪装通道的状态走。
+    """
+
+    name, label = "eastmoney_gateway", "东财(网关)"
+    capabilities = frozenset({"fund_flow"})
+
+    def fetch_fund_flow(self, request) -> Optional[FundFlowHistory]:
+        from .. import http_channel
+
+        response = http_channel.gateway_request(
+            "GET",
+            "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get",
+            params={
+                "lmt": "0", "klt": "101", "secid": request.secid,
+                "fields1": "f1,f2,f3,f7", "fields2": _FUND_FLOW_FIELDS,
+                "ut": "b2884a393a59ad64002292a3e90d46a5",
+                "_": int(time.time() * 1000),
+            },
+        )
+        if response is None:
+            return None
+        klines = ((response.json() or {}).get("data") or {}).get("klines") or []
+        if not klines:
+            return None
+        return FundFlowHistory(frame=_fund_flow_frame(klines), complete=True)
+
+
 pf.register(EastmoneyPlatform())
 pf.register(EastmoneyDataApiPlatform())
 pf.register(EastmoneyDelayPlatform())
+pf.register(EastmoneyGatewayPlatform())

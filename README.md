@@ -307,7 +307,7 @@ mcporter call cn-stock market_events \
 | `LOG_FILE` | 服务日志文件的路径，`health` 工具读它算可用率和耗时。`start.sh` 启动时会把实际路径传进来，正常不用配 | 路径（默认 `logs/cn-stock-mcp.log`） |
 | `LOG_RETENTION_DAYS` | 归档日志保留几天。每次启动会把上一轮日志存成一份归档，超过这个天数的清掉。`health` 默认把归档一起统计，所以这个值决定它最多能回看多久 | 天数，`0` 表示不留归档（默认 `3`） |
 | `TRADING_CALENDAR_PROVIDERS` | 判「今天开不开市」的日历来源：<br>`sina` 上交所公布的交易日名单，最权威<br>`holiday_cn` [NateScarlet/holiday-cn](https://github.com/NateScarlet/holiday-cn) 的国务院放假安排换算而来，与交易所名单的差异只在个别调休日<br>`weekday` 兜底，周一到周五算交易日——长假会被整段算成交易日，所以放最后 | `sina`<br>`holiday_cn`<br>`weekday`<br>`off`<br>（默认 `sina,holiday_cn,weekday`） |
-| `FUND_FLOW_PROVIDERS` | 个股/指数资金流的来源顺序（页面兜底另算，排在这一层之后）：<br>`eastmoney` 给全部历史<br>`eastmoney_delay` 只回当日一行，但主源拒绝当前出口时它还通 | `eastmoney`<br>`eastmoney_delay`<br>`off`<br>（默认 `eastmoney,eastmoney_delay`） |
+| `FUND_FLOW_PROVIDERS` | 个股/指数资金流的来源顺序（页面兜底另算，排在这一层之后）：<br>`eastmoney` 给全部历史<br>`eastmoney_delay` 只回当日一行，但主源拒绝当前出口时它还通<br>`eastmoney_gateway` 同一个接口走付费网关，放链尾才不花冤枉钱 | `eastmoney`<br>`eastmoney_delay`<br>`eastmoney_gateway`<br>`off`<br>（默认 `eastmoney,eastmoney_delay`） |
 | `REALTIME_FUND_FLOW_PROVIDERS` | 没有资金流向页面的标的（科创 50 等）盘中实时资金流的来源，给当日累计的五档净流入；有页面的标的不走这里 | `eastmoney_delay`<br>`off`<br>（默认 `eastmoney_delay`） |
 | `SECTOR_FUND_FLOW_PROVIDERS` | 板块资金流的取数顺序：<br>`eastmoney` 字段全<br>`eastmoney_dataapi` 只有主力净额，但主源连不上时它还通；报告备注里会标出是降级源 | `eastmoney`<br>`eastmoney_dataapi`<br>`off`<br>（默认 `eastmoney,eastmoney_dataapi`） |
 | `MARKET_MAP_PROVIDERS` | 市场云图的来源顺序：<br>`eastmoney` 主集群<br>`eastmoney_delay` 同口径备用集群 | `eastmoney`<br>`eastmoney_delay`<br>`off`<br>（默认 `eastmoney,eastmoney_delay`） |

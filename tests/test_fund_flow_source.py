@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import datetime
+import types
 
 import pandas as pd
 import pytest
@@ -445,3 +446,52 @@ def test_page_ratio_violation_is_scale_independent():
     ])
     issues = ffs.consistency_violations(frame, rendered=True)
     assert any("占比之和" in i for i in issues)
+
+
+# --- eastmoney_gateway：同一个接口，强制走付费网关 -------------------------------
+
+
+def test_gateway_platform_is_registered_but_not_in_the_default_order():
+    """付费回退必须显式配置才进链——默认顺序不变，不花冤枉钱。"""
+    platform = pf.get("eastmoney_gateway")
+    assert platform is not None and "fund_flow" in platform.capabilities
+    assert "eastmoney_gateway" not in ffs.DEFAULT_PROVIDER_ORDER
+
+
+def test_gateway_platform_replays_the_same_request_through_the_gateway(monkeypatch):
+    """URL、参数、解析与主源完全一致——网关只是传输，不产生第二种数据形态。"""
+    from finmcp.datasource import http_channel
+
+    seen = {}
+
+    def fake_gateway_request(method, url, **kwargs):
+        seen.update(method=method, url=url, **kwargs)
+        return types.SimpleNamespace(
+            json=lambda: {"rc": 0, "data": {"klines": [DELAY_KLINE]}})
+
+    monkeypatch.setattr(http_channel, "gateway_request", fake_gateway_request)
+    history = pf.get("eastmoney_gateway").fetch_fund_flow(REQUEST)
+
+    assert seen["method"] == "GET"
+    assert "push2his.eastmoney.com/api/qt/stock/fflow/daykline/get" in seen["url"]
+    assert seen["params"]["secid"] == "1.000688"   # 沪市 ETF 的 secid 不能算错
+    assert seen["params"]["lmt"] == "0" and seen["params"]["klt"] == "101"
+    assert history.complete is True and history.rows == 1
+    assert ffs._honours_contract(history) is True
+
+
+def test_gateway_platform_returns_none_when_the_gateway_is_unavailable(monkeypatch):
+    from finmcp.datasource import http_channel
+
+    monkeypatch.setattr(http_channel, "gateway_request", lambda *a, **k: None)
+    assert pf.get("eastmoney_gateway").fetch_fund_flow(REQUEST) is None
+
+
+def test_gateway_platform_returns_none_for_an_empty_payload(monkeypatch):
+    from finmcp.datasource import http_channel
+
+    monkeypatch.setattr(
+        http_channel, "gateway_request",
+        lambda *a, **k: types.SimpleNamespace(json=lambda: {"rc": 100, "data": None}),
+    )
+    assert pf.get("eastmoney_gateway").fetch_fund_flow(REQUEST) is None
