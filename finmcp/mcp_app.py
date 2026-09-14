@@ -287,6 +287,7 @@ async def fetch_batch_reports(
         # （research.py 里 IS_HISTORICAL_QUERY 那个分支会跳过），所以不存在把实时
         # 挤掉的问题，页面加载也就不是白付。
         fund_flow_page=(mode == "full" or bool(date)),
+        fund_flow_pinned_date=date,
     )
     report_cache = get_report_cache()
 

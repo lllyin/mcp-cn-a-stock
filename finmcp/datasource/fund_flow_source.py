@@ -235,6 +235,45 @@ def consistency_violations(frame, *, rendered: bool = False) -> list:
     return issues
 
 
+@dataclass(frozen=True)
+class FundFlowNeed:
+    """一次查询对资金流历史的要求。链按它决定"还要不要问下一个源"：
+    拿到满足需求的就停，不满足才继续——付费的网关级尤其不能在需求已满足时被调用。
+    """
+
+    history_rows: int = 0             # 需要的历史行数（full 的历史表）
+    pinned_date: Optional[str] = None  # 钉日期：历史里必须有这一天
+
+
+def satisfies(history: Optional[FundFlowHistory], need: FundFlowNeed) -> bool:
+    """这份历史帧满足本次查询的需求吗。
+
+    全量历史（``complete``）有就有、没有就是谁都没有，定局，不再问下一个源——
+    钉了一个非交易日或早于上市日期的，任何源都给不出，为它付费是纯亏。
+    部分帧看覆盖：钉日期要精确命中那天（不借最新一行），历史表要行数够。
+    """
+    if history is None or history.rows == 0:
+        return False
+    if history.complete:
+        return True
+    if need is None:
+        return False
+    if need.pinned_date:
+        return _has_date(history.frame, need.pinned_date)
+    return history.rows >= need.history_rows
+
+
+def _has_date(frame, pinned: str) -> bool:
+    """帧里有没有这一天。日期列在不同来源里是 date 对象或字符串，统一按文本比。"""
+    columns = getattr(frame, "columns", None)
+    if columns is None or "日期" not in columns:
+        return False
+    try:
+        return bool((frame["日期"].astype(str) == pinned).any())
+    except Exception:  # noqa: BLE001 - 列内容异常就当没命中，让链继续走
+        return False
+
+
 def _enough(value: FundFlowHistory) -> bool:
     """拿到完整历史就停，不再问下一个源。"""
     return value.complete
@@ -245,14 +284,20 @@ def resolve(
     *,
     order: Optional[tuple] = None,
     status: Optional[dict] = None,
+    need: Optional[FundFlowNeed] = None,
 ) -> Optional[FundFlowResult]:
-    """按配置顺序问每个平台：第一个给出完整历史的赢；都不完整就留行数最多的。"""
+    """按配置顺序问每个平台：第一个满足需求的赢；都不满足就留行数最多的。
+
+    ``need`` 为空时维持旧语义：拿到完整历史才停。传了 need 就按需求判定——
+    链尾的付费级（eastmoney_gateway）因此不会在需求已满足时被调用。
+    """
+    enough = _enough if need is None else lambda value: satisfies(value, need)
     resolved = pf.resolve(
         CAPABILITY,
         request,
         order=configured_order() if order is None else order,
         merge=_longer,
-        enough=_enough,
+        enough=enough,
         status=status,
     )
     if resolved is None:
@@ -265,11 +310,27 @@ def registered() -> tuple:
     return pf.registered(CAPABILITY)
 
 
+def split_order(order: tuple) -> tuple:
+    """把配置顺序切成（页面之前的同步段，页面之后的同步段）。
+
+    页面兜底（``fund_flow_page``）走浏览器、绑事件循环，进不了线程池里的同步
+    provider 链，由编排层在 gather 之后执行。它在配置里的位置决定网关级
+    （``eastmoney_gateway``）排在它前面还是后面——目标顺序是
+    ``eastmoney,eastmoney_delay,fund_flow_page,eastmoney_gateway``：页面是免费的，
+    排在付费级前面。配置里没写页面时，页面按既有行为挂在链尾。
+    """
+    if "fund_flow_page" in order:
+        index = order.index("fund_flow_page")
+        return order[:index], order[index + 1:]
+    return order, ()
+
+
 __all__ = [
     "CAPABILITY",
     "DEFAULT_PROVIDER_ORDER",
     "FUND_FLOW_COLUMNS",
     "FundFlowHistory",
+    "FundFlowNeed",
     "FundFlowRequest",
     "FundFlowResult",
     "PROVIDER_ORDER_ENV",
@@ -278,4 +339,6 @@ __all__ = [
     "provider_endpoint",
     "registered",
     "resolve",
+    "satisfies",
+    "split_order",
 ]

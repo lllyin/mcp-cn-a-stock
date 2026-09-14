@@ -30,8 +30,10 @@ DELAY_KLINE = (
 def _frame(rows: int = 3) -> pd.DataFrame:
     if rows == 0:
         return pd.DataFrame(columns=COLUMNS)
+    start = datetime.date(2026, 1, 1)
     return pd.DataFrame([
-        {**{c: float(i) for c in COLUMNS[1:]}, "日期": datetime.date(2026, 9, 1 + i)}
+        {**{c: float(i) for c in COLUMNS[1:]},
+         "日期": start + datetime.timedelta(days=i)}
         for i in range(rows)
     ])[COLUMNS]
 
@@ -495,3 +497,72 @@ def test_gateway_platform_returns_none_for_an_empty_payload(monkeypatch):
         lambda *a, **k: types.SimpleNamespace(json=lambda: {"rc": 100, "data": None}),
     )
     assert pf.get("eastmoney_gateway").fetch_fund_flow(REQUEST) is None
+
+
+# --- satisfies：按查询需求判断"还要不要问下一个源" -------------------------------
+
+
+def _history(rows: int, complete: bool, dates=None) -> ffs.FundFlowHistory:
+    frame = _frame(rows)
+    if dates is not None:
+        import datetime as _dt
+        frame["日期"] = [_dt.date.fromisoformat(d) for d in dates]
+    return ffs.FundFlowHistory(frame=frame, complete=complete)
+
+
+class TestSatisfies:
+    def test_nothing_satisfies_nothing(self):
+        assert ffs.satisfies(None, ffs.FundFlowNeed()) is False
+
+    def test_complete_history_always_satisfies(self):
+        # 全量历史定局：有就有，没有就是谁都没有。哪怕钉了一个非交易日，
+        # 也不为"谁都没有"的日期再问下一个源（付费级更是纯亏）。
+        need = ffs.FundFlowNeed(history_rows=60, pinned_date="2026-06-23")
+        assert ffs.satisfies(_history(5, complete=True), need) is True
+
+    def test_brief_realtime_stops_at_a_partial_frame(self):
+        """实时 brief 的需求是"有一行"：delay 的当日行就满足，不碰链尾付费级。"""
+        need = ffs.FundFlowNeed(history_rows=0)
+        assert ffs.satisfies(_history(1, complete=False), need) is True
+
+    def test_full_history_table_needs_the_rows(self):
+        need = ffs.FundFlowNeed(history_rows=60)
+        assert ffs.satisfies(_history(120, complete=False), need) is True   # 页面 120 行够
+        assert ffs.satisfies(_history(1, complete=False), need) is False   # delay 一行不够
+
+    def test_pinned_date_must_be_hit_exactly(self):
+        need = ffs.FundFlowNeed(pinned_date="2026-06-23")
+        frame_with = _history(3, complete=False, dates=["2026-06-19", "2026-06-22", "2026-06-23"])
+        frame_without = _history(3, complete=False, dates=["2026-06-19", "2026-06-22", "2026-06-24"])
+        assert ffs.satisfies(frame_with, need) is True
+        assert ffs.satisfies(frame_without, need) is False
+
+    def test_pinned_date_tolerates_string_date_columns(self):
+        """页面兜底给的日期列是字符串，命中判定两种形态都要认。"""
+        need = ffs.FundFlowNeed(pinned_date="2026-06-23")
+        frame = _frame(2)
+        frame["日期"] = ["2026-06-22", "2026-06-23"]
+        assert ffs.satisfies(ffs.FundFlowHistory(frame=frame, complete=False), need) is True
+
+
+def test_resolve_stops_at_the_first_satisfying_source(registry):
+    """need 让链在部分满足时停下：不再走到下一个源。"""
+    partial = _Stub("partial", ffs.FundFlowHistory(frame=_frame(2), complete=False))
+    gateway = _Stub("gateway", ffs.FundFlowHistory(frame=_frame(99), complete=True))
+    pf.register(partial)
+    pf.register(gateway)
+    result = ffs.resolve(REQUEST, order=("partial", "gateway"),
+                         need=ffs.FundFlowNeed(history_rows=0))
+    assert result is not None and result.provider == "partial"
+    assert gateway.calls == 0
+
+
+def test_resolve_continues_when_the_need_is_not_met(registry):
+    partial = _Stub("partial", ffs.FundFlowHistory(frame=_frame(2), complete=False))
+    gateway = _Stub("gateway", ffs.FundFlowHistory(frame=_frame(99), complete=True))
+    pf.register(partial)
+    pf.register(gateway)
+    result = ffs.resolve(REQUEST, order=("partial", "gateway"),
+                         need=ffs.FundFlowNeed(history_rows=60))
+    assert gateway.calls == 1
+    assert result is not None and len(result.frame) == 99

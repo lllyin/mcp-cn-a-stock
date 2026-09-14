@@ -955,7 +955,8 @@ class CNStockDataSource(DataSource):
                 )
         return {"finance": result["finance"].copy(deep=True)}
     
-    def _fetch_fund_flow_sync(self, code: str, symbol: str = None) -> Optional[Dict]:
+    def _fetch_fund_flow_sync(self, code: str, symbol: str = None,
+                              need: "fund_flow_source.FundFlowNeed | None" = None) -> Optional[Dict]:
         """同步获取资金流向数据。
 
         源在平台层：``FUND_FLOW_PROVIDERS`` 决定问谁、按什么顺序（默认 eastmoney →
@@ -963,6 +964,9 @@ class CNStockDataSource(DataSource):
         ``complete``——这份是不是该源能给的全部历史。编排层靠它决定还要不要付一次
         页面加载：主源给的是全部，不用补；delay 只有当日一行，有页面的标的还该去页面
         把 120 行历史取回来。
+
+        ``need`` 是这次查询对历史帧的要求（钉日期/行数）：链拿到满足需求的就停，
+        链尾的付费级（eastmoney_gateway）不该在需求已满足时被调用。为空维持旧语义。
 
         "获取资金流向数据失败 <code>:" 这行的措辞不能改：verify_release 和 loadtest
         都按它数主源失败的次数。主源没给、只拿到 delay 那一行时同样打这一行——
@@ -974,7 +978,7 @@ class CNStockDataSource(DataSource):
         request = fund_flow_source.FundFlowRequest(code=code, symbol=symbol, is_index=is_index)
         status: dict = {}
         try:
-            result = fund_flow_source.resolve(request, status=status)
+            result = fund_flow_source.resolve(request, status=status, need=need)
         except Exception as e:
             logger.warning(f"获取资金流向数据失败 {code}: {e}")
             return _fetch_failure("fund_flow")
@@ -994,7 +998,8 @@ class CNStockDataSource(DataSource):
                 "complete": result.complete, "provider": result.provider}
 
     def _fetch_fund_flow_cached(
-        self, code: str, symbol: str, rows_needed: int
+        self, code: str, symbol: str, rows_needed: int,
+        need: "fund_flow_source.FundFlowNeed | None" = None,
     ) -> Optional[Dict]:
         """带缓存的资金流取数。同步，仍然跑在线程池里。
 
@@ -1015,7 +1020,7 @@ class CNStockDataSource(DataSource):
         return _fund_flow_from_cache(
             symbol,
             rows_needed,
-            lambda: self._fetch_fund_flow_sync(code, symbol),
+            lambda: self._fetch_fund_flow_sync(code, symbol, need),
         )
 
     def _build_fund_flow_history(self, df, symbol: str, is_market: bool) -> Optional[Dict[str, np.ndarray]]:
@@ -1294,6 +1299,15 @@ class CNStockDataSource(DataSource):
                 ("finance", self._fetch_finance_cached(code, canonical_symbol))
             )
         if requirements.fund_flow:
+            # 钉日期只看"那天在不在历史帧里"，行数不是需求；full 的历史表才按行数要。
+            fund_flow_need = fund_flow_source.FundFlowNeed(
+                history_rows=(
+                    requirements.fund_flow_rows
+                    if requirements.fund_flow_page and not requirements.fund_flow_pinned_date
+                    else 0
+                ),
+                pinned_date=requirements.fund_flow_pinned_date,
+            )
             task_specs.append(
                 (
                     "fund_flow",
@@ -1302,6 +1316,7 @@ class CNStockDataSource(DataSource):
                         code,
                         canonical_symbol,
                         requirements.fund_flow_rows,
+                        fund_flow_need,
                     ),
                 )
             )
