@@ -467,6 +467,170 @@ def test_auto_proxy_state_is_per_host(monkeypatch):
     assert state_p2["active"] is False
 
 
+def _enable_auto_proxy(monkeypatch, *, auth=None):
+    channel._auto_proxy = True
+    channel._auto_proxy_gateway = "gateway"
+    channel._auto_proxy_token = "token"
+    channel._auto_proxy_states.clear()
+    fake_patch = types.SimpleNamespace(
+        get_auth_config_with_cache=lambda *args: auth
+        or {"proxy": "http://proxy", "cookie": "nid18=value"},
+        _cache=types.SimpleNamespace(expire_at=0),
+    )
+    monkeypatch.setitem(__import__("sys").modules, "akshare_proxy_patch", fake_patch)
+
+
+def test_auto_proxy_singleflight_per_host(monkeypatch):
+    """同一 host 同时只允许一次网关尝试在飞，并发的直接走原有回退链。"""
+    _enable_auto_proxy(monkeypatch)
+    url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    channel._auto_proxy_state("push2his.eastmoney.com")["active"] = True
+    channel._auto_proxy_state("push2his.eastmoney.com")["in_flight"] = True
+    gateway_calls = []
+
+    class Original:
+        @staticmethod
+        def request(session, method, request_url, **kwargs):
+            gateway_calls.append(kwargs)
+            return types.SimpleNamespace(status_code=200)
+
+    assert channel._auto_proxy_request(Original, object(), "GET", url, {}) is None
+    assert gateway_calls == []
+
+
+def test_auto_proxy_clears_in_flight_after_an_attempt(monkeypatch):
+    """在飞标志必须在结束后复位，否则一次尝试会永久挡住后续回退。"""
+    _enable_auto_proxy(monkeypatch)
+    url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    state = channel._auto_proxy_state("push2his.eastmoney.com")
+    state["active"] = True
+
+    class Original:
+        @staticmethod
+        def request(session, method, request_url, **kwargs):
+            return types.SimpleNamespace(status_code=200)
+
+    channel._auto_proxy_request(Original, object(), "GET", url, {})
+    assert state["in_flight"] is False
+
+
+def test_gateway_200_with_html_body_is_not_a_recovery(monkeypatch):
+    """200 但正文是拦截页：不能记成恢复，否则状态机会持续付费。"""
+    _enable_auto_proxy(monkeypatch)
+    url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    state = channel._auto_proxy_state("push2his.eastmoney.com")
+    state["active"] = True
+
+    class Original:
+        @staticmethod
+        def request(session, method, request_url, **kwargs):
+            return types.SimpleNamespace(
+                status_code=200, headers={"Content-Type": "text/html"},
+            )
+
+    assert channel._auto_proxy_request(Original, object(), "GET", url, {}) is None
+    assert state["cooldown_until"] > channel.time.monotonic()
+    assert state["in_flight"] is False
+
+
+def test_gateway_200_with_valid_json_is_a_recovery(monkeypatch):
+    _enable_auto_proxy(monkeypatch)
+    url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    state = channel._auto_proxy_state("push2his.eastmoney.com")
+    state["active"] = True
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"Content-Type": "application/json"}
+        _content_consumed = True
+
+        def json(self):
+            return {"rc": 0, "data": {"klines": ["2026-09-11,1,2,3,4"]}}
+
+    class Original:
+        @staticmethod
+        def request(session, method, request_url, **kwargs):
+            return FakeResponse()
+
+    response = channel._auto_proxy_request(Original, object(), "GET", url, {})
+    assert response is not None and response.status_code == 200
+    assert state["cooldown_until"] == 0.0
+
+
+def test_gateway_200_with_broken_json_is_not_a_recovery(monkeypatch):
+    _enable_auto_proxy(monkeypatch)
+    url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    state = channel._auto_proxy_state("push2his.eastmoney.com")
+    state["active"] = True
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"Content-Type": "application/json"}
+        _content_consumed = True
+
+        def json(self):
+            raise ValueError("not json")
+
+    class Original:
+        @staticmethod
+        def request(session, method, request_url, **kwargs):
+            return FakeResponse()
+
+    assert channel._auto_proxy_request(Original, object(), "GET", url, {}) is None
+    assert state["cooldown_until"] > channel.time.monotonic()
+
+
+def test_retryable_status_from_plain_replay_goes_to_gateway(monkeypatch):
+    """原生重放拿到 403 也算本地失败：记账并尝试网关。"""
+    _install_impersonate_with_fake_cffi(
+        monkeypatch, [RuntimeError("blocked")] * channel.IMPERSONATE_RETRY
+    )
+    original = getattr(std_requests, "_qtf_original_session")
+    monkeypatch.setattr(
+        original, "request",
+        lambda *args, **kwargs: types.SimpleNamespace(status_code=403),
+    )
+    _enable_auto_proxy(monkeypatch)
+    gateway_calls = []
+    monkeypatch.setattr(
+        channel, "_auto_proxy_request",
+        lambda *args: gateway_calls.append(args)
+        or types.SimpleNamespace(status_code=200),
+    )
+    url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+
+    response = std_requests.Session().request("GET", url)
+
+    assert response.status_code == 200
+    assert len(gateway_calls) == 1
+    assert channel._auto_proxy_state("push2his.eastmoney.com")["failures"] == 1
+
+
+def test_client_error_status_is_not_retried_via_gateway(monkeypatch):
+    """404 是请求本身的问题，换出口只会原样再错一遍、白花积分。"""
+    _install_impersonate_with_fake_cffi(
+        monkeypatch, [RuntimeError("blocked")] * channel.IMPERSONATE_RETRY
+    )
+    original = getattr(std_requests, "_qtf_original_session")
+    monkeypatch.setattr(
+        original, "request",
+        lambda *args, **kwargs: types.SimpleNamespace(status_code=404),
+    )
+    _enable_auto_proxy(monkeypatch)
+    gateway_calls = []
+    monkeypatch.setattr(
+        channel, "_auto_proxy_request",
+        lambda *args: gateway_calls.append(args),
+    )
+
+    response = std_requests.Session().request(
+        "GET", "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    )
+
+    assert response.status_code == 404
+    assert gateway_calls == []
+
+
 def test_broken_cffi_session_is_not_reused(monkeypatch):
     channel._thread_local.cffi_session = object()
     _install_impersonate_with_fake_cffi(monkeypatch, [RuntimeError("reset"), 200])

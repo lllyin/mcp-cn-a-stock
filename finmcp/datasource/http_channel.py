@@ -88,8 +88,14 @@ def _auto_proxy_state(host):
     return _auto_proxy_states.setdefault(
         host, {"failures": 0, "active": False, "cooldown_until": 0.0,
                "local_successes": 0, "last_probe_at": 0.0,
-               "last_failed_proxy": None}
+               "last_failed_proxy": None, "in_flight": False}
     )
+
+
+#: 本地通道的非 200 里，哪些值得按"通道失败"记账并尝试网关。400/401/404/405
+#: 是请求本身的问题，换出口只会原样再错一遍、白花积分；403/429/5xx 才可能是
+#: 出口待遇或上游网关层的问题。
+_RETRYABLE_STATUSES = frozenset({403, 408, 425, 429, 500, 502, 503, 504})
 
 
 def _in_auto_proxy_scope(host) -> bool:
@@ -259,6 +265,64 @@ def _plain_with_auth_outcome(
     return response
 
 
+def _gateway_response_ok(response) -> bool:
+    """HTTP 200 不等于拿到了数据。
+
+    东财风控的另一种形态是返回 200 但正文是验证码/拦截页（HTML）或空体，
+    直接记成"恢复"会让状态机误以为网关有效、持续付费，还污染日志。这里
+    只看响应头和已下载完的正文，**不主动读流**：``stream=True`` 的响应体
+    还没下载，读了会破坏调用方（见 _plain_with_auth_outcome 的注释）。
+    """
+    if getattr(response, "status_code", None) != 200:
+        return False
+    try:
+        content_type = str(getattr(response, "headers", {}).get("Content-Type", "")).lower()
+    except Exception:  # noqa: BLE001 - 桩/别的通道的响应类型不进校验
+        return True
+    if "html" in content_type:
+        return False
+    if "json" not in content_type:
+        # 取不到头、或 JSONP（text/javascript，正文不是合法 JSON）都不在这里
+        # 加码判断，交给调用方的解析兜底。
+        return True
+    if not getattr(response, "_content_consumed", True):
+        return True  # 流式响应体未下载，不在这里读
+    try:
+        return isinstance(response.json(), dict)
+    except Exception:  # noqa: BLE001 - JSON 接口解析失败即无效
+        return False
+
+
+def _plain_then_gateway(base_cls, session, method, url, kwargs, track_auth):
+    """原生重放；本地没拿到有效结果就记账并尝试网关。
+
+    "没拿到"包括两种：连接异常（东财拒绝的典型形态），以及可重试的状态码
+    （403/429/5xx——出口待遇或上游网关层的问题）。网关也没给出有效响应时，
+    原异常/原响应原样还给调用方，不为"走过网关"改变调用方看到的失败形态。
+    """
+    try:
+        response = _plain_with_auth_outcome(
+            base_cls, session, method, url, kwargs, track_auth=track_auth,
+        )
+    except Exception:
+        _record_auto_proxy_local_failure(url)
+        proxy_response = _auto_proxy_request(base_cls, session, method, url, kwargs)
+        if proxy_response is not None:
+            return proxy_response
+        raise
+    status = getattr(response, "status_code", None)
+    if status == 200:
+        # 原生路径也是本地路径：它能成功，说明不需要网关，恢复记账同样认它。
+        _record_auto_proxy_local_success(url)
+        return response
+    if status in _RETRYABLE_STATUSES:
+        _record_auto_proxy_local_failure(url)
+        proxy_response = _auto_proxy_request(base_cls, session, method, url, kwargs)
+        if proxy_response is not None:
+            return proxy_response
+    return response
+
+
 def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
     """Retry one failed Eastmoney request through the paid gateway.
 
@@ -275,10 +339,24 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
     with _auto_proxy_lock:
         now = time.monotonic()
         state = _auto_proxy_state(host)
-        if state["cooldown_until"] > now:
+        if state["cooldown_until"] > now or not state["active"]:
             return None
-        if not state["active"]:
+        if state["in_flight"]:
+            # 同一 host 一次只允许一个网关尝试在飞。并发下 N 个失败同时冲进来，
+            # 冷却要等请求返回才设置，不设这道闸就是 N 次付费调用叠在一起。
+            # 没抢到的不等：等待会占住取数线程，它们走原有回退链。
+            logger.debug("auto_proxy_skip host=%s reason=in_flight", host)
             return None
+        state["in_flight"] = True
+    try:
+        return _auto_proxy_request_locked(base_cls, session, method, url, kwargs, host)
+    finally:
+        with _auto_proxy_lock:
+            _auto_proxy_state(host)["in_flight"] = False
+
+
+def _auto_proxy_request_locked(base_cls, session, method, url, kwargs: dict, host: str):
+    global _auto_proxy_auth, _auto_proxy_auth_at
     started = time.perf_counter()
     used_auth = None
     try:
@@ -288,19 +366,27 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
             if _auto_proxy_auth and now - _auto_proxy_auth_at < 28:
                 auth = _auto_proxy_auth
             else:
-                auth = akshare_proxy_patch.get_auth_config_with_cache(
-                    f"http://{_auto_proxy_gateway}:47001/api/akshare-auth",
-                    _auto_proxy_token,
-                )
-                if auth:
+                auth = None
+        if auth is None:
+            # 认证是网络调用，不能捏着 _auto_proxy_lock 做——它会同时挡住另一个
+            # host 的状态操作和本地成败记账。插件自带的 28s 缓存+锁已经保证了
+            # 认证本身不会并发打两次，这里只负责把结果记进自己的账。
+            auth = akshare_proxy_patch.get_auth_config_with_cache(
+                f"http://{_auto_proxy_gateway}:47001/api/akshare-auth",
+                _auto_proxy_token,
+            )
+            if auth:
+                with _auto_proxy_lock:
                     _auto_proxy_auth = auth
                     _auto_proxy_auth_at = now
         used_auth = auth
+        with _auto_proxy_lock:
+            state = _auto_proxy_state(host)
+            last_failed = state["last_failed_proxy"]
         # 上一次这个出口刚失败过、而认证层又把同一个出口吐回来（插件的缓存
         # 在重新认证失败时会原样返回旧数据），等于没有新出口可用——这不能
         # 记成"刚获取的认证"，按认证不可用走长冷却。
-        if auth and state["last_failed_proxy"] and \
-                auth.get("proxy") == state["last_failed_proxy"]:
+        if auth and last_failed and auth.get("proxy") == last_failed:
             auth = None
         if not auth or not auth.get("proxy"):
             with _auto_proxy_lock:
@@ -326,7 +412,7 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
         )
         response = base_cls.request(session, method, url, **retry_kwargs)
         elapsed = time.perf_counter() - started
-        if getattr(response, "status_code", None) == 200:
+        if _gateway_response_ok(response):
             with _auto_proxy_lock:
                 state = _auto_proxy_state(host)
                 state["failures"] = 0
@@ -337,9 +423,8 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
                 host, urlsplit(url).path, elapsed, request_id,
             )
             return response
-        # 非 200 说明出口能连但请求没成：多半是这个出口本身待遇差。作废**这一代**
-        # 认证（另一请求刚拿到的新出口不受牵连）并失效插件的二级缓存，下一次
-        # 换新出口；冷却用短的——等 300 秒没有意义。
+        # 200 但正文无效（验证码页/空体）和直接断连同等处理：作废这一代认证，
+        # 短冷却后换出口再试。
         logger.warning(
             "auto_proxy_failure host=%s path=%s status=%s elapsed=%.2fs",
             host, urlsplit(url).path, getattr(response, "status_code", None), elapsed,
@@ -400,8 +485,10 @@ def _record_auto_proxy_local_failure(url) -> None:
 def _record_auto_proxy_local_success(url) -> None:
     if not _auto_proxy:
         return
+    host = (urlsplit(url).hostname or "?").lower()
+    if not _in_auto_proxy_scope(host):
+        return
     with _auto_proxy_lock:
-        host = (urlsplit(url).hostname or "?").lower()
         state = _auto_proxy_state(host)
         if not state["active"]:
             state["failures"] = 0
@@ -621,19 +708,10 @@ def _install_impersonate(
             kwargs, track_auth = _with_auth_cookie(url, kwargs)
             if not _is_impersonated(url) or _impersonation_suspended():
                 kwargs.pop("impersonate", None)
-                try:
-                    return _plain_with_auth_outcome(
-                        original_session_cls, self, method, url, kwargs,
-                        track_auth=track_auth,
-                    )
-                except Exception:
-                    _record_auto_proxy_local_failure(url)
-                    proxy_response = _auto_proxy_request(
-                        original_session_cls, self, method, url, kwargs
-                    )
-                    if proxy_response is not None:
-                        return proxy_response
-                    raise
+                return _plain_then_gateway(
+                    original_session_cls, self, method, url, kwargs,
+                    track_auth=track_auth,
+                )
 
             attempt_kwargs = dict(kwargs)
             attempt_kwargs["timeout"] = timeout
@@ -684,19 +762,10 @@ def _install_impersonate(
             kwargs.pop("impersonate", None)
             # 只按最终结果记凭据成败：伪装失败、普通请求成功时凭据显然仍然可用，
             # 不能因为中间路径失败就触发重采。
-            try:
-                return _plain_with_auth_outcome(
-                    original_session_cls, self, method, url, kwargs,
-                    track_auth=track_auth,
-                )
-            except Exception:
-                _record_auto_proxy_local_failure(url)
-                proxy_response = _auto_proxy_request(
-                    original_session_cls, self, method, url, kwargs
-                )
-                if proxy_response is not None:
-                    return proxy_response
-                raise
+            return _plain_then_gateway(
+                original_session_cls, self, method, url, kwargs,
+                track_auth=track_auth,
+            )
 
     def impersonate_get(url, params=None, **kwargs):
         with ImpersonateSession() as session:
