@@ -408,6 +408,30 @@ class TestLostSectionCollapse:
         diff = verify.compare_documents(old, "## 价格\n- a: 1\n", "x")
         assert sorted(d.key for d in diff.hard) == ["价格 › - b", "价格 › - c"]
 
+    def test_a_section_replaced_by_a_degradation_notice_is_a_gap(self):
+        """钉日期重放取不到资金流历史时整段退回降级提示：缺失多行 + 新增一行
+        已知提示。这是重放环境没取到数据，不是数字漂了——归"缺数据"，不计回归分。
+        （旧实现的折叠条件要求全缺失，被那一行提示挡在门外，整段误判成漂移。）"""
+        old = "## 资金流向\n" + "\n".join(
+            f"- {field}: 1.0" for field in
+            ["当日主力净流入", "主力净占比", "超大单净流入", "大单净流入", "中单净流入", "小单净流入"]
+        )
+        new = "## 资金流向\n- 指定日期查询暂不展示实时资金流向\n"
+        diff = verify.compare_documents(old, new, "brief")
+        assert len(diff.gaps) == 1 and "整段没取到" in diff.gaps[0].key
+        assert not diff.hard
+
+    def test_a_section_gaining_real_content_is_not_collapsed(self):
+        """新增的不只是降级提示，说明段落的产出形态变了——逐行报，不许折叠。"""
+        old = "## 资金流向\n" + "\n".join(
+            f"- {field}: 1.0" for field in
+            ["当日主力净流入", "主力净占比", "超大单净流入", "大单净流入", "中单净流入", "小单净流入"]
+        )
+        new = ("## 资金流向\n- 指定日期查询暂不展示实时资金流向\n"
+               "- 当日主力净流入: 9.9\n")
+        diff = verify.compare_documents(old, new, "brief")
+        assert not [d for d in diff.gaps if "整段没取到" in d.key]
+
 
 class TestStructureDiff:
     def test_a_new_field_across_an_array_collapses_to_one_row(self):

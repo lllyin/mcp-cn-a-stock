@@ -951,7 +951,9 @@ def _classify(document: str, diffs: list[LineDiff]) -> None:
     for diff in diffs:
         if diff.kind in ("实时口径", "复权漂移"):
             continue
-        if "整段不见了" in diff.key:
+        # 两个措辞对应 _collapse_lost_sections 的两个分支：整段全丢（不见了）、
+        # 丢了行且只多出降级提示（没取到）。都是可用性问题，不是漂移。
+        if "整段不见了" in diff.key or "整段没取到" in diff.key:
             diff.kind = "缺数据"
             continue
         reason = _known_reason(document, diff)
@@ -991,7 +993,9 @@ def _collapse_lost_sections(diffs: list[LineDiff]) -> list[LineDiff]:
             continue
         lost = [d for d in members if d.kind == "缺失"]
         gained = [d for d in members if d.kind == "新增"]
-        if len(lost) >= 5 and gained and all(
+        # 段内每一行都得是"丢了"或"多出来的只是降级提示"——有值变化说明段落
+        # 还在、是内容变了，折叠会把真变化吞掉。
+        if len(lost) >= 5 and len(members) == len(lost) + len(gained) and all(
             any(marker in d.key for marker in _DEGRADED_MARKER_TEXTS)
             for d in gained
         ):
