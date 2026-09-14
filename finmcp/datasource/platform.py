@@ -173,6 +173,11 @@ def configured_order(capability: str, env_name: str, default: tuple) -> tuple:
 
     order = []
     for name in names:
+        # 编排层环节（浏览器页面兜底）不是平台，由编排层在链的对应位置执行。
+        # 配在链里只是表达顺序，不该按"未注册平台"告警。
+        if name == "fund_flow_page":
+            order.append(name)
+            continue
         platform = _PLATFORMS.get(name)
         if platform is None:
             logger.warning(

@@ -295,6 +295,15 @@ def _plain_then_gateway(base_cls, session, method, url, kwargs, track_auth):
     return response
 
 
+#: 编排链里有没有配网关级，install 时算一次：配置在启动时定死，运行期不会变。
+#: 每次请求都重读会拖起 provider 注册链，还会在每个失败请求上重复打告警。
+_fflow_gateway_in_chain_cache: Optional[bool] = None
+
+
+def _fflow_gateway_in_chain_cached() -> bool:
+    return bool(_fflow_gateway_in_chain_cache)
+
+
 def _fflow_gateway_in_chain() -> bool:
     """资金流编排链里有没有配网关级。lazy import：http_channel 在数据源导入期
     就装好，不能在这里提前拖起 provider 注册链。"""
@@ -323,7 +332,8 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
     host = (urlsplit(url).hostname or "?").lower()
     if not _in_auto_proxy_scope(host):
         return None
-    if gateway.path_family(url) == "fflow" and _fflow_gateway_in_chain():
+    if (gateway.path_family(url) == "fflow" and _fflow_gateway_in_chain_cached()
+            and gateway.get_gateway_client() is not None):
         # 资金流编排链接了网关级时，fflow 路径让位给它——通道层在这里再拦一次
         # 就是同一请求付两次费。K 线/base_info 没有编排层链，继续走通道层。
         return None
@@ -785,6 +795,9 @@ def install_http_channel(
         _installed_reason = reason
         logger.debug("HTTP channel installed %s", describe_installed_channel())
 
+    global _fflow_gateway_in_chain_cache
+    _fflow_gateway_in_chain_cache = _fflow_gateway_in_chain()
+
     # 锁外读盘：盘上有一份没过期的就直接用，省掉一次页面加载。
     #
     # 这里**只读盘、不采集**。安装发生在 cn_stock_source 的 import 期，在这里起一次
@@ -821,6 +834,8 @@ def uninstall_http_channel() -> None:
     # per-host 状态一并清空：残留会让重装后的通道继承上一轮的激活/冷却，
     # 测试里也靠它保证隔离。旧版的三个全局计数已废弃，不再存在。
     _auto_proxy_states.clear()
+    global _fflow_gateway_in_chain_cache
+    _fflow_gateway_in_chain_cache = None
     gateway.reset_gateway_client()
 
 

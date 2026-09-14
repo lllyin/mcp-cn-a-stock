@@ -483,6 +483,9 @@ def _enable_auto_proxy(monkeypatch, auths=None, **client_kwargs):
     transport = _FakeGatewayTransport(auths or ["http://proxy-a:1"])
     client = gateway.GatewayClient(transport, **client_kwargs)
     monkeypatch.setattr(gateway, "get_gateway_client", lambda: client)
+    # install 时才算一次的让位判定，测试里显式补——不然请求路径上读的是
+    # "没人装过通道"的初始值。
+    monkeypatch.setattr(channel, "_fflow_gateway_in_chain_cache", False)
     return client, transport
 
 
@@ -1237,8 +1240,7 @@ def test_channel_yields_fflow_when_the_orchestration_has_a_gateway(monkeypatch):
             calls.append(1)
             return types.SimpleNamespace(status_code=200)
 
-    monkeypatch.setattr(
-        channel, "_fflow_gateway_in_chain", lambda: True)
+    monkeypatch.setattr(channel, "_fflow_gateway_in_chain_cache", True)
     fflow = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
     kline = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 
