@@ -295,13 +295,18 @@ def _plain_then_gateway(base_cls, session, method, url, kwargs, track_auth):
     return response
 
 
-#: 编排链里有没有配网关级，install 时算一次：配置在启动时定死，运行期不会变。
-#: 每次请求都重读会拖起 provider 注册链，还会在每个失败请求上重复打告警。
+#: 编排链里有没有配网关级。不能在 install 时算——那时 provider 还没注册，
+#: configured_order() 会把 eastmoney_gateway 误判成"未注册平台"返回空链，
+#: 通道层据此不让位，网关就在页面之前被通道层自己调用（23:32 日志实证）。
+#: 改成请求路径上 lazy 判定、进程内只算一次：配置在启动时定死，运行期不会变。
 _fflow_gateway_in_chain_cache: Optional[bool] = None
 
 
 def _fflow_gateway_in_chain_cached() -> bool:
-    return bool(_fflow_gateway_in_chain_cache)
+    global _fflow_gateway_in_chain_cache
+    if _fflow_gateway_in_chain_cache is None:
+        _fflow_gateway_in_chain_cache = _fflow_gateway_in_chain()
+    return _fflow_gateway_in_chain_cache
 
 
 def _fflow_gateway_in_chain() -> bool:
@@ -794,9 +799,6 @@ def install_http_channel(
         _installed_mode = mode
         _installed_reason = reason
         logger.debug("HTTP channel installed %s", describe_installed_channel())
-
-    global _fflow_gateway_in_chain_cache
-    _fflow_gateway_in_chain_cache = _fflow_gateway_in_chain()
 
     # 锁外读盘：盘上有一份没过期的就直接用，省掉一次页面加载。
     #

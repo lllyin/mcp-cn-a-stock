@@ -1087,16 +1087,8 @@ class TestAutoProxyRecoveryAndRotation:
         assert transport.auth_calls == 1  # 好出口继续复用，不重新认证
 
     def test_an_attempt_is_logged_with_request_context(self, monkeypatch, caplog):
-        channel._auto_proxy = True
-        channel._auto_proxy_gateway = "gateway"
-        channel._auto_proxy_token = "token"
-        channel._auto_proxy_states.clear()
-        state = channel._auto_proxy_state("push2his.eastmoney.com")
-        state["active"] = True
-        fake_patch = types.SimpleNamespace(
-            get_auth_config_with_cache=lambda *args: {"proxy": "http://p", "cookie": "c"}
-        )
-        monkeypatch.setitem(__import__("sys").modules, "akshare_proxy_patch", fake_patch)
+        client, transport = _enable_auto_proxy(monkeypatch)
+        channel._auto_proxy_state("push2his.eastmoney.com")["active"] = True
         original = getattr(std_requests, "_qtf_original_session", std_requests.Session)
         monkeypatch.setattr(
             original, "request",
