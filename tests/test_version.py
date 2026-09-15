@@ -13,8 +13,7 @@ def test_runtime_version_matches_project_metadata():
     with pyproject_path.open("rb") as pyproject_file:
         project = tomllib.load(pyproject_file)
 
-    assert __version__ == "2.1.0"
-    assert project["project"]["version"] == __version__
+    assert __version__ == project["project"]["version"]
 
 
 def test_application_version_is_logged(caplog):
@@ -23,7 +22,7 @@ def test_application_version_is_logged(caplog):
 
     app_main.log_application_version()
 
-    assert "cn-stock-mcp version=2.1.0" in caplog.text
+    assert f"cn-stock-mcp version={__version__}" in caplog.text
 
 
 def test_http_channel_is_logged_at_startup(caplog):
