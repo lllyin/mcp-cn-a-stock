@@ -26,7 +26,7 @@ _FOREIGN = {"REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"}
 
 # 只作为旧名字继续认、但不再对外推荐的配置：代码里读，文档里故意不写。
 # 写进文档等于把它们重新变成两套并列的正式名字，下一个人不知道该配哪个。
-_LEGACY = {"AKSHARE_PROXY_IP", "AKSHARE_PROXY_PASSWORD", "AKSHARE_PROXY_PORT"}
+_LEGACY = {"AKSHARE_PROXY_IP", "AKSHARE_PROXY_PASSWORD", "AKSHARE_PROXY_PORT", "AKSHARE_PROXY_RETRY"}
 
 
 #: 按命名空间派生的配置名：``CACHE_<命名空间>_TTL_SECONDS`` / ``_MAX_ENTRIES``。

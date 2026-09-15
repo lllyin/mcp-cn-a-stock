@@ -19,16 +19,13 @@ _FALSEY = {"0", "false", "no", "off", "disabled", "none", ""}
 # 一律写裸名字——原先每一项都顶着 CN_STOCK_ 前缀，读起来吵，改起来还要改几十处。
 ENV_PREFIX = os.getenv("ENV_PREFIX", "")
 
-
 def env(name: str, default=None):
     """按配置名取值。名字不带前缀写，前缀由 ENV_PREFIX 统一决定。"""
     return os.getenv(f"{ENV_PREFIX}{name}", default)
 
-
 # 1.x 的配置项全部顶着这个前缀；2.0.0 去掉之后旧名字不再被读，也不会报错——
 # 写着旧名的 .env 会静默退回默认值，线程池、缓存目录这些改了也不知道。
 _LEGACY_PREFIX = "CN_STOCK_"
-
 
 def legacy_env_names(environ=None, prefix: str | None = None) -> list[str]:
     """环境里还顶着 1.x 前缀、现在不会被读到的配置名，给启动日志报出来。
@@ -41,13 +38,11 @@ def legacy_env_names(environ=None, prefix: str | None = None) -> list[str]:
         return []
     return sorted(name for name in environ if name.startswith(_LEGACY_PREFIX))
 
-
 def _parse_bool(raw, default: bool) -> bool:
     """Parse common operator spellings for an environment switch."""
     if raw is None:
         return default
     return str(raw).strip().lower() not in _FALSEY
-
 
 # AkShare Proxy Patch Configuration
 # 默认关闭：网关是付费的，每次认证都计积分，而 impersonate 通道在同样的东财主机
@@ -57,9 +52,13 @@ def _parse_bool(raw, default: bool) -> bool:
 AKSHARE_PROXY_ENABLED = str(env("AKSHARE_PROXY_ENABLED", "0")).strip().lower()
 AKSHARE_PROXY_IP = env("AKSHARE_PROXY_GATEWAY") or env("AKSHARE_PROXY_IP")
 AKSHARE_PROXY_PASSWORD = env("AKSHARE_PROXY_TOKEN") or env("AKSHARE_PROXY_PASSWORD")
-AKSHARE_PROXY_RETRY = int(env("AKSHARE_PROXY_RETRY", env("AKSHARE_PROXY_PORT", "30")))
-# Backward-compatible alias. Historically this variable was named PORT, but
-# akshare-proxy-patch treats the third argument as retry count.
+# 网关出口死了换新的重试次数。三条路共用：插件全局模式（AKSHARE_PROXY_ENABLED=1）、
+# 通道层 auto 回退、以及编排层的 eastmoney_gateway provider。住宅代理出口有一定比例
+# 当场死亡（2026-09-15 实测约 15%），死一个就冷却会让网关频繁整段不可用；换 N 次
+# 把单次失败率压到 0.15^N 量级。旧名 AKSHARE_PROXY_RETRY / AKSHARE_PROXY_PORT 仍然认。
+GATEWAY_EXIT_RETRIES = max(1, int(
+    env("GATEWAY_EXIT_RETRIES") or env("AKSHARE_PROXY_RETRY") or env("AKSHARE_PROXY_PORT") or "3"))
+AKSHARE_PROXY_RETRY = GATEWAY_EXIT_RETRIES
 AKSHARE_PROXY_PORT = AKSHARE_PROXY_RETRY
 AUTO_PROXY_AFTER_FAILURES = max(1, int(env("AUTO_PROXY_AFTER_FAILURES", "3")))
 AUTO_PROXY_COOLDOWN_SECONDS = max(1.0, float(env("AUTO_PROXY_COOLDOWN_SECONDS", "300")))
@@ -82,10 +81,6 @@ GATEWAY_AUTH_REUSE_SECONDS = max(1.0, float(env("GATEWAY_AUTH_REUSE_SECONDS", "6
 # 同一 (host, 接口族) 已有网关请求在飞时，其余请求等它出结果的上限。超时或
 # leader 失败就走原回退链，不无限排队。
 GATEWAY_SINGLEFLIGHT_WAIT_SECONDS = max(0.5, float(env("GATEWAY_SINGLEFLIGHT_WAIT_SECONDS", "5")))
-# 一次网关请求里，出口死了换新的重试的次数。住宅代理出口有一定比例当场死亡
-# （2026-09-15 实测约 15%），死一个就冷却会让网关频繁整段不可用；换 N 次把
-# 单次失败率压到 0.15^N 量级。连续 N 次都失败才进数据冷却
-GATEWAY_EXIT_RETRIES = max(1, int(env("GATEWAY_EXIT_RETRIES", "3")))
 
 # --- Outbound HTTP channel (finmcp/datasource/http_channel.py) ---
 # Some upstream quote hosts drop connections from plain HTTP clients, so requests
@@ -126,7 +121,6 @@ IMPERSONATE_SUSPEND_SECONDS = max(
     float(env("IMPERSONATE_SUSPEND_SECONDS", "300")),
 )
 
-
 # --- Upstream source breaker (finmcp/datasource/cn_stock_source.py) ---
 # Eastmoney rate-limits per endpoint: on 2026-09-03 the K-line and fund-flow
 # endpoints on push2his refused this egress IP for over half an hour while the
@@ -145,7 +139,6 @@ SOURCE_BREAKER_COOLDOWN_SECONDS = max(
     1.0,
     float(env("SOURCE_BREAKER_COOLDOWN_SECONDS", "120")),
 )
-
 
 # --- Fund-flow page fallback (finmcp/datasource/fund_flow_page.py) ---
 # When the Eastmoney fund-flow endpoint refuses us, the same data is on
@@ -303,7 +296,6 @@ FUND_FLOW_PAGE_COOLDOWN_SECONDS = max(
 #     所以省不下任何东西。
 FUND_FLOW_PAGE_MAX_LOADS = max(1, int(env("FUND_FLOW_PAGE_MAX_LOADS", "2")))
 
-
 # --- 东财 nid18 凭据 (finmcp/datasource/eastmoney_auth.py) ---
 # 自动取得并复用东财访问凭据，提高行情列表、快照和资金流接口的成功率。
 # 关闭后继续走既有 HTTP 通道和备用数据源。
@@ -332,7 +324,6 @@ EASTMONEY_AUTH_HARVEST_TIMEOUT_SECONDS = max(
     5.0,
     float(env("EASTMONEY_AUTH_HARVEST_TIMEOUT_SECONDS", "45")),
 )
-
 
 # 把无头浏览器的自报特征改成普通浏览器的样子。
 #
@@ -372,7 +363,6 @@ def _parse_range_ms(raw, default: str) -> tuple[float, float]:
     if not values:
         raise ValueError(f"区间为空: {raw!r}")
     return values[0], values[-1]
-
 
 # 同一个 tab 上 reload 之前的随机等待区间，毫秒，写作 "下界,上界"。只作用在重试
 # 路径上：那一次已经没拿到数据、本来就要再付一次页面加载，所以顺利路径一秒都不
@@ -482,10 +472,8 @@ BROWSER_IDLE_TIMEOUT_CLOSED_SECONDS = max(
     float(env("BROWSER_IDLE_TIMEOUT_CLOSED_SECONDS", "300")),
 )
 
-
 class HttpModeError(ValueError):
     """Raised when an explicitly requested channel mode cannot be honoured."""
-
 
 def resolve_http_mode(
     requested=None,
@@ -616,7 +604,6 @@ CACHE_DIR = os.path.normpath(
     os.path.join(_PROJECT_ROOT, env("CACHE_DIR") or ".runtime/cache")
 )
 
-
 # 相邻两根 K 线之间允许缺多少个**交易日**，超过就判该源失败、让链路回退。
 # 置 0 关闭这道闸门。
 #
@@ -662,16 +649,13 @@ MARKET_MAP_BUDGET_SECONDS = max(
     float(env("MARKET_MAP_BUDGET_SECONDS", "30")),
 )
 
-
 # 服务日志文件的路径，``health`` 工具读它。start.sh 启动时会把实际路径导进来，
 # 正常不用配；只有直接跑 main.py 又把输出重定向到别处时才需要。
 LOG_FILE = env("LOG_FILE") or os.path.join(_PROJECT_ROOT, "logs", "cn-stock-mcp.log")
 
-
 def cache_ttl(namespace: str, default: float) -> float:
     """某个命名空间的 TTL 覆盖：``CACHE_<NS>_TTL_SECONDS``。"""
     return max(0.0, float(env(f"CACHE_{namespace.upper()}_TTL_SECONDS", str(default))))
-
 
 # 资金流历史一条最多存多少行。主源 lmt=0 给全部历史,老标的数千行、一条 182 KiB
 # （1200 行实测）,条数上限再乘上去就不是可忽略的内存了。截断到 250 行之后一条
@@ -681,7 +665,6 @@ CACHE_FUND_FLOW_MAX_ROWS = max(
     1,
     int(env("CACHE_FUND_FLOW_MAX_ROWS", "250")),
 )
-
 
 def cache_enabled(namespace: str) -> bool:
     """某个命名空间的单独开关：``CACHE_<NS>_ENABLED``，缺省跟随总开关。
@@ -693,11 +676,9 @@ def cache_enabled(namespace: str) -> bool:
     """
     return _parse_bool(env(f"CACHE_{namespace.upper()}_ENABLED"), CACHE_ENABLED)
 
-
 def cache_max_entries(namespace: str, default: int) -> int:
     """某个命名空间的条数上限覆盖：``CACHE_<NS>_MAX_ENTRIES``。"""
     return max(1, int(env(f"CACHE_{namespace.upper()}_MAX_ENTRIES", str(default))))
-
 
 def _parse_hhmm(raw, default: datetime.time) -> datetime.time:
     """Parse a four-digit HHMM clock, falling back to ``default``."""
@@ -708,7 +689,6 @@ def _parse_hhmm(raw, default: datetime.time) -> datetime.time:
         return datetime.time(int(text[:2]), int(text[2:]))
     except ValueError:
         return default
-
 
 # --- 市场纪元边界 (finmcp/market_session.py) ---
 # 交易所的时刻表是死的（09:30/11:30/13:00/15:00，那些是常量），但**上游不在这些
@@ -750,7 +730,6 @@ MARKET_EPOCH_BUFFER_MINUTES = max(
 # CONF_DIR 可以指到别处，用于运维临时替换名单而不重装。
 _PACKAGED_CONF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "confs")
 
-
 def conf_path(name: str) -> str:
     """返回参考数据文件的绝对路径。CONF_DIR 覆盖优先，否则用包内那份。
 
@@ -764,7 +743,6 @@ def conf_path(name: str) -> str:
             return candidate
     return os.path.join(_PACKAGED_CONF_DIR, name)
 
-
 # --- Market Indices Configuration ---
 import json
 import logging as _logging
@@ -776,7 +754,6 @@ _INDICES_FILE = conf_path("indices.json")
 # 深市。静默返回另一只证券比整段缺数据危险得多，所以现在先给默认值再尝试覆盖。
 _FALLBACK_SH_INDICES = frozenset({"000001", "000300", "000016", "000905", "000688", "000852"})
 _FALLBACK_SZ_INDICES = frozenset({"399001", "399006", "399005", "399300", "399007"})
-
 
 def _load_indices(path: str) -> tuple[set[str], set[str]]:
     """读指数名单。读不到就回落到内置名单，并且必须在日志里说出来。
@@ -801,7 +778,6 @@ def _load_indices(path: str) -> tuple[set[str], set[str]]:
             exc,
         )
         return set(_FALLBACK_SH_INDICES), set(_FALLBACK_SZ_INDICES)
-
 
 SH_INDICES, SZ_INDICES = _load_indices(_INDICES_FILE)
 ALL_INDICES: set[str] = SH_INDICES | SZ_INDICES

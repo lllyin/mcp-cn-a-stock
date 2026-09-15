@@ -279,7 +279,7 @@ mcporter call cn-stock market_events \
 | `AKSHARE_PROXY_ENABLED` | 网关使用方式；`auto` 仅在东财本地请求失败后按请求回退 | `0`<br>`1`<br>`auto`<br>（默认 `0`） |
 | `AKSHARE_PROXY_GATEWAY` | 授权网关地址，不含协议和端口 | 主机名或 IP（默认空） |
 | `AKSHARE_PROXY_TOKEN` | 网关访问令牌 | 字符串（默认空） |
-| `AKSHARE_PROXY_RETRY` | 网关请求的失败重试次数（旧名 `AKSHARE_PROXY_PORT` 仍然认） | 正整数（默认 `30`） |
+| `GATEWAY_EXIT_RETRIES` | 网关出口死了换新的重试次数；连续失败才进冷却（旧名 `AKSHARE_PROXY_RETRY`/`AKSHARE_PROXY_PORT` 仍然认） | 次数（默认 `3`） |
 | `AUTO_PROXY_AFTER_FAILURES` | `AKSHARE_PROXY_ENABLED=auto` 时，触发网关回退前的连续本地失败次数 | 正整数（默认 `3`） |
 | `AUTO_PROXY_COOLDOWN_SECONDS` | `auto` 模式网关回退失败后的暂停时长 | 秒（默认 `300`） |
 | `AUTO_PROXY_DATA_COOLDOWN_SECONDS` | 网关数据失败（出口已拿到、请求没成）后的暂停秒数；失败同时作废缓存的认证，下一次尝试换新出口 | 秒（默认 `30`） |
@@ -288,7 +288,6 @@ mcporter call cn-stock market_events \
 | `GATEWAY_TRANSPORT` | 网关传输实现；接新的代理库时在 `gateway.py` 写一个 `GatewayTransport` 实现再加一个可选值 | 默认 `akshare_proxy_patch` |
 | `GATEWAY_AUTH_REUSE_SECONDS` | 一份网关出口凭据的复用上限；出口死亡是静默的，由失败即作废兜住 | 秒（默认 `600`） |
 | `GATEWAY_SINGLEFLIGHT_WAIT_SECONDS` | 同一主机同一接口族已有网关请求在飞时，其余请求等它出结果的上限 | 秒（默认 `5`） |
-| `GATEWAY_EXIT_RETRIES` | 一次网关请求里出口死了换新的重试次数；连续失败才进冷却 | 次数（默认 `3`） |
 
 从旧版本升级时注意：这个开关以前默认开启，现在需要显式写 `AKSHARE_PROXY_ENABLED=1`
 才会继续走网关，否则自动降级到 `impersonate`。
