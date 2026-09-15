@@ -544,6 +544,21 @@ class TestSatisfies:
         frame["日期"] = ["2026-06-22", "2026-06-23"]
         assert ffs.satisfies(ffs.FundFlowHistory(frame=frame, complete=False), need) is True
 
+    def test_full_pinned_today_still_needs_the_rows(self):
+        """full 钉今天：delay 的当日单行命中日期但只有 1 行，历史表会缩成一行，
+        不能算满足——行数需求在钉日期时同样成立（交集，不是二选一）。"""
+        need = ffs.FundFlowNeed(history_rows=60, pinned_date="2026-09-15")
+        delay_today = _history(1, complete=False, dates=["2026-09-15"])
+        page_full = _history(120, complete=False, dates=["2026-09-15"] * 120)
+        assert ffs.satisfies(delay_today, need) is False   # 命中日期但行数不够
+        assert ffs.satisfies(page_full, need) is True      # 命中且行数够
+
+    def test_brief_pinned_today_only_needs_the_date(self):
+        """brief/medium 不渲染历史表，钉今天只需命中那一天，行数不是需求。"""
+        need = ffs.FundFlowNeed(history_rows=0, pinned_date="2026-09-15")
+        delay_today = _history(1, complete=False, dates=["2026-09-15"])
+        assert ffs.satisfies(delay_today, need) is True
+
 
 def test_resolve_stops_at_the_first_satisfying_source(registry):
     """need 让链在部分满足时停下：不再走到下一个源。"""

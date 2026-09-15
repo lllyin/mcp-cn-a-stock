@@ -36,6 +36,10 @@ class FetchRequirements:
     #: 钉日期查询的目标日期（YYYY-MM-DD）。资金流链按它判断部分帧够不够：钉的那天的
     #: 那一行就在历史帧里，部分帧没命中就得继续问下一个源，命中即停。
     fund_flow_pinned_date: Optional[str] = None
+    #: 这次渲染要不要历史资金流向表。只有 full 渲染它——所以 full 的资金流需求里
+    #: 行数恰恰是需求（哪怕钉了日期也一样）；brief/medium 不渲染，钉日期时只需要
+    #: 命中那一天，行数不是需求。
+    fund_flow_history_table: bool = True
 
     @classmethod
     def technical(cls) -> "FetchRequirements":

@@ -258,8 +258,10 @@ def satisfies(history: Optional[FundFlowHistory], need: FundFlowNeed) -> bool:
         return True
     if need is None:
         return False
-    if need.pinned_date:
-        return _has_date(history.frame, need.pinned_date)
+    # 钉日期是必要条件：部分帧没命中那天就不满足。行数同样要够——full 渲染历史表，
+    # 钉今天时 delay 的当日单行虽命中日期但只有 1 行，历史表会缩成一行，不能算满足。
+    if need.pinned_date and not _has_date(history.frame, need.pinned_date):
+        return False
     return history.rows >= need.history_rows
 
 

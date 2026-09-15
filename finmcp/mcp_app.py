@@ -288,6 +288,10 @@ async def fetch_batch_reports(
         # 挤掉的问题，页面加载也就不是白付。
         fund_flow_page=(mode == "full" or bool(date)),
         fund_flow_pinned_date=date,
+        # 只有 full 渲染历史表，所以只有 full 的资金流需求带行数——钉日期时也一样。
+        # brief/medium 不渲染，钉日期只需命中那一天，行数不是需求（置 0 正是为了
+        # 省掉无谓的页面加载）。
+        fund_flow_history_table=(mode == "full"),
     )
     report_cache = get_report_cache()
 

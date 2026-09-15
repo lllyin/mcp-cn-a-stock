@@ -1321,11 +1321,12 @@ class CNStockDataSource(DataSource):
                 ("finance", self._fetch_finance_cached(code, canonical_symbol))
             )
         if requirements.fund_flow:
-            # 钉日期只看"那天在不在历史帧里"，行数不是需求；full 的历史表才按行数要。
+            # 行数需求只在渲染历史表时成立（full，钉日期也一样）；brief/medium 不渲染，
+            # 钉日期只需命中那一天，行数不是需求。
             fund_flow_need = fund_flow_source.FundFlowNeed(
                 history_rows=(
                     requirements.fund_flow_rows
-                    if requirements.fund_flow_page and not requirements.fund_flow_pinned_date
+                    if requirements.fund_flow_history_table
                     else 0
                 ),
                 pinned_date=requirements.fund_flow_pinned_date,
