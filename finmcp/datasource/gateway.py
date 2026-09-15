@@ -123,7 +123,7 @@ _ENDPOINT_VALIDATORS = {
     "/api/qt/stock/fflow/kline/get": _fflow_payload_ok,
     "/api/qt/stock/get": _data_payload_ok,
     "/api/qt/clist/get": _data_payload_ok,
-    "/api/qt/stock/kline/get": _fflow_payload_ok,
+    # kline/get 不在这里：停牌标的空 klines 是合法答案，不能用"必须有 klines"判死。
 }
 
 
