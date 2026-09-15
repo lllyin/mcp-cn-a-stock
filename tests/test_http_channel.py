@@ -402,7 +402,7 @@ def test_auto_does_not_use_gateway_when_local_request_succeeds(monkeypatch):
 
 
 def test_auto_proxy_is_bounded_by_failure_threshold_and_cooldown(monkeypatch):
-    client, transport = _enable_auto_proxy(monkeypatch)
+    client, transport = _enable_auto_proxy(monkeypatch, exit_retries=1)
     original = getattr(std_requests, "_qtf_original_session", std_requests.Session)
     monkeypatch.setattr(original, "request", lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionError("blocked")))
 
@@ -1060,7 +1060,7 @@ class TestAutoProxyRecoveryAndRotation:
     def test_a_gateway_data_failure_rotates_the_exit(self, monkeypatch):
         """出口拿到了但请求没成 → 作废认证换新出口 + 短冷却，不是 300 秒。"""
         client, transport = _enable_auto_proxy(
-            monkeypatch, auths=["http://proxy-a:1", "http://proxy-b:1"])
+            monkeypatch, auths=["http://proxy-a:1", "http://proxy-b:1"], exit_retries=1)
         channel._auto_proxy_state("push2his.eastmoney.com")["active"] = True
         original = getattr(std_requests, "_qtf_original_session", std_requests.Session)
         monkeypatch.setattr(

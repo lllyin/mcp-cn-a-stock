@@ -82,6 +82,10 @@ GATEWAY_AUTH_REUSE_SECONDS = max(1.0, float(env("GATEWAY_AUTH_REUSE_SECONDS", "6
 # 同一 (host, 接口族) 已有网关请求在飞时，其余请求等它出结果的上限。超时或
 # leader 失败就走原回退链，不无限排队。
 GATEWAY_SINGLEFLIGHT_WAIT_SECONDS = max(0.5, float(env("GATEWAY_SINGLEFLIGHT_WAIT_SECONDS", "5")))
+# 一次网关请求里，出口死了换新的重试的次数。住宅代理出口有一定比例当场死亡
+# （2026-09-15 实测约 15%），死一个就冷却会让网关频繁整段不可用；换 N 次把
+# 单次失败率压到 0.15^N 量级。连续 N 次都失败才进数据冷却
+GATEWAY_EXIT_RETRIES = max(1, int(env("GATEWAY_EXIT_RETRIES", "3")))
 
 # --- Outbound HTTP channel (finmcp/datasource/http_channel.py) ---
 # Some upstream quote hosts drop connections from plain HTTP clients, so requests

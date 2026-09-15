@@ -112,7 +112,7 @@ class TestAuthReuse:
 
     def test_failure_invalidates_only_that_generation(self):
         transport = FakeTransport(exits=["http://proxy-a:1", "http://proxy-b:1"])
-        client = make_client(transport, data_cooldown_seconds=0.01)
+        client = make_client(transport, data_cooldown_seconds=0.01, exit_retries=1)
 
         assert client.request("GET", URL, lambda *a, **k: (_ for _ in ()).throw(
             ConnectionError("refused"))) is None
@@ -222,10 +222,47 @@ class TestSingleflight:
         assert not sends
 
 
+class TestExitRotation:
+    def test_a_dead_exit_is_rotated_within_the_same_request(self):
+        """出口当场死亡不该冷却 30s——换一个新出口重试，同一请求内补上。"""
+        transport = FakeTransport(exits=["http://dead:1", "http://live:1"])
+        client = make_client(transport, exit_retries=3)
+        sends = []
+
+        def send(*args, **kwargs):
+            sends.append(kwargs["proxies"]["http"])
+            if "dead" in kwargs["proxies"]["http"]:
+                raise ConnectionError("exit died")
+            return ok_response()
+
+        response = client.request("GET", URL, send)
+        assert response is not None
+        assert sends == ["http://dead:1", "http://live:1"]  # 死出口后立刻换活的
+        assert transport.invalidated == ["http://dead:1"]
+        # 没进冷却：下一个请求还能走网关
+        state = client._states[("push2his.eastmoney.com", "fflow")]
+        assert state.cooldown_until == 0.0
+
+    def test_cooldown_only_after_all_retries_fail(self):
+        """连续几个出口都失败才冷却。"""
+        transport = FakeTransport(exits=["http://dead:1"])  # 永远给同一个死出口
+        client = make_client(transport, exit_retries=3, data_cooldown_seconds=30)
+        sends = []
+
+        def send(*args, **kwargs):
+            sends.append(1)
+            raise ConnectionError("exit died")
+
+        assert client.request("GET", URL, send) is None
+        assert len(sends) == 1  # 同一个死出口被 last_failed_proxy 拒收，只发了一次
+        state = client._states[("push2his.eastmoney.com", "fflow")]
+        assert state.cooldown_until > time.monotonic()
+
+
 class TestPathFamily:
     def test_kline_and_fflow_have_separate_states(self):
         transport = FakeTransport(exits=["http://proxy-a:1", "http://proxy-b:1"])
-        client = make_client(transport, data_cooldown_seconds=30)
+        client = make_client(transport, data_cooldown_seconds=30, exit_retries=1)
         # fflow 失败进冷却
         client.request("GET", URL, lambda *a, **k: (_ for _ in ()).throw(ConnectionError("x")))
         # kline 不受牵连

@@ -288,6 +288,7 @@ mcporter call cn-stock market_events \
 | `GATEWAY_TRANSPORT` | 网关传输实现；接新的代理库时在 `gateway.py` 写一个 `GatewayTransport` 实现再加一个可选值 | 默认 `akshare_proxy_patch` |
 | `GATEWAY_AUTH_REUSE_SECONDS` | 一份网关出口凭据的复用上限；出口死亡是静默的，由失败即作废兜住 | 秒（默认 `600`） |
 | `GATEWAY_SINGLEFLIGHT_WAIT_SECONDS` | 同一主机同一接口族已有网关请求在飞时，其余请求等它出结果的上限 | 秒（默认 `5`） |
+| `GATEWAY_EXIT_RETRIES` | 一次网关请求里出口死了换新的重试次数；连续失败才进冷却 | 次数（默认 `3`） |
 
 从旧版本升级时注意：这个开关以前默认开启，现在需要显式写 `AKSHARE_PROXY_ENABLED=1`
 才会继续走网关，否则自动降级到 `impersonate`。

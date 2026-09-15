@@ -19,6 +19,7 @@ from ..config import (
     AUTO_PROXY_COOLDOWN_SECONDS,
     AUTO_PROXY_DATA_COOLDOWN_SECONDS,
     GATEWAY_AUTH_REUSE_SECONDS,
+    GATEWAY_EXIT_RETRIES,
     GATEWAY_SINGLEFLIGHT_WAIT_SECONDS,
 )
 
@@ -189,12 +190,14 @@ class GatewayClient:
         cooldown_seconds: float = AUTO_PROXY_COOLDOWN_SECONDS,
         data_cooldown_seconds: float = AUTO_PROXY_DATA_COOLDOWN_SECONDS,
         wait_seconds: float = GATEWAY_SINGLEFLIGHT_WAIT_SECONDS,
+        exit_retries: int = GATEWAY_EXIT_RETRIES,
     ) -> None:
         self._transport = transport
         self._reuse_seconds = reuse_seconds
         self._cooldown_seconds = cooldown_seconds
         self._data_cooldown_seconds = data_cooldown_seconds
         self._wait_seconds = wait_seconds
+        self._exit_retries = max(1, exit_retries)
         self._lock = threading.Lock()
         self._auth: Optional[GatewayAuth] = None
         self._auth_at = 0.0
@@ -288,48 +291,57 @@ class GatewayClient:
                 state.leader_done.set()
 
     def _attempt(self, method, url, send, kwargs, key, *, leader: bool):
-        host = key[0]
-        auth = self._acquire_auth()
-        if auth is None:
-            self._cool_down(key, self._cooldown_seconds, "authentication_unavailable")
-            return None
-        retry_kwargs = dict(kwargs)
-        headers = dict(retry_kwargs.get("headers") or {})
-        if auth.user_agent:
-            headers["User-Agent"] = auth.user_agent
-        if auth.cookie:
-            headers["Cookie"] = auth.cookie
-        retry_kwargs["headers"] = headers
-        retry_kwargs["proxies"] = {"http": auth.proxy, "https": auth.proxy}
-        retry_kwargs.pop("impersonate", None)
+        """发一次网关请求，出口死了就换新的重试，连续失败才冷却。
 
-        started = time.perf_counter()
-        try:
-            response = send(method, url, **retry_kwargs)
-        except Exception as exc:
+        网关出口是住宅代理，有一定比例的当场死亡（2026-09-15 实测约 15%）。
+        一个死出口就冷却 30s 的话，网关会频繁整段不可用；换成"死了立刻换新的
+        重试 N 次"，把单次请求的失败率从 15% 压到 0.15^N 量级。
+        """
+        host = key[0]
+        for attempt in range(self._exit_retries):
+            auth = self._acquire_auth()
+            if auth is None:
+                self._cool_down(key, self._cooldown_seconds, "authentication_unavailable")
+                return None
+            retry_kwargs = dict(kwargs)
+            headers = dict(retry_kwargs.get("headers") or {})
+            if auth.user_agent:
+                headers["User-Agent"] = auth.user_agent
+            if auth.cookie:
+                headers["Cookie"] = auth.cookie
+            retry_kwargs["headers"] = headers
+            retry_kwargs["proxies"] = {"http": auth.proxy, "https": auth.proxy}
+            retry_kwargs.pop("impersonate", None)
+
+            started = time.perf_counter()
+            try:
+                response = send(method, url, **retry_kwargs)
+            except Exception as exc:
+                logger.warning(
+                    "gateway_failure host=%s family=%s path=%s attempt=%d/%d error=%s",
+                    host, key[1], urlsplit(url).path, attempt + 1, self._exit_retries,
+                    _sanitize(str(exc), auth),
+                )
+                self._drop_auth(auth)
+                continue  # 出口死了，换一个新的重试
+            elapsed = time.perf_counter() - started
+            if response_ok(url, response):
+                if leader:
+                    with self._lock:
+                        self._state(key).leader_ok = True
+                logger.info(
+                    "gateway_success host=%s family=%s path=%s elapsed=%.2fs",
+                    host, key[1], urlsplit(url).path, elapsed,
+                )
+                return response
             logger.warning(
-                "gateway_failure host=%s family=%s path=%s error=%s",
-                host, key[1], urlsplit(url).path, _sanitize(str(exc), auth),
+                "gateway_failure host=%s family=%s path=%s status=%s attempt=%d/%d elapsed=%.2fs",
+                host, key[1], urlsplit(url).path,
+                getattr(response, "status_code", None), attempt + 1, self._exit_retries, elapsed,
             )
             self._drop_auth(auth)
-            self._cool_down(key, self._data_cooldown_seconds, "data_failure")
-            return None
-        elapsed = time.perf_counter() - started
-        if response_ok(url, response):
-            if leader:
-                with self._lock:
-                    self._state(key).leader_ok = True
-            logger.info(
-                "gateway_success host=%s family=%s path=%s elapsed=%.2fs",
-                host, key[1], urlsplit(url).path, elapsed,
-            )
-            return response
-        logger.warning(
-            "gateway_failure host=%s family=%s path=%s status=%s elapsed=%.2fs",
-            host, key[1], urlsplit(url).path,
-            getattr(response, "status_code", None), elapsed,
-        )
-        self._drop_auth(auth)
+            continue  # 响应无效，换一个新的重试
+        # 连续几个出口都失败才冷却
         self._cool_down(key, self._data_cooldown_seconds, "data_failure")
         return None
 
