@@ -55,11 +55,10 @@ AKSHARE_PROXY_PASSWORD = env("AKSHARE_PROXY_TOKEN") or env("AKSHARE_PROXY_PASSWO
 # 网关出口死了换新的重试次数。三条路共用：插件全局模式（AKSHARE_PROXY_ENABLED=1）、
 # 通道层 auto 回退、以及编排层的 eastmoney_gateway provider。住宅代理出口有一定比例
 # 当场死亡（2026-09-15 实测约 15%），死一个就冷却会让网关频繁整段不可用；换 N 次
-# 把单次失败率压到 0.15^N 量级。旧名 AKSHARE_PROXY_RETRY / AKSHARE_PROXY_PORT 仍然认。
+# 把单次失败率压到 0.15^N 量级。旧名 AKSHARE_PROXY_RETRY 仍然认。
 GATEWAY_EXIT_RETRIES = max(1, int(
-    env("GATEWAY_EXIT_RETRIES") or env("AKSHARE_PROXY_RETRY") or env("AKSHARE_PROXY_PORT") or "3"))
+    env("GATEWAY_EXIT_RETRIES") or env("AKSHARE_PROXY_RETRY") or "3"))
 AKSHARE_PROXY_RETRY = GATEWAY_EXIT_RETRIES
-AKSHARE_PROXY_PORT = AKSHARE_PROXY_RETRY
 AUTO_PROXY_AFTER_FAILURES = max(1, int(env("AUTO_PROXY_AFTER_FAILURES", "3")))
 AUTO_PROXY_COOLDOWN_SECONDS = max(1.0, float(env("AUTO_PROXY_COOLDOWN_SECONDS", "300")))
 # 网关数据失败（拿到出口但请求没成）大多坏在出口本身，换一个出口常就好了：

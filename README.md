@@ -279,7 +279,7 @@ mcporter call cn-stock market_events \
 | `AKSHARE_PROXY_ENABLED` | 网关使用方式；`auto` 仅在东财本地请求失败后按请求回退 | `0`<br>`1`<br>`auto`<br>（默认 `0`） |
 | `AKSHARE_PROXY_GATEWAY` | 授权网关地址，不含协议和端口 | 主机名或 IP（默认空） |
 | `AKSHARE_PROXY_TOKEN` | 网关访问令牌 | 字符串（默认空） |
-| `GATEWAY_EXIT_RETRIES` | 网关出口死了换新的重试次数；连续失败才进冷却（旧名 `AKSHARE_PROXY_RETRY`/`AKSHARE_PROXY_PORT` 仍然认） | 次数（默认 `3`） |
+| `GATEWAY_EXIT_RETRIES` | 网关出口死了换新的重试次数；连续失败才进冷却（旧名 `AKSHARE_PROXY_RETRY` 仍然认） | 次数（默认 `3`） |
 | `AUTO_PROXY_AFTER_FAILURES` | `AKSHARE_PROXY_ENABLED=auto` 时，触发网关回退前的连续本地失败次数 | 正整数（默认 `3`） |
 | `AUTO_PROXY_COOLDOWN_SECONDS` | `auto` 模式网关回退失败后的暂停时长 | 秒（默认 `300`） |
 | `AUTO_PROXY_DATA_COOLDOWN_SECONDS` | 网关数据失败（出口已拿到、请求没成）后的暂停秒数；失败同时作废缓存的认证，下一次尝试换新出口 | 秒（默认 `30`） |
