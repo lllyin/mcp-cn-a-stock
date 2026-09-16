@@ -166,6 +166,7 @@ mcporter call cn-stock tech symbol=SZ002463 days=30 date=2026-06-05
 ```bash
 mcporter call cn-stock kline_daily symbol=SH603986 date=2026-05-29 adjust=qfq
 mcporter call cn-stock kline_range symbol=SH603986 start_date=2026-05-22 end_date=2026-05-29
+mcporter call cn-stock kline_range symbol=SH603986 start_date=2026-05-22 end_date=2026-05-29 adjust=none
 ```
 
 查询全市场涨跌分布：

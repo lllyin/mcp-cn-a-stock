@@ -1019,7 +1019,7 @@ async def tech(
 async def kline_daily(
   symbol: str,
   date: str,
-  adjust: Literal["qfq", "hfq", "none"] = "qfq",
+  adjust: Optional[Literal["qfq", "hfq", "none"]] = "qfq",
   ctx: Context = None,  # type: ignore
 ) -> str:
   """获取指定日期的股票日K线数据
@@ -1031,12 +1031,13 @@ async def kline_daily(
                   Stock symbol, must be in the format of "SH600000" or "SZ000001".
     date (str): 查询日期，格式 "YYYY-MM-DD"，如 "2024-12-13"。
                 Query date in format "YYYY-MM-DD".
-    adjust (str): 复权类型。"qfq"=前复权(默认), "hfq"=后复权, "none"=不复权。
+    adjust (str): 复权类型。"qfq"=前复权(默认), "hfq"=后复权, "none"=不复权；显式 null 也按不复权处理。
                   Adjustment type: "qfq"=forward adjust(default), "hfq"=backward adjust, "none"=no adjust.
   
   Returns:
     该日期的K线数据，包含开盘价、收盘价、最高价、最低价、成交量、成交额等。
   """
+  adjust = "none" if adjust is None else adjust
   datasource = get_datasource()
   report_cache = get_report_cache()
   started_at = time.perf_counter()
@@ -1115,7 +1116,7 @@ async def kline_range(
   symbol: str,
   start_date: str,
   end_date: str,
-  adjust: Literal["qfq", "hfq", "none"] = "qfq",
+  adjust: Optional[Literal["qfq", "hfq", "none"]] = "qfq",
   ctx: Context = None,  # type: ignore
 ) -> str:
   """获取指定日期区间的股票日K线数据
@@ -1129,12 +1130,13 @@ async def kline_range(
                       Start date in format "YYYY-MM-DD".
     end_date (str): 结束日期，格式 "YYYY-MM-DD"，如 "2024-12-13"。
                     End date in format "YYYY-MM-DD".
-    adjust (str): 复权类型。"qfq"=前复权(默认), "hfq"=后复权, "none"=不复权。
+    adjust (str): 复权类型。"qfq"=前复权(默认), "hfq"=后复权, "none"=不复权；显式 null 也按不复权处理。
                   Adjustment type: "qfq"=forward adjust(default), "hfq"=backward adjust, "none"=no adjust.
   
   Returns:
     日期区间内的K线数据表格，包含每日的开高低收、成交量、涨跌幅等。
   """
+  adjust = "none" if adjust is None else adjust
   datasource = get_datasource()
   report_cache = get_report_cache()
   started_at = time.perf_counter()
