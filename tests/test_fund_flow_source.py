@@ -243,16 +243,25 @@ def test_eastmoney_platform_calls_akshare_the_same_way_as_before(monkeypatch):
     assert history.complete is True and history.rows == 4
 
 
-# --- 编排：什么时候还要去页面 -------------------------------------------------
+# --- 编排：这一帧覆盖本次需求了吗（页面兜底和报告缓存共用） ---------------------
 
 
-def test_page_fallback_runs_for_failures_and_partials_only():
-    needs = source_module._fund_flow_needs_page
-    assert needs(source_module._fetch_failure("fund_flow")) is True
-    assert needs({"fund_flow": _frame(1), "is_market": False, "complete": False}) is True
-    assert needs({"fund_flow": _frame(5), "is_market": False, "complete": True}) is False
-    assert needs({"fund_flow": _frame(5), "is_market": False}) is False   # 页面/老缓存给的，没这个键 = 全份
-    assert needs(None) is False
+def test_the_coverage_predicate_decides_fallback_and_caching():
+    """一个谓词管两件事：还要不要问下一个源，以及这份报告能不能进跨请求缓存。
+
+    以前是**两个**谓词，而页面返回不带 ``complete`` 键——第二个就把 3 行当全份，
+    于是短供报告能进缓存冻满一个 CLOSED 纪元（最长 64 小时）。同一个事实在两处
+    给出相反结论，是那次修复的根因。
+    """
+    need = ffs.FundFlowNeed(history_rows=5)
+    satisfies = source_module._fund_flow_satisfies
+    assert satisfies(source_module._fetch_failure("fund_flow"), need) is False
+    assert satisfies({"fund_flow": _frame(1), "is_market": False, "complete": False}, need) is False
+    assert satisfies({"fund_flow": _frame(5), "is_market": False, "complete": True}, need) is True
+    # 页面封顶 120 行、不带 complete：够需求才算满足，多一行都不放行
+    assert satisfies({"fund_flow": _frame(6), "is_market": False, "provider": "page_fallback"}, need) is True
+    assert satisfies({"fund_flow": _frame(4), "is_market": False, "provider": "page_fallback"}, need) is False
+    assert satisfies(None, need) is True   # 这次没要资金流，不是失败
 
 
 def test_fetch_fund_flow_sync_reports_the_partial_backup(monkeypatch):
@@ -265,7 +274,7 @@ def test_fetch_fund_flow_sync_reports_the_partial_backup(monkeypatch):
     result = source_module.CNStockDataSource()._fetch_fund_flow_sync("000688", "SH000688")
     assert result["complete"] is False and result["is_market"] is False
     assert len(result["fund_flow"]) == 1
-    assert source_module._fund_flow_needs_page(result) is True
+    assert source_module._fund_flow_satisfies(result, ffs.FundFlowNeed(history_rows=5)) is False
 
 
 def test_fetch_fund_flow_sync_marks_the_primary_complete(monkeypatch):

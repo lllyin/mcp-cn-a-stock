@@ -362,20 +362,6 @@ def _fund_flow_satisfies(value, need) -> bool:
     return fund_flow_source.satisfies(history, need)
 
 
-def _fund_flow_needs_page(value) -> bool:
-    """HTTP 那一层的结果还要不要去页面补。
-
-    失败要补；只拿到 delay 那一行（``complete`` 为 False）也要补——页面有 120 行历史。
-    主源给的全份（哪怕新股只有几行）不补：那已经是这个标的全部的历史，页面上也不会更多。
-    ``None`` 是"这次没要资金流"，不是失败。
-    """
-    if value is None:
-        return False
-    if _is_fetch_failure(value):
-        return True
-    return not bool(value.get("complete", True))
-
-
 def _truncate_fund_flow(value: Optional[Dict], keep: int) -> Optional[Dict]:
     """只留最新 ``keep`` 行。
 
@@ -1438,11 +1424,16 @@ class CNStockDataSource(DataSource):
         #     三个不同的值。
         # "当日那一行还没落地"这个真问题由另一道守卫管（cache.is_cacheable_report
         # 的 fund_flow_lagging），和行数无关，不受这里影响。
+        #
+        # 判据用"最终这一帧覆盖没覆盖本次需求"，不用"还要不要去页面补"：后者的语义
+        # 是补数动作，页面结果没有 ``complete`` 键就被当成全份，于是页面只给到 3 行
+        # 的报告也能进缓存、一冻就是一个 CLOSED 纪元（最长 64 小时）。而"源声明全份
+        # 就只有几行"（新股、退市）仍然按定局放行——那已经是这个标的全部的历史。
         fund_flow_partial = (
             requirements.fund_flow
             and requirements.fund_flow_page
             and not _is_fetch_failure(fetched.get("fund_flow"))
-            and _fund_flow_needs_page(fetched.get("fund_flow"))
+            and not _fund_flow_satisfies(fetched.get("fund_flow"), fund_flow_need)
         )
 
         kline_data = fetched.get("kline")

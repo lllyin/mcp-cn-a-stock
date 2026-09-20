@@ -12,6 +12,7 @@
 
 import pandas as pd
 import pytest
+from typing import Optional
 
 from finmcp import cache
 from finmcp.datasource import cn_stock_source as css
@@ -316,7 +317,7 @@ class TestPerNamespaceSwitch:
 
 
 class TestPartialFundFlowOnlyBlocksTheToolThatRendersHistory:
-    """``fund_flow:partial`` 拦缓存的判据是"行数不够"，而只有 full 渲染历史表。
+    """``fund_flow:partial`` 拦缓存的判据是"这一帧没覆盖本次需求"，而只有 full 渲染历史表。
 
     2026-09-07 定位：brief 只印"当日主力净流入"一行，1 行和 120 行对它的输出完全
     一样；而它的页面兜底本来就不触发（要求 requirements.fund_flow_page），所以
@@ -326,34 +327,56 @@ class TestPartialFundFlowOnlyBlocksTheToolThatRendersHistory:
     """
 
     @staticmethod
-    def _partial(*, fund_flow: bool, fund_flow_page: bool, complete: bool) -> bool:
+    def _partial(*, fund_flow: bool = True, fund_flow_page: bool, flow: dict,
+                 need_rows: int = 60, pinned: Optional[str] = None) -> bool:
         """照搬 cn_stock_source 里那个判据，参数化后单独测。"""
+        from finmcp.datasource import fund_flow_source
         from finmcp.datasource.cn_stock_source import (
-            _fund_flow_needs_page, _is_fetch_failure,
+            _fund_flow_satisfies, _is_fetch_failure,
         )
 
-        value = {"complete": complete}
+        need = fund_flow_source.FundFlowNeed(history_rows=need_rows, pinned_date=pinned)
         return bool(
             fund_flow
             and fund_flow_page
-            and not _is_fetch_failure(value)
-            and _fund_flow_needs_page(value)
+            and not _is_fetch_failure(flow)
+            and not _fund_flow_satisfies(flow, need)
         )
 
     def test_full_still_refuses_to_cache_a_one_row_history(self):
         """full 渲染历史表，1 行确实是降级，仍然要拦。"""
-        assert self._partial(fund_flow=True, fund_flow_page=True, complete=False) is True
+        assert self._partial(fund_flow_page=True, flow={**_flow(1), "complete": False}) is True
 
     def test_brief_is_cacheable_with_only_the_delay_row(self):
         """brief 不渲染历史表，一行就是它的完整答案。"""
-        assert self._partial(fund_flow=True, fund_flow_page=False, complete=False) is False
+        assert self._partial(fund_flow_page=False, flow={**_flow(1), "complete": False}) is False
 
     def test_a_complete_history_is_never_partial(self):
+        """源声明这就是它的全部历史（新股、退市）：远少于请求行数也是定局，不拦。"""
         for page in (True, False):
-            assert self._partial(fund_flow=True, fund_flow_page=page, complete=True) is False
+            assert self._partial(fund_flow_page=page, flow={**_flow(3), "complete": True}) is False
+
+    def test_a_page_that_delivered_the_requested_rows_is_cacheable(self):
+        """页面兜底成功补到 120 行就是要的都给了——它没有 complete 键，也不能拦。"""
+        flow = {**_flow(120), "provider": "page_fallback"}
+        assert self._partial(fund_flow_page=True, flow=flow, need_rows=60) is False
+
+    def test_a_page_that_short_delivered_is_not_cacheable(self):
+        """页面封顶 120 行、返回又不带 complete：给 3 行就是没覆盖需求。
+
+        这种报告进了缓存，就是把短供冻进 CLOSED 纪元（最长 64 小时），而那几天里
+        主源完全可能恢复。判据不能是"还要不要去页面补"——页面结果当然不用再补页面，
+        但它也不是全份。
+        """
+        flow = {**_flow(3), "provider": "page_fallback"}
+        assert self._partial(fund_flow_page=True, flow=flow, need_rows=60) is True
+
+    def test_a_page_missing_the_pinned_date_is_not_cacheable(self):
+        flow = {**_flow(120), "provider": "page_fallback"}
+        assert self._partial(fund_flow_page=True, flow=flow, pinned="2019-01-01") is True
 
     def test_a_call_that_did_not_ask_for_fund_flow_is_never_partial(self):
-        assert self._partial(fund_flow=False, fund_flow_page=True, complete=False) is False
+        assert self._partial(fund_flow=False, fund_flow_page=True, flow=_flow(3)) is False
 
     def test_the_source_still_wires_the_flag_the_same_way(self):
         """判据不能只活在测试里——源码里那四个条件必须还是这四个。"""
@@ -365,7 +388,7 @@ class TestPartialFundFlowOnlyBlocksTheToolThatRendersHistory:
         block = src[src.index("fund_flow_partial = ("):]
         block = block[: block.index("\n        )")]
         for needed in ("requirements.fund_flow", "requirements.fund_flow_page",
-                       "_is_fetch_failure", "_fund_flow_needs_page"):
+                       "_is_fetch_failure", "_fund_flow_satisfies"):
             assert needed in block, f"{needed} 不在判据里了：{block}"
 
     def test_the_landing_guard_is_a_separate_concern(self):
