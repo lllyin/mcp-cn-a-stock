@@ -586,6 +586,58 @@ class TestPriceToBook:
         assert self._pb_line(data) == ""
 
 
+class TestStaticPriceEarnings:
+    """静态市盈率只在**真的拿到年度净利润**时才打印。
+
+    分母来自财务数据（`_DS_FINANCE` 的 NP + 最新年度期），分子来自实时行情，所以
+    财务源挂掉时这一维是"没有分母"，不是"分母为 0"。退化成分母 0 会算出 ``inf``
+    并照样打印，而契约按"标记在=拿到了"记分——一个假数字把整条财务链的故障藏住了
+    （2026-09-20 注入同花顺失败实测到）。
+    """
+
+    def _data(self, **overrides) -> dict:
+        data = {
+            "SYMBOL": "SZ300408",
+            "NAME": "三环集团",
+            "DATE": np.array([_ns(2026, 9, 3)]),
+            "CLOSE2": np.array([110.910]),
+            "TCAP": np.array([19.9672e8]),
+            # to_dict 把财务数组同时摊在顶层和 _DS_FINANCE 里，顶层那份是这一维的取值，
+            # _DS_FINANCE 只提供"最新年度期"的索引（见 base.py:151-152 与 :181-182）。
+            "NP": np.array([21.90e8, 26.18e8]),
+            "_DS_FINANCE": _finance_dataset(),
+        }
+        data.update(overrides)
+        return data
+
+    def _pe_line(self, data: dict) -> str:
+        fp = StringIO()
+        build_basic_data(fp, "SZ300408", data)
+        lines = [line for line in fp.getvalue().splitlines() if "市盈率(静)" in line]
+        return lines[0] if lines else ""
+
+    def test_source_value_wins(self):
+        assert self._pe_line(self._data()) == "- 市盈率(静): 84.59"
+
+    def test_no_annual_period_leaves_the_dimension_out_instead_of_inf(self):
+        """财务源没给数据：这一维缺席，不是一行 inf。"""
+        without_dataset = {k: v for k, v in self._data().items() if k != "_DS_FINANCE"}
+        for data in (
+            without_dataset,
+            self._data(NP=np.array([])),
+            self._data(NP=np.array([21.90e8])),          # 只有报告期，没有年度期
+        ):
+            assert self._pe_line(data) == ""
+
+    def test_zero_profit_is_not_printable_either(self):
+        assert self._pe_line(self._data(NP=np.array([21.90e8, 0.0]))) == ""
+
+    def test_a_loss_still_prints_its_negative_multiple(self):
+        """亏损公司有真实的静态市盈率口径，不能连带屏蔽掉。"""
+        assert self._pe_line(self._data(NP=np.array([21.90e8, -26.18e8]))) == \
+            "- 市盈率(静): -84.59"
+
+
 class TestFinancialSectionSymbolCorrection:
     """交易所前缀写错时不能静默丢掉财务数据段。
 

@@ -371,18 +371,20 @@ def build_basic_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> None:
         close2 = data.get("CLOSE2", data.get("CLOSE", np.array([])))
         current_price = close2[-1] if len(close2) > 0 else 0
         
-        # 净利润
+        # 净利润：最新一个**年度期**的归属净利润，是静态市盈率的分母。
+        # 没有年度期（财务源没给数据、或财报里没有年度期）就是**没有分母**，不等于
+        # 分母是 0。以前退化成 0 之后照样往下算，打印出 "- 市盈率(静): inf"——一个
+        # 假数字，而契约按"标记在=拿到了"记分，于是整条财务链的故障被藏在这行里。
         np_arr = data.get("NP", np.array([]))
-        if len(np_arr) > 0 and last_year_index >= 0 and last_year_index < len(np_arr):
-            net_profit = np_arr[last_year_index]
-        else:
-            net_profit = 0
+        has_annual_profit = len(np_arr) > 0 and 0 <= last_year_index < len(np_arr)
+        net_profit = np_arr[last_year_index] if has_annual_profit else 0
         
         # 计算市盈率
         if total_shares > 0 and current_price > 0:
             total_amount = total_shares * current_price
-            pe_static = total_amount / net_profit if net_profit != 0 else float("inf")
-            print(f"- 市盈率(静): {pe_static:.2f}", file=fp)
+            # 年度净利润恰好为 0 的公司同样算不出市盈率，与没有分母一样不打这一行。
+            if net_profit != 0:
+                print(f"- 市盈率(静): {total_amount / net_profit:.2f}", file=fp)
             
             # 动态市盈率 (优先使用数据源直接提供的)
             pe_ttm_arr = data.get("PE_TTM", np.array([]))
