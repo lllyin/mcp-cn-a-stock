@@ -73,10 +73,15 @@ _BASIC = (
     Dimension("行业概念", "- 行业概念:", "realtime", applies_to=STOCK_ONLY),
     Dimension("总市值", "- 总市值:", "realtime", applies_to=STOCK_ONLY),
     Dimension("流通市值", "- 流通市值:", "realtime", applies_to=STOCK_ONLY),
-    Dimension("市盈率(静)", "- 市盈率(静):", "realtime", applies_to=STOCK_ONLY),
+    # 括号是"这个数还额外要谁的输入"，不是"两份数据拼起来"（那是 basic_info 里
+    # ``eastmoney+tencent`` 的写法）。静态市盈率 = 实时总股本 × 现价 ÷ 财务年度净利润。
+    Dimension("市盈率(静)", "- 市盈率(静):", "realtime(财务净利润)", applies_to=STOCK_ONLY),
     Dimension("市盈率(动)", "- 市盈率(动):", "realtime", applies_to=STOCK_ONLY),
     Dimension("市净率", "- 市净率:", "realtime", applies_to=STOCK_ONLY),
-    Dimension("净资产收益率", "- 净资产收益率:", "realtime", applies_to=STOCK_ONLY),
+    # 名字带"收益率"不代表是实时口径：这一行的值只有财务表提供（`cn_stock_source`
+    # 从同花顺财务指标的 ``净资产收益率`` 列填 ``stock_data.roe``）。标成 realtime 时
+    # 发版报告会把"同花顺挂了"写成"realtime 源没取到 净资产收益率"，归因指向错的源。
+    Dimension("净资产收益率", "- 净资产收益率:", "finance", applies_to=STOCK_ONLY),
 )
 
 _TRADING = (

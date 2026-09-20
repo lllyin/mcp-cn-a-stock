@@ -505,6 +505,10 @@ class TestCompleteness:
         sources = {item.dimension.name: item.dimension.source for item in result.findings}
         assert sources["总市值"] == "realtime"
         assert sources["换手率"] == "realtime(流通市值)"
+        # 财务供的维度不能记到 realtime 头上：同花顺挂掉时报告曾写成
+        # "`realtime` 源没取到 净资产收益率"，把排查指向一条好着的链路。
+        assert sources["净资产收益率"] == "finance"
+        assert sources["市盈率(静)"] == "realtime(财务净利润)"
         assert result.available < result.graded
 
     def test_indices_are_not_faulted_for_dimensions_they_never_have(self):
