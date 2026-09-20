@@ -526,6 +526,14 @@ class TestCompleteness:
 
         2026-09-04 就漏过 ``暂无资金流向数据``：四个标的的资金流实际是空的，
         而维度矩阵把它们全标成了 ✅。所以这里直接去 research.py 里数一遍。
+
+        **f-string 也要扫。** 2026-09-20 加了 ``历史资金流向只取到 {}/{} 个交易日``
+        那句，它既不是常量字符串、措辞里也没有"暂无"那几个字，两重都躲过了这题——
+        而它恰恰是"段落在、值不全"那一类。所以：常量之外再看 JoinedStr，把占位符
+        压成骨架；匹配也从"整行等于"放宽成"某个标记是这行的子串"。
+
+        仍然靠词表认"这是一句降级提示"，所以一个措辞完全不含这些词的新句式还是会
+        漏——那要靠 review 补词表，别指望这题自己想到。
         """
         import ast
         import re as _re
@@ -533,16 +541,30 @@ class TestCompleteness:
         source = (Path(__file__).resolve().parents[1] / "finmcp" / "research.py").read_text(
             encoding="utf-8"
         )
+
+        def skeleton(first) -> str:
+            """print 第一个实参的字面骨架：f-string 的 ``{expr}`` 段压成空格。"""
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                return first.value
+            if isinstance(first, ast.JoinedStr):
+                return "".join(
+                    v.value if isinstance(v, ast.Constant) and isinstance(v.value, str) else " "
+                    for v in first.values
+                )
+            return ""
+
         phrases = set()
         for node in ast.walk(ast.parse(source)):
             if (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "print"
                     and node.args):
-                first = node.args[0]
-                if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                    if _re.search(r"暂无|不可用|获取失败|暂不", first.value):
-                        phrases.add(first.value.strip().lstrip("- "))
-        missing = sorted(p for p in phrases if p not in verify.DEGRADED_MARKERS)
-        assert not missing, f"research.py 里这些提示语没进 DEGRADED_MARKERS: {missing}"
+                text = skeleton(node.args[0])
+                if _re.search(r"暂无|不可用|获取失败|暂不|只取到", text):
+                    phrases.add(text.strip().lstrip("- "))
+        uncovered = sorted(
+            p for p in phrases
+            if not any(marker in p for marker in verify.DEGRADED_MARKERS)
+        )
+        assert not uncovered, f"research.py 里这些提示语没进 DEGRADED_MARKERS: {uncovered}"
 
     def test_an_empty_section_is_also_degraded(self):
         document = _index_report(fund_flow="")
