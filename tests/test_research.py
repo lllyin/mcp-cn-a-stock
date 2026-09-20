@@ -267,6 +267,84 @@ class TestHistoricalFundFlow:
         assert "2026-06-01" in output
         assert "2026-06-02" not in output
 
+    @staticmethod
+    def _rows(dates: list) -> dict:
+        """只填表格真的会读的列。"""
+        n = len(dates)
+        return {
+            "DATE": np.array([
+                int(datetime.datetime.strptime(d, "%Y-%m-%d").timestamp() * 1e9) for d in dates
+            ], dtype=np.int64),
+            "CLOSE": np.full(n, 10.0, dtype=np.float64),
+            "PCT_CHG": np.zeros(n, dtype=np.float64),
+        }
+
+    @staticmethod
+    def _days(n: int, last: str = "2026-06-02") -> list:
+        end = datetime.datetime.strptime(last, "%Y-%m-%d")
+        return [(end - datetime.timedelta(days=i)).strftime("%Y-%m-%d")
+                for i in range(n - 1, -1, -1)]
+
+    def _kline_dates(self, dates: list) -> np.ndarray:
+        return np.array([
+            int(datetime.datetime.strptime(d, "%Y-%m-%d").timestamp() * 1e9) for d in dates
+        ], dtype=np.int64)
+
+    def _render(self, flow_dates, kline_dates, limit, query_date=None):
+        data = {
+            "_DS_FUND_FLOW": self._rows(flow_dates),
+            "DATE": self._kline_dates(kline_dates),
+        }
+        if query_date:
+            data["QUERY_DATE"] = query_date
+        fp = StringIO()
+        build_historical_fund_flow_data(fp, data, limit=limit)
+        return fp.getvalue()
+
+    def test_short_supply_says_how_many_rows_are_missing(self):
+        """上游只给到 1 行、K 线却有 60 个交易日：报告必须自己讲出来，
+        不能让读者以为这一行就是 60 行。"""
+        kline = self._days(60)
+
+        output = self._render(kline[-1:], kline, limit=60)
+
+        assert "历史资金流向只取到 1/60 个交易日，其余 59 天上游没有返回" in output
+
+    def test_request_smaller_than_history_is_quiet(self):
+        """要 5 行、手上 10 行：给全了，一句都不该说。"""
+        dates = self._days(10)
+
+        output = self._render(dates, dates, limit=5)
+
+        assert "只取到" not in output
+        assert output.count("| 2026-") == 5
+
+    def test_new_stock_with_less_history_than_requested_is_quiet(self):
+        """上市只有 20 个交易日、请求 60 行——差额是正当的，不是缺数据。"""
+        dates = self._days(20)
+
+        output = self._render(dates, dates, limit=60)
+
+        assert "只取到" not in output
+
+    def test_missing_kline_dates_disables_the_claim(self):
+        """没有 K 线就不知道该有几行，宁可不说不写。"""
+        data = {"_DS_FUND_FLOW": self._rows(self._days(2))}
+        fp = StringIO()
+
+        build_historical_fund_flow_data(fp, data, limit=60)
+
+        assert "只取到" not in fp.getvalue()
+
+    def test_query_date_cutoff_applies_to_the_baseline_too(self):
+        """钉日期时基准也只数那天之前，否则会把之后的交易日算进缺口。"""
+        kline = self._days(10)                      # 05-24 … 06-02
+        up_to_cutoff = [d for d in kline if d <= "2026-05-31"]   # 8 天
+
+        output = self._render(up_to_cutoff[:2], kline, limit=60, query_date="2026-05-31")
+
+        assert "历史资金流向只取到 2/8 个交易日，其余 6 天上游没有返回" in output
+
 
 class TestRealtimeFundFlowTarget:
     """测试实时资金流向抓取目标"""

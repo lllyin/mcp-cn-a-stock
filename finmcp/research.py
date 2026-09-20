@@ -676,14 +676,17 @@ def build_historical_fund_flow_data(fp: TextIO, data: Dict[str, ndarray], limit:
         return
 
     query_date = data.get("QUERY_DATE")
-    indices = list(range(len(dates)))
+    query_ns = None
     if query_date:
         try:
             query_dt = datetime.datetime.strptime(str(query_date)[:10], "%Y-%m-%d")
             query_ns = int(query_dt.timestamp() * 1e9)
-            indices = [idx for idx in indices if dates[idx] <= query_ns]
         except ValueError:
             pass
+
+    indices = list(range(len(dates)))
+    if query_ns is not None:
+        indices = [idx for idx in indices if dates[idx] <= query_ns]
 
     indices = indices[-limit:][::-1]
     if not indices:
@@ -691,6 +694,23 @@ def build_historical_fund_flow_data(fp: TextIO, data: Dict[str, ndarray], limit:
 
     print("## 历史资金流向", file=fp)
     print("", file=fp)
+
+    # 「本该有几行」以同一份报告里的 K 线交易日为准，不拿 limit 当基准：新股上市不足
+    # limit、或 K 线窗口本身短于 limit 时那个差额是正当的，报成缺失是把没坏的东西喊出来。
+    raw_kline_dates = data.get("DATE")
+    if raw_kline_dates is not None:
+        kline_dates = np.asarray(raw_kline_dates, dtype=np.int64)
+        if query_ns is not None:
+            kline_dates = kline_dates[kline_dates <= query_ns]
+        want = min(limit, len(kline_dates))
+        if len(indices) < want:
+            print(
+                f"- 历史资金流向只取到 {len(indices)}/{want} 个交易日，"
+                f"其余 {want - len(indices)} 天上游没有返回（已给出的行不受影响）",
+                file=fp,
+            )
+            print("", file=fp)
+
     print(
         "| 日期 | 收盘价 | 涨跌幅 | 主力净流入 | 主力占比 | 超大单净流入 | 超大单占比 | 大单净流入 | 大单占比 | 中单净流入 | 中单占比 | 小单净流入 | 小单占比 |",
         file=fp,
