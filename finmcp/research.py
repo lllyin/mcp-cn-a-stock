@@ -23,6 +23,7 @@ from . import market_session
 from .datasource.realtime_ff import get_fund_flow
 from .datasource import realtime_fund_flow_source
 from .datasource.fund_flow_source import FundFlowRequest
+from .datasource import fund_flow_source
 from .symbols import symbol_with_name
 
 logger = logging.getLogger("finmcp")
@@ -675,41 +676,24 @@ def build_historical_fund_flow_data(fp: TextIO, data: Dict[str, ndarray], limit:
     if len(dates) == 0:
         return
 
-    query_date = data.get("QUERY_DATE")
-    query_ns = None
-    if query_date:
-        try:
-            query_dt = datetime.datetime.strptime(str(query_date)[:10], "%Y-%m-%d")
-            query_ns = int(query_dt.timestamp() * 1e9)
-        except ValueError:
-            pass
-
-    indices = list(range(len(dates)))
-    if query_ns is not None:
-        indices = [idx for idx in indices if dates[idx] <= query_ns]
-
-    indices = indices[-limit:][::-1]
-    if not indices:
+    query_ns = fund_flow_source.date_to_ns(data.get("QUERY_DATE"))
+    supply = fund_flow_source.fund_flow_supply(dates, data.get("DATE"), limit, query_ns)
+    if not supply.indices:
         return
 
     print("## 历史资金流向", file=fp)
     print("", file=fp)
 
-    # 「本该有几行」以同一份报告里的 K 线交易日为准，不拿 limit 当基准：新股上市不足
-    # limit、或 K 线窗口本身短于 limit 时那个差额是正当的，报成缺失是把没坏的东西喊出来。
-    raw_kline_dates = data.get("DATE")
-    if raw_kline_dates is not None:
-        kline_dates = np.asarray(raw_kline_dates, dtype=np.int64)
-        if query_ns is not None:
-            kline_dates = kline_dates[kline_dates <= query_ns]
-        want = min(limit, len(kline_dates))
-        if len(indices) < want:
-            print(
-                f"- 历史资金流向只取到 {len(indices)}/{want} 个交易日，"
-                f"其余 {want - len(indices)} 天上游没有返回（已给出的行不受影响）",
-                file=fp,
-            )
-            print("", file=fp)
+    # 「该有几行」不由这里单独判断：同一个 ``supply`` 也喂给报告缓存的拦与不拦，
+    # 见 fund_flow_source.fund_flow_supply 的文档。基准是同一份报告里的 K 线交易日数
+    # 而不是 limit——新股不足 limit、K 线窗口短于 limit 的那个差额是正当的。
+    if supply.short:
+        print(
+            f"- 历史资金流向只取到 {supply.rows}/{supply.want} 个交易日，"
+            f"其余 {supply.want - supply.rows} 天上游没有返回（已给出的行不受影响）",
+            file=fp,
+        )
+        print("", file=fp)
 
     print(
         "| 日期 | 收盘价 | 涨跌幅 | 主力净流入 | 主力占比 | 超大单净流入 | 超大单占比 | 大单净流入 | 大单占比 | 中单净流入 | 中单占比 | 小单净流入 | 小单占比 |",
@@ -720,7 +704,7 @@ def build_historical_fund_flow_data(fp: TextIO, data: Dict[str, ndarray], limit:
         file=fp,
     )
 
-    for idx in indices:
+    for idx in supply.indices:
         def value_for(key: str):
             values = fund_flow.get(key)
             if values is None or len(values) <= idx:

@@ -487,7 +487,10 @@ async def fetch_batch_reports(
                             symbol,
                             raw_data,
                             include_historical_fund_flow=True,
-                            historical_fund_flow_limit=fund_flow_limit,
+                            # 用取数层实际按它要的那个数，不传原始参数：渲染层的
+                            # "该有几行"和缓存层的"拦不拦"必须是同一个数，否则同一份
+                            # 报告会出现"印了短供句却照进缓存"和它的反面。
+                            historical_fund_flow_limit=requirements.fund_flow_rows,
                             realtime_fund_flow=prefetch,
                         ),
                         client_disconnect_event,

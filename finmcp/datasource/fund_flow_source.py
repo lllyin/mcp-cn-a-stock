@@ -21,6 +21,7 @@ AkShare 封装，给全部历史），``eastmoney_delay`` 是同一个接口在 
 
 from __future__ import annotations
 
+import datetime
 import logging
 from dataclasses import dataclass
 from typing import Optional
@@ -263,6 +264,64 @@ def satisfies(history: Optional[FundFlowHistory], need: FundFlowNeed) -> bool:
     if need.pinned_date and not _has_date(history.frame, need.pinned_date):
         return False
     return history.rows >= need.history_rows
+
+
+@dataclass(frozen=True)
+class FundFlowSupply:
+    """本次请求**该有几行**、**给到几行**，以及要渲染的那几个下标。
+
+    渲染层那句"只取到 N/M"和报告缓存拦不拦，都从这一个判定里取数。两边各自数一遍
+    就会数出两个答案：基准取 ``limit`` 的那一侧会把"新股只有 20 个交易日"当成缺 40 天
+    而拦住缓存，取 K 线交易日数的那一侧又放过"源自称全份却只给 3 行"。
+    """
+
+    indices: tuple[int, ...]     # 要渲染的下标，按日期从新到旧
+    want: int                    # 该有几行；0 = 无从判断，不主张缺失
+
+    @property
+    def rows(self) -> int:
+        return len(self.indices)
+
+    @property
+    def short(self) -> bool:
+        return 0 < self.want and self.rows < self.want
+
+
+def fund_flow_supply(flow_dates, kline_dates, limit: int,
+                     query_ns: Optional[int] = None) -> FundFlowSupply:
+    """数一遍这次能渲染几行、该有几行。
+
+    基准取 ``min(limit, 同一份报告里的 K 线交易日数)`` 而不是 ``limit``：新股上市不足
+    limit、K 线窗口本身短于 limit 时那个差额是正当的，报成缺失是把没坏的东西喊出来。
+    K 线那一维没给日期时 ``want`` 记 0——宁可不主张缺失，也不误伤。
+    """
+    limit = int(limit or 0)
+    dates = list(flow_dates) if flow_dates is not None else []
+    kept = [i for i, day in enumerate(dates) if query_ns is None or day <= query_ns]
+    if limit <= 0:
+        kept = []
+    else:
+        kept = kept[-limit:][::-1]
+    if kline_dates is None or limit <= 0:
+        want = 0
+    else:
+        kline = [d for d in kline_dates if query_ns is None or d <= query_ns]
+        want = min(limit, len(kline))
+    return FundFlowSupply(indices=tuple(kept), want=want)
+
+
+def date_to_ns(value) -> Optional[int]:
+    """``YYYY-MM-DD`` → 日期数组用的同一套 ns 时间戳。解析不了返回 None（＝不裁剪）。
+
+    取数层和渲染层要裁的是同一条线，换算也得是同一处：两边各写一遍 ``strptime``，
+    一边漏了本地时区口径就会差一天，而差一天的表现是"该报的没报"，看不见。
+    """
+    if not value:
+        return None
+    try:
+        return int(datetime.datetime.strptime(str(value)[:10], "%Y-%m-%d").timestamp() * 1e9)
+    except ValueError:
+        return None
 
 
 def _has_date(frame, pinned: str) -> bool:

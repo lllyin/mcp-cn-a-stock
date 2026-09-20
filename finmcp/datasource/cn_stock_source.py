@@ -362,6 +362,35 @@ def _fund_flow_satisfies(value, need) -> bool:
     return fund_flow_source.satisfies(history, need)
 
 
+def _fund_flow_report_incomplete(value, need, supply) -> bool:
+    """这份资金流**没覆盖本次请求**吗——报告缓存拦不拦就看它。三条独立的理由，任一成立即拦。
+
+    1. ``supply.short``：报告里会印那句"只取到 N/M"。渲染层用的是**同一个** ``supply``
+       （同样的资金流日期数组、同报告的 K 线日期数组、同一个 limit、同一个钉的日期），
+       所以那句出现时这里必为真，反之亦然——不会出现"印了短供却照常进缓存"。
+    2. 源自己声明这不是全份（``complete=False``，push2delay 那一行就是）：迁移前一直拦，
+       保留。它防的是"下一次可能就落地了"的瞬时状态，和行数满不满是两件事。只认显式的
+       ``False``——页面兜底的返回不带这个键，不能被这条误判成部分帧。
+    3. 钉了那一天而这一帧里没有它。行数看不出来：表里照样凑得出 limit 行，只是全是别的
+       日子，读者看到的"数据日期"却是查的那一天。
+
+    第 3 条的基准也换成 ``supply.want``：新股只有 20 个交易日、页面给满 20 行时那是齐全，
+    不是缺 40 行——按 ``limit`` 判就会把它拦成永久回源。K 线那一维没给日期时 ``want`` 为
+    0（无从判断该有几行），退回按请求行数原样判，宁可保守拦一次。
+    """
+    if supply.short:
+        return True
+    if value.get("complete") is False:
+        return True
+    if need is None:
+        return False
+    capped = fund_flow_source.FundFlowNeed(
+        history_rows=supply.want or need.history_rows,
+        pinned_date=need.pinned_date,
+    )
+    return not _fund_flow_satisfies(value, capped)
+
+
 def _truncate_fund_flow(value: Optional[Dict], keep: int) -> Optional[Dict]:
     """只留最新 ``keep`` 行。
 
@@ -1410,32 +1439,8 @@ class CNStockDataSource(DataSource):
                 0 if final_failed else _fund_flow_rows(final),
                 "-" if final_failed else final.get("complete", "-"),
             )
-        # 页面也没补上、手里仍是 delay 那一行：报告照常渲染，但它是降级结果，不能进
-        # 跨请求缓存——下一次页面可能就成功了，缓存住等于把一行历史冻进整个纪元
-        # （cache-design §七 不变量 4）。用 fetch_failures 表达，它唯一的用途就是拦缓存。
-        #
-        # **只对真的渲染历史表的工具成立**（``fund_flow_page``，也就是 full）。
-        # brief / medium 只印"当日主力净流入"一行，1 行和 120 行对它们的输出完全
-        # 一样，"行数不够"因此不是降级——拿它拦缓存是纯亏：
-        #   - 这两个工具的页面兜底本来就不会触发（上面那个 if 要求 fund_flow_page），
-        #     所以 partial 对它们是**永久状态**，不是"下次可能好"，等不到那个下次；
-        #   - 代价实测：2026-09-07 收盘后 brief 15 次调用 15 次 Report cache skipped、
-        #     0 次命中，每次都全额打上游；连续三次调用还会因为上游当日行抖动给出
-        #     三个不同的值。
-        # "当日那一行还没落地"这个真问题由另一道守卫管（cache.is_cacheable_report
-        # 的 fund_flow_lagging），和行数无关，不受这里影响。
-        #
-        # 判据用"最终这一帧覆盖没覆盖本次需求"，不用"还要不要去页面补"：后者的语义
-        # 是补数动作，页面结果没有 ``complete`` 键就被当成全份，于是页面只给到 3 行
-        # 的报告也能进缓存、一冻就是一个 CLOSED 纪元（最长 64 小时）。而"源声明全份
-        # 就只有几行"（新股、退市）仍然按定局放行——那已经是这个标的全部的历史。
-        fund_flow_partial = (
-            requirements.fund_flow
-            and requirements.fund_flow_page
-            and not _is_fetch_failure(fetched.get("fund_flow"))
-            and not _fund_flow_satisfies(fetched.get("fund_flow"), fund_flow_need)
-        )
-
+        # 资金流"没覆盖本次请求"的判定要等 K 线和日表都建好才能算（基准是同报告里的
+        # K 线交易日数），见下面 ``fund_flow:partial`` 那一处。
         kline_data = fetched.get("kline")
         finance_data = fetched.get("finance")
         fund_flow_data = fetched.get("fund_flow")
@@ -1447,8 +1452,6 @@ class CNStockDataSource(DataSource):
             for result in fetched.values()
             if _is_fetch_failure(result)
         ]
-        if fund_flow_partial:
-            stock_data.fetch_failures.append("fund_flow:partial")
 
         if realtime_data and "info" in realtime_data:
             info = realtime_data["info"]
@@ -1552,6 +1555,39 @@ class CNStockDataSource(DataSource):
                     )
                     if stock_data.fund_flow_history is None:
                         stock_data.fetch_failures.append("fund_flow")
+                    # 报告里那句"只取到 N/M"和这里拦不拦缓存，是同一个 ``supply`` 算出来的：
+                    # 输入完全一样（资金流日期数组 + 同报告的 K 线日期数组 + 同一个 limit +
+                    # 钉的那一天），所以两边数不出两个答案。基准不是 ``need.history_rows``
+                    # 而是 ``min(limit, K线交易日数)``——新股只有 20 个交易日、页面给满 20 行
+                    # 时那是齐全，不是缺 40 行，拦它就是把没坏的东西冻在反复回源上。
+                    #
+                    # 页面也没补上、手里仍是 delay 那一行：报告照常渲染，但它是降级结果，
+                    # 不能进跨请求缓存——下一次页面可能就成功了，缓存住等于把一行历史冻进
+                    # 整个 CLOSED 纪元（cache-design §七 不变量 4）。用 fetch_failures 表达，
+                    # 它唯一的用途就是拦缓存。
+                    #
+                    # **只对真的渲染历史表的工具成立**（``fund_flow_page``，也就是 full，
+                    # 或钉了日期的查询）。brief / medium 只印"当日主力净流入"一行，1 行和
+                    # 120 行对它们的输出完全一样，"行数不够"因此不是降级——拿它拦缓存是纯亏：
+                    #   - partial 对它们是**永久状态**，不是"下次可能好"，等不到那个下次；
+                    #   - 代价实测：2026-09-07 收盘后 brief 15 次调用 15 次 Report cache
+                    #     skipped、0 次命中，每次都全额打上游；连续三次调用还会因为上游当日
+                    #     行抖动给出三个不同的值。
+                    # "当日那一行还没落地"这个真问题由另一道守卫管（cache.is_cacheable_report
+                    # 的 fund_flow_lagging），和行数无关，不受这里影响。
+                    supply = fund_flow_source.fund_flow_supply(
+                        (stock_data.fund_flow_history or {}).get("DATE"),
+                        stock_data.date,
+                        # 只有真的渲染历史表的请求才有"该有几行"这回事。brief / medium
+                        # 钉日期时也带着 fund_flow_page，但它一张表都不画，按行数判就会
+                        # 把它拦成永久回源——那正是上面那段例外要躲开的坑。
+                        requirements.fund_flow_rows if requirements.fund_flow_history_table else 0,
+                        fund_flow_source.date_to_ns(requirements.fund_flow_pinned_date),
+                    )
+                    if requirements.fund_flow_page and _fund_flow_report_incomplete(
+                        fund_flow_data, fund_flow_need, supply,
+                    ):
+                        stock_data.fetch_failures.append("fund_flow:partial")
                     latest = df.iloc[-1] if len(df) > 0 else None
                     if latest is not None:
                         # 字段映射表：(DataFrame字段名, StockData属性名, 是否为占比)

@@ -10,6 +10,7 @@
 之后不能让要得多的请求命中它，否则缓存把数据变少了（AGENTS §一）。
 """
 
+import numpy as np
 import pandas as pd
 import pytest
 from typing import Optional
@@ -317,79 +318,136 @@ class TestPerNamespaceSwitch:
 
 
 class TestPartialFundFlowOnlyBlocksTheToolThatRendersHistory:
-    """``fund_flow:partial`` 拦缓存的判据是"这一帧没覆盖本次需求"，而只有 full 渲染历史表。
+    """``fund_flow:partial`` 与报告里那句"只取到 N/M"必须是**同一个判定**。
 
-    2026-09-07 定位：brief 只印"当日主力净流入"一行，1 行和 120 行对它的输出完全
-    一样；而它的页面兜底本来就不触发（要求 requirements.fund_flow_page），所以
-    partial 对它是**永久状态**，"下次页面可能就成功了"这个理由等不到那个下次。
-    代价实测：收盘后 brief 15 次调用 15 次 Report cache skipped、0 次命中，每次
-    都全额打上游，而且连续三次调用因为上游当日行抖动给出三个不同的值。
+    两层各自数一遍就会数出两个答案，而且两个方向都错得起来：拿 ``limit`` 当基准的那侧
+    把"新股只有 20 个交易日、页面给满 20 行"当成缺 40 天而拦住缓存（永久回源）；拿 K 线
+    交易日数当基准的那侧又放过"源自称全份却只给 3 行"（README 的承诺就此不成立）。
+    所以下面每格都同时问渲染层和缓存层。
+
+    工具范围这条不变：只有渲染历史表的请求参与（``fund_flow_page``，即 full 与钉日期的
+    查询）。brief 只印"当日主力净流入"一行，1 行和 120 行对它的输出完全一样，partial 对它
+    是**永久状态**——2026-09-07 实测收盘后 brief 15 次调用 15 次 Report cache skipped、
+    0 次命中，每次都全额打上游，还因为上游当日行抖动给出三个不同的值。
     """
 
+    _LIMIT = 60
+
     @staticmethod
-    def _partial(*, fund_flow: bool = True, fund_flow_page: bool, flow: dict,
-                 need_rows: int = 60, pinned: Optional[str] = None) -> bool:
-        """照搬 cn_stock_source 里那个判据，参数化后单独测。"""
-        from finmcp.datasource import fund_flow_source
-        from finmcp.datasource.cn_stock_source import (
-            _fund_flow_satisfies, _is_fetch_failure,
-        )
+    def _ns_days(n: int, last: str = "2026-09-18"):
+        """造 n 个连续日期的 ns 值，**用生产同一套换算**（本地时区的 ``date_to_ns``）。
 
-        need = fund_flow_source.FundFlowNeed(history_rows=need_rows, pinned_date=pinned)
-        return bool(
-            fund_flow
-            and fund_flow_page
-            and not _is_fetch_failure(flow)
-            and not _fund_flow_satisfies(flow, need)
-        )
-
-    def test_full_still_refuses_to_cache_a_one_row_history(self):
-        """full 渲染历史表，1 行确实是降级，仍然要拦。"""
-        assert self._partial(fund_flow_page=True, flow={**_flow(1), "complete": False}) is True
-
-    def test_brief_is_cacheable_with_only_the_delay_row(self):
-        """brief 不渲染历史表，一行就是它的完整答案。"""
-        assert self._partial(fund_flow_page=False, flow={**_flow(1), "complete": False}) is False
-
-    def test_a_complete_history_is_never_partial(self):
-        """源声明这就是它的全部历史（新股、退市）：远少于请求行数也是定局，不拦。"""
-        for page in (True, False):
-            assert self._partial(fund_flow_page=page, flow={**_flow(3), "complete": True}) is False
-
-    def test_a_page_that_delivered_the_requested_rows_is_cacheable(self):
-        """页面兜底成功补到 120 行就是要的都给了——它没有 complete 键，也不能拦。"""
-        flow = {**_flow(120), "provider": "page_fallback"}
-        assert self._partial(fund_flow_page=True, flow=flow, need_rows=60) is False
-
-    def test_a_page_that_short_delivered_is_not_cacheable(self):
-        """页面封顶 120 行、返回又不带 complete：给 3 行就是没覆盖需求。
-
-        这种报告进了缓存，就是把短供冻进 CLOSED 纪元（最长 64 小时），而那几天里
-        主源完全可能恢复。判据不能是"还要不要去页面补"——页面结果当然不用再补页面，
-        但它也不是全份。
+        换成 ``pd.DatetimeIndex.astype('int64')`` 是 UTC 口径，非 UTC 机器上会和
+        ``_date_to_ns`` 差一个时区偏移，测试就成了自证。
         """
-        flow = {**_flow(3), "provider": "page_fallback"}
-        assert self._partial(fund_flow_page=True, flow=flow, need_rows=60) is True
+        from finmcp.datasource import fund_flow_source as ffs
 
-    def test_a_page_missing_the_pinned_date_is_not_cacheable(self):
-        flow = {**_flow(120), "provider": "page_fallback"}
-        assert self._partial(fund_flow_page=True, flow=flow, pinned="2019-01-01") is True
+        end = pd.Timestamp(last)
+        return [ffs.date_to_ns((end - pd.Timedelta(days=i)).strftime("%Y-%m-%d"))
+                for i in range(n)][::-1]
 
-    def test_a_call_that_did_not_ask_for_fund_flow_is_never_partial(self):
-        assert self._partial(fund_flow=False, fund_flow_page=True, flow=_flow(3)) is False
+    @classmethod
+    def _verdict(cls, *, flow_rows: int, kline_rows, provider: str = "eastmoney",
+                 complete=None, pinned=None, limit: Optional[int] = None,
+                 history_table: bool = True):
+        """同一次请求，问两个层：报告印不印那句、缓存拦不拦。
 
-    def test_the_source_still_wires_the_flag_the_same_way(self):
-        """判据不能只活在测试里——源码里那四个条件必须还是这四个。"""
+        ``history_table=False`` 是 brief / medium 的形状：不画历史表，但钉日期时照样
+        开着 ``fund_flow_page``，所以它也要过一遍这段判据。
+        """
+        import io
+
+        from finmcp import research
+        from finmcp.datasource import fund_flow_source as ffs
+        from finmcp.datasource.cn_stock_source import _fund_flow_report_incomplete
+
+        limit = cls._LIMIT if limit is None else limit
+        flow_days = cls._ns_days(flow_rows, last=pinned or "2026-09-18")
+        data = {"_DS_FUND_FLOW": {"DATE": np.array(flow_days, dtype=np.int64)}}
+        if kline_rows is not None:
+            data["DATE"] = np.array(cls._ns_days(kline_rows, last=pinned or "2026-09-18"),
+                                    dtype=np.int64)
+        if pinned:
+            data["QUERY_DATE"] = pinned
+        printed = ""
+        if history_table:   # 只有 full 会画这张表，见 mcp_app 的 include_historical_fund_flow
+            fp = io.StringIO()
+            research.build_historical_fund_flow_data(fp, data, limit)
+            printed = fp.getvalue()
+
+        value = {"fund_flow": pd.DataFrame({"日期": pd.to_datetime(flow_days, unit="ns")
+                                            .strftime("%Y-%m-%d")}),
+                 "is_market": False, "provider": provider}
+        if complete is not None:
+            value["complete"] = complete
+        supply = ffs.fund_flow_supply(
+            data["_DS_FUND_FLOW"]["DATE"], data.get("DATE"),
+            limit if history_table else 0, ffs.date_to_ns(pinned))
+        need = ffs.FundFlowNeed(history_rows=limit if history_table else 0,
+                                pinned_date=pinned)
+        return "只取到" in printed, _fund_flow_report_incomplete(value, need, supply)
+
+    #: (说明, 给到的行数, K 线交易日数, 源, complete)
+    SHAPES = [
+        ("主源自称全份却只给 3 行，K 线有 486 个交易日", 3, 486, "eastmoney", True),
+        ("新股：K 线只有 20 天，页面给满 20 行", 20, 20, "page_fallback", None),
+        ("页面只给到 3 行，K 线有 486 个交易日", 3, 486, "page_fallback", None),
+        ("页面给满 120 行，请求 60 行", 120, 486, "page_fallback", None),
+        ("delay 那单行（源自己说不全）", 1, 486, "eastmoney_delay", False),
+        ("新股全份 3 行，K 线也只有 3 天", 3, 3, "eastmoney", True),
+    ]
+
+    @pytest.mark.parametrize("label,flow_rows,kline_rows,provider,complete", SHAPES)
+    def test_the_report_and_the_cache_gate_never_disagree(
+            self, label, flow_rows, kline_rows, provider, complete):
+        note, blocked = self._verdict(flow_rows=flow_rows, kline_rows=kline_rows,
+                                      provider=provider, complete=complete)
+        assert note == blocked, f"{label}: 报告印={note} 缓存拦={blocked}，不同进同出"
+
+    def test_only_the_history_rendering_tools_are_gated(self):
+        """外层那两道闸：不渲染历史表（brief/medium）就永不拦。"""
         import inspect
 
         from finmcp.datasource import cn_stock_source
 
         src = inspect.getsource(cn_stock_source)
-        block = src[src.index("fund_flow_partial = ("):]
-        block = block[: block.index("\n        )")]
-        for needed in ("requirements.fund_flow", "requirements.fund_flow_page",
-                       "_is_fetch_failure", "_fund_flow_satisfies"):
-            assert needed in block, f"{needed} 不在判据里了：{block}"
+        block = src[src.index("supply = fund_flow_source.fund_flow_supply("):]
+        marker = 'fetch_failures.append("fund_flow:partial")'
+        block = block[: block.index(marker) + len(marker)]
+        for needed in ("requirements.fund_flow_page", "_fund_flow_report_incomplete",
+                       "requirements.fund_flow_rows", marker):
+            assert needed in block, f"{needed} 不在那一处里了：{block}"
+
+    def test_a_page_missing_the_pinned_date_is_not_cacheable(self):
+        """钉的那一天不在帧里：行数照样凑得满，但那天根本没有——拦。"""
+        note, blocked = self._verdict(flow_rows=120, kline_rows=486,
+                                      provider="page_fallback", pinned="2019-01-01")
+        assert blocked is True and note is False
+
+    def test_a_brief_never_pays_for_a_table_it_does_not_draw(self):
+        """同一份数据：full 拦（它要印那句），钉日期的 brief 不拦（它一张表都不画）。
+
+        这一格是这次收口最容易踩的坑——brief 钉日期也带着 ``fund_flow_page``，如果按
+        请求行数拦，它就成了**永久状态**：每次都全额打上游，而它的输出一字不变。
+        """
+        same = dict(flow_rows=3, kline_rows=486, complete=True, pinned="2026-09-18")
+        assert self._verdict(**same) == (True, True)
+        assert self._verdict(history_table=False, **same) == (False, False)
+
+    def test_a_missing_kline_baseline_blocks_without_nagging_the_reader(self):
+        """K 线那一维没给日期时无从判断"该有几行"，报告不印，但缓存保守拦。
+
+        方向和不一致是故意的：宁可少命中一次缓存，也不能把缺一段的报告冻整个纪元。
+        反过来（印了句子却照常进缓存）才是 README 兜不住的那种。
+        """
+        note, blocked = self._verdict(flow_rows=3, kline_rows=None,
+                                      provider="page_fallback")
+        assert note is False and blocked is True
+
+    def test_a_call_that_did_not_ask_for_fund_flow_is_never_partial(self):
+        from finmcp.datasource.cn_stock_source import _is_fetch_failure
+
+        assert _is_fetch_failure({"fund_flow": None}) is False
 
     def test_the_landing_guard_is_a_separate_concern(self):
         """"当日那一行还没落地"由 fund_flow_lagging 管，和行数无关，不受这次改动影响。"""
