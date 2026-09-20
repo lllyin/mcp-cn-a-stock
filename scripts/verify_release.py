@@ -1576,8 +1576,11 @@ LIVE_BATCHES = (
 )
 
 
-def probe_suite(tools: set[str]) -> list[CallSpec]:
+def probe_suite(tools: set[str], events_date: str = "") -> list[CallSpec]:
     """不钉日期的实时探活：每个工具都跑，标的按上面三批走。
+
+    ``events_date`` 是公开事件池要问的那一天，由 ``_settled_trading_day`` 现问服务
+    自己的日历拿到（最近一个已收盘的交易日）。默认空 = 按今天，只在日历答不出来时用。
 
     和钉日期那套的区别不只是少一个参数：
 
@@ -1614,9 +1617,11 @@ def probe_suite(tools: set[str]) -> list[CallSpec]:
             )
         )
     specs.append(CallSpec("market_breadth", {}, "market_breadth"))
-    specs.append(
-        CallSpec("market_events", {"date": today, "sources": "lhb,limit_up"}, "market_events")
-    )
+    specs.append(CallSpec(
+        "market_events",
+        {"date": events_date or today, "sources": "lhb,limit_up"},
+        "market_events" if events_date else "market_events（日历没给出前一交易日，按今天问）",
+    ))
     specs.append(CallSpec(
         "sector_fund_flow",
         {"sector_type": "industry", "period": "today", "top": "3"},
@@ -1634,6 +1639,27 @@ def probe_suite(tools: set[str]) -> list[CallSpec]:
 
 def _shift(date: str, days: int) -> str:
     return (dt.date.fromisoformat(date) + dt.timedelta(days=days)).isoformat()
+
+
+def _settled_trading_day(config: Path, timeout_ms: int) -> str:
+    """公开事件池的探活该问哪一天：最近一个**已经收盘**的交易日，由服务自己的日历给。
+
+    龙虎榜是盘后逐条发布的，问"今天"在多数时段是结构性空答案（周末、节假日、当天还没
+    发完），而探活要回答的是"现在还能不能搜到事件"。答不出来就别问今天。
+
+    日历给不出（调用失败、没覆盖到、previous_trading_day 为 null）时返回空串，调用方
+    退回按今天问，并把原因写在探活那一行的标签上——**不拿工作日猜**：日历说不知道，
+    猜出来的日期更容易被误读成源坏了。
+    """
+    result = run_call(
+        CallSpec("trading_calendar", {"date": dt.date.today().isoformat(), "back": "1"},
+                 "trading_calendar 取前一交易日"),
+        config, timeout_ms)
+    if not result.ok:
+        return ""
+    document = parse_payload(result.payload).structures.get("（整份）")
+    previous = document.get("previous_trading_day") if isinstance(document, dict) else None
+    return previous if isinstance(previous, str) and previous else ""
 
 
 def capture_baseline(result: CallResult, directory: Path, config: Path) -> Path:
@@ -2741,7 +2767,10 @@ def main() -> int:
 
     probes: list[tuple[CallResult, Payload, Completeness]] = []
     if not args.skip_probe:
-        specs = probe_suite(tools)
+        # 公开事件池单独问一天：龙虎榜盘后才发布，问"今天"在周末和盘前必然是空的。
+        events_date = _settled_trading_day(config, args.timeout_ms) if "market_events" in tools else ""
+        specs = probe_suite(tools, events_date)
+        print(f"[验证] 公开事件池探活问 {events_date or '今天（日历没给出前一交易日）'}")
         print(f"[验证] 探活 {len(specs)} 个调用…"
               f"（并发 {args.concurrency}，单个上限 {args.timeout_ms / 1000:.0f}s；"
               f"下面按完成先后逐行打印）", flush=True)

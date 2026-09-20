@@ -338,7 +338,26 @@ def _fetch_source_day(
     if source == "broken_board":
         return call("stock_zt_pool_zbgc_em", date=compact_date)
     if source == "lhb":
-        return call("stock_lhb_detail_em", start_date=compact_date, end_date=compact_date)
+        # 东财对"这个日期没有榜"（非交易日，或当日还没发布）返回 code 9201 + ``result: null``。
+        # akshare 不判空，直接 ``data_json["result"]["pages"]``，于是同一个事实有两种表现：
+        # 键整个不在时是 ``KeyError('result')``，键在但为 null 时是
+        # ``TypeError: 'NoneType' object is not subscriptable``（实测这台机器上是后者）。
+        # 那是**当天确实没有记录**，不是取数失败——两者必须分开往上报（见 _cached_day）：
+        # 记成 FAILED，"周日没有龙虎榜"就被写成一次源故障，每个周末白响一段 traceback，
+        # 而归档里 12 次 lhb 失败全落在这种时段上，交易日一次都没有。
+        # 传输层的失败（连不上、超时、回来的不是 JSON）照旧抛。
+        try:
+            return call("stock_lhb_detail_em", start_date=compact_date, end_date=compact_date)
+        except KeyError as error:
+            if error.args != ("result",):
+                raise
+        except TypeError as error:
+            if "NoneType" not in str(error):
+                raise
+        # 本模块不打日志：一切结论走响应里的 source_statuses 和 warnings。
+        # 这一支落进去就是 status=SUCCESS / raw_row_count=0，外加已有的那句
+        # "空结果不代表当日无事件"——比原来那句 error='result' 外加一段 traceback 准确。
+        return pd.DataFrame()
     if source == "earnings_forecast":
         frame = call("stock_yjyg_em", date=compact_date)
         if frame is None or frame.empty:

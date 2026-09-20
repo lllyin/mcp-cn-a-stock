@@ -635,6 +635,57 @@ class TestProbeSuite:
             "board": "star", "fmt": "json", "sectors": "3", "stocks_per_sector": "20",
         }
 
+    def test_the_events_probe_asks_a_settled_trading_day(self):
+        """问"今天"的龙虎榜在周末、节假日和盘前必然是空的——那是正当缺席，不是源坏。
+
+        2026-09-20 那次 99.6% 里的一个"缺失"就是这么来的：跑在周日，池子当然空，
+        而什么都没坏。
+        """
+        spec = next(s for s in verify.probe_suite({"market_events"}, events_date="2026-09-18"))
+        assert spec.args["date"] == "2026-09-18"
+        assert spec.label == "market_events"
+
+    def test_an_unanswered_calendar_falls_back_to_today_and_says_so(self):
+        """日历答不出来时照今天问，但把原因写在标签上，别让它看起来像一次干净的实测。"""
+        import datetime
+
+        spec = next(s for s in verify.probe_suite({"market_events"}))
+        assert spec.args["date"] == datetime.date.today().isoformat()
+        assert "按今天问" in spec.label
+
+
+class TestSettledTradingDay:
+    """那一天由**服务的日历**答，不在这台机器上猜。"""
+
+    def _result(self, payload, code=0, err=""):
+        spec = verify.CallSpec("trading_calendar", {})
+        return verify.CallResult(spec, code, payload, err, 0.1)
+
+    def test_it_asks_the_calendar_tool_for_the_previous_day(self, monkeypatch):
+        import json
+
+        seen = []
+
+        def fake(spec, config, timeout_ms):
+            seen.append(spec)
+            return self._result(json.dumps({"previous_trading_day": "2026-09-18"}))
+
+        monkeypatch.setattr(verify, "run_call", fake)
+        assert verify._settled_trading_day(Path("mcporter.json"), 1000) == "2026-09-18"
+        assert seen[0].tool == "trading_calendar"
+        assert seen[0].args["back"] == "1"
+
+    @pytest.mark.parametrize("payload, code", [
+        ( '{"previous_trading_day": null}', 0),   # 日历没覆盖到，是"不知道"不是"没有"
+        ('{"previous_trading_day": ""}', 0),
+        ("", 1),                                   # 调用本身失败
+        ("Error executing tool trading_calendar", 0),
+    ])
+    def test_no_answer_from_the_calendar_is_no_date(self, monkeypatch, payload, code):
+        monkeypatch.setattr(verify, "run_call",
+                            lambda spec, config, timeout_ms: self._result(payload, code))
+        assert verify._settled_trading_day(Path("mcporter.json"), 1000) == ""
+
 
 def test_tool_error_text_is_a_failed_call_even_when_mcporter_exits_zero():
     result = verify.CallResult(

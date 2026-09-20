@@ -495,6 +495,44 @@ def test_a_genuinely_empty_day_stays_successful(monkeypatch):
     assert any("不代表当日无事件" in w for w in response.warnings)
 
 
+def test_a_day_with_no_board_is_absent_not_broken(monkeypatch):
+    """非交易日或当日未发布：那是"当天没有榜"，不是源坏了。
+
+    东财对这种日期返回 code 9201 + ``result: null``。akshare 不判空，直接
+    ``data_json["result"]["pages"]``，同一个事实有两种表现：整个键不在时是
+    ``KeyError('result')``，键在但为 null 时是 ``TypeError: 'NoneType' object is
+    not subscriptable``（实测两种都遇到过）。以前它们和一次 502 一样记 FAILED 并打整段
+    traceback——归档 12 次 lhb 失败全部落在非交易日或未发布时段，交易日一次都没有，
+    等于每个周末白报一次故障，还把发版探活的可用率打到 0%。
+    """
+    for error in (KeyError("result"),
+                  TypeError("'NoneType' object is not subscriptable")):
+        class NoBoard:
+            def stock_lhb_detail_em(self, start_date, end_date):
+                raise error
+
+        _cached(monkeypatch)
+        response = fetch_public_market_events_sync(
+            "2026-09-20", "20260920", ["lhb"], 1, [], 1000, ak_module=NoBoard())
+        status = response.source_statuses[0]
+        assert status.status == "SUCCESS" and status.raw_row_count == 0, error
+        assert status.error is None, error
+        assert any("不代表当日无事件" in w for w in response.warnings)
+
+
+def test_any_other_key_or_type_error_is_still_a_failure(monkeypatch):
+    """只放行 akshare 那两种"result 是空"的表现，不把整类异常都判成"没有榜"。"""
+    for error in (KeyError("data"), TypeError("argument of type 'int' is not iterable")):
+        class BadShape:
+            def stock_lhb_detail_em(self, start_date, end_date):
+                raise error
+
+        _cached(monkeypatch)
+        response = fetch_public_market_events_sync(
+            "2026-08-20", "20260820", ["lhb"], 1, [], 1000, ak_module=BadShape())
+        assert response.source_statuses[0].status == "FAILED", error
+
+
 def test_an_upstream_returning_none_is_also_a_failure(monkeypatch):
     """上游给 None 同样是没取到，不是当天没有。"""
     class Nothing:
