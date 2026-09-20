@@ -405,7 +405,13 @@ class TestPartialFundFlowOnlyBlocksTheToolThatRendersHistory:
         assert note == blocked, f"{label}: 报告印={note} 缓存拦={blocked}，不同进同出"
 
     def test_only_the_history_rendering_tools_are_gated(self):
-        """外层那两道闸：不渲染历史表（brief/medium）就永不拦。"""
+        """外层那两道闸：不渲染历史表（brief/medium）就永不拦。
+
+        ``_verdict`` 自己复算了这段接线（``limit if history_table else 0``），所以上面
+        那几题证明的是**判据本身**对，证明不了源码还照这样接。这题补的就是接线：
+        少了 ``fund_flow_history_table`` 那一支，钉日期的 brief 会按请求行数被拦成
+        永久回源，而上面每一题照样全绿。
+        """
         import inspect
 
         from finmcp.datasource import cn_stock_source
@@ -415,8 +421,52 @@ class TestPartialFundFlowOnlyBlocksTheToolThatRendersHistory:
         marker = 'fetch_failures.append("fund_flow:partial")'
         block = block[: block.index(marker) + len(marker)]
         for needed in ("requirements.fund_flow_page", "_fund_flow_report_incomplete",
-                       "requirements.fund_flow_rows", marker):
+                       "requirements.fund_flow_rows",
+                       "requirements.fund_flow_history_table", marker):
             assert needed in block, f"{needed} 不在那一处里了：{block}"
+
+    def test_the_renderer_is_handed_the_same_row_count_the_gate_uses(self):
+        """渲染层的 limit 必须是 ``requirements.fund_flow_rows``，不是工具的原始参数。
+
+        缓存那一侧读的就是 ``requirements.fund_flow_rows``；渲染层若改读原始参数，
+        两层立刻数出两个数——``fund_flow_limit`` 没有任何上下限校验，客户端传 0 时
+        ``requirements`` 归一成 15 而原始值是 0，报告整段不打印，缓存却按 15 判"给全了"。
+        下面第二段断言证明这不是空断言：那两个数真的会不一样。
+        """
+        import ast
+        from pathlib import Path
+
+        # 读文件而不是 inspect：``from finmcp import mcp_app`` 拿到的是那个
+        # ``QtfMCP`` 实例，不是模块。
+        source = (Path(__file__).resolve().parents[1] / "finmcp" / "mcp_app.py").read_text(
+            encoding="utf-8"
+        )
+        passed = [
+            kw.value for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            for kw in node.keywords
+            if kw.arg == "historical_fund_flow_limit"
+        ]
+        assert passed, "mcp_app 不再往渲染层传 historical_fund_flow_limit 了？"
+        for value in passed:
+            assert (isinstance(value, ast.Attribute)
+                    and value.attr == "fund_flow_rows"
+                    and getattr(value.value, "id", "") == "requirements"), (
+                "渲染层的行数必须取自 requirements.fund_flow_rows，"
+                f"现在传的是 {ast.dump(value)}"
+            )
+
+        # 这一题测得出问题吗：两个数确实不是一个数——``requirements`` 收的是归一过的
+        # 表达式而不是裸参数，所以"改传原始参数"是真的会改变行为，不是同义替换。
+        built = [
+            kw.value for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "FetchRequirements"
+            for kw in node.keywords
+            if kw.arg == "fund_flow_rows"
+        ]
+        assert built and not any(
+            isinstance(v, ast.Name) and v.id == "fund_flow_limit" for v in built
+        ), "fund_flow_rows 现在就是裸的 fund_flow_limit，这题于是什么也没守住"
 
     def test_a_page_missing_the_pinned_date_is_not_cacheable(self):
         """钉的那一天不在帧里：行数照样凑得满，但那天根本没有——拦。"""
