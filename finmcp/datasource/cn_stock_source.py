@@ -99,7 +99,7 @@ _FUND_FLOW_PAGE_BREAKER = SourceBreaker(
 
 # 兜底 K 线的帧归一逻辑搬到了 kline_frame，好让 provider 直接用而不产生循环依赖。
 # 这些名字仍从本模块可见：外部按 cn_stock_source.<name> 取的地方不用改。
-from . import fund_flow_source, kline_source
+from . import finance_source, fund_flow_source, kline_source
 from .kline_frame import (  # noqa: F401
     FALLBACK_FRAME_COLUMNS,
     _FALLBACK_REQUIRED,
@@ -883,20 +883,17 @@ class CNStockDataSource(DataSource):
         )
     
     def _fetch_finance_sync(self, code: str, symbol: str = None) -> Optional[Dict]:
-        """同步获取财务数据"""
+        """同步获取财务数据。源在 ``finance_source`` 的链里，顺序由
+        ``FINANCE_PROVIDERS`` 定（默认同花顺 → 新浪），这里只负责"这一维要不要取"。
+        """
         from ..symbols import get_symbol_name
         symbol_name = get_symbol_name(symbol) if symbol else ""
         if code.startswith(("1", "5")) or check_is_index(symbol, symbol_name):
             return None
-        try:
-            import akshare as ak
-            df = ak.stock_financial_abstract_ths(symbol=code)
-            if df is None or df.empty:
-                return _fetch_failure("finance")
-            return {"finance": df}
-        except Exception as e:
-            logger.warning(f"获取财务数据失败 {code}: {e}")
+        frame = finance_source.resolve(code, symbol or code)
+        if frame is None:
             return _fetch_failure("finance")
+        return {"finance": frame.frame, "provider": frame.provider}
 
     async def _fetch_finance_cached(self, code: str, symbol: str) -> Optional[Dict]:
         """Return a copied finance result without submitting cache hits to the executor."""
@@ -908,7 +905,8 @@ class CNStockDataSource(DataSource):
                 cached = _finance_cache.get(cache_key)
                 if cached is not None and now - cached[0] <= FINANCE_CACHE_TTL_SECONDS:
                     cached_at, cached_result = cached
-                    result = {"finance": cached_result["finance"].copy(deep=True)}
+                    result = {**cached_result,
+                              "finance": cached_result["finance"].copy(deep=True)}
                 else:
                     result = None
                 cache_size = len(_finance_cache)
@@ -957,7 +955,7 @@ class CNStockDataSource(DataSource):
         )
         if result is None or "finance" not in result or result["finance"].empty:
             return result
-        return {"finance": result["finance"].copy(deep=True)}
+        return {**result, "finance": result["finance"].copy(deep=True)}
 
     async def _fetch_and_cache_finance(
         self,
@@ -978,7 +976,7 @@ class CNStockDataSource(DataSource):
                 )
                 _finance_cache[cache_key] = (
                     time.monotonic(),
-                    {"finance": result["finance"].copy(deep=True)},
+                    {**result, "finance": result["finance"].copy(deep=True)},
                 )
                 cache_size = len(_finance_cache)
             if expired or evicted:
@@ -988,7 +986,7 @@ class CNStockDataSource(DataSource):
                     evicted,
                     cache_size,
                 )
-        return {"finance": result["finance"].copy(deep=True)}
+        return {**result, "finance": result["finance"].copy(deep=True)}
     
     def _fetch_fund_flow_sync(self, code: str, symbol: str = None,
                               need: "fund_flow_source.FundFlowNeed | None" = None,
@@ -1503,6 +1501,7 @@ class CNStockDataSource(DataSource):
         
         if finance_data and "finance" in finance_data:
             df = finance_data["finance"]
+            stock_data.finance_provider = str(finance_data.get("provider") or "")
             if not df.empty:
                 try:
                     if "报告期" in df.columns:

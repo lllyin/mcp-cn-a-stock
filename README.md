@@ -307,6 +307,7 @@ M 取 `fund_flow_limit` 与同一份报告里 K 线交易日数的较小值—�
 | 配置名 | 作用 | 可选参数 |
 | --- | --- | --- |
 | `BASIC_INFO_PROVIDERS` | 基本数据（市值、市盈率、市净率）的尝试顺序，后面的源补前面缺的字段：<br>`eastmoney` 字段最全，需要网关或未被封的出口<br>`tencent` 无需鉴权，没有网关的部署靠它兜住这一组 | `eastmoney`<br>`tencent`<br>`off`<br>（默认 `eastmoney,tencent`） |
+| `FINANCE_PROVIDERS` | 财务报表（净利润、营业总收入、每股收益、每股净资产、净资产收益率）的尝试顺序：**第一个给全这六列的源整份胜出**，不按字段跨源拼表——两家的报告期轴不同，拼一次错一位就是把上一年的净利润配到今年的净资产收益率上。`ths` 列最多、是主源；`sina` 是独立主机，一次调用带全部历史期。年度净资产收益率两家口径不同，走了回退时报告会在财务段写明这一节来自谁 | `ths`<br>`sina`<br>`off`<br>（默认 `ths,sina`） |
 | `INTRADAY_QUOTE_PROVIDERS` | 盘中实时行情的尝试顺序，逗号分隔按序尝试，`off` 关闭整层。**当天那一根 K 线只认这一层**（历史 K 线给的当天数据不作准）：<br>`fund_flow_page` 复用已解析的资金流页面，不发请求但没有开高低<br>`tencent` 字段全<br>`tonghuashun` 字段全<br>`sina` 个股/ETF 的末级兜底，不提供指数报价和换手率 | `fund_flow_page`<br>`tencent`<br>`tonghuashun`<br>`sina`<br>`off`<br>（默认 `fund_flow_page,tencent,tonghuashun,sina`） |
 | `INTRADAY_QUOTE_PROVIDERS_INDEX` | **指数**用的顺序，和上一项分开配：指数的成交量各源口径不一致，腾讯/新浪比东财/同花顺低约 3.5%（两家同源，互相校验不了）。东财是基准源，所以指数把同花顺排前面；个股各源逐位一致，不换 | `fund_flow_page`、`tonghuashun`、`tencent`、`off`（默认 `fund_flow_page,tonghuashun,tencent`） |
 | `INTRADAY_QUOTE_CROSS_CHECK_PCT` | 报价字段相对偏差的告警阈值。排查时按当前环境设置；这一段挡在报价返回之前，开启会串行请求所有剩余来源，每个标的多付一份下面的预算 | 百分比，`0` 关闭（默认 `0`） |

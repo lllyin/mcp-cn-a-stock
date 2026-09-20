@@ -83,6 +83,9 @@ class StockData:
     eps: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))            # 每股收益
     nav_per_share: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))  # 每股净资产
     roe: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))            # 净资产收益率
+    #: 给出上面那组财务字段的源（``finance_source`` 的 provider 名）。年度净资产收益率
+    #: 在同花顺和新浪之间不是一套口径，渲染层要能说出这一节是谁给的。
+    finance_provider: str = ""
     
     # 估值指标
     pe_static: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))     # 静态市盈率
@@ -185,6 +188,9 @@ class StockData:
                     "ROE": self.roe,
                     "TCAP": self.total_shares,
                     "FCAP": self.float_shares,
+                    # 这一节是谁给的。渲染层只在非主源时打一行说明，两个源的年度
+                    # 净资产收益率不是一套口径（见 finance_source 的模块说明）。
+                    "SOURCE": self.finance_provider,
                 },
                 "1q",
             )  # type: ignore

@@ -18,7 +18,7 @@ from numpy import ndarray
 from .datafeed import load_data_msd
 from .config import ALL_INDICES
 from .datasource.base import FetchRequirements
-from .datasource import trading_calendar
+from .datasource import finance_source, trading_calendar
 from . import market_session
 from .datasource.realtime_ff import get_fund_flow
 from .datasource import realtime_fund_flow_source
@@ -1085,6 +1085,13 @@ def build_financial_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> N
     max_years = 5
     print("# 财务数据", file=fp)
     print("", file=fp)
+    # 回退源给的那一份要自己说清来路：两个源的年度净资产收益率不是同一口径，
+    # 换源的那份报告会和前一天的差一截，不写明就成了一个无从解释的跳变。
+    provider = str(fin.get("SOURCE") or "")
+    if provider and provider != finance_source.PRIMARY_PROVIDER:
+        print(f"- 本节财务数据来自{finance_source.provider_label(provider)}"
+              f"（主源这次没有给出；年度净资产收益率两家的口径不同）", file=fp)
+        print("", file=fp)
     years = 0
     fields = [
         # (名称, 字段ID, 除数, 是否显示)
