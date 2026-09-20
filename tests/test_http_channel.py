@@ -1145,6 +1145,18 @@ class TestAutoProxyRecoveryAndRotation:
             channel._record_auto_proxy_local_failure("https://d.10jqka.com.cn/x")
         assert channel._auto_proxy_states == {}
 
+    def test_push2ex_is_in_scope_for_the_zt_pool_family(self):
+        """涨停池一族（market_events 的 limit_up 等）在 push2ex 上，被拒时
+        同样按东财主机记账激活网关（2026-09-15 两轮 verify events 整份为空）。"""
+        channel._auto_proxy = True
+        channel._auto_proxy_states.clear()
+        for _ in range(channel.AUTO_PROXY_AFTER_FAILURES):
+            channel._record_auto_proxy_local_failure(
+                "https://push2ex.eastmoney.com/getTopicZTPool?date=20260915")
+        state = channel._auto_proxy_state("push2ex.eastmoney.com")
+        assert state["failures"] == channel.AUTO_PROXY_AFTER_FAILURES
+        assert state["active"] is True
+
     def test_a_repeated_bad_exit_is_treated_as_auth_unavailable(self, monkeypatch):
         """重新认证仍吐回同一个坏出口（插件缓存在重认证失败时原样返回旧数据），
         不能记成"刚获取的认证"，要走认证不可用的长冷却。"""

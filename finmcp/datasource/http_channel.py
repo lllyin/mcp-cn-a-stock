@@ -75,8 +75,12 @@ _auto_proxy_states = {}
 
 #: 网关回退只对东财行情 API 主机生效。``d.10jqka.com.cn`` 也在伪装主机名单里，
 #: 它偶发失败时不该把积分花在非东财的 host 上（2026-09-13 实测发生过 2 次）。
+#: push2ex 是涨停池一族接口（market_events 的 limit_up/strong/previous/broken），
+#: 同样按出口 IP 区别对待，拒绝时段 events 整份为空（2026-09-15 verify 两轮实证）。
+#: 它的"没数据"合法形态是 rc 非 0 或空 pool，传输层按默认结构校验放行，
+#: 不在 gateway._ENDPOINT_VALIDATORS 里注册 data 非空的严校验。
 _AUTO_PROXY_SCOPED_HOSTS = frozenset({
-    "push2.eastmoney.com", "push2his.eastmoney.com",
+    "push2.eastmoney.com", "push2his.eastmoney.com", "push2ex.eastmoney.com",
 })
 
 
