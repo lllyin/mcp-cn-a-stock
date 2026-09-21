@@ -2621,3 +2621,64 @@ async def test_a_follower_with_a_bigger_need_runs_its_own_tail(monkeypatch):
     )
 
     assert gateway_calls == ["SH600519", "SH600519"]  # leader 一次 + full 自己一次
+
+
+@pytest.mark.asyncio
+async def test_a_leader_failure_does_not_take_the_follower_down(monkeypatch):
+    """leader 的腿抛异常：follower 不连坐（改动前的行为是各跑各的、坏一个），
+    回落到自己再跑一份并成功。CancelledError 不拦——自己的取消照常传达。"""
+    datasource = CNStockDataSource()
+    _fund_flow_orchestration_stubs(monkeypatch, datasource)
+    # 同步链直接失败：两个请求在毫秒级走到尾部单飞；走真网络的话第二个请求
+    # 到达尾部时 leader 早失败完了，会变成新 leader，follower 路径根本没被测到。
+    monkeypatch.setattr(
+        datasource, "_fetch_fund_flow_sync",
+        lambda code, symbol, need=None, order=None: source_module._fetch_failure("fund_flow"),
+    )
+    source_module._fund_flow_empty_probes.clear()
+    attempts = []
+    good = {"fund_flow": _empty_probes_delay_frame(rows=1, end=datetime.date(2026, 6, 16)),
+            "is_market": False, "provider": "eastmoney_gateway"}
+
+    follower_joined = asyncio.Event()
+
+    async def flaky_inner(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            # 等 follower 真的挂上单飞再失败；否则它到场时任务已完成，
+            # 它会自己当新 leader——follower 路径根本没被测到。
+            await follower_joined.wait()
+            raise RuntimeError("注入：leader 第一次失败")
+        return good, "1"
+
+    monkeypatch.setattr(datasource, "_run_fund_flow_tail_inner", flaky_inner)
+
+    # 在 wrapper 上探出 follower 的到场：registry 里已有未完成任务的那次调用就是。
+    original_tail = CNStockDataSource._fetch_fund_flow_tail
+
+    async def tail_hook(self, code, canonical_symbol, *args, **kwargs):
+        task = source_module._get_fund_flow_tail_inflight().get(canonical_symbol)
+        if task is not None and not task.done():
+            follower_joined.set()
+        return await original_tail(self, code, canonical_symbol, *args, **kwargs)
+
+    monkeypatch.setattr(CNStockDataSource, "_fetch_fund_flow_tail", tail_hook)
+    # 等待预算放大到秒级：无 log context 时 follower 的等待预算可能只有 0.1s，
+    # 和事件释放点撞线——follower 会因自己的超时而落败，"异常连坐"路径根本没
+    # 被走到，这条断言就假绿了。
+    monkeypatch.setattr(source_module, "_fund_flow_page_wait_budget", lambda rid: 5.0)
+    req = FetchRequirements(fund_flow_page=True, fund_flow_history_table=False)
+
+    results = await asyncio.gather(
+        datasource.fetch_stock_data_with_requirements(
+            "SH600519", "2024-01-01", "2026-06-16", requirements=req),
+        datasource.fetch_stock_data_with_requirements(
+            "SH600519", "2024-01-01", "2026-06-16", requirements=req),
+        return_exceptions=True,
+    )
+
+    failures = [r for r in results if isinstance(r, RuntimeError)]
+    successes = [r for r in results if not isinstance(r, RuntimeError)]
+    assert len(failures) == 1  # leader 坏自己那份
+    assert len(successes) == 1  # follower 回落后成功
+    assert attempts == [1, 1]   # 恰两份：leader 一次 + follower 自己一次

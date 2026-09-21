@@ -1545,6 +1545,17 @@ class CNStockDataSource(DataSource):
             outcome = await asyncio.wait_for(asyncio.shield(task), timeout=max(0.1, budget))
         except (asyncio.TimeoutError, TimeoutError):
             outcome = None
+        except Exception as e:
+            # leader 出错不该连坐：wait_for(shield(task)) 会把 leader 的异常原样
+            # 送进每个 follower——改动前一个请求坏了只坏自己，不能让单飞把它变成
+            # 同标的一起坏。回落到自己再跑一份，风险面回到改动前。
+            # CancelledError 是 BaseException，不在这一层拦：follower 自己被取消
+            # （客户端断开）必须照常传出去。
+            logger.info(
+                "资金流兜底单飞等待落空 %s: %s: %s，自己再跑一份",
+                canonical_symbol, type(e).__name__, e,
+            )
+            outcome = None
         wait = time.perf_counter() - wait_started
         if outcome is not None:
             value, _ = outcome
