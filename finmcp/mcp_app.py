@@ -516,9 +516,13 @@ async def fetch_batch_reports(
                 lag = research.fund_flow_lag(raw_data)
                 if lag is not None:
                     flow_day, kline_day = lag
+                    if flow_day < kline_day:
+                        detail = "上游的当日资金流还没落地"
+                    else:
+                        detail = "K 线那一路的数据比资金流旧"
                     output["warnings"].append(
-                        f"{symbol}: 资金流向数据止于 {flow_day}，比报告的数据日期 "
-                        f"{kline_day} 晚一步——上游的当日资金流还没落地"
+                        f"{symbol}: 资金流向数据止于 {flow_day}，与报告的数据日期 "
+                        f"{kline_day} 不一致——{detail}"
                     )
                 # 一致性检测咬住的扰动副本（算术不闭合的历史资金流行）在这里浮出：
                 # 数字看着齐全，但不是真实成交的账，读者必须知道哪些行不可信。

@@ -465,7 +465,21 @@ def _print_fund_flow_lines(fp: TextIO, data: Dict[str, ndarray]) -> bool:
 
     非交易时段分支和钉日期分支共用：两条路的数据来源相同（``A_A``/``XL_A``……
     那组字段），差别只在取不到时的兜底文案，由调用方自己写。
+
+    资金流最后一行必须和报告的数据日期（K 线最后一根）是同一天：不一致时打印
+    滞后数据配新日期，比如实说没有更糟——读者只看得到开头那一个日期。钉日期
+    查询的字段已被换成钉住那一行（_select_fund_flow_row_for_query_date），帧
+    最后一行不是它的判定基准，跳过这道校验。
     """
+    if not data.get("IS_HISTORICAL_QUERY", False):
+        flow_day = fund_flow_date(data)
+        report_day = data_date(data)
+        if (
+            flow_day is not None
+            and report_day is not None
+            and flow_day != report_day
+        ):
+            return False
     has_fund_flow = False
     fields = [
         ("主力", "A"), ("超大单", "XL"), ("大单", "L"), ("中单", "M"), ("小单", "S"),
@@ -522,7 +536,7 @@ def data_date(data: Dict[str, ndarray]) -> Optional[datetime.date]:
 
 
 def fund_flow_lag(data: Dict[str, ndarray]) -> Optional[tuple]:
-    """资金流比 K 线晚了几天。一致就返回 None。
+    """资金流和数据日期（K 线最后一根）差几天。一致就返回 None。
 
     返回 ``(资金流日期, 数据日期)``。两个用途：
 
@@ -531,12 +545,16 @@ def fund_flow_lag(data: Dict[str, ndarray]) -> Optional[tuple]:
     - **缓存守卫**：CLOSED 纪元长达 16-64 小时，而 AkShare 的当日资金流行要到
       收盘后一段时间才落地。没落地就把报告冻进去，等于缺一段冻一整晚。
 
+    两个方向都算：资金流比 K 线旧是上游还没落地；资金流比 K 线新是 K 线那一路
+    旧了（兜底源滞后）——渲染层只印和数据日期同一天的那行，两个方向的不一致
+    对读者都是"那一段没了"。
+
     盘中不算滞后：那时资金流走的是实时抓取，本来就是当天的。
     """
     if is_realtime_fund_flow_window() and not data.get("IS_HISTORICAL_QUERY", False):
         return None
     flow, kline = fund_flow_date(data), data_date(data)
-    if flow is None or kline is None or flow >= kline:
+    if flow is None or kline is None or flow == kline:
         return None
     return flow, kline
 
@@ -560,7 +578,12 @@ def fund_flow_date(data: Dict[str, ndarray]) -> Optional[datetime.date]:
 
 
 def has_today_fund_flow_from_api(data: Dict[str, ndarray], today: Optional[datetime.date] = None) -> bool:
-    """Return whether AkShare fund-flow history has a latest row for today."""
+    """Return whether AkShare fund-flow history's latest row matches the data date.
+
+    判定基准是报告的数据日期（K 线最后一根），不是墙钟今天：盘中两者相同，
+    但一旦 K 线那一天不是今天（上游滞后、合约基准各异），按墙钟判就会把
+    对齐的数据当成不对齐。
+    """
     fund_flow = data.get("_DS_FUND_FLOW")
     if not fund_flow:
         return False
@@ -570,7 +593,7 @@ def has_today_fund_flow_from_api(data: Dict[str, ndarray], today: Optional[datet
         return False
 
     if today is None:
-        today = datetime.datetime.now().date()
+        today = data_date(data) or datetime.datetime.now().date()
 
     try:
         latest_date = datetime.datetime.fromtimestamp(dates[-1] / 1e9).date()

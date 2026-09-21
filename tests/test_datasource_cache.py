@@ -420,10 +420,14 @@ class TestPartialFundFlowOnlyBlocksTheToolThatRendersHistory:
         block = src[src.index("supply = fund_flow_source.fund_flow_supply("):]
         marker = 'fetch_failures.append("fund_flow:partial")'
         block = block[: block.index(marker) + len(marker)]
-        for needed in ("requirements.fund_flow_page", "_fund_flow_report_incomplete",
-                       "requirements.fund_flow_rows",
-                       "requirements.fund_flow_history_table", marker):
+        # 外层条件必须是"渲染历史表或钉日期"——曾经用 fund_flow_page，它改成配置链
+        # 推导之后对 brief/medium 恒为真，规则 2 会把 delay 供数的 brief 拦成永久回源。
+        for needed in ("requirements.fund_flow_history_table",
+                       "requirements.fund_flow_pinned_date",
+                       "_fund_flow_report_incomplete",
+                       "requirements.fund_flow_rows", marker):
             assert needed in block, f"{needed} 不在那一处里了：{block}"
+        assert "requirements.fund_flow_page and _fund_flow_report_incomplete" not in block
 
     def test_the_renderer_is_handed_the_same_row_count_the_gate_uses(self):
         """渲染层的 limit 必须是 ``requirements.fund_flow_rows``，不是工具的原始参数。

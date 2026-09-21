@@ -38,6 +38,7 @@ from ..config import (
 )
 from .. import cache
 from . import basic_info
+from .. import market_session
 from .base import DataSource, FetchRequirements, StockData
 from .breaker import SourceBreaker  # noqa: F401  原地定义已抽到 breaker.py，这里保留名字给旧引用
 from .http_channel import (
@@ -332,7 +333,8 @@ def _fund_flow_satisfies(value, need) -> bool:
     """编排层手上的资金流结果（dict）满足这次查询的需求吗。复用链上的同一判定。
 
     页面兜底最多 120 行，不是全量历史：钉日期超出窗口时不能算满足，所以页面
-    给的结果在这里按"非全量"判——哪怕它没标 complete。
+    给的结果在这里按"非全量"判——哪怕它没标 complete。合并结果（provider 里
+    带 page_fallback 的复合名）同理：里面有页面给的行，就不能按全量短路。
     """
     if value is None:
         # 这一维根本没取（requirements 没要）。生产里不会出现在这里——外层已按
@@ -343,9 +345,119 @@ def _fund_flow_satisfies(value, need) -> bool:
     frame = value.get("fund_flow")
     if frame is None or len(frame) == 0:
         return False
-    complete = value.get("complete", True) and value.get("provider") != "page_fallback"
+    complete = value.get("complete", True) and "page_fallback" not in value.get("provider", "")
     history = fund_flow_source.FundFlowHistory(frame=frame, complete=complete)
     return fund_flow_source.satisfies(history, need)
+
+
+def _frame_last_date(frame):
+    """帧最后一行的日期（``日期`` 列）。取不到返回 None——无从判断，不是缺失。"""
+    if frame is None or len(frame) == 0 or "日期" not in frame.columns:
+        return None
+    try:
+        return datetime.strptime(str(frame["日期"].iloc[-1])[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _fund_flow_last_date(value):
+    """资金流结果最后一行的日期。失败哨兵/空帧一律 None。"""
+    if not isinstance(value, dict) or _is_fetch_failure(value):
+        return None
+    return _frame_last_date(value.get("fund_flow"))
+
+
+def _kline_last_date(kline_value):
+    """K 线结果最后一根的日期——就是报告开头那个"数据日期"。"""
+    if not isinstance(kline_value, dict):
+        return None
+    return _frame_last_date(kline_value.get("adjusted"))
+
+
+def _fund_flow_date_gate_armed(kline_day) -> bool:
+    """"资金流最后一行 == 数据日期"这道门此刻武装吗。
+
+    数据日期是今天、且还没到当日资金流行落地的时刻（FINAL_TIME）：不武装。
+    窗口内五档走实时路径（research.py 的 Playwright/provider 分支），不读帧的
+    最后一行，"帧止于昨天"在该时段不构成不一致；为它付一次页面加载，买到的
+    大概率也是还没落地的行。数据日期是过去的交易日（周末、盘前）或今天已过了
+    final：那是已收盘的确定值，武装。
+    """
+    if kline_day is None:
+        return False
+    now = market_session.now_shanghai()
+    return not (kline_day == now.date() and now.time() < market_session.FINAL_TIME)
+
+
+def _fund_flow_lags_kline(value, kline_day) -> bool:
+    """资金流帧的最后一行比数据日期旧吗——旧就是和报告开头的日期不一致。
+
+    只认"资金流落后"（``<``）：资金流比 K 线新是 K 线那一维旧了，往资金流的
+    链尾走（页面/网关）修不了它。两边有一个取不到日期就无从判断，不拦。
+    """
+    flow_day = _fund_flow_last_date(value)
+    if flow_day is None or kline_day is None:
+        return False
+    return flow_day < kline_day
+
+
+def _fund_flow_needs_more(value, need, kline_day) -> bool:
+    """手上的资金流结果还要不要往链尾走（页面/网关）。两道后置闸门共用。
+
+    两个理由任一成立就走：没满足需求（行数/钉日期），或者满足了对不上数据日期
+    （滞后的完整帧也是错的数据）。钉日期查询不查新旧——它的目标是钉住的那一天，
+    由 satisfies 的精确命中判定管。
+    """
+    if not _fund_flow_satisfies(value, need):
+        return True
+    if need is not None and need.pinned_date:
+        return False
+    if not _fund_flow_date_gate_armed(kline_day):
+        return False
+    return _fund_flow_lags_kline(value, kline_day)
+
+
+def _merge_fund_flow(current, new) -> Optional[Dict]:
+    """按日期并集合并两份资金流结果；新源没有贡献任何新日期时返回 None。
+
+    "行数多的赢"会把对齐的一行换成不对齐的一整份（盘后 delay 给当天 1 行、
+    页面给 120 行止于昨天，120 > 1 就把今天丢了）——所以改成并集：新源补上
+    旧源没有的日期。同一天的行留旧源：链顺序就是权威顺序（eastmoney > delay
+    > 页面 > 网关），同一上游同一口径，先到的为准。
+
+    ``complete`` 不往合并结果里带：它是单源语义（"该源能给的全部历史"），合并
+    帧不是任何单一源的产出，够不够由行数/钉日期/日期对齐各自判。
+    """
+    if not isinstance(new, dict) or _is_fetch_failure(new):
+        return None
+    new_frame = new.get("fund_flow")
+    if new_frame is None or len(new_frame) == 0:
+        return None
+    if not isinstance(current, dict) or _is_fetch_failure(current):
+        return dict(new)
+    current_frame = current.get("fund_flow")
+    if current_frame is None or len(current_frame) == 0:
+        return dict(new)
+
+    import pandas as pd
+
+    have = {str(d)[:10] for d in current_frame["日期"]}
+    add = new_frame[[str(d)[:10] not in have for d in new_frame["日期"]]]
+    if len(add) == 0:
+        return None
+    combined = pd.concat([current_frame, add])
+    merged = (
+        combined
+        .assign(_k=[str(d)[:10] for d in combined["日期"]])
+        .sort_values("_k")
+        .drop(columns="_k")
+        .reset_index(drop=True)
+    )
+    result = dict(current)
+    result["fund_flow"] = merged
+    result.pop("complete", None)
+    result["provider"] = f'{current.get("provider", "?")}+{new.get("provider", "?")}'
+    return result
 
 
 def _fund_flow_report_incomplete(value, need, supply) -> bool:
@@ -1356,10 +1468,15 @@ class CNStockDataSource(DataSource):
         task_results = await asyncio.gather(*(future for _, future in task_specs))
         fetched = dict(zip((name for name, _ in task_specs), task_results))
 
+        # 数据日期（K 线最后一根）在这里可得：两道后置闸门的"资金流最后一行必须
+        # 和数据日期一致"判定拿它当基准。钉日期查询不查新旧（钉的那天由 satisfies
+        # 的精确命中管），实时窗口内不武装（五档走实时路径，不读帧的最后一行）。
+        kline_day = _kline_last_date(fetched.get("kline"))
+
         if (
             requirements.fund_flow
             and requirements.fund_flow_page
-            and not _fund_flow_satisfies(fetched.get("fund_flow"), fund_flow_need)
+            and _fund_flow_needs_more(fetched.get("fund_flow"), fund_flow_need, kline_day)
         ):
             # 页面兜底挂在 gather 之后：只有主源真的失败、或只拿到 delay 那一行时才付
             # 这一次页面加载，正常情况下这条路一次都不会走。必须在下面统计
@@ -1367,22 +1484,21 @@ class CNStockDataSource(DataSource):
             # requirements.fund_flow_page 由配置链推导（mcp_app）：链里配了
             # fund_flow_page 时所有模式都走这里，没配才跳过。
             page_result = await self._fetch_fund_flow_from_page(canonical_symbol)
-            if page_result is not None and (
-                _fund_flow_rows(page_result) > _fund_flow_rows(fetched.get("fund_flow"))
-            ):
-                # 页面给 120 行，只在它比手上的多时才换——手上那一行是 delay 给的当日，
-                # 页面失败或更少时留着它，别把有变成没有。
-                fetched["fund_flow"] = page_result
+            merged = _merge_fund_flow(fetched.get("fund_flow"), page_result)
+            if merged is not None:
+                # 并集合并而不是"行数多的赢"：页面给 120 行止于昨天、delay 给当天
+                # 1 行时，替换会把对齐的那行换成不对齐的一整份；并集两边都留住。
+                fetched["fund_flow"] = merged
                 # 写回缓存：兜底不走 get_or_load（它挂在 gather 之后，包进去会改
                 # 触发时机），不显式写回的话下一次同标的又是一次 6.4 秒的页面加载。
-                store_fund_flow(canonical_symbol, page_result)
+                store_fund_flow(canonical_symbol, merged)
         # 页面之后的同步段（配置里排在 fund_flow_page 后面的级，比如付费网关
         # eastmoney_gateway）：页面也没满足需求才轮到它。默认配置这一段是空的，
         # 一次都不会走。
         if (
             requirements.fund_flow
             and fund_flow_post_order
-            and not _fund_flow_satisfies(fetched.get("fund_flow"), fund_flow_need)
+            and _fund_flow_needs_more(fetched.get("fund_flow"), fund_flow_need, kline_day)
         ):
             post_result = await _run_in_executor(
                 self._fetch_fund_flow_sync,
@@ -1391,22 +1507,20 @@ class CNStockDataSource(DataSource):
                 fund_flow_need,
                 fund_flow_post_order,
             )
-            if (
-                post_result is not None
-                and not _is_fetch_failure(post_result)
-                and _fund_flow_rows(post_result) > _fund_flow_rows(fetched.get("fund_flow"))
-            ):
-                fetched["fund_flow"] = post_result
-                store_fund_flow(canonical_symbol, post_result)
+            merged = _merge_fund_flow(fetched.get("fund_flow"), post_result)
+            if merged is not None:
+                fetched["fund_flow"] = merged
+                store_fund_flow(canonical_symbol, merged)
         if requirements.fund_flow:
-            # 每次资金流查询的最终落点：哪个源给的、多少行、是否全量。
-            # "网关补齐率"和"恢复后是否停止付费"都靠这行算。
+            # 每次资金流查询的最终落点：哪个源给的、多少行、是否全量、止于哪天。
+            # "网关补齐率"和"恢复后是否停止付费"都靠这行算；last_date 对 data_date
+            # 是"资金流滞后"这个可观测量的唯一出处。
             final = fetched.get("fund_flow")
             final_failed = final is None or _is_fetch_failure(final)
             request_id, _, _ = log_context()
             logger.info(
                 "fund_flow_outcome request_id=%s symbol=%s need=%s final_source=%s "
-                "rows=%s complete=%s",
+                "rows=%s complete=%s last_date=%s data_date=%s",
                 request_id or "-",
                 canonical_symbol,
                 f"pinned:{fund_flow_need.pinned_date}"
@@ -1416,6 +1530,8 @@ class CNStockDataSource(DataSource):
                 "-" if final_failed else final.get("provider", "-"),
                 0 if final_failed else _fund_flow_rows(final),
                 "-" if final_failed else final.get("complete", "-"),
+                _fund_flow_last_date(final) or "-",
+                kline_day or "-",
             )
         # 资金流"没覆盖本次请求"的判定要等 K 线和日表都建好才能算（基准是同报告里的
         # K 线交易日数），见下面 ``fund_flow:partial`` 那一处。
@@ -1545,13 +1661,17 @@ class CNStockDataSource(DataSource):
                     # 整个 CLOSED 纪元（cache-design §七 不变量 4）。用 fetch_failures 表达，
                     # 它唯一的用途就是拦缓存。
                     #
-                    # **只对真的渲染历史表的工具成立**（``fund_flow_page``，也就是 full，
-                    # 或钉了日期的查询）。brief / medium 只印"当日主力净流入"一行，1 行和
+                    # **只对真的渲染历史表的查询成立**（``fund_flow_history_table``
+                    # 或钉了日期）。brief / medium 只印"当日主力净流入"一行，1 行和
                     # 120 行对它们的输出完全一样，"行数不够"因此不是降级——拿它拦缓存是纯亏：
                     #   - partial 对它们是**永久状态**，不是"下次可能好"，等不到那个下次；
                     #   - 代价实测：2026-09-07 收盘后 brief 15 次调用 15 次 Report cache
                     #     skipped、0 次命中，每次都全额打上游；连续三次调用还会因为上游当日
                     #     行抖动给出三个不同的值。
+                    # 这道门的外层条件曾经是 fund_flow_page——它从"full 或钉日期"改成
+                    # 配置链推导之后对 brief/medium 恒为真，规则 2（complete=False）会把
+                    # delay 供数的 brief 全部拦成永久回源。条件必须按"渲染不渲染历史表"
+                    # 写，不能复用那个变了语义的字段。
                     # "当日那一行还没落地"这个真问题由另一道守卫管（cache.is_cacheable_report
                     # 的 fund_flow_lagging），和行数无关，不受这里影响。
                     supply = fund_flow_source.fund_flow_supply(
@@ -1563,7 +1683,10 @@ class CNStockDataSource(DataSource):
                         requirements.fund_flow_rows if requirements.fund_flow_history_table else 0,
                         fund_flow_source.date_to_ns(requirements.fund_flow_pinned_date),
                     )
-                    if requirements.fund_flow_page and _fund_flow_report_incomplete(
+                    if (
+                        requirements.fund_flow_history_table
+                        or requirements.fund_flow_pinned_date
+                    ) and _fund_flow_report_incomplete(
                         fund_flow_data, fund_flow_need, supply,
                     ):
                         stock_data.fetch_failures.append("fund_flow:partial")

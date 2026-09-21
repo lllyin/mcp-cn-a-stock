@@ -1385,7 +1385,8 @@ async def test_partial_fund_flow_still_goes_to_the_page_and_takes_its_history(mo
     result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
 
     assert loaded == ["SZ300408"]
-    assert len(result.fund_flow_history["DATE"]) == 121
+    # 并集合并：页面 121 行（止于 09-03）+ delay 的 09-04 那一行，两边都留住。
+    assert len(result.fund_flow_history["DATE"]) == 122
     assert result.fetch_failures == []           # 页面补齐了，报告可以进缓存
 
 
@@ -2041,10 +2042,14 @@ async def test_brief_never_pays_for_the_page_history(monkeypatch):
 # --- 资金流编排：页面与网关按配置顺序执行 -----------------------------------------
 
 
-def _fund_flow_frame_of(rows: int):
+def _fund_flow_frame_of(rows: int, end: "datetime.date | None" = None):
     from finmcp.datasource.platforms import eastmoney
 
-    start = datetime.date(2026, 1, 1)
+    # 帧的最后一行对齐 K 线桩的最后一根（2026-06-16）：编排层有"资金流最后一行
+    # == 数据日期"的对齐门，帧止于别的日期会被判成滞后，继续往链尾走。
+    # 要造"滞后"的形态就传 end= 更早的日期。
+    end = end or datetime.date(2026, 6, 16)
+    start = end - datetime.timedelta(days=rows - 1)
     klines = [
         f"{start + datetime.timedelta(days=i)},"
         "-100.0,50.0,25.0,15.0,10.0,-1.43,1.73,-0.30,-0.73,-0.70,"
@@ -2131,3 +2136,137 @@ async def test_gateway_is_not_paid_when_the_page_satisfies(monkeypatch):
     )
 
     assert calls == [("eastmoney", "eastmoney_delay")]  # 网关一次都没被调到
+
+
+# --- 资金流最后一行必须对齐数据日期（K 线最后一根） --------------------------
+#
+# 报告只写一个"数据日期"，资金流那段没有自己的日期：对不上就是错的数据。
+# 对齐门挂在 gather 之后的两道兜底闸门上（页面、网关），基准是 K 线最后一根——
+# 不是墙钟今天：周末/盘前的数据日期本来就是上一个交易日，delay 的旧行是正确
+# 答案，不该为它付页面加载，更不付网关积分。
+
+
+@pytest.mark.asyncio
+async def test_a_stale_complete_frame_still_goes_to_the_page(monkeypatch):
+    """主源给"止于昨天的一整份"（complete=True）：行数和全量都满足，但和
+    数据日期对不上——complete 的短路不能盖住日期对齐门，页面必须照常走。"""
+    datasource = CNStockDataSource()
+    _fund_flow_orchestration_stubs(monkeypatch, datasource)  # K 线止于 2026-06-16
+    monkeypatch.setattr(
+        source_module.fund_flow_source, "configured_order",
+        lambda: ("eastmoney", "eastmoney_delay", "fund_flow_page"),
+    )
+    # 盘后当日行还没落地的形态：complete=True，但最后一行是 06-15。
+    monkeypatch.setattr(
+        datasource, "_fetch_fund_flow_sync",
+        lambda code, symbol, need=None, order=None: {
+            "fund_flow": _fund_flow_frame_of(99, end=datetime.date(2026, 6, 15)),
+            "is_market": False, "complete": True, "provider": "eastmoney"},
+    )
+    loaded = []
+
+    async def fake_page(symbol):
+        loaded.append(symbol)
+        return {"fund_flow": _fund_flow_frame_of(120), "is_market": False,
+                "provider": "page_fallback"}
+
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_from_page", fake_page)
+    monkeypatch.setattr(source_module, "store_fund_flow", lambda s, v: None)
+
+    await datasource.fetch_stock_data_with_requirements(
+        "SH600519", "2024-01-01", "2026-06-17",
+        requirements=FetchRequirements(fund_flow_page=True, fund_flow_rows=60),
+    )
+
+    assert loaded == ["SH600519"]  # complete 短路没盖住日期门
+
+
+@pytest.mark.asyncio
+async def test_the_date_gate_stays_disarmed_during_the_realtime_window(monkeypatch):
+    """数据日期是今天且还没过 final：不武装。窗口内五档走实时路径，不读帧的
+    最后一行，"帧止于昨天"在该时段不构成不一致，不该为它付页面加载。"""
+    datasource = CNStockDataSource()
+    _fund_flow_orchestration_stubs(monkeypatch, datasource)  # K 线止于 2026-06-16
+    monkeypatch.setattr(
+        source_module.fund_flow_source, "configured_order",
+        lambda: ("eastmoney", "eastmoney_delay", "fund_flow_page"),
+    )
+    # 此刻 = 2026-06-16 10:00：K 线桩的最后一根就是"今天"，且没过 FINAL_TIME。
+    fake_now = datetime.datetime(2026, 6, 16, 10, 0)
+    monkeypatch.setattr(
+        source_module.market_session, "now_shanghai", lambda now=None: fake_now
+    )
+    monkeypatch.setattr(
+        datasource, "_fetch_fund_flow_sync",
+        lambda code, symbol, need=None, order=None: {
+            "fund_flow": _fund_flow_frame_of(99, end=datetime.date(2026, 6, 15)),
+            "is_market": False, "complete": True, "provider": "eastmoney"},
+    )
+
+    async def unexpected(symbol):
+        raise AssertionError("实时窗口内不该为日期对齐付页面加载")
+
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_from_page", unexpected)
+
+    await datasource.fetch_stock_data_with_requirements(
+        "SH600519", "2024-01-01", "2026-06-17",
+        requirements=FetchRequirements(fund_flow_page=True, fund_flow_rows=60),
+    )
+    # 不炸就是没走页面
+
+
+@pytest.mark.asyncio
+async def test_the_merge_keeps_the_aligned_row_when_the_page_is_longer_but_stale(monkeypatch):
+    """并集合并：delay 给对齐的当天 1 行，页面给 120 行止于前天——"行数多的赢"
+    会把对齐那行换成不对齐的一整份；并集两边都留，最后一行仍对齐数据日期。"""
+    datasource = CNStockDataSource()
+    _fund_flow_orchestration_stubs(monkeypatch, datasource)  # K 线止于 2026-06-16
+    monkeypatch.setattr(
+        source_module.fund_flow_source, "configured_order",
+        lambda: ("eastmoney", "eastmoney_delay", "fund_flow_page"),
+    )
+    # delay：对齐的当天单行（complete=False，行数不满足 full 的 60 行需求 → 走页面）
+    monkeypatch.setattr(
+        datasource, "_fetch_fund_flow_sync",
+        lambda code, symbol, need=None, order=None: {
+            "fund_flow": _fund_flow_frame_of(1),  # 止于 2026-06-16，对齐
+            "is_market": False, "complete": False, "provider": "eastmoney_delay"},
+    )
+
+    async def fake_page(symbol):
+        # 页面 120 行止于 06-13：更长但滞后
+        return {"fund_flow": _fund_flow_frame_of(120, end=datetime.date(2026, 6, 13)),
+                "is_market": False, "provider": "page_fallback"}
+
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_from_page", fake_page)
+    stored = []
+    monkeypatch.setattr(source_module, "store_fund_flow", lambda s, v: stored.append(v))
+
+    result = await datasource.fetch_stock_data_with_requirements(
+        "SH600519", "2024-01-01", "2026-06-17",
+        requirements=FetchRequirements(fund_flow_page=True, fund_flow_rows=60),
+    )
+
+    history = result.fund_flow_history["DATE"]
+    assert len(history) == 121                      # 120 + delay 对齐的那一行
+    last = datetime.datetime.fromtimestamp(history[-1] / 1e9).date()
+    assert last == datetime.date(2026, 6, 16)       # 最后一行仍对齐数据日期
+    assert stored and len(stored) == 1              # 合并结果写回了缓存
+
+
+@pytest.mark.asyncio
+async def test_delay_served_brief_is_not_blocked_from_the_cache(monkeypatch):
+    """brief 不渲染历史表：delay 的单行（complete=False）不能把它拦成永久回源。
+
+    缓存闸门的外层条件曾经复用 fund_flow_page——它改成配置链推导之后对 brief
+    恒为真，规则 2 会把 delay 供数的 brief 全部拦下（09-07 那组 15 次调用
+    15 次 skipped 的回归）。条件必须按"渲染不渲染历史表"写。
+    """
+    datasource = _page_fallback_datasource(monkeypatch, _partial_fund_flow_result())
+
+    result = await datasource.fetch_stock_data_with_requirements(
+        "SZ300408", "2024-01-01", "2026-09-03",
+        requirements=FetchRequirements(fund_flow_page=True, fund_flow_history_table=False),
+    )
+
+    assert "fund_flow:partial" not in result.fetch_failures

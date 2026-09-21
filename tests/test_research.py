@@ -762,6 +762,49 @@ def test_a_lag_is_reported_with_both_dates():
     assert lag == (datetime.date(2026, 9, 3), datetime.date(2026, 9, 4))
 
 
+def test_a_lead_is_also_reported(monkeypatch):
+    """资金流比 K 线新也是不一致——那是 K 线那一路旧了（兜底源滞后）。"""
+    monkeypatch.setattr(research, "is_realtime_fund_flow_window", lambda now=None: False)
+    lag = research.fund_flow_lag(_data("2026-09-03", "2026-09-04"))
+    assert lag == (datetime.date(2026, 9, 4), datetime.date(2026, 9, 3))
+
+
+def _flow_data(kline_day: str, flow_day: str):
+    """kline 日期 + 资金流日期 + 五档字段都齐的渲染输入。"""
+    out = _data(kline_day, flow_day)
+    for field in ("A", "XL", "L", "M", "S"):
+        out[f"{field}_A"] = np.array([100.0])
+        out[f"{field}_R"] = np.array([0.01])
+    return out
+
+
+def test_fund_flow_lines_dropped_when_the_flow_lags_the_data_date():
+    """资金流最后一行和数据日期不是同一天：一行都不印，走降级文案。
+
+    印出来就是滞后数据配新日期——读者只看得到开头那一个日期，无从察觉。
+    """
+    buf = StringIO()
+    ok = research._print_fund_flow_lines(buf, _flow_data("2026-09-04", "2026-09-03"))
+    assert ok is False
+    assert buf.getvalue() == ""
+
+
+def test_fund_flow_lines_print_when_the_dates_agree():
+    buf = StringIO()
+    ok = research._print_fund_flow_lines(buf, _flow_data("2026-09-04", "2026-09-04"))
+    assert ok is True
+    assert "当日主力净流入" in buf.getvalue()
+
+
+def test_fund_flow_lines_skip_the_date_check_for_pinned_queries():
+    """钉日期查询的字段已被换成钉住那一行的值，帧最后一行不是它的判定基准。"""
+    data = _flow_data("2026-09-04", "2026-09-03")
+    data["IS_HISTORICAL_QUERY"] = True
+    buf = StringIO()
+    ok = research._print_fund_flow_lines(buf, data)
+    assert ok is True
+
+
 def test_no_lag_without_fund_flow_history():
     """科创50 这类标的本来就没有资金流，别报成滞后。"""
     assert research.fund_flow_lag(_data("2026-09-04", None)) is None

@@ -251,6 +251,12 @@ def satisfies(history: Optional[FundFlowHistory], need: FundFlowNeed) -> bool:
 
     全量历史（``complete``）有就有、没有就是谁都没有，定局，不再问下一个源——
     钉了一个非交易日或早于上市日期的，任何源都给不出，为它付费是纯亏。
+
+    注意"定局"只管**有没有**这份历史，不管**新不新**：complete=True 的帧也可能
+    止于昨天（盘后到当日行落地之间，主源给的就是"止于昨天的一整份"）。新旧由
+    编排层在 gather 之后按数据日期（K 线最后一根）判，见 cn_stock_source
+    的 ``_fund_flow_needs_more``——别把那个校验挪进这里，这里拿不到 K 线。
+
     部分帧看覆盖：钉日期要精确命中那天（不借最新一行），历史表要行数够。
     """
     if history is None or history.rows == 0:
