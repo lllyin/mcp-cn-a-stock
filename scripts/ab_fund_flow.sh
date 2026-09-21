@@ -29,11 +29,14 @@ BACKUP=".env.ab-backup"
 [ -f "$BACKUP" ] || cp .env "$BACKUP"
 
 # 报告缓存会把第二轮直接命中掉，量不出取数成功率，所以整轮关掉。
+# 名字是 CACHE_REPORT_ENABLED：旧名 REPORT_CACHE_ENABLED 在 2.0 改名后已经没人读了，
+# 写进去只关掉一个不存在的开关，第二轮照样整批命中。顺手把两版名字都清掉，
+# 免得早先跑出来的那行留在 .env 里误导下一个人。
 {
-  grep -vE '^BROWSER_(HEADFUL|KEEP_PAGES)=|^REPORT_CACHE_ENABLED=' "$BACKUP"
+  grep -vE '^BROWSER_(HEADFUL|KEEP_PAGES)=|^REPORT_CACHE_ENABLED=|^CACHE_REPORT_ENABLED=' "$BACKUP"
   echo "BROWSER_HEADFUL=$HEADFUL"
   echo "BROWSER_KEEP_PAGES=$KEEP_PAGES"
-  echo "REPORT_CACHE_ENABLED=0"
+  echo "CACHE_REPORT_ENABLED=0"
 } > .env
 
 ./stop.sh >/dev/null 2>&1

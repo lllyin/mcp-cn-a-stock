@@ -136,6 +136,42 @@ def test_env_example_covers_exactly_what_the_code_reads():
     assert not doc - code, f".env.example 写了代码不读的配置: {sorted(doc - code)}"
 
 
+def _cache_derived() -> set[str]:
+    """按命名空间派生的真实开关名。
+
+    `config.cache_enabled()` 用 f-string 拼名字，扫源码扫不到，但它们确实在生效——
+    A/B 脚本往 .env 里写的正是这一类。注册表在 import `finmcp.cache` 时就填齐了。
+    """
+    from finmcp import cache
+    return {
+        f"CACHE_{name.upper()}_{suffix}"
+        for name in cache._NAMESPACES
+        for suffix in ("ENABLED", "TTL_SECONDS", "MAX_ENTRIES")
+    }
+
+
+def test_scripts_only_write_config_the_code_reads():
+    """脚本写进 `.env` 的名字必须真的被读——写一个没人读的名字是静默失效。
+
+    实测踩过：两个 A/B 脚本写的是 `REPORT_CACHE_ENABLED=0`，那是 2.0 改名前的旧名，
+    代码里已经没人读了。于是"整轮关掉报告缓存"这句话从来没成立过，第二轮照样整批
+    命中缓存，量出来的"取数成功率"其实是缓存命中率。README 和 .env.example 那两条
+    检查抓不到它——这个不住在文档里，住在脚本里。
+
+    只扫"写进 .env 的那一行"，不扫注释和文档里 `NAME=值` 形状的提法：实测那样会捞出
+    `ENV_PREFIX`、`MCPORTER_CONFIG`、脚本自己的局部变量乃至 `NID18` 十几个假阳性，
+    为了过测试就得养一张豁免名单——那种检查量不出问题，不做。
+    """
+    read = set(_code_configs()) | _cache_derived()
+    offenders: dict[str, list[str]] = {}
+    for path in sorted((ROOT / "scripts").glob("*.sh")) + [ROOT / "start.sh", ROOT / "stop.sh"]:
+        text = path.read_text(encoding="utf-8")
+        for name in re.findall(r'echo\s+"([A-Z][A-Z0-9_]{3,})=', text):
+            if name not in read:
+                offenders.setdefault(name, []).append(path.name)
+    assert not offenders, f"这些名字会被写进 .env，但代码不读: {offenders}"
+
+
 def test_readme_covers_exactly_what_the_code_reads():
     code = set(_drop_namespaced(_code_configs()))
     doc = set(_drop_namespaced(_readme_configs()))
