@@ -17,6 +17,7 @@ from . import report_contract, research
 from . import market_session
 from .cache import build_key, get_report_cache, is_cacheable_report
 from .datasource import get_datasource
+from .datasource import fund_flow_source
 from .datasource import trading_calendar as trading_calendar_layer
 from .datasource.base import (FETCH_FAILURES_KEY, FUND_FLOW_ANOMALIES_KEY,
                               FetchRequirements)
@@ -278,15 +279,11 @@ async def fetch_batch_reports(
     date_label = f", date={date}" if date else ""
     requirements = FetchRequirements(
         fund_flow_rows=max(1, int(fund_flow_limit or 15)),
-        # full 渲染历史资金流向表，所以要；**钉了日期的查询同样要**——它展示的那一行
-        # 就在历史里（见 research._select_fund_flow_row_for_query_date），拿不到历史
-        # 就只能打降级提示，而那一行是已收盘的确定值，不是"取不到就算了"的实时量。
-        #
-        # 当初 brief/medium 关掉它的理由是"为一张不渲染的表去打页面，代价落在同一个
-        # 浏览器上的实时那条路"。钉日期查询不适用那个理由：它根本不取实时资金流
-        # （research.py 里 IS_HISTORICAL_QUERY 那个分支会跳过），所以不存在把实时
-        # 挤掉的问题，页面加载也就不是白付。
-        fund_flow_page=(mode == "full" or bool(date)),
+        # 页面兜底走不走完全由 FUND_FLOW_PROVIDERS 决定：链里配了 fund_flow_page，
+        # 所有模式都在主源/delay 之后先试页面，页面也没拿到才轮到链尾的付费网关。
+        # 不按工具类型砍——brief/medium 的当日资金流同样值得先过这道免费关，
+        # 跳过它的替代代价是网关积分。
+        fund_flow_page=("fund_flow_page" in fund_flow_source.configured_order()),
         fund_flow_pinned_date=date,
         # 只有 full 渲染历史表，所以只有 full 的资金流需求带行数——钉日期时也一样。
         # brief/medium 不渲染，钉日期只需命中那一天，行数不是需求（置 0 正是为了

@@ -295,8 +295,14 @@ async def test_medium_keeps_historical_fund_flow_disabled(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("providers,page_expected", [
+    ("eastmoney,eastmoney_delay,fund_flow_page,eastmoney_gateway", True),
+    ("eastmoney,eastmoney_delay,eastmoney_gateway", False),
+])
 @pytest.mark.parametrize("mode", ["brief", "medium", "full"])
-async def test_markdown_reports_preserve_all_datasource_requirements(monkeypatch, mode):
+async def test_markdown_reports_preserve_all_datasource_requirements(
+    monkeypatch, mode, providers, page_expected
+):
     seen = {}
 
     async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
@@ -306,15 +312,17 @@ async def test_markdown_reports_preserve_all_datasource_requirements(monkeypatch
     async def fake_build_trading_data(fp, symbol, data, **kwargs):
         print("# trading", file=fp)
 
+    monkeypatch.setenv("FUND_FLOW_PROVIDERS", providers)
     monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
     monkeypatch.setattr(app_module.research, "build_trading_data", fake_build_trading_data)
 
     response = await app_module.fetch_batch_reports("SZ002463", mode, "")
 
     assert response.errors == {}
-    # 只有 full 渲染历史资金流向表，也只有它允许为历史去打浏览器页面；其余项目三种模式相同
+    # 页面兜底走不走只看链里有没有 fund_flow_page，与工具模式无关；历史表行数需求
+    # 仍只有 full 带。
     assert seen["requirements"] == FetchRequirements(
-        fund_flow_page=(mode == "full"),
+        fund_flow_page=page_expected,
         fund_flow_history_table=(mode == "full"),
     )
 

@@ -308,33 +308,6 @@ def test_the_in_page_fetch_cannot_break_the_load(quiet_waits):
     assert refusal is None and parsed is not None and parsed.has_today
 
 
-# --- 钉日期查询要接上兜底 ---------------------------------------------------
-
-
-@pytest.mark.parametrize("mode,date,expected", [
-    ("full", None, True),        # full 渲染历史表，一直都要
-    ("full", "2026-06-23", True),
-    ("brief", "2026-06-23", True),   # ← 这次补的：钉日期要展示历史里的那一行
-    ("medium", "2026-06-23", True),
-    ("brief", None, False),      # 不钉日期的 brief 仍然不为一张不渲染的表打页面
-    ("medium", None, False),
-])
-def test_a_pinned_date_query_is_allowed_to_use_the_page(mode, date, expected):
-    """brief/medium 关掉页面兜底的理由是"为一张不渲染的表打页面，挤掉同一个浏览器上
-    的实时那条路"。钉日期查询不适用：它根本不取实时资金流，所以不存在挤占。
-
-    而它**需要**历史——展示的那一行就在历史里，拿不到就只能打降级提示，可那一行是
-    已收盘的确定值。
-    """
-    from finmcp.datasource.cn_stock_source import FetchRequirements
-
-    requirements = FetchRequirements(
-        fund_flow_rows=15,
-        fund_flow_page=(mode == "full" or bool(date)),
-    )
-    assert requirements.fund_flow_page is expected
-
-
 # --- 失败必须留痕 -----------------------------------------------------------
 #
 # 2026-09-13 线上踩到：页面历史表空了 10 次，而这条补空表的路一条日志都没留，
