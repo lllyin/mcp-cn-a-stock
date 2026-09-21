@@ -290,7 +290,7 @@ M 取 `fund_flow_limit` 与同一份报告里 K 线交易日数的较小值—�
 | `AUTO_PROXY_AFTER_FAILURES` | `AKSHARE_PROXY_ENABLED=auto` 时，触发网关回退前的连续本地失败次数 | 正整数（默认 `3`） |
 | `AUTO_PROXY_COOLDOWN_SECONDS` | `auto` 模式网关回退失败后的暂停时长 | 秒（默认 `300`） |
 | `AUTO_PROXY_DATA_COOLDOWN_SECONDS` | 网关数据失败（出口已拿到、请求没成）后的暂停秒数；失败同时作废缓存的认证，下一次尝试换新出口 | 秒（默认 `30`） |
-| `AUTO_PROXY_RECOVERY_PROBES` | 网关回退激活期间，本地成功要按间隔攒够多少次才退出回退（防一次偶然成功来回抖动） | 次数（默认 `3`） |
+| `AUTO_PROXY_RECOVERY_PROBES` | 网关回退激活期间，本地成功多少次就退出回退。默认 `1`：间歇性拒绝下"连续 N 次"几乎攒不够，网关会永久激活；误判恢复的代价只是几个请求走回退链 | 次数（默认 `1`） |
 | `AUTO_PROXY_RECOVERY_INTERVAL_SECONDS` | 相邻两次恢复探测的最小间隔秒数；间隔内的本地成功不累计 | 秒（默认 `60`） |
 | `GATEWAY_TRANSPORT` | 网关传输实现；接新的代理库时在 `gateway.py` 写一个 `GatewayTransport` 实现再加一个可选值 | 默认 `akshare_proxy_patch` |
 | `GATEWAY_AUTH_REUSE_SECONDS` | 一份网关出口凭据的复用上限；出口死亡是静默的，由失败即作废兜住 | 秒（默认 `600`） |

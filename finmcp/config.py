@@ -65,9 +65,11 @@ AUTO_PROXY_COOLDOWN_SECONDS = max(1.0, float(env("AUTO_PROXY_COOLDOWN_SECONDS", 
 # 失败时作废缓存的认证让下一次立刻换出口，冷却也只用短的。认证失败（网关本身
 # 没出口可给）才用长的 AUTO_PROXY_COOLDOWN_SECONDS。
 AUTO_PROXY_DATA_COOLDOWN_SECONDS = max(1.0, float(env("AUTO_PROXY_DATA_COOLDOWN_SECONDS", "30")))
-# 恢复迟滞：active 期间本地成功要按间隔攒够 N 次才退出网关回退。一次偶然成功
-# 立即退出，会让状态在"激活/恢复"之间来回抖，抖回去的代价是再攒一轮失败。
-AUTO_PROXY_RECOVERY_PROBES = max(1, int(env("AUTO_PROXY_RECOVERY_PROBES", "3")))
+# 恢复判据：active 期间本地成功一次就退出网关回退。间歇性拒绝（本地成功率两三成）
+# 下"连续 N 次"几乎永远攒不够，网关一激活就永久激活、所有流量持续付费；而误判
+# 恢复的代价是有界的——再攒一轮连续失败才重新激活，那几个请求走逐级回退链，
+# 数据不少，只是源降一级。间隔只限制探测的记账频率。
+AUTO_PROXY_RECOVERY_PROBES = max(1, int(env("AUTO_PROXY_RECOVERY_PROBES", "1")))
 AUTO_PROXY_RECOVERY_INTERVAL_SECONDS = max(1.0, float(env("AUTO_PROXY_RECOVERY_INTERVAL_SECONDS", "60")))
 # 网关传输实现（finmcp/datasource/gateway.py 的 GatewayTransport）。默认
 # akshare_proxy_patch；接新的代理库就是写一个实现类再加一个可选值。

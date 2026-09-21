@@ -410,6 +410,9 @@ def _record_auto_proxy_local_failure(url) -> None:
             state["local_successes"] = 0
         if state["failures"] >= AUTO_PROXY_AFTER_FAILURES and not state["active"]:
             state["active"] = True
+            # 新一段激活期从头起探测时钟：留着上一段的 last_probe_at，恢复后的
+            # 第一次本地成功若落在间隔内会被跳过，PROBES=1 时等于白白推迟恢复。
+            state["last_probe_at"] = 0.0
             logger.warning("auto_proxy_state host=%s state=active failures=%s", host, state["failures"])
 
 

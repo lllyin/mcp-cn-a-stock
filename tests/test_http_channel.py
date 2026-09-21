@@ -1037,7 +1037,31 @@ class TestAutoProxyRecoveryAndRotation:
             channel._record_auto_proxy_local_failure(self.URL)
         return channel._auto_proxy_states["push2his.eastmoney.com"]
 
-    def test_recovery_needs_spaced_consecutive_successes(self):
+    def test_one_local_success_recovers_by_default(self):
+        """默认 1 次本地成功即恢复：间歇性拒绝下"连续 N 次"几乎攒不够，
+        网关会永久激活、所有流量持续付费。"""
+        state = self._activate()
+        assert channel.AUTO_PROXY_RECOVERY_PROBES == 1
+        channel._record_auto_proxy_local_success(self.URL)
+        assert state["active"] is False and state["local_successes"] == 0
+        assert state["failures"] == 0
+
+    def test_reactivation_resets_the_probe_clock(self):
+        """重新激活后第一次本地成功必须立即恢复：留着上一段的 last_probe_at，
+        落在间隔内的成功会被跳过，PROBES=1 时等于白白推迟恢复。"""
+        state = self._activate()
+        channel._record_auto_proxy_local_success(self.URL)
+        assert state["active"] is False
+        # 立刻重新激活（距上次探测 0 秒，远在间隔内）
+        for _ in range(channel.AUTO_PROXY_AFTER_FAILURES):
+            channel._record_auto_proxy_local_failure(self.URL)
+        assert state["active"] is True
+        channel._record_auto_proxy_local_success(self.URL)
+        assert state["active"] is False
+
+    def test_recovery_needs_spaced_consecutive_successes(self, monkeypatch):
+        """多次探测的间隔语义保留：PROBES>1 时，间隔内的成功不累计。"""
+        monkeypatch.setattr(channel, "AUTO_PROXY_RECOVERY_PROBES", 3)
         state = self._activate()
         channel._record_auto_proxy_local_success(self.URL)
         assert state["active"] is True and state["local_successes"] == 1
@@ -1050,7 +1074,8 @@ class TestAutoProxyRecoveryAndRotation:
         channel._record_auto_proxy_local_success(self.URL)
         assert state["active"] is False and state["local_successes"] == 0
 
-    def test_a_local_failure_during_active_resets_progress(self):
+    def test_a_local_failure_during_active_resets_progress(self, monkeypatch):
+        monkeypatch.setattr(channel, "AUTO_PROXY_RECOVERY_PROBES", 2)
         state = self._activate()
         channel._record_auto_proxy_local_success(self.URL)
         assert state["local_successes"] == 1
