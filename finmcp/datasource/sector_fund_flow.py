@@ -148,7 +148,7 @@ def _with_levels(board: SectorFundFlowBoard) -> SectorFundFlowBoard:
 # 渲染是纯计算，每次重做的代价可以忽略。
 #
 # 复用 ReportCache 而不是自己开一个字典，图的是三样现成的东西：市场纪元（非交易日
-# 一个纪元长达 64 小时）、盘中 TTL、以及 ``REPORT_CACHE_ENABLED=0`` 能一起关掉——
+# 一个纪元长达 64 小时）、盘中 TTL、以及 ``CACHE_REPORT_ENABLED=0`` 能一起关掉——
 # 少了最后这条，prove_equivalence.py 的"关掉缓存再比对"就又变成假的了。
 
 

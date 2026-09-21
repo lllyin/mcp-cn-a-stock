@@ -6,10 +6,12 @@ import datetime
 from io import StringIO
 
 import numpy as np
+import pandas as pd
 import pathlib
 import pytest
 
 from finmcp import research
+from finmcp.datasource import fund_flow_source
 
 from finmcp.research import (
     build_basic_data,
@@ -878,6 +880,25 @@ class TestSelectFundFlowRowForQueryDate:
                 "A_A": np.array([12345.0])}
         research._select_fund_flow_row_for_query_date(data, data["QUERY_DATE"])
         assert "A_A" not in data
+
+    def test_a_complete_frame_missing_the_day_stops_the_chain_without_lying(self):
+        """源自称全份 → 取数链就此停止（不再为谁都给不出的那天付网关）；但停止不能变成假数。
+
+        这是一个跨层契约，两半各在一层：``satisfies()`` 对 complete 帧短路省积分，
+        当日那五行靠"先清除、再精确选行"兜住"没有这天就没有数"。任何一半被单独
+        "优化"掉，表现都是一份开头写着 08-30、资金流却是 08-27 的报告。
+        """
+        history = fund_flow_source.FundFlowHistory(
+            frame=pd.DataFrame({"日期": ["2026-08-26", "2026-08-27"]}), complete=True)
+        need = fund_flow_source.FundFlowNeed(history_rows=60, pinned_date="2026-08-30")
+        assert fund_flow_source.satisfies(history, need) is True     # 停链，省一次网关
+        data = {"QUERY_DATE": "2026-08-30", "IS_HISTORICAL_QUERY": True,
+                "_DS_FUND_FLOW": self._history(),
+                "A_A": np.array([12345.0]), "A_R": np.array([0.1234])}
+        research._select_fund_flow_row_for_query_date(data, data["QUERY_DATE"])
+        buf = StringIO()
+        assert research._print_fund_flow_lines(buf, data) is False
+        assert buf.getvalue() == ""
 
     def test_without_fund_flow_history_clears_latest_values(self):
         data = {"QUERY_DATE": "2026-08-27", "A_A": np.array([12345.0])}

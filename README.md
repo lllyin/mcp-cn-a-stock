@@ -344,7 +344,7 @@ M 取 `fund_flow_limit` 与同一份报告里 K 线交易日数的较小值—�
 | `FUND_FLOW_PAGE_OPEN_AFTER_FAILURES` | 实时页面加载多少次被拒后暂停实时路径（历史兜底不熔断，它是付费网关前的最后一级免费途径） | 正整数（默认 `4`） |
 | `FUND_FLOW_PAGE_FAILURE_WINDOW_SECONDS` | 上一项按这个滑动窗口计数 | 秒，`0` 退回连续计数（默认 `60`） |
 | `FUND_FLOW_PAGE_COOLDOWN_SECONDS` | 实时路径的暂停时长 | 秒（默认 `60`） |
-| `FUND_FLOW_EMPTY_PROBE_SECONDS` | 日期对齐门的空探测有效期：探到目标日的行在上游不存在后，这段时间内同一（标的, 目标日）不再重复付页面/网关。按落地窗口量（probe_tuning 的 gateway-exit 项） | 秒（默认 `3600`） |
+| `FUND_FLOW_EMPTY_PROBE_SECONDS` | 日期对齐门的空探测有效期：探到目标日的行在上游不存在后，这段时间内同一（标的, 目标日）不再重复付页面/网关。按落地窗口的最大值量（probe_tuning 的 fund-flow-landing 项），量不到样本时宁小勿大 | 秒（默认 `3600`） |
 
 ### 上游源熔断
 

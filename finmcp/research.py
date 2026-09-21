@@ -540,6 +540,10 @@ def build_fund_flow(field: tuple[str, str], data: Dict[str, ndarray]) -> str:
     # NaN 不是值：部分帧（停牌、页面占位、今日栏部分有值）会把缺档带成
     # NaN——印 nan万/nan% 是假数字，report_contract 还按"标记在"记成拿到，
     # 缺口就被盖住了。缺的档跳过，只印真的拿到的。
+    #
+    # 少印一行对调用方是零变化而不是新行为：解析方按"净额+净占比"整行取数，
+    # "nan万"本来就匹配不上数值，改动前后都读成 null；它的判定一律 gating 在
+    # `!== null` 上，null 走"没有证据"分支，不会被当成 0%。
     if np.isnan(raw_amount) or np.isnan(ratio):
         return ""
 

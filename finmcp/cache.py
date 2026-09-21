@@ -6,8 +6,9 @@ produced it. An epoch is a window in which regenerating the report would read
 the same upstream numbers and take the same rendering branch, so a hit returns
 what a live call would have returned.
 
-Everything here is inert when ``REPORT_CACHE_ENABLED`` is false — call sites
-fall through to the original path with no extra work.
+Everything here is inert when ``CACHE_REPORT_ENABLED`` (or the master
+``CACHE_ENABLED``) is false — call sites fall through to the original path with
+no extra work. The old name ``REPORT_CACHE_ENABLED`` reads as nothing at all.
 
 Two invariants keep this honest, and both are load-bearing:
 

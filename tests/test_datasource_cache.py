@@ -511,3 +511,40 @@ class TestPartialFundFlowOnlyBlocksTheToolThatRendersHistory:
                                    fund_flow_lagging=True) is False
         assert is_cacheable_report("报告正文", phase=PHASE_CLOSED,
                                    fund_flow_lagging=False) is True
+
+
+class TestWriteBackShrink:
+    """只增不减的确切边界（实测钉住，别被下次"顺手改松"吃掉）。
+
+    它挡的是"缓存丢一天"，代价是上游把行数改小的自我修正会**整份**被拒（不是部分
+    合并），要等纪元翻转。行数相同的修正照常落地——所以东财那种"同一天两个值来回
+    翻"的抖动不会被冻在这里。
+    """
+
+    def _flow(self, rows: int, amount: float) -> dict:
+        """整帧同一个常量，断言才能一眼看出新值有没有以任何形式混进来。"""
+        return {
+            "fund_flow": pd.DataFrame({
+                "日期": pd.date_range("2026-01-01", periods=rows).astype(str),
+                "主力净流入-净额": [amount] * rows,
+            }),
+            "provider": "page_fallback",
+        }
+
+    def test_a_smaller_frame_is_rejected_whole(self):
+        css.store_fund_flow("SH600519", self._flow(121, 1.0))
+        css.store_fund_flow("SH600519", self._flow(120, 9.0))
+        # Cache.get 给的是**值**本身，不是 entry
+        kept = cache.cache_for(cache.FUND_FLOW_NAMESPACE.name).get(
+            cache.key_for(cache.FUND_FLOW_NAMESPACE.name, "SH600519"))
+        assert css._fund_flow_rows(kept) == 121
+        # 整份拒绝：新值没以任何形式混进来
+        assert kept["fund_flow"]["主力净流入-净额"].iloc[-1] == 1.0
+
+    def test_an_equal_length_correction_still_lands(self):
+        """上游改了值但没少行——这种修正必须能进来，否则就把"变准"挡住了。"""
+        css.store_fund_flow("SH600519", self._flow(121, 1.0))
+        css.store_fund_flow("SH600519", self._flow(121, 7.0))
+        kept = cache.cache_for(cache.FUND_FLOW_NAMESPACE.name).get(
+            cache.key_for(cache.FUND_FLOW_NAMESPACE.name, "SH600519"))
+        assert kept["fund_flow"]["主力净流入-净额"].iloc[-1] == 7.0
