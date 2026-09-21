@@ -390,6 +390,19 @@ def _kline_last_date(kline_value):
     return _frame_last_date(kline_value.get("adjusted"))
 
 
+def _settled_trading_day() -> "datetime.date":
+    """东财今日栏此刻渲染的是哪一天的结算数据：开盘起算今天，盘前/非交易日算
+    上一个交易日。今日栏在服务端渲染、与页面加载时刻一致——拿它当合成的锚
+    点而不是墙钟：盘前（K 线最后一根是昨天、墙钟已是今天）和周末今日栏给
+    的都是这一天的值，与 K 线最后一根一致时就能合成，不再误杀盘前与周末。
+    """
+    now = market_session.now_shanghai()
+    today = now.date()
+    if market_session._is_trading_day(today) and now.time() >= market_session.OPEN:
+        return today
+    return market_session._previous_trading_day(today)
+
+
 def _fund_flow_date_gate_armed(kline_day) -> bool:
     """"资金流最后一行 == 数据日期"这道门此刻武装吗。
 
@@ -1483,7 +1496,7 @@ class CNStockDataSource(DataSource):
                             kline_day is not None
                             and fund_flow_need.history_rows == 0
                             and not fund_flow_need.pinned_date
-                            and kline_day == market_session.now_shanghai().date()
+                            and kline_day == _settled_trading_day()
                         )
                         else None
                     ),

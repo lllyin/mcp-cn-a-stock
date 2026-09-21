@@ -2723,3 +2723,90 @@ async def test_the_today_block_tops_up_a_history_that_stops_yesterday(monkeypatc
         result.fund_flow_history["DATE"][-1] / 1e9).date()
     assert last == datetime.date(2026, 6, 16)
     assert result.fund_main_amount[-1] == pytest.approx(3.062e9)  # 行来自今日栏
+
+
+def test_settled_trading_day_tracks_what_the_today_block_shows(monkeypatch):
+    """今日栏的锚点：开盘后=今天；盘前/周末/节假日=最近一个已结束交易日。"""
+    cases = [
+        (datetime.datetime(2026, 6, 17, 10, 0), datetime.date(2026, 6, 17)),  # 中午
+        (datetime.datetime(2026, 6, 17, 7, 30), datetime.date(2026, 6, 16)),  # 盘前
+        (datetime.datetime(2026, 6, 21, 12, 0), datetime.date(2026, 6, 18)),  # 周日→周四(周五休市)
+    ]
+    for fake_now, expected in cases:
+        monkeypatch.setattr(source_module.market_session, "now_shanghai", lambda now=None: fake_now)
+        assert source_module._settled_trading_day() == expected, fake_now
+
+
+def _pre_market_stubs(monkeypatch, datasource, now_dt):
+    """同步链全挂、K 线止于 2026-06-16、时间锚到 now_dt（盘前）。"""
+    _fund_flow_orchestration_stubs(monkeypatch, datasource)
+    monkeypatch.setattr(
+        source_module.fund_flow_source, "configured_order",
+        lambda: ("eastmoney", "eastmoney_delay", "fund_flow_page", "eastmoney_gateway"),
+    )
+    monkeypatch.setattr(
+        source_module.market_session, "now_shanghai", lambda now=None: now_dt,
+    )
+    calls = {"gateway": 0}
+
+    def fake_sync(code, symbol, need=None, order=None):
+        if order == ("eastmoney_gateway",):
+            calls["gateway"] += 1
+        return source_module._fetch_failure("fund_flow")
+
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_sync", fake_sync)
+    monkeypatch.setattr(source_module, "store_fund_flow", lambda s, v: None)
+    source_module._fund_flow_empty_probes.clear()
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_today_block_is_adopted_during_pre_market(monkeypatch):
+    """盘前（K 线最后一根是昨天、墙钟已是今天）：今日栏显示的就是昨天——
+    合成对齐，免费拿到，不买网关。"""
+    datasource = CNStockDataSource()
+    calls = _pre_market_stubs(
+        monkeypatch, datasource, datetime.datetime(2026, 6, 17, 7, 30))
+
+    from finmcp.datasource import realtime_ff as realtime_ff_module
+
+    async def fake_page(symbol):
+        return _today_only_page_stub()   # 今日=True 历史=0 的形态（盘前常见）
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+
+    result = await datasource.fetch_stock_data_with_requirements(
+        "SH600519", "2024-01-01", "2026-06-16",
+        requirements=FetchRequirements(fund_flow_page=True, fund_flow_history_table=False),
+    )
+
+    assert calls["gateway"] == 0
+    assert result.fund_main_amount[-1] == pytest.approx(3.062e9)
+
+
+@pytest.mark.asyncio
+async def test_today_block_is_rejected_when_the_kline_is_stale(monkeypatch):
+    """K 线滞后于最近交易日（kline_day=周一、今日栏锚点=周二）：对不上号，
+    宁走网关也不拿今日栏冒充。"""
+    datasource = CNStockDataSource()
+    calls = _pre_market_stubs(
+        monkeypatch, datasource, datetime.datetime(2026, 6, 17, 7, 30))
+    # 把 K 线改成止于 2026-06-15（周一）：今日栏锚点是 06-16，对不上
+    frame = _sample_kline_frame().copy()
+    frame["日期"] = [datetime.date(2026, 6, 15)]
+    monkeypatch.setattr(datasource, "_fetch_kline_sync",
+                        lambda *a, **kw: {"adjusted": frame, "unadj": frame, "adjust_type": "qfq"})
+
+    from finmcp.datasource import realtime_ff as realtime_ff_module
+
+    async def fake_page(symbol):
+        return _today_only_page_stub()
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+
+    await datasource.fetch_stock_data_with_requirements(
+        "SH600519", "2024-01-01", "2026-06-16",
+        requirements=FetchRequirements(fund_flow_page=True, fund_flow_history_table=False),
+    )
+
+    assert calls["gateway"] == 1   # 没合成，照走网关
