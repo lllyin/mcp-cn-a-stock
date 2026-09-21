@@ -507,6 +507,7 @@ async def test_warning_names_missing_fund_flow_tiers(monkeypatch):
 
     async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
         data = _make_raw_data(symbol)
+        data["_DS_FUND_FLOW"] = {"DATE": data["DATE"]}
         data.update({
             "A_A": np.array([1.59e8]), "A_R": np.array([0.03]),
             "XL_A": np.array([1.0e8]), "XL_R": np.array([0.02]),

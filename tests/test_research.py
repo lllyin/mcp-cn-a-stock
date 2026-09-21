@@ -1010,3 +1010,40 @@ def test_missing_tiers_names_only_the_nan_ones():
 
     assert research.fund_flow_missing_tiers({}) == []       # 这一维本来就没有
 
+
+
+def test_missing_tiers_reuses_the_render_judgment():
+    """空数组/`build_fund_flow` 判不出来的才算缺——不再另数一套 NaN。
+
+    旧判据把"空数组"当存在：正文一行没印（返回"暂无"），warnings 却声称
+    "已给出 4 档"。现在缺档 = 渲染判定印不出来的那些。
+    """
+    data = _flow_data("2026-09-04", "2026-09-04")
+    # 四档字段是空数组 + 中单 NaN：正文印 0 行
+    for fid in ("A", "XL", "L", "S"):
+        data[f"{fid}_A"] = np.array([])
+        data[f"{fid}_R"] = np.array([])
+    data["M_A"] = np.array([np.nan])
+    data["M_R"] = np.array([np.nan])
+    assert research._print_fund_flow_lines(StringIO(), data) is False
+    assert research.fund_flow_missing_tiers(data) == []  # 不再误报"已给出 4 档"
+
+    # 正常部分缺：3 真 2 NaN → 缺 [中单, 小单]
+    data2 = _flow_data("2026-09-04", "2026-09-04")
+    data2["M_A"] = np.array([np.nan])
+    data2["S_A"] = np.array([np.nan])
+    data2["S_R"] = np.array([np.nan])
+    assert research.fund_flow_missing_tiers(data2) == ["中单", "小单"]
+
+
+def test_partial_tiers_leave_a_degraded_note_in_the_body():
+    """部分缺档要在正文留降级注记：不然发布闸门的可用率矩阵照样给满分。"""
+    data = _flow_data("2026-09-04", "2026-09-04")
+    data["M_A"] = np.array([np.nan])
+    data["S_R"] = np.array([np.nan])
+    buf = StringIO()
+    research._print_fund_flow_lines(buf, data)
+    body = buf.getvalue()
+    assert "当日资金流只取到部分档：缺 中单、小单" in body
+    from finmcp.report_contract import degraded_in
+    assert "当日资金流只取到部分档" in degraded_in(body)
