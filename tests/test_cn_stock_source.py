@@ -2147,9 +2147,11 @@ async def test_gateway_is_not_paid_when_the_page_satisfies(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_stale_complete_frame_still_goes_to_the_page(monkeypatch):
+async def test_a_stale_complete_frame_still_goes_to_the_page(monkeypatch, caplog):
     """主源给"止于昨天的一整份"（complete=True）：行数和全量都满足，但和
     数据日期对不上——complete 的短路不能盖住日期对齐门，页面必须照常走。"""
+    import logging
+
     datasource = CNStockDataSource()
     _fund_flow_orchestration_stubs(monkeypatch, datasource)  # K 线止于 2026-06-16
     monkeypatch.setattr(
@@ -2173,12 +2175,18 @@ async def test_a_stale_complete_frame_still_goes_to_the_page(monkeypatch):
     monkeypatch.setattr(datasource, "_fetch_fund_flow_from_page", fake_page)
     monkeypatch.setattr(source_module, "store_fund_flow", lambda s, v: None)
 
-    await datasource.fetch_stock_data_with_requirements(
-        "SH600519", "2024-01-01", "2026-06-17",
-        requirements=FetchRequirements(fund_flow_page=True, fund_flow_rows=60),
-    )
+    with caplog.at_level(logging.INFO, logger="finmcp"):
+        await datasource.fetch_stock_data_with_requirements(
+            "SH600519", "2024-01-01", "2026-06-17",
+            requirements=FetchRequirements(fund_flow_page=True, fund_flow_rows=60),
+        )
 
     assert loaded == ["SH600519"]  # complete 短路没盖住日期门
+    # 触发原因要落日志：事后分析"为什么往链尾走"靠它区分"主源失败"和"帧滞后"
+    assert any(
+        "资金流止于 2026-06-15，落后于数据日期 2026-06-16" in r.message
+        for r in caplog.records
+    )
 
 
 @pytest.mark.asyncio

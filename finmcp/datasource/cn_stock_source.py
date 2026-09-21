@@ -1478,6 +1478,14 @@ class CNStockDataSource(DataSource):
             and requirements.fund_flow_page
             and _fund_flow_needs_more(fetched.get("fund_flow"), fund_flow_need, kline_day)
         ):
+            if _fund_flow_satisfies(fetched.get("fund_flow"), fund_flow_need):
+                # satisfies 过了还走到这里，就是日期对齐门拦的——把两个日期打出来，
+                # 事后分析"为什么往链尾走"靠这行区分"主源失败"和"帧滞后"。
+                logger.info(
+                    "资金流止于 %s，落后于数据日期 %s，往链尾补 symbol=%s",
+                    _fund_flow_last_date(fetched.get("fund_flow")), kline_day,
+                    canonical_symbol,
+                )
             # 页面兜底挂在 gather 之后：只有主源真的失败、或只拿到 delay 那一行时才付
             # 这一次页面加载，正常情况下这条路一次都不会走。必须在下面统计
             # fetch_failures 之前替换，否则兜底成功了报告依然被判定为不完整而整体不进缓存。
