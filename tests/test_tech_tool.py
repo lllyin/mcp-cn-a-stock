@@ -495,3 +495,36 @@ async def test_cancelling_disconnect_waiter_cancels_wrapped_operation():
         await waiter
 
     assert operation_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_warning_names_missing_fund_flow_tiers(monkeypatch):
+    """当日五档只给出三档时，warnings 必须点出缺了哪两档。
+
+    正文只印真实值之后，缺档是静默的——不说出来，读者会把"只给三档"
+    当成"本来共五档"。
+    """
+
+    async def fake_load_raw_data(symbol, end_date=None, who="", requirements=None):
+        data = _make_raw_data(symbol)
+        data.update({
+            "A_A": np.array([1.59e8]), "A_R": np.array([0.03]),
+            "XL_A": np.array([1.0e8]), "XL_R": np.array([0.02]),
+            "L_A": np.array([5.9e7]), "L_R": np.array([0.01]),
+            "M_A": np.array([np.nan]), "M_R": np.array([np.nan]),
+            "S_A": np.array([np.nan]), "S_R": np.array([np.nan]),
+        })
+        return data
+
+    async def fake_build_trading_data(fp, symbol, data, **kwargs):
+        pass
+
+    monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
+    monkeypatch.setattr(app_module.research, "build_trading_data", fake_build_trading_data)
+
+    response = await app_module.fetch_batch_reports("SZ002463", "brief", "")
+
+    assert any(
+        "中单" in w and "小单" in w and "不受影响" in w
+        for w in response.warnings
+    ), response.warnings

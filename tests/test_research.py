@@ -991,3 +991,22 @@ def test_all_nan_tiers_look_like_missing_not_zero():
     buf = StringIO()
     assert research._print_fund_flow_lines(buf, data) is False
     assert buf.getvalue() == ""
+
+
+def test_missing_tiers_names_only_the_nan_ones():
+    """部分缺：报出缺的那几档；完好/全缺/字段不存在都不报。"""
+    data = _flow_data("2026-09-04", "2026-09-04")
+    data["M_A"] = np.array([np.nan])
+    data["S_A"] = np.array([np.nan])
+    data["S_R"] = np.array([np.nan])
+    assert research.fund_flow_missing_tiers(data) == ["中单", "小单"]
+
+    assert research.fund_flow_missing_tiers(_flow_data("2026-09-04", "2026-09-04")) == []
+
+    all_nan = _flow_data("2026-09-04", "2026-09-04")
+    for field in ("A", "XL", "L", "M", "S"):
+        all_nan[f"{field}_A"] = np.array([np.nan])
+    assert research.fund_flow_missing_tiers(all_nan) == []  # 全缺由"暂无"表达
+
+    assert research.fund_flow_missing_tiers({}) == []       # 这一维本来就没有
+

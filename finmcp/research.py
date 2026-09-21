@@ -492,6 +492,42 @@ def _print_fund_flow_lines(fp: TextIO, data: Dict[str, ndarray]) -> bool:
     return has_fund_flow
 
 
+_FUND_FLOW_TIER_FIELDS = (
+    ("主力", "A"), ("超大单", "XL"), ("大单", "L"), ("中单", "M"), ("小单", "S"),
+)
+
+
+def _last_is_nan(arr) -> bool:
+    if arr is None or len(arr) == 0:
+        return False
+    try:
+        return bool(np.isnan(arr[-1]))
+    except (TypeError, ValueError):
+        return False
+
+
+def fund_flow_missing_tiers(data: Dict[str, ndarray]) -> list:
+    """当日资金流五档里缺了哪几档（最后一行的净额或净占比是 NaN）。
+
+    缺档不印不等于缺档不存在：报告正文只印真实值之后，缺了哪档得在
+    warnings 里说清，否则读者读不出"只给三档"和"本来共五档"的区别。
+    字段整个不存在（这一维本来就没有）不算缺档；五档全缺不算缺档——
+    报告已印"暂无资金流向数据"。
+    """
+    missing = []
+    present_any = False
+    for name, fid in _FUND_FLOW_TIER_FIELDS:
+        amounts = data.get(f"{fid}_A")
+        ratios = data.get(f"{fid}_R")
+        if amounts is None and ratios is None:
+            continue
+        if _last_is_nan(amounts) or _last_is_nan(ratios):
+            missing.append(name)
+        else:
+            present_any = True
+    return missing if present_any else []
+
+
 def build_fund_flow(field: tuple[str, str], data: Dict[str, ndarray]) -> str:
     """构建资金流向信息"""
     field_amount = field[1] + "_A"

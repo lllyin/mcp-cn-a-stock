@@ -534,6 +534,15 @@ async def fetch_batch_reports(
                         f"{symbol}: 历史资金流向有 {shown} 违反内部恒等式"
                         "（主力≠超大+大 / 四档之和≠0），数据疑似被上游扰动，不可信"
                     )
+                missing_tiers = research.fund_flow_missing_tiers(raw_data)
+                if missing_tiers:
+                    # 缺档在正文里是静默的（只印真实值）——不说出来，读者会把
+                    # "只给三档"当成"本来共五档"。
+                    output["warnings"].append(
+                        f"{symbol}: 当日资金流缺 {'/'.join(missing_tiers)} "
+                        f"{len(missing_tiers)} 档（上游未给出该档数值）；"
+                        f"已给出的 {5 - len(missing_tiers)} 档不受影响"
+                    )
                 if (
                     cache_key is not None
                     and not fetch_failures
