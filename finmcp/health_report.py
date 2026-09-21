@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import datetime
+
 from .log_digest import EVENTS, MIN_HOUR_SAMPLES
 
 #: 结论的判据。写成表而不是散在渲染代码里——阈值要能一眼看全、一处改完。
@@ -24,6 +26,29 @@ def _pct(value) -> str:
 
 def _sec(value) -> str:
     return "—" if value is None else f"{value:.2f}s"
+
+
+def _uptime(started_at: str, last_at) -> str:
+    """启动时间 → 窗口末尾（最新一条日志）的时长。日志停更时长也跟着停——
+    服务死了还按墙钟算"运行时长"是假话。算不出来就空着，不猜。"""
+    if not started_at or not last_at:
+        return ""
+    try:
+        start = datetime.datetime.strptime(started_at, "%Y-%m-%d %H:%M:%S")
+        end = datetime.datetime.strptime(str(last_at)[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return ""
+    seconds = int((end - start).total_seconds())
+    if seconds < 0:
+        return ""
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes = seconds // 60
+    if days:
+        return f"{days} 天 {hours} 小时"
+    if hours:
+        return f"{hours} 小时 {minutes} 分"
+    return f"{minutes} 分钟"
 
 
 def _verdict(data: dict) -> tuple:
@@ -224,6 +249,11 @@ def _headline(data: dict) -> list:
     #
     # 用引用块：它是出处不是数据，跟正文分开排，扫的时候可以整块跳过。
     meta = [f"版本 {window.get('version') or '—'}"]
+    if window.get("started_at"):
+        meta.append(f"启动时间 {window['started_at']}")
+        uptime = _uptime(window["started_at"], window.get("to"))
+        if uptime:
+            meta.append(f"运行时长 {uptime}")
     if window.get("fingerprint"):
         meta.append(f"渲染指纹 {window['fingerprint']}")
     if window.get("restarts"):

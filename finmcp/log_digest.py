@@ -256,6 +256,7 @@ def digest(log_file: str, *, since: str = "startup", symbol: str = "",
     first_at = last_at = None
     restarts = 0
     version = fingerprint = ""
+    started_at = ""
     symbols: list = []
     stages = defaultdict(Series)
     batches, pages = Series(), Series()
@@ -289,6 +290,9 @@ def digest(log_file: str, *, since: str = "startup", symbol: str = "",
         if (m := _RE_VERSION.search(line)):
             restarts += 1
             version = m.group(2)
+            # 最后一条 version 行的时间戳就是当前进程的启动时间——每次重启都会
+            # 写这一行，归档里的旧行被后面的覆盖。
+            started_at = m.group(1)
             continue
         if not fingerprint and (m := _RE_RENDER.search(line)):
             fingerprint = m.group(1)
@@ -371,6 +375,7 @@ def digest(log_file: str, *, since: str = "startup", symbol: str = "",
         "window": {"since": since, "from": first_at, "to": last_at,
                    "restarts": max(0, restarts - 1) if since != "startup" else 0,
                    "version": version, "fingerprint": fingerprint,
+                   "started_at": started_at,
                    "files": [os.path.basename(p) for p in paths],
                    "archived": archived,
                    # 只留文件名。这份报告会发给 MCP 调用方，绝对路径会把服务器的
