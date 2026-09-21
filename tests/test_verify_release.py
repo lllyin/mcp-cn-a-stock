@@ -5,6 +5,8 @@
 """
 
 import importlib.util
+import os
+import re
 import sys
 from pathlib import Path
 
@@ -851,6 +853,76 @@ class TestPerformanceSection:
         text = "\n".join(verify._render_performance(verify.MemoryWatch(), []))
         assert "没有成功的调用" in text
 
+    # 「超预算」要能落到一个旋钮上：先说清多出来的是浏览器实例还是服务本体。
+    # 拆分只在整棵树和浏览器进程都读全 PSS 的采样上取——少读一个会把浏览器报低、
+    # 把服务本体报高，那比不拆更危险。
+
+    def test_pss_peak_splits_into_browser_and_service(self):
+        watch = verify.MemoryWatch()
+        watch.samples = [
+            verify.TreeSample(300, 5, 0, 0, 1.0, 260, 5, 0, 0),
+            verify.TreeSample(1813, 17, 1290, 14, 2.0, 1024, 17, 729, 14),
+            verify.TreeSample(1500, 12, 1000, 11, 3.0, 800, 12, 690, 11),
+        ]
+        info = watch.summary()
+        assert info["pss_peak_browser"] == 729
+        assert info["pss_peak_service"] == 1024 - 729   # 同一采样时刻，加起来是峰值
+        assert info["browser_pss_peak"] == 729
+        text = "\n".join(verify._render_performance(
+            watch, [self._call("brief", 1.0)]))
+        assert "| ├─ 其中浏览器 | 729 MiB" in text
+        assert "| └─ 服务本体 | 295 MiB |" in text
+
+    def test_a_browser_process_without_pss_cancels_the_split(self):
+        watch = verify.MemoryWatch()
+        # 14 个浏览器进程只读到 13 个：700 是个偏低的数，不能印出去。
+        watch.samples = [
+            verify.TreeSample(1813, 17, 1290, 14, 2.0, 1024, 17, 700, 13),
+        ]
+        info = watch.summary()
+        assert info["pss_peak"] == 1024          # 整棵树读全了，峰值照给
+        assert info["pss_peak_browser"] is None
+        assert info["browser_pss_peak"] is None
+        text = "\n".join(verify._render_performance(
+            watch, [self._call("brief", 1.0)]))
+        assert "├─ 其中浏览器" not in text
+        assert "服务本体" not in text
+        assert "峰值 PSS" in text          # 整棵树的峰值照给，只是不拆
+
+    def test_legacy_samples_without_the_split_fields_still_render(self):
+        """老采样是 5 元组，拆分那两行该安静缺席而不是崩。"""
+        watch = verify.MemoryWatch()
+        watch.samples = [(100.0, 3, 0.0, 0, 10.0), (800.0, 9, 700.0, 6, 14.0)]
+        info = watch.summary()
+        assert info["pss_peak"] is None and info["pss_peak_browser"] is None
+        text = "\n".join(verify._render_performance(
+            watch, [self._call("brief", 1.0)]))
+        assert "峰值 RSS 合计" in text and "服务本体" not in text
+
+    def test_tree_rss_accumulates_browser_pss_only_from_read_processes(self, monkeypatch):
+        """采样器自己：谁算浏览器、读不到 PSS 的那个进程不能被当成 0。"""
+        procs = {
+            1: ("cmd", 200 * 1024, "python3", 1.0),
+            2: ("cmd", 300 * 1024, "chrome", 2.0),
+            3: ("cmd", 250 * 1024, "headless_shell", 3.0),
+            4: ("cmd", 50 * 1024, "Xvfb", 0.5),
+        }
+        kids = {1: [2, 3, 4]}
+        monkeypatch.setattr(verify, "_process_table", lambda: (procs, kids))
+        readable = {1: 150.0, 2: 300.0, 3: 250.0}     # Xvfb 那次没读到
+
+        def fake_pss(pid):
+            value = readable.get(pid)
+            return value * 1024 if value is not None else None
+        monkeypatch.setattr(verify, "_pss_kib", fake_pss)
+
+        sample = verify.tree_rss(1)
+        assert sample.processes == 4 and sample.pss_processes == 3
+        assert sample.pss_mib == pytest.approx(700.0)
+        assert sample.browser_processes == 3          # chrome + headless_shell + Xvfb
+        assert sample.browser_pss_processes == 2      # Xvfb 没读到，不算进浏览器 PSS
+        assert sample.browser_pss_mib == pytest.approx(550.0)
+
 
 # --- 指数专项的"资金流向"一列 ---------------------------------------------
 # 三个坑都真出过：tech 没这一维却被判 ❌、full 的历史表头里有"净流入"导致
@@ -1334,3 +1406,219 @@ def test_the_check_never_touches_availability():
     import inspect
     source = inspect.getsource(verify._pb_consistency)
     assert "score" not in source and "可用率" not in source
+
+
+# --- 闸门有没有真的跑到代码 -------------------------------------------------
+# 有一次跑出来 67 份报告全部 `Report cache hit`、0 份 `Finished symbol`，三个分数
+# 照样满分——量的是缓存里的旧输出。分数没变差，绿灯却是假的，所以这必须是独立一道闸。
+# 关键口径：命中缓存的那份**不打** `Finished symbol`，所以分母是两者相加；拿渲染数
+# 当分母会算出 195%，反而放行。
+
+
+class TestGateMustExecuteCode:
+    def _scan(self, hits: int, rendered: int) -> verify.LogScan:
+        scan = verify.LogScan()
+        scan.report_cache_hits = hits
+        scan.reports_rendered = rendered
+        return scan
+
+    def test_a_run_where_everything_came_from_cache_is_invalid(self):
+        score = verify.Score(tools_ok=25, tools_total=25, dims_ok=531, dims_total=531,
+                             docs_ok=28, docs_total=28,
+                             cache_hits=67, rendered=0)
+        assert score.cache_invalid is True
+        assert "闸门无效" in score.verdict and score.verdict.startswith("❌")
+
+    def test_majority_cached_cannot_get_a_clean_pass(self):
+        score = verify.Score(tools_ok=25, tools_total=25, dims_ok=531, dims_total=531,
+                             docs_ok=28, docs_total=28, cache_hits=39, rendered=20)
+        assert score.cache_invalid is False        # 至少执行过 20 份
+        assert score.cache_majority is True
+        assert score.verdict.startswith("⚠️") and "缓存" in score.verdict
+
+    def test_a_cold_run_scores_exactly_as_before(self):
+        cold = verify.Score(tools_ok=25, tools_total=25, dims_ok=531, dims_total=531,
+                            docs_ok=28, docs_total=28, cache_hits=0, rendered=59)
+        assert cold.verdict == "✅ 可发布"
+        # 少数命中也不误伤：一次跑里同一标的重复探活本来就会命中
+        few = verify.Score(tools_ok=25, tools_total=25, dims_ok=531, dims_total=531,
+                           docs_ok=28, docs_total=28, cache_hits=4, rendered=55)
+        assert few.verdict == "✅ 可发布"
+
+    def test_no_log_says_it_cannot_prove_the_code_ran(self):
+        """没有日志时不给假清白——但也不改判定，只把话说在前面。"""
+        scan = verify.LogScan(available=False, note="日志不存在：logs/x.log")
+        text, failed, _ = verify.render_report(
+            __import__("datetime").datetime(2026, 9, 21, 22, 42),
+            __import__("pathlib").Path("/tmp/mcporter.json"), [], [], scan)
+        assert "无法证明这一跑真的执行过代码" in text
+        assert failed is False                     # 没证据不等于有证据说不行
+
+    def test_the_injection_actually_turns_the_light_red(self, tmp_path):
+        """报"没问题"之前先证明这道闸测得出来：造一份全命中的日志。"""
+        log = tmp_path / "cn-stock-mcp.log"
+        log.write_text("\n".join([
+            "2026-09-21 22:53:17,009 INFO Report cache hit request_id=a-1 tool=brief "
+            "symbol=SH600519 epoch=closed-2026-09-21 phase=closed elapsed=0.002s chars=982",
+            "2026-09-21 22:53:17,010 INFO Report cache hit request_id=a-2 tool=medium "
+            "symbol=SH600519 epoch=closed-2026-09-21 phase=closed elapsed=0.001s chars=1008",
+        ]) + "\n", encoding="utf-8")
+        import datetime as dt
+        scan = verify.scan_log(log, dt.datetime(2026, 9, 21, 22, 0))
+        assert (scan.report_cache_hits, scan.reports_rendered) == (2, 0)
+        text, failed, verdict = verify.render_report(
+            dt.datetime(2026, 9, 21, 22, 42), __import__("pathlib").Path("/tmp/m.json"),
+            [], [], scan)
+        assert failed is True and "闸门无效" in verdict
+        assert "报告来源" in text and "命中报告缓存直接返回 2 份" in text
+
+    def test_rendered_reports_are_counted_once_each(self, tmp_path):
+        log = tmp_path / "cn-stock-mcp.log"
+        log.write_text("\n".join([
+            "2026-09-21 22:43:13,009 INFO Report cache hit request_id=a-1 tool=brief "
+            "symbol=SH600519 epoch=closed phase=closed elapsed=0.002s chars=982",
+            "2026-09-21 22:43:27,261 INFO Finished symbol request_id=a-2 tool=medium "
+            "symbol=SH600519 raw_data=28.586s render=0.001s total=28.588s chars=830",
+            "2026-09-21 22:43:27,270 INFO Finished full query request_id=a-2 "
+            "symbols=SH600519 cost=10.60s reports=4 errors=0 response_chars=40940",
+        ]) + "\n", encoding="utf-8")
+        import datetime as dt
+        scan = verify.scan_log(log, dt.datetime(2026, 9, 21, 22, 0))
+        # `Finished full query` 是批一级的，不能混进"每份报告一条"的分母
+        assert (scan.report_cache_hits, scan.reports_rendered) == (1, 1)
+
+
+def test_browser_pss_splits_by_launcher_family(monkeypatch):
+    """有头那台（market_breadth 起）和无头池（页面腿起）要分开报——
+    它们是两台实例，Xvfb 只为前者存在，混在一起就指不准该收哪一个。"""
+    procs = {
+        1: ("cmd", 200 * 1024, "python3", 1.0),
+        2: ("cmd", 300 * 1024, "chrome", 2.0),
+        3: ("cmd", 250 * 1024, "Xvfb", 0.5),
+        4: ("cmd", 180 * 1024, "headless_shell", 1.5),
+    }
+    monkeypatch.setattr(verify, "_process_table", lambda: (procs, {1: [2, 3, 4]}))
+    pss = {1: 150.0, 2: 300.0, 3: 60.0, 4: 180.0}
+    monkeypatch.setattr(verify, "_pss_kib",
+                        lambda pid: pss[pid] * 1024 if pid in pss else None)
+    sample = verify.tree_rss(1)
+    assert sample.browser_headed_pss_mib == pytest.approx(360.0)   # chrome + Xvfb
+    assert sample.browser_headless_pss_mib == pytest.approx(180.0)
+    assert sample.browser_pss_mib == pytest.approx(540.0)          # 两族相加=浏览器合计
+    watch = verify.MemoryWatch()
+    watch.samples = [sample]
+    info = watch.summary()
+    call = verify.CallResult(verify.CallSpec("brief", {}), 0, "x", "", 1.0)
+    text = "\n".join(verify._render_performance(watch, [call]))
+    assert "chrome/Xvfb 一族 360 MiB · headless_shell 一族 180 MiB" in text
+
+
+# --- 跑之前就提醒"这一跑可能测不到代码"（省下的是一次白花的网关积分）--------
+
+
+class TestCachePreflight:
+    def test_reads_the_service_own_declaration_and_takes_the_last_startup(self, tmp_path):
+        log = tmp_path / "cn-stock-mcp.log"
+        log.write_text(
+            "2026-09-21 10:00:00,000 INFO Cache initialised ns=report enabled=False\n"
+            "2026-09-21 10:00:00,001 INFO Cache initialised ns=fund_flow enabled=True\n"
+            "2026-09-22 09:00:00,000 INFO Cache initialised ns=report enabled=True\n",
+            encoding="utf-8")
+        assert verify._report_cache_state_from_log(log) is True   # 只看 report，且取最后一条
+
+    def test_warns_when_on_and_says_how_to_get_a_valid_run(self, tmp_path):
+        log = tmp_path / "a.log"
+        log.write_text("2026-09-22 09:00:00,000 INFO Cache initialised ns=report enabled=True\n",
+                       encoding="utf-8")
+        note = verify._cache_preflight(log)
+        assert note and "CACHE_REPORT_ENABLED=0" in note
+
+    def test_recommended_switch_really_gates_the_report_cache(self, tmp_path, monkeypatch):
+        """提醒里那个变量名必须是服务真的读的那个。
+
+        写成没人读的名字（历史上有过 `REPORT_CACHE_ENABLED`，改名后就只剩文档里还认识它）
+        比不提醒更糟：人照做、重启、再跑，仍然整批命中缓存，网关积分白花一遍。
+        所以这里从提示语里把名字抠出来，真的去关一次。
+        """
+        from finmcp import config
+        log = tmp_path / "c.log"
+        log.write_text("2026-09-22 09:00:00,000 INFO Cache initialised ns=report enabled=True\n",
+                       encoding="utf-8")
+        note = verify._cache_preflight(log)
+        name = re.search(r"（([A-Z_]+)=0", note).group(1)
+        # conftest 把总开关设成 0，而它是导入期算定的模块常量（不是每次查 env），
+        # 所以要 setattr 摆正；否则"关不掉"和"本来就是关的"两种情况读起来一样。
+        monkeypatch.setattr(config, "CACHE_ENABLED", True)
+        monkeypatch.delenv("CACHE_REPORT_ENABLED", raising=False)
+        monkeypatch.delenv("REPORT_CACHE_ENABLED", raising=False)
+        assert config.cache_enabled("report") is True          # 没设之前是开的
+        monkeypatch.setenv(name, "0")
+        assert config.cache_enabled("report") is False
+
+    def test_silent_when_the_cache_is_off(self, tmp_path):
+        log = tmp_path / "b.log"
+        log.write_text("2026-09-22 09:00:00,000 INFO Cache initialised ns=report enabled=False\n",
+                       encoding="utf-8")
+        assert verify._cache_preflight(log) is None
+
+    def test_missing_log_says_it_cannot_tell_instead_of_guessing(self, tmp_path):
+        """不拿本地 .env 推远端进程的开关：那是凭空推断部署态。"""
+        note = verify._cache_preflight(tmp_path / "does-not-exist.log")
+        assert note and "还不知道" in note
+
+    def test_a_fresh_process_that_has_not_declared_yet_is_not_guessed(self, tmp_path):
+        """真场景（2026-09-22 冷跑撞上）：本进程还没写声明，归档里那个 True 属于**上个已停进程**。
+
+        缓存对象是首次请求时才建的，所以"当前文件没有声明"有两种意思：本进程还没写过
+        （不知道），或本进程活得比文件长、声明轮转走了（去归档找）。当前文件里有本次启动行
+        就是前者，那时借归档的值会在开/关两个方向都说错——上一版我就是这么把一次
+        `CACHE_REPORT_ENABLED=0` 的有效冷跑报成"缓存开着"的。
+        """
+        current = tmp_path / "cn-stock-mcp.log"
+        current.write_text("2026-09-22 06:46:27,341 INFO cn-stock-mcp version=2.2.0\n",
+                           encoding="utf-8")
+        archived = tmp_path / "cn-stock-mcp.log.20260922-064626"
+        archived.write_text("2026-09-22 02:35:50,886 INFO Cache initialised ns=report enabled=True\n",
+                            encoding="utf-8")
+        assert verify._report_cache_state_from_log(current) is None
+        note = verify._cache_preflight(current)
+        assert note and "还不知道" in note and "报告来源" in note   # 指向跑完那一节，不假装知道
+
+    def test_uses_the_archive_only_when_this_process_outlived_the_file(self, tmp_path):
+        """当前文件里没有本次启动行 = 进程比文件老，声明确实只在归档里。"""
+        current = tmp_path / "cn-stock-mcp.log"
+        current.write_text("2026-09-22 03:10:00 INFO 请求进来了\n", encoding="utf-8")
+        archived = tmp_path / "cn-stock-mcp.log.20260922-030500"
+        archived.write_text(
+            "2026-09-22 00:34:08 INFO cn-stock-mcp version=2.2.0\n"
+            "2026-09-22 00:34:08 INFO Cache initialised ns=report enabled=True ttl=30s\n",
+            encoding="utf-8")
+        assert verify._report_cache_state_from_log(current) is True
+        assert verify._cache_preflight(current) and "CACHE_REPORT_ENABLED=0" in (
+            verify._cache_preflight(current))
+
+    def test_among_archives_takes_the_newest_startup(self, tmp_path):
+        """多份归档都躺着历史声明时取最新那份：旧值会把已经关掉的缓存报成开着。"""
+        current = tmp_path / "cn-stock-mcp.log"
+        current.write_text("2026-09-22 03:10:00 INFO 请求进来了\n", encoding="utf-8")
+        older = tmp_path / "cn-stock-mcp.log.20260922-003640"
+        older.write_text("2026-09-22 00:34:08 INFO Cache initialised ns=report enabled=True\n",
+                         encoding="utf-8")
+        newer = tmp_path / "cn-stock-mcp.log.20260922-023000"
+        newer.write_text("2026-09-22 02:30:00 INFO Cache initialised ns=report enabled=False\n",
+                         encoding="utf-8")
+        os.utime(older, (1_000_000, 1_000_000))
+        os.utime(newer, (1_500_000, 1_500_000))
+        os.utime(current, (2_000_000, 2_000_000))
+        assert verify._report_cache_state_from_log(current) is False
+
+    def test_prefers_the_running_files_declaration_over_an_older_archive(self, tmp_path):
+        """当前文件有声明时不许被归档里的旧值盖掉：那会把已关掉的缓存报成开着。"""
+        current = tmp_path / "cn-stock-mcp.log"
+        current.write_text("2026-09-22 02:35:50 INFO Cache initialised ns=report enabled=False\n",
+                           encoding="utf-8")
+        archived = tmp_path / "cn-stock-mcp.log.20260922-003640"
+        archived.write_text("2026-09-22 00:34:08 INFO Cache initialised ns=report enabled=True\n",
+                            encoding="utf-8")
+        assert verify._report_cache_state_from_log(current) is False
+        assert verify._cache_preflight(current) is None

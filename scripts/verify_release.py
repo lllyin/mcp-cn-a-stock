@@ -1179,6 +1179,12 @@ class LogScan:
     available: bool = True
     note: str = ""
     diagnostics: dict = field(default_factory=dict)
+    #: 本次窗口里"报告从缓存直接返回"的份数。命中缓存的那份**不会**打
+    #: `Finished symbol`（实测两份日志里交集为 0），所以分数不能拿渲染数当分母——
+    #: 那样一个全程命中的跑分会算出 195%，闸门反而放行。真正的分母是两者相加。
+    report_cache_hits: int = 0
+    #: 真的执行了取数与渲染的报告份数（每份一条 `Finished symbol`）。
+    reports_rendered: int = 0
 
 
 def scan_log(path: Path, since: dt.datetime) -> LogScan:
@@ -1204,6 +1210,10 @@ def scan_log(path: Path, since: dt.datetime) -> LogScan:
         if stamp < since:
             continue
         scan.lines_scanned += 1
+        if message.startswith("Report cache hit"):
+            scan.report_cache_hits += 1
+        elif message.startswith("Finished symbol "):
+            scan.reports_rendered += 1
         for pattern, category, explanation in LOG_SIGNALS:
             if re.search(pattern, message):
                 scan.signals.setdefault(f"{category}｜{explanation}", []).append(
@@ -1748,6 +1758,10 @@ class Score:
     docs_total: int = 0
     gaps: int = 0          # 整段没取到的文档数，单独报，不进回归一致率
     known: int = 0         # 命中已核实上游差异的文档数
+    # 闸门自己有没有跑在代码上：报告从缓存直接返回的份数，和真的执行过取数渲染的
+    # 份数。两个数分开计，因为命中缓存的那份不打渲染日志。
+    cache_hits: int = 0
+    rendered: int = 0
 
     @staticmethod
     def _pct(ok: int, total: int) -> float:
@@ -1779,7 +1793,25 @@ class Score:
         return min(rates)
 
     @property
+    def reports_seen(self) -> int:
+        return self.cache_hits + self.rendered
+
+    @property
+    def cache_invalid(self) -> bool:
+        """这一跑有没有**任何**一份报告真的执行过。全命中缓存时三个分数量的是
+        缓存里的旧输出，与被测代码无关——绿灯是假的。日志没扫到时不算。"""
+        return self.reports_seen > 0 and self.rendered == 0
+
+    @property
+    def cache_majority(self) -> bool:
+        """过半报告来自缓存。分数还能看，但✅要给不了：一半以上的输出不是这次
+        代码产出的。"""
+        return self.cache_hits > self.rendered
+
+    @property
     def verdict(self) -> str:
+        if self.cache_invalid:
+            return "❌ 闸门无效：本次没有一份报告真的执行（全部命中报告缓存），先关报告缓存重跑"
         if self.overall < 90.0:
             return "❌ 不可发布"
         if self.overall < 99.0:
@@ -1788,6 +1820,8 @@ class Score:
             # 三个分数都满，但有文档整段没取到数据。不当成漂移（那是可用性），
             # 也不能给个干净的通过——先判断是偶发还是系统性。
             return "⚠️ 数字没漂，但有数据缺口，确认是偶发还是系统性再发"
+        if self.cache_majority:
+            return "⚠️ 过半报告来自缓存，量的是旧输出不是这次代码，关掉报告缓存重跑"
         return "✅ 可发布"
 
 
@@ -1978,6 +2012,67 @@ def _extract(document: str, section: str, prefix: str) -> str:
     return "—"
 
 
+def _report_cache_state_from_log(path: Path) -> bool | None:
+    """**当前这个进程**声明的报告缓存开关。取不到就返回 None，不猜。
+
+    为什么读日志而不是读本地 `.env`：这一层常用来验远端那台在跑的服务，脚本这边
+    看到的配置文件与被进程的进程环境是两回事，拿前者推后者就是凭空推断部署态。
+
+    为什么只认当前进程自己的声明（2026-09-22 实测到的两类错，方向相反、根因同一个）：
+    缓存对象是首次请求时才建的，所以刚起的进程可能一行声明都还没有。那次我按"从新到旧
+    翻归档"兜底，结果一次 `CACHE_REPORT_ENABLED=0` 的冷跑被报成"报告缓存是开着的"——
+    读进来的是上一个已经被停掉的进程的值。跨重启借值，开着/关着两个方向都可能说错，
+    所以只在**当前文件里没有本次启动行**（说明这个进程活得比文件长，声明被轮转走了）时
+    才去归档里找；否则 None，让调用方明说"还不知道"。
+    """
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    state: bool | None = None
+    for match in re.finditer(r"Cache initialised ns=report\b.*?enabled=(\S+)", text):
+        state = match.group(1).strip().lower() in ("true", "1")
+    if state is not None:
+        return state
+    if re.search(r"\bcn-stock-mcp version=", text):
+        return None          # 本次进程自己还没声明，别拿上个进程的旧值顶
+    for candidate in sorted((p for p in path.parent.glob(path.name + ".*")),
+                            key=lambda p: p.stat().st_mtime, reverse=True):
+        if not candidate.is_file():
+            continue
+        try:
+            older = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for match in re.finditer(r"Cache initialised ns=report\b.*?enabled=(\S+)", older):
+            return match.group(1).strip().lower() in ("true", "1")
+    return None
+
+
+def _cache_preflight(path: Path) -> str | None:
+    """跑之前先说清这一跑能不能测到代码：关着报告缓存跑，分数才是在测这次构建。
+
+    实时探活问的是"此刻"，而收盘后的纪元里同一份报告本来就该命中缓存——那时这一跑
+    大部分调用只是把上一次的字节读回来，钱花了、代码没跑。跑完还有一道判定兜底，
+    但那是事后；这里提前说，是为了让这次上游请求（含网关积分）不白花。
+    """
+    state = _report_cache_state_from_log(path)
+    if state is None:
+        return ("还不知道报告缓存开着没有：本次进程还没写 `Cache initialised ns=report`"
+                f"（缓存对象是首次请求时才建的，{path}）。这一跑跑完的「报告来源」那一节"
+                "量得出真实比例，届时会直接判有效/无效；要现在就确定，看服务进程的启动环境。")
+    if state:
+        return ("报告缓存是开着的：收盘后/周末这一跑大概率大部分命中缓存，三个分数量的"
+                "是缓存里的旧字节。要让它测到这次代码，关掉报告缓存再重启服务"
+                "（CACHE_REPORT_ENABLED=0；别用 CACHE_ENABLED=0，那连免费源的取数缓存一起"
+                "关了，多花的是上游请求。入口是 load_dotenv(override=True)，所以 .env 里"
+                "有同名项时得改文件，光加前缀会被盖回去）；或者等纪元翻转、当日资金流落地"
+                "之后再跑。只想看线上稳不稳，就照现在这样跑。")
+    return None
+
+
 def render_report(
     started: dt.datetime,
     config: Path,
@@ -2015,7 +2110,11 @@ def render_report(
         docs_total=len(all_docs) + len(replay_failures),
         gaps=len(docs_gap),
         known=len(docs_known),
+        cache_hits=scan.report_cache_hits,
+        rendered=scan.reports_rendered,
     )
+    # 分数没变差但闸门是假的，也要红：全命中缓存的那一跑什么都没测。
+    failed = failed or score.cache_invalid
 
     lines.append("# 上线数据验证报告")
     lines.append("")
@@ -2101,9 +2200,18 @@ def render_report(
     lines.append("")
     if not scan.available:
         lines.append(f"- {scan.note}，这一节无从判断。")
+        lines.append("- 报告缓存的命中数也拿不到：**无法证明这一跑真的执行过代码**，"
+                     "结论里的 ✅ 只覆盖调用返回，不覆盖\"代码有没有被跑到\"。")
     else:
         lines.append(f"- 出站通道：`{scan.channel}`")
         lines.append(f"- 本次运行窗口内的服务日志：{scan.lines_scanned} 行")
+        seen = score.reports_seen
+        if seen:
+            lines.append(
+                f"- 报告来源：真的执行取数渲染 {score.rendered} 份，"
+                f"命中报告缓存直接返回 {score.cache_hits} 份（{score.cache_hits * 100 // seen}%）"
+                "——命中那份不会重新执行代码，所以这个数高到过半，分数量的就不是这次代码"
+            )
         if scan.signals:
             lines.append("")
             lines.append("| 类别 | 说明 | 次数 | 样例 |")
@@ -2502,6 +2610,15 @@ class TreeSample(NamedTuple):
     #: 成功读到 PSS 的进程数。小于 processes 就说明 PSS 那列是不完整的，
     #: 不能拿去和预算比——宁可不给数，也不给一个偏低的数。
     pss_processes: int = 0
+    #: 浏览器那几个进程的 PSS 之和。整棵树的峰值基本由它决定，而预算说的是
+    #: "服务及其全部子进程"，两者要能分开看，才知道超出的那部分是谁占的。
+    browser_pss_mib: float = 0.0
+    browser_pss_processes: int = 0
+    #: 浏览器按"哪个启动器"拆开：无头池（`headless_shell`）与有头一族（chrome/chromium
+    #: 加 Xvfb）。分开的理由是有头那个是另一台实例，Xvfb 只为它存在，两台的代价要能
+    #: 各归各账——只看"浏览器合计"会指错旋钮。
+    browser_headed_pss_mib: float = 0.0
+    browser_headless_pss_mib: float = 0.0
 
 
 def tree_rss(pid: int, *, extra_pids: tuple[int, ...] = ()) -> TreeSample:
@@ -2517,6 +2634,10 @@ def tree_rss(pid: int, *, extra_pids: tuple[int, ...] = ()) -> TreeSample:
     count = browser_count = 0
     pss = 0.0
     pss_count = 0
+    browser_pss = 0.0
+    browser_pss_count = 0
+    browser_headed = 0.0
+    browser_headless = 0.0
     cpu = 0.0
     seen: set[int] = set()
     # Xvfb 可由启动脚本单独管理，不一定是服务的子进程；同一 PID 只计一次。
@@ -2530,19 +2651,30 @@ def tree_rss(pid: int, *, extra_pids: tuple[int, ...] = ()) -> TreeSample:
         total += rss
         cpu += proc_cpu
         count += 1
+        is_browser = any(hint.lower() in comm.lower() for hint in _BROWSER_HINTS)
         # 只对树里的进程读 smaps_rollup。_process_table 扫的是全机进程，
         # 对每一个都读一次页表汇总，代价就不是可以忽略的了。
         measured = _pss_kib(current)
         if measured is not None:
             pss += measured
             pss_count += 1
-        if any(hint.lower() in comm.lower() for hint in _BROWSER_HINTS):
+            if is_browser:
+                browser_pss += measured
+                browser_pss_count += 1
+                comm_l = comm.lower()
+                if "headless_shell" in comm_l:
+                    browser_headless += measured
+                else:
+                    # chrome/chromium/Xvfb 算一族：有头那台实例（Xvfb 只为它存在）
+                    browser_headed += measured
+        if is_browser:
             browser += rss
             browser_count += 1
         stack.extend(kids.get(current, ()))
     return TreeSample(
         total / 1024, count, browser / 1024, browser_count, cpu,
-        pss / 1024, pss_count,
+        pss / 1024, pss_count, browser_pss / 1024, browser_pss_count,
+        browser_headed / 1024, browser_headless / 1024,
     )
 
 
@@ -2606,6 +2738,13 @@ class MemoryWatch:
         complete = [s for s in self.samples
                     if len(s) > 6 and s[6] and s[6] == s[1]]
         pss = [s[5] for s in complete]
+        # 拆分只在整棵树读全的那次采样里给，且要求浏览器那几个进程也全都读到了
+        # PSS——少读一个就把服务本体虚高，正是"偏低的内存数比没有更危险"那一类。
+        splittable = [s for s in complete if len(s) > 8 and s[8] == s[3]]
+        peak_sample = max(complete, key=lambda s: s[5]) if complete else None
+        # 拆分那两行只在浏览器进程**全部**读到 PSS 的采样上取，否则少读一个会把
+        # 浏览器报低、把服务本体报高——正是"偏低的内存数比没有更危险"那一类。
+        split_peak = peak_sample if peak_sample in splittable else None
         return {
             "first": totals[0],
             "peak": max(totals),
@@ -2622,6 +2761,14 @@ class MemoryWatch:
             "pss_mean": (sum(pss) / len(pss)) if pss else None,
             "pss_last": pss[-1] if pss else None,
             "pss_samples": len(pss),
+            # 峰值那一刻浏览器与服务本体各占多少（同一采样时刻，加起来就是峰值）。
+            "pss_peak_browser": (split_peak[7] if split_peak else None),
+            "pss_peak_browser_headed": (split_peak[9] if split_peak else 0.0),
+            "pss_peak_browser_headless": (split_peak[10] if split_peak else 0.0),
+            "pss_peak_service": (
+                split_peak[5] - split_peak[7] if split_peak else None),
+            # 浏览器单独的最峰值：页面用完即关，它未必落在整棵树峰值那一刻。
+            "browser_pss_peak": max((s[7] for s in splittable), default=None),
         }
 
 
@@ -2680,6 +2827,24 @@ def _render_performance(watch: "MemoryWatch", calls: list[CallResult]) -> list[s
         verdict = "✅ 在预算内" if info["pss_peak"] <= budget else "❌ 超预算"
         lines.append(f"| **峰值 PSS** | **{info['pss_peak']:.0f} MiB**"
                      f"（预算 {budget:.0f} MiB，{verdict}）|")
+        if info["pss_peak_browser"] is not None:
+            # 超预算时"降内存"这句话要落到一个旋钮上，先说清那 1 GiB 是谁占的。
+            # 浏览器单列的最峰值可能落在另一次采样（页面用完即关），读不全就不印
+            # 括号——一个 0 会让它看着像"浏览器没占内存"。
+            extra = ""
+            if info["browser_pss_peak"] is not None:
+                extra = f"（全程最峰值 {info['browser_pss_peak']:.0f} MiB）"
+            headed = info.get("pss_peak_browser_headed") or 0.0
+            headless = info.get("pss_peak_browser_headless") or 0.0
+            if headed and headless:
+                # 浏览器进程名分成两族（chrome/chromium+Xvfb 与 headless_shell）。
+                # 两族都有说明同时跑着两台实例。这只是**按进程名**分族：池子若改用
+                # chrome 的新无头模式，它也会落进前一族，所以这一行用来定位"是不是
+                # 两台并存"，不能直接当"哪一台贵"的结论。
+                extra += (f"，按进程名分：chrome/Xvfb 一族 {headed:.0f} MiB"
+                          f" · headless_shell 一族 {headless:.0f} MiB")
+            lines.append(f"| ├─ 其中浏览器 | {info['pss_peak_browser']:.0f} MiB{extra} |")
+            lines.append(f"| └─ 服务本体 | {info['pss_peak_service']:.0f} MiB |")
         lines.append(f"| 峰值 RSS 合计 | {info['peak']:.0f} MiB"
                      f"（{info['peak_processes']} 进程，含重复计的共享页）|")
         lines.append(f"| 均值 PSS | {info['pss_mean']:.0f} MiB |")
@@ -2710,6 +2875,11 @@ def _render_performance(watch: "MemoryWatch", calls: list[CallResult]) -> list[s
                      f"PSS 采到 {info['pss_samples']}/{info['samples']} 次"
                      f"（只在整棵树都读到时才计入，缺一个就整次作废，"
                      f"偏低的内存数比没有更危险）。")
+        if info["pss_peak_browser"] is not None:
+            lines.append("")
+            lines.append("> 峰值拆两行，是因为「降内存」得先知道降谁：服务本体那部分是常驻"
+                         "（缓存、线程池），浏览器那部分是一次实例的固定开销，页面用完即关"
+                         "但进程数不会归零。两者要降的是不同的东西。")
     else:
         lines.append("> 口径：`ps` 的 RSS 逐进程相加，共享页在每个进程里各算一次，"
                      "所以这个数是**偏高的上界**（Chromium 上实测约 1.8 倍），"
@@ -2757,6 +2927,10 @@ def main() -> int:
 
     print(f"[验证] 配置={config}")
     print(f"[验证] 工具={','.join(sorted(tools))}")
+    warning = _cache_preflight(args.log)
+    if warning:
+        # 走 stderr：这次跑要不要继续由人决定，钱花在哪要在他按下之前就知道。
+        print(f"[验证] ⚠️ {warning}", file=sys.stderr, flush=True)
 
     watch = MemoryWatch(interval=args.memory_interval)
     if args.memory_interval > 0:
