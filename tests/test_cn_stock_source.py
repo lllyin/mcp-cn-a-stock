@@ -2518,3 +2518,106 @@ async def test_full_still_goes_to_the_gateway_when_only_the_today_block_is_there
     )
 
     assert calls["gateway"] == 1   # 今日栏不是历史需求的答案，照付
+
+
+# --- P0-2/P0-3：缓存只增不减 + 尾部单飞 ---------------------------------------
+
+
+def test_store_fund_flow_never_shrinks_the_cache(monkeypatch):
+    """1 行的当日合成帧不能把缓存里的 120 行换小；更多行才准写（只增不减）。"""
+    writes = []
+
+    class _StubCache:
+        def get(self, key):
+            return {"fund_flow": _empty_probes_delay_frame(rows=120),
+                    "is_market": False}
+
+    monkeypatch.setattr(source_module.cache, "cache_for", lambda ns: _StubCache())
+    monkeypatch.setattr(source_module.cache, "key_for", lambda ns, key: key)
+    monkeypatch.setattr(
+        source_module.cache, "put_value", lambda ns, key, value: writes.append(value)
+    )
+
+    source_module.store_fund_flow(
+        "SH600519",
+        {"fund_flow": _empty_probes_delay_frame(rows=1), "is_market": False},
+    )
+    assert writes == []  # 1 < 120：不写
+
+    source_module.store_fund_flow(
+        "SH600519",
+        {"fund_flow": _empty_probes_delay_frame(rows=121), "is_market": False},
+    )
+    assert len(writes) == 1 and len(writes[0]["fund_flow"]) == 121  # 只增
+
+
+def _singleflight_stubs(monkeypatch, datasource, gateway_frame):
+    """同步链全挂、网关腿很慢（线程里睡 50ms），便于制造并发重叠。"""
+    import threading
+
+    _fund_flow_orchestration_stubs(monkeypatch, datasource)
+    monkeypatch.setattr(
+        source_module.fund_flow_source, "configured_order",
+        lambda: ("eastmoney", "eastmoney_delay", "fund_flow_page", "eastmoney_gateway"),
+    )
+    monkeypatch.setattr(
+        source_module.market_session, "now_shanghai",
+        lambda now=None: datetime.datetime(2026, 6, 16, 16, 30),
+    )
+    gateway_calls = []
+
+    def fake_sync(code, symbol, need=None, order=None):
+        if order == ("eastmoney_gateway",):
+            gateway_calls.append(symbol)
+            time.sleep(0.05)
+            return {"fund_flow": gateway_frame, "is_market": False,
+                    "complete": False, "provider": "eastmoney_gateway"}
+        return source_module._fetch_failure("fund_flow")
+
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_sync", fake_sync)
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_from_page",
+                        lambda symbol, today_date=None: asyncio.sleep(0))
+    monkeypatch.setattr(source_module, "store_fund_flow", lambda s, v: None)
+    source_module._fund_flow_empty_probes.clear()
+    return gateway_calls
+
+
+@pytest.mark.asyncio
+async def test_one_gateway_payment_serves_two_concurrent_same_symbol_requests(monkeypatch):
+    """同标的并发：leader 付一次，follower 等着复用（paid=waited），不付第二份。"""
+    datasource = CNStockDataSource()
+    frame = _empty_probes_delay_frame(rows=1, end=datetime.date(2026, 6, 16))
+    gateway_calls = _singleflight_stubs(monkeypatch, datasource, frame)
+
+    req = FetchRequirements(fund_flow_page=True, fund_flow_history_table=False)
+    results = await asyncio.gather(
+        datasource.fetch_stock_data_with_requirements(
+            "SH600519", "2024-01-01", "2026-06-16", requirements=req),
+        datasource.fetch_stock_data_with_requirements(
+            "SH600519", "2024-01-01", "2026-06-16", requirements=req),
+    )
+
+    assert gateway_calls == ["SH600519"]          # 一次付费，两份报告
+    assert all(not r.fetch_failures for r in results)
+
+
+@pytest.mark.asyncio
+async def test_a_follower_with_a_bigger_need_runs_its_own_tail(monkeypatch):
+    """follower 需求更大（full 要 60 行历史）：leader 的 1 行今日帧满足不了它，
+    它自己再跑一份——不能为别人省钱把自己的数据弄少。"""
+    datasource = CNStockDataSource()
+    gateway_calls = _singleflight_stubs(
+        monkeypatch, datasource,
+        _empty_probes_delay_frame(rows=1, end=datetime.date(2026, 6, 16)),
+    )
+
+    brief_req = FetchRequirements(fund_flow_page=True, fund_flow_history_table=False)
+    full_req = FetchRequirements(fund_flow_page=True, fund_flow_rows=60)
+    await asyncio.gather(
+        datasource.fetch_stock_data_with_requirements(
+            "SH600519", "2024-01-01", "2026-06-16", requirements=brief_req),
+        datasource.fetch_stock_data_with_requirements(
+            "SH600519", "2024-01-01", "2026-06-16", requirements=full_req),
+    )
+
+    assert gateway_calls == ["SH600519", "SH600519"]  # leader 一次 + full 自己一次
