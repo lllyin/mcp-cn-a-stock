@@ -27,6 +27,7 @@ from ..config import (
     FINANCE_CACHE_TTL_SECONDS,
     FUND_FLOW_PAGE_CONCURRENCY,
     FUND_FLOW_PAGE_ENABLED,
+    FUND_FLOW_EMPTY_PROBE_SECONDS,
     FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS,
     CACHE_FUND_FLOW_MAX_ROWS,
     FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS,
@@ -401,6 +402,63 @@ def _fund_flow_lags_kline(value, kline_day) -> bool:
     return flow_day < kline_day
 
 
+# ── 空探测止损：行在上游不存在 ≠ 我们被拒 ──────────────────────────────────
+#
+# 对齐门面对的两种失败要分开：被拒是间歇性的，下一次可能成功，所以页面不熔断
+# （f8f6b66）；而"目标日的行在上游根本不存在"在落地前是确定性的——页面/网关
+# 都应答了、帧里也确实没有那一天，再试多少次结果都一样。不记下来止损的话，
+# 每个请求都为对齐门付一次页面加载加一次网关积分，一整晚。
+#
+# 只记"学到了"：应答了、帧非空、但帧止于目标日之前。滑块/拒绝/超时都是什么
+# 都没学到，不记，下个请求照常重试。记录按腿分开——页面学不到网关的事（不同
+# 出口），网关学不到的事页面也替代不了。
+#
+# 独立有界结构，不往缓存帧上挂：epoch_bound 的缓存域在收盘纪元不过期，挂上
+# 就等于把这个结论冻 16-64 小时。重启忘掉没关系——它是省钱机制，行落地后
+# 免费的同步链立刻对齐， correctness 不依赖它。
+_FUND_FLOW_EMPTY_PROBE_MAX = 512
+_fund_flow_empty_probes: "collections.OrderedDict[tuple, dict]" = collections.OrderedDict()
+
+
+def _empty_probe_fresh(symbol: str, target_day, leg: str) -> Optional[float]:
+    """（标的, 目标日, 腿）的有效空探测的时刻；没有或过期返回 None。"""
+    if target_day is None:
+        return None
+    with _empty_probe_lock:
+        entry = _fund_flow_empty_probes.get((symbol, str(target_day)))
+        if entry is None:
+            return None
+        learned_at = entry.get(leg)
+        if learned_at is None:
+            return None
+        if time.monotonic() - learned_at > FUND_FLOW_EMPTY_PROBE_SECONDS:
+            return None
+        return learned_at
+
+
+def _record_empty_probe(symbol: str, target_day, leg: str) -> None:
+    """记下（标的, 目标日, 腿）探到了"行不存在"。LRU 封顶并顺手清过期项。"""
+    if target_day is None:
+        return
+    key = (symbol, str(target_day))
+    with _empty_probe_lock:
+        entry = _fund_flow_empty_probes.setdefault(key, {})
+        entry[leg] = time.monotonic()
+        _fund_flow_empty_probes.move_to_end(key)
+        if len(_fund_flow_empty_probes) > _FUND_FLOW_EMPTY_PROBE_MAX:
+            _fund_flow_empty_probes.popitem(last=False)
+        if len(_fund_flow_empty_probes) > _FUND_FLOW_EMPTY_PROBE_MAX // 2:
+            now = time.monotonic()
+            for stale_key in [k for k, v in _fund_flow_empty_probes.items()
+                              if all(now - t > FUND_FLOW_EMPTY_PROBE_SECONDS
+                                     for t in v.values())]:
+                _fund_flow_empty_probes.pop(stale_key, None)
+
+
+#: 空探测结构的锁。自成一把：这一层只管资金流对齐门，别和通道层的锁混用。
+_empty_probe_lock = threading.Lock()
+
+
 def _fund_flow_needs_more(value, need, kline_day) -> bool:
     """手上的资金流结果还要不要往链尾走（页面/网关）。两道后置闸门共用。
 
@@ -425,8 +483,14 @@ def _merge_fund_flow(current, new) -> Optional[Dict]:
     旧源没有的日期。同一天的行留旧源：链顺序就是权威顺序（eastmoney > delay
     > 页面 > 网关），同一上游同一口径，先到的为准。
 
-    ``complete`` 不往合并结果里带：它是单源语义（"该源能给的全部历史"），合并
-    帧不是任何单一源的产出，够不够由行数/钉日期/日期对齐各自判。
+    每行记一行来路（``_src`` 列）：容差是它的属性——API 行是精确值，页面行经
+    两位小数渲染。合并前帧级 provider 碰巧等于行级来路，合并后就破了，一致性
+    检测按错容差会把真数据判成"被扰动"（实测一帧 86 条误报）。列跟帧进缓存，
+    records 序列化天然带它走。
+
+    ``complete`` 只在任一源明确为全量时置 True（网关/主源 = 全量历史）；否则不
+    带——delay 的"只有一行"标记在合并补上历史后就过时了，够不够由行数/钉日期/
+    日期对齐各自判，不靠默认值。
     """
     if not isinstance(new, dict) or _is_fetch_failure(new):
         return None
@@ -441,10 +505,14 @@ def _merge_fund_flow(current, new) -> Optional[Dict]:
 
     import pandas as pd
 
+    if "_src" not in current_frame.columns:
+        current_frame = current_frame.assign(
+            _src=current.get("provider") or "unknown")
     have = {str(d)[:10] for d in current_frame["日期"]}
     add = new_frame[[str(d)[:10] not in have for d in new_frame["日期"]]]
     if len(add) == 0:
         return None
+    add = add.assign(_src=new.get("provider") or "unknown")
     combined = pd.concat([current_frame, add])
     merged = (
         combined
@@ -456,6 +524,8 @@ def _merge_fund_flow(current, new) -> Optional[Dict]:
     result = dict(current)
     result["fund_flow"] = merged
     result.pop("complete", None)
+    if current.get("complete") is True or new.get("complete") is True:
+        result["complete"] = True
     result["provider"] = f'{current.get("provider", "?")}+{new.get("provider", "?")}'
     return result
 
@@ -1491,44 +1561,80 @@ class CNStockDataSource(DataSource):
             # fetch_failures 之前替换，否则兜底成功了报告依然被判定为不完整而整体不进缓存。
             # requirements.fund_flow_page 由配置链推导（mcp_app）：链里配了
             # fund_flow_page 时所有模式都走这里，没配才跳过。
-            page_result = await self._fetch_fund_flow_from_page(canonical_symbol)
-            merged = _merge_fund_flow(fetched.get("fund_flow"), page_result)
-            if merged is not None:
-                # 并集合并而不是"行数多的赢"：页面给 120 行止于昨天、delay 给当天
-                # 1 行时，替换会把对齐的那行换成不对齐的一整份；并集两边都留住。
-                fetched["fund_flow"] = merged
-                # 写回缓存：兜底不走 get_or_load（它挂在 gather 之后，包进去会改
-                # 触发时机），不显式写回的话下一次同标的又是一次 6.4 秒的页面加载。
-                store_fund_flow(canonical_symbol, merged)
+            learned_at = _empty_probe_fresh(canonical_symbol, kline_day, "page")
+            if learned_at is not None:
+                # 已经探明目标日的行在上游不存在：不再为它重复付页面加载。
+                # 行一落地，免费同步链自然对齐，这条记录随 TTL 一起作废。
+                logger.info(
+                    "对齐门空探测跳过页面 %s：%s 的行已探明不存在（%d 分钟前，TTL %ds）",
+                    canonical_symbol, kline_day,
+                    int((time.monotonic() - learned_at) / 60),
+                    FUND_FLOW_EMPTY_PROBE_SECONDS,
+                )
+            else:
+                page_result = await self._fetch_fund_flow_from_page(canonical_symbol)
+                merged = _merge_fund_flow(fetched.get("fund_flow"), page_result)
+                if merged is not None:
+                    # 并集合并而不是"行数多的赢"：页面给 120 行止于昨天、delay 给当天
+                    # 1 行时，替换会把对齐的那行换成不对齐的一整份；并集两边都留住。
+                    fetched["fund_flow"] = merged
+                    # 写回缓存：兜底不走 get_or_load（它挂在 gather 之后，包进去会改
+                    # 触发时机），不显式写回的话下一次同标的又是一次 6.4 秒的页面加载。
+                    store_fund_flow(canonical_symbol, merged)
+                if page_result is not None and _fund_flow_lags_kline(
+                        fetched.get("fund_flow"), kline_day):
+                    # 页面尽力了（加载成功、帧非空）却还是止于目标日之前——
+                    # 这就是"行此刻不存在"，记下来，别再为它重复加载。
+                    _record_empty_probe(canonical_symbol, kline_day, "page")
         # 页面之后的同步段（配置里排在 fund_flow_page 后面的级，比如付费网关
         # eastmoney_gateway）：页面也没满足需求才轮到它。默认配置这一段是空的，
         # 一次都不会走。
+        paid = "0"
         if (
             requirements.fund_flow
             and fund_flow_post_order
             and _fund_flow_needs_more(fetched.get("fund_flow"), fund_flow_need, kline_day)
         ):
-            post_result = await _run_in_executor(
-                self._fetch_fund_flow_sync,
-                code,
-                canonical_symbol,
-                fund_flow_need,
-                fund_flow_post_order,
-            )
-            merged = _merge_fund_flow(fetched.get("fund_flow"), post_result)
-            if merged is not None:
-                fetched["fund_flow"] = merged
-                store_fund_flow(canonical_symbol, merged)
+            learned_at = _empty_probe_fresh(canonical_symbol, kline_day, "gateway")
+            if learned_at is not None:
+                paid = "skipped"
+                logger.info(
+                    "对齐门空探测跳过网关 %s：%s 的行已探明不存在（%d 分钟前，TTL %ds）",
+                    canonical_symbol, kline_day,
+                    int((time.monotonic() - learned_at) / 60),
+                    FUND_FLOW_EMPTY_PROBE_SECONDS,
+                )
+            else:
+                paid = "1"
+                post_result = await _run_in_executor(
+                    self._fetch_fund_flow_sync,
+                    code,
+                    canonical_symbol,
+                    fund_flow_need,
+                    fund_flow_post_order,
+                )
+                merged = _merge_fund_flow(fetched.get("fund_flow"), post_result)
+                if merged is not None:
+                    fetched["fund_flow"] = merged
+                    store_fund_flow(canonical_symbol, merged)
+                if (
+                    post_result is not None
+                    and not _is_fetch_failure(post_result)
+                    and _fund_flow_lags_kline(fetched.get("fund_flow"), kline_day)
+                ):
+                    # 网关应答了但帧里仍没有目标日——上游确实没有这一行。
+                    _record_empty_probe(canonical_symbol, kline_day, "gateway")
         if requirements.fund_flow:
             # 每次资金流查询的最终落点：哪个源给的、多少行、是否全量、止于哪天。
             # "网关补齐率"和"恢复后是否停止付费"都靠这行算；last_date 对 data_date
-            # 是"资金流滞后"这个可观测量的唯一出处。
+            # 是"资金流滞后"这个可观测量的唯一出处；paid 三态分出"门没开/被止损
+            # 拦住/真付了"，空探测省下的积分靠它数。
             final = fetched.get("fund_flow")
             final_failed = final is None or _is_fetch_failure(final)
             request_id, _, _ = log_context()
             logger.info(
                 "fund_flow_outcome request_id=%s symbol=%s need=%s final_source=%s "
-                "rows=%s complete=%s last_date=%s data_date=%s",
+                "rows=%s complete=%s last_date=%s data_date=%s paid=%s",
                 request_id or "-",
                 canonical_symbol,
                 f"pinned:{fund_flow_need.pinned_date}"
@@ -1540,6 +1646,7 @@ class CNStockDataSource(DataSource):
                 "-" if final_failed else final.get("complete", "-"),
                 _fund_flow_last_date(final) or "-",
                 kline_day or "-",
+                paid,
             )
         # 资金流"没覆盖本次请求"的判定要等 K 线和日表都建好才能算（基准是同报告里的
         # K 线交易日数），见下面 ``fund_flow:partial`` 那一处。
@@ -1639,7 +1746,7 @@ class CNStockDataSource(DataSource):
                     # 数据可疑，进 warnings 和 degraded，让读者和缓存守卫知道。
                     # 每条记录前缀上游端点：事后排查"这份坏数据是谁给的"不用再猜。
                     violations = fund_flow_source.consistency_violations(
-                        df, rendered=fund_flow_data.get("provider") == "page_fallback")
+                        df, rendered="page_fallback" in (fund_flow_data.get("provider") or ""))
                     if violations:
                         endpoint = fund_flow_source.provider_endpoint(
                             fund_flow_data.get("provider"))

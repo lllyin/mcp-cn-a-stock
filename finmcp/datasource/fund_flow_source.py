@@ -158,7 +158,13 @@ PROVIDER_ENDPOINTS = {
 
 
 def provider_endpoint(name: Optional[str]) -> str:
-    """提供方 → 上游端点描述。未登记的名字原样返回，不让告警哑掉。"""
+    """提供方 → 上游端点描述。未登记的名字原样返回，不让告警哑掉。
+
+    合并结果的复合名（``eastmoney_delay+page_fallback``）拆开逐个映射：
+    整串查不到就打"未知来源"，"这份坏数据是谁给的"就白记了。
+    """
+    if name and "+" in name:
+        return "+".join(provider_endpoint(part) for part in name.split("+"))
     return PROVIDER_ENDPOINTS.get(name or "", f"未知来源 {name or '-'}")
 
 
@@ -188,6 +194,11 @@ def consistency_violations(frame, *, rendered: bool = False) -> list:
     ``rendered=True`` 表示这批行来自页面兜底，金额经两位小数的"万/亿"渲染，
     金额容差按行内显示单位放宽（见 _PAGE_YI_TOLERANCE）；占比容差不变。
 
+    容差按行判，不按帧判。帧带 ``_src`` 列（合并帧）时逐行取来路——混合帧里
+    页面行和 API 行各有各的容差；没有 ``_src`` 列（未合并的帧、旧缓存条目）
+    回落到帧级 ``rendered``。放宽只生效于行内最大金额到 ``_PAGE_YI_SCALE``
+    的行：页面的万粒度行按 API 同值容差（1 万元），不放松检测。
+
     只做算术，不发请求、不比 K 线。金额列有 NaN 的行跳过——那是页面占位符
     （停牌之类），让 None 与 0 的区分保持原样。
     """
@@ -200,11 +211,16 @@ def consistency_violations(frame, *, rendered: bool = False) -> list:
                 "主力净流入-净占比", "中单净流入-净占比", "小单净流入-净占比"}
     if not required <= set(frame.columns):
         return issues
+    has_row_src = "_src" in frame.columns
     # itertuples 的命名元组会把中文列名改写成 _5 这类位置名，按列位取值。
     order = list(frame.columns)
     for values in frame.itertuples(index=False, name=None):
         row = dict(zip(order, values))
         date = row.get("日期", "?")
+        row_rendered = (
+            "page_fallback" in str(row.get("_src") or "")
+            if has_row_src else rendered
+        )
         major, xl, big, mid, small = (row.get(name) for name in
             ("主力净流入-净额", "超大单净流入-净额", "大单净流入-净额",
              "中单净流入-净额", "小单净流入-净额"))
@@ -212,7 +228,7 @@ def consistency_violations(frame, *, rendered: bool = False) -> list:
         amounts_known = [v for v in (major, xl, big, mid, small)
                          if isinstance(v, (int, float))]
         amount_tol = _AMOUNT_TOLERANCE
-        if rendered and amounts_known and max(map(abs, amounts_known)) >= _PAGE_YI_SCALE:
+        if row_rendered and amounts_known and max(map(abs, amounts_known)) >= _PAGE_YI_SCALE:
             amount_tol = _PAGE_YI_TOLERANCE
         if None not in (major, xl, big) and all(
                 isinstance(v, (int, float)) for v in (major, xl, big)):

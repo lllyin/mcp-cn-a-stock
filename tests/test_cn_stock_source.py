@@ -2278,3 +2278,155 @@ async def test_delay_served_brief_is_not_blocked_from_the_cache(monkeypatch):
     )
 
     assert "fund_flow:partial" not in result.fetch_failures
+
+
+# --- 合并帧的行级来路（_src）与空探测止损 ------------------------------------
+
+
+def test_the_merge_marks_each_row_with_its_source_and_judges_tolerances_per_row():
+    """合并帧的每行带来路：页面行按页面容差、API 行按严格容差，互不放松。
+
+    帧级 rendered 在合并后就破了——真实页面 fixture 的 121 行在严格容差下有
+    86 条误报，而它们全部是真数据。
+    """
+    from pathlib import Path
+
+    from finmcp.datasource.fund_flow_page import parse_fund_flow_page
+
+    page = parse_fund_flow_page(
+        Path(__file__).parent.joinpath("fixtures", "eastmoney_zjlx_300408.html")
+        .read_text(encoding="utf-8"))
+    current = {"fund_flow": _empty_probes_delay_frame(), "is_market": False,
+               "complete": False, "provider": "eastmoney_delay"}
+    new = {"fund_flow": pd.DataFrame(page.history_records()),
+           "is_market": False, "provider": "page_fallback"}
+
+    merged = source_module._merge_fund_flow(current, new)
+
+    frame = merged["fund_flow"]
+    assert "_src" in frame.columns
+    assert set(frame["_src"]) == {"eastmoney_delay", "page_fallback"}
+    # 86 条误报一条都不该有；delay 那行精确值也不该被页面容差放松
+    assert source_module.fund_flow_source.consistency_violations(frame) == []
+
+
+def _empty_probes_delay_frame(rows=1, end=datetime.date(2026, 6, 15)):
+    """对齐门测试用的 delay 帧：rows 行，最后一行 end。"""
+    from finmcp.datasource.platforms import eastmoney
+
+    start = end - datetime.timedelta(days=rows - 1)
+    return eastmoney._fund_flow_frame([
+        f"{start + datetime.timedelta(days=i)},-7200599040.0,8721076224.0,"
+        "-1520476160.0,-3684253696.0,-3516345344.0,-1.43,1.73,-0.30,-0.73,"
+        "-0.70,3286.55,-0.78,0.00,0.00"
+        for i in range(rows)
+    ])
+
+
+def _empty_probe_datasource(monkeypatch):
+    """上游不生成目标日（2026-06-16）的行的数据源：delay 和页面都止于前一天。"""
+    source_module._fund_flow_empty_probes.clear()
+    datasource = CNStockDataSource()
+    _fund_flow_orchestration_stubs(monkeypatch, datasource)  # K 线止于 2026-06-16
+    monkeypatch.setattr(
+        source_module.fund_flow_source, "configured_order",
+        lambda: ("eastmoney", "eastmoney_delay", "fund_flow_page", "eastmoney_gateway"),
+    )
+    calls = {"page": 0, "gateway": 0}
+
+    def fake_sync(code, symbol, need=None, order=None):
+        if order == ("eastmoney_gateway",):
+            calls["gateway"] += 1
+            return {"fund_flow": _empty_probes_delay_frame(rows=120),
+                    "is_market": False, "complete": True,
+                    "provider": "eastmoney_gateway"}
+        return {"fund_flow": _empty_probes_delay_frame(),
+                "is_market": False, "complete": False, "provider": "eastmoney_delay"}
+
+    async def fake_page(symbol):
+        calls["page"] += 1
+        return {"fund_flow": _empty_probes_delay_frame(rows=120),
+                "is_market": False, "provider": "page_fallback"}
+
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_sync", fake_sync)
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_from_page", fake_page)
+    monkeypatch.setattr(source_module, "store_fund_flow", lambda s, v: None)
+    return datasource, calls
+
+
+@pytest.mark.asyncio
+async def test_a_proven_missing_row_is_not_probed_again_within_the_ttl(monkeypatch):
+    """第一次探明目标日的行不存在后，TTL 内页面和网关都不再重试。"""
+    datasource, calls = _empty_probe_datasource(monkeypatch)
+
+    for _ in range(3):
+        await datasource.fetch_stock_data_with_requirements(
+            "SH600519", "2024-01-01", "2026-06-17",
+            requirements=FetchRequirements(fund_flow_page=True, fund_flow_rows=60),
+        )
+
+    # 修复前是 3 次页面 + 3 次网关；止损后只有第一次真试
+    assert calls == {"page": 1, "gateway": 1}
+
+
+@pytest.mark.asyncio
+async def test_a_refused_page_is_not_recorded_and_the_next_request_retries(monkeypatch):
+    """被拒 = 什么都没学到，不记空探测：下一个请求照常重试页面。"""
+    source_module._fund_flow_empty_probes.clear()
+    datasource = CNStockDataSource()
+    _fund_flow_orchestration_stubs(monkeypatch, datasource)
+    monkeypatch.setattr(
+        source_module.fund_flow_source, "configured_order",
+        lambda: ("eastmoney", "eastmoney_delay", "fund_flow_page"),
+    )
+    monkeypatch.setattr(
+        datasource, "_fetch_fund_flow_sync",
+        lambda code, symbol, need=None, order=None: {
+            "fund_flow": _empty_probes_delay_frame(),
+            "is_market": False, "complete": False, "provider": "eastmoney_delay"},
+    )
+    calls = []
+
+    # _fetch_fund_flow_from_page 内部把异常吃掉、返回 None——模拟"什么都没学到"
+    async def failing_page(symbol):
+        calls.append(symbol)
+        return None
+
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_from_page", failing_page)
+    monkeypatch.setattr(source_module, "store_fund_flow", lambda s, v: None)
+
+    for _ in range(2):
+        await datasource.fetch_stock_data_with_requirements(
+            "SH600519", "2024-01-01", "2026-06-17",
+            requirements=FetchRequirements(fund_flow_page=True, fund_flow_rows=60),
+        )
+
+    assert calls == ["SH600519", "SH600519"]  # 每次都重试，没被止损
+
+
+@pytest.mark.asyncio
+async def test_an_expired_probe_retries(monkeypatch):
+    """TTL 过了就重试：行落地后不能让一条旧记录把数据挡在外面。"""
+    datasource, calls = _empty_probe_datasource(monkeypatch)
+    monkeypatch.setattr(source_module, "FUND_FLOW_EMPTY_PROBE_SECONDS", 0.0)
+
+    for _ in range(2):
+        await datasource.fetch_stock_data_with_requirements(
+            "SH600519", "2024-01-01", "2026-06-17",
+            requirements=FetchRequirements(fund_flow_page=True, fund_flow_rows=60),
+        )
+
+    assert calls == {"page": 2, "gateway": 2}  # TTL=0：每次都重试
+
+
+def test_the_probe_store_is_bounded(monkeypatch):
+    """空探测结构有界：LRU 封顶，过期项顺手清。"""
+    monkeypatch.setattr(source_module, "_FUND_FLOW_EMPTY_PROBE_MAX", 8)
+    source_module._fund_flow_empty_probes.clear()
+    for i in range(20):
+        source_module._record_empty_probe(f"SZ{i:06d}", "2026-06-16", "page")
+    assert len(source_module._fund_flow_empty_probes) <= 8
+
+    # 过期的项被查出来（TTL 很短时 fresh 判定为 False）
+    monkeypatch.setattr(source_module, "FUND_FLOW_EMPTY_PROBE_SECONDS", 0.0)
+    assert source_module._empty_probe_fresh("SZ000019", "2026-06-16", "page") is None

@@ -590,3 +590,52 @@ def test_resolve_continues_when_the_need_is_not_met(registry):
                          need=ffs.FundFlowNeed(history_rows=60))
     assert gateway.calls == 1
     assert result is not None and len(result.frame) == 99
+
+
+def test_merged_frame_judges_each_row_by_its_own_source():
+    """合并帧：页面行用页面容差，API 行用严格容差，互不放松。
+
+    帧级 rendered 标志在合并后就破了——页面行经两位小数渲染，四档之和偏 20 万
+    在页面容差内（真数据），在 API 容差外（会被误判成"被扰动"）。
+    """
+    # 金额到亿粒度的行：超大 1 亿、四档配平后之和 +200,200 元——超出 API 容差
+    # 1 万，在页面容差 210 万内。
+    page_row = _row(datetime.date(2026, 6, 15), 100000000.0, 100000000.0, 0.0,
+                    -50000000.0, -49799800.0)
+    api_row = _row(datetime.date(2026, 6, 16), 100000000.0, 100000000.0, 0.0,
+                   -50000000.0, -49799800.0)
+    page_row["_src"] = "page_fallback"
+    api_row["_src"] = "eastmoney_delay"
+    frame = pd.DataFrame([page_row, api_row])
+
+    issues = ffs.consistency_violations(frame, rendered=False)
+
+    # 页面行放行（它的来路决定了容差），API 行照样咬住
+    assert len(issues) == 1 and "2026-06-16" in issues[0] and "四档之和" in issues[0]
+
+
+def test_row_level_magnitude_condition_is_kept_for_millions_granularity():
+    """页面的万粒度行按 API 同值容差判：放宽只给亿粒度，不放松检测。"""
+    # 最大金额 < 1e8（万粒度），四档之和 +20,000：即便来路是页面，也按严格容差——
+    # 万粒度的渲染误差只有几百元，2 万是真扰动。
+    row = _row(datetime.date(2026, 6, 15), 50000000.0, 50000000.0, 0.0,
+               0.0, 20000.0)
+    row["_src"] = "page_fallback"
+    issues = ffs.consistency_violations(pd.DataFrame([row]), rendered=False)
+    assert len(issues) == 1 and "四档之和" in issues[0]
+
+
+def test_frames_without_src_fall_back_to_the_frame_level_flag():
+    """没有 _src 列（未合并的帧、旧缓存条目）：回落到帧级 rendered。"""
+    row = _row(datetime.date(2026, 6, 15), 100000000.0, 100000000.0, 0.0,
+               -50000000.0, -49799800.0)
+    frame = pd.DataFrame([row])
+    assert ffs.consistency_violations(frame, rendered=True) == []      # 整帧当页面
+    assert len(ffs.consistency_violations(frame, rendered=False)) == 1  # 整帧当 API
+
+
+def test_provider_endpoint_maps_each_part_of_a_composite_name():
+    """合并结果的复合 provider 名拆开逐个映射——告警不该落成"未知来源"。"""
+    endpoint = ffs.provider_endpoint("eastmoney_delay+page_fallback")
+    assert "push2delay" in endpoint and "zjlx" in endpoint
+    assert "未知" not in endpoint

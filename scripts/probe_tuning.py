@@ -1924,6 +1924,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     p_gw.add_argument("--interval", type=float, default=15.0, help="每出口轮询间隔秒数")
     p_gw.add_argument("--max-minutes", type=float, default=20.0, help="单出口观测上限（分钟）")
 
+    p_landing = sub.add_parser(
+        "fund-flow-landing",
+        help="从生产日志的 fund_flow_outcome 量当日资金流行的落地窗口，定 FUND_FLOW_EMPTY_PROBE_SECONDS")
+    common(p_landing)
+    p_landing.add_argument("--days", type=int, default=14, help="回看几天")
+    p_landing.add_argument("--log-glob", action="append",
+                           default=["logs/cn-stock-mcp.log*", ".server-logs/logs/cn-stock-mcp.log*"],
+                           help="日志文件 glob，可多次指定")
+
     p_all = sub.add_parser("all", help="facts → browser → tonghuashun → recommend")
     common(p_all)
     for source in (p_facts, p_browser, p_ths, p_rec):
@@ -2047,12 +2056,87 @@ def run_gateway_lifetime(args) -> int:
     return 0
 
 
+_OUTCOME_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ INFO fund_flow_outcome .*?"
+    r"need=(\S+) .*?last_date=(\S+) data_date=(\S+)")
+
+
+def run_fund_flow_landing(args) -> int:
+    """量"当日资金流行落地要多久"，定 FUND_FLOW_EMPTY_PROBE_SECONDS。
+
+    对齐门的空探测 TTL 是该盖住落地窗口的：行没落地前探到"不存在"是对的，
+    落地后要尽快作废重试。窗口长度不从代码推，从生产日志量——fund_flow_outcome
+    的 last_date/data_date 就是为这个加的。对每个（交易日, 标的）取第一次
+    "数据日期=当天而资金流止于更早"（发现没有）到第一次对齐（上游有了）的
+    墙钟差；TTL 按最大值定——分位数会砍长尾，而长尾正是要保住的部分（§五）。
+    """
+    since_day = (dt.datetime.now() - dt.timedelta(days=args.days)).date()
+    events = []  # (ts, symbol, mismatch: bool)
+    for path in _log_paths(args):
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            m = _OUTCOME_RE.search(line)
+            if not m or m.group(2).startswith("pinned:"):
+                continue
+            try:
+                ts = dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            if ts.date() < since_day:
+                continue
+            last, data = m.group(3), m.group(4)
+            if last == "-" or data == "-":
+                continue
+            events.append((ts, m.group(0).split("symbol=")[1].split()[0],
+                           last != data))
+
+    delays = []
+    by_pair: dict = {}
+    for ts, symbol, mismatch in sorted(events):
+        key = (symbol, ts.date())
+        pair = by_pair.setdefault(key, {"first_missing": None, "first_aligned": None})
+        if mismatch and pair["first_missing"] is None:
+            pair["first_missing"] = ts
+        elif not mismatch and pair["first_aligned"] is None:
+            pair["first_aligned"] = ts
+    for (symbol, day), pair in sorted(by_pair.items()):
+        missing, aligned = pair["first_missing"], pair["first_aligned"]
+        if missing and aligned and aligned > missing:
+            delay = (aligned - missing).total_seconds()
+            delays.append(delay)
+            print(f"[landing] {day} {symbol} 落地耗时 {delay / 60:.0f} 分钟"
+                  f"（{missing.time()} 发现缺 → {aligned.time()} 对齐）")
+
+    if not delays:
+        print('[landing] 窗口内没有"先缺后齐"的样本——埋点上线后的日志才量得到，'
+              '攒几天再跑', file=sys.stderr)
+        return 1
+    delays.sort()
+    print(f"[landing] {len(delays)} 个样本：中位 {delays[len(delays) // 2] / 60:.0f} 分钟，"
+          f"最大 {delays[-1] / 60:.0f} 分钟")
+    print(f"[landing] 按最大值取 FUND_FLOW_EMPTY_PROBE_SECONDS={delays[-1]:.0f}"
+          f"（当前默认 3600）")
+    return 0
+
+
+def _log_paths(args):
+    import glob
+    paths = []
+    for pattern in args.log_glob:
+        paths.extend(Path(p) for p in glob.glob(pattern))
+    return paths
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     _require_venv()
     handlers = {"facts": run_facts, "browser": run_browser, "recommend": run_recommend,
                 "tonghuashun": run_tonghuashun, "verify": run_verify, "batch": run_batch,
                 "gateway-lifetime": run_gateway_lifetime,
+                "fund-flow-landing": run_fund_flow_landing,
                 "all": run_all}
     return handlers[args.command](args)
 

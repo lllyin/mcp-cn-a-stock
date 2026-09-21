@@ -273,6 +273,16 @@ FUND_FLOW_PAGE_COOLDOWN_SECONDS = max(
     1.0,
     float(env("FUND_FLOW_PAGE_COOLDOWN_SECONDS", "60")),
 )
+# "资金流某一行在上游不存在"这个结论的有效期。页面/网关探到目标日的行不存在
+# （应答了但帧止于目标日之前）后记一次空探测，有效期内同一（标的, 目标日）
+# 不再为对齐门重复付页面加载/网关积分——那不叫重试，重试对抗的是间歇性拒绝，
+# 而"行不存在"在落地前是确定性的。有效期也是落地后的补数机会：行一落地，
+# 免费的同步链立刻对齐，空探测自然作废。值要按落地窗口量（probe_tuning 的
+# gateway-exit 项），预估量级是收盘后一小时。
+FUND_FLOW_EMPTY_PROBE_SECONDS = max(
+    60.0,
+    float(env("FUND_FLOW_EMPTY_PROBE_SECONDS", "3600")),
+)
 
 # 一次请求内允许的页面加载次数。
 #
