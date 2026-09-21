@@ -989,15 +989,16 @@ def test_the_provenance_line_comes_right_after_the_title(tmp_path):
 
 
 def test_the_provenance_line_carries_start_time_and_uptime(tmp_path):
-    """启动时间取最后一条 version 行（当前进程），运行时长算到窗口末尾——
-    日志停更时长也跟着停，服务死了还按墙钟算是假话。"""
+    """启动时间取最后一条 version 行（当前进程），运行时长 = 当前时间 - 启动时间，
+    最新响应时间取窗口末尾（最新一条日志）。"""
     log = _write(tmp_path, [
         _line("10:00:00", "cn-stock-mcp version=2.1.0"),   # 旧进程
         _line("12:30:00", "cn-stock-mcp version=2.2.0"),   # 当前进程
         _symbol_line("15:00:00", "SZ000333", 2.0, present=17, expected_n=17),
     ])
     report = health_report.render(log_digest.digest(log))
-    assert "版本 2.2.0 · 启动时间 2026-09-09 12:30:00 · 运行时长 2 小时 30 分" in report
+    assert "版本 2.2.0 · 启动时间 2026-09-09 12:30:00 · 运行时长 " in report
+    assert "最新响应时间 2026-09-09 15:00:00" in report
 
 
 def test_uptime_is_omitted_when_no_version_line_was_seen(tmp_path):

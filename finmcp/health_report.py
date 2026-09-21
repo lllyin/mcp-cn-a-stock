@@ -28,17 +28,15 @@ def _sec(value) -> str:
     return "—" if value is None else f"{value:.2f}s"
 
 
-def _uptime(started_at: str, last_at) -> str:
-    """启动时间 → 窗口末尾（最新一条日志）的时长。日志停更时长也跟着停——
-    服务死了还按墙钟算"运行时长"是假话。算不出来就空着，不猜。"""
-    if not started_at or not last_at:
+def _uptime(started_at: str) -> str:
+    """当前时间 - 启动时间。算不出来就空着，不猜。"""
+    if not started_at:
         return ""
     try:
         start = datetime.datetime.strptime(started_at, "%Y-%m-%d %H:%M:%S")
-        end = datetime.datetime.strptime(str(last_at)[:19], "%Y-%m-%d %H:%M:%S")
     except ValueError:
         return ""
-    seconds = int((end - start).total_seconds())
+    seconds = int((datetime.datetime.now() - start).total_seconds())
     if seconds < 0:
         return ""
     days, seconds = divmod(seconds, 86400)
@@ -251,9 +249,11 @@ def _headline(data: dict) -> list:
     meta = [f"版本 {window.get('version') or '—'}"]
     if window.get("started_at"):
         meta.append(f"启动时间 {window['started_at']}")
-        uptime = _uptime(window["started_at"], window.get("to"))
+        uptime = _uptime(window["started_at"])
         if uptime:
             meta.append(f"运行时长 {uptime}")
+    if window.get("to"):
+        meta.append(f"最新响应时间 {window['to']}")
     if window.get("fingerprint"):
         meta.append(f"渲染指纹 {window['fingerprint']}")
     if window.get("restarts"):
