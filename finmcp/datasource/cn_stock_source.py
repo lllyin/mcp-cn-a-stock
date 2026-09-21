@@ -1394,6 +1394,19 @@ class CNStockDataSource(DataSource):
             return {"fund_flow": frame, "is_market": False,
                     "provider": "page_fallback_today"}
 
+        # 历史表有行、今日栏是今天、但历史止于今天之前：盘后落地窗口就是这个形态
+        # （API 被拒不放出当天行，今日栏自己却填得出）。把今日栏追加为当天那一行，
+        # 帧才能和数据日期对齐——不然这次请求就要落到付费网关。
+        if today_date is not None:
+            if all(str(r["日期"])[:10] != str(today_date)[:10] for r in records):
+                record = page.today_record(today_date)
+                if record is not None:
+                    logger.info(
+                        "资金流向页面今日栏补当天行 %s：历史表止于 %s，今日栏有值",
+                        symbol, records[-1]["日期"],
+                    )
+                    records = records + [record]
+
         import pandas as pd
 
         logger.info(

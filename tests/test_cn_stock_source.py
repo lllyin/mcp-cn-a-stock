@@ -2682,3 +2682,44 @@ async def test_a_leader_failure_does_not_take_the_follower_down(monkeypatch):
     assert len(failures) == 1  # leader 坏自己那份
     assert len(successes) == 1  # follower 回落后成功
     assert attempts == [1, 1]   # 恰两份：leader 一次 + follower 自己一次
+
+
+@pytest.mark.asyncio
+async def test_the_today_block_tops_up_a_history_that_stops_yesterday(monkeypatch):
+    """历史表有行但止于昨天（盘后落地窗口的形态）：今日栏补成"当天那一行"——
+    帧对齐数据日期，不用落到付费网关。"""
+    datasource = CNStockDataSource()
+    calls = _today_block_orchestration_stubs(monkeypatch, datasource)
+    page = _today_only_page_stub()
+    # 再加 120 行止于 06-15 的历史
+    from finmcp.datasource.fund_flow_page import FundFlowRow
+
+    start = datetime.date(2026, 6, 15) - datetime.timedelta(days=119)
+    page.history = [
+        FundFlowRow(
+            date=str(start + datetime.timedelta(days=i)),
+            close=10.2, pct_chg=2.0,
+            amounts=(1.0, 0.5, 0.5, 0.0, 0.0),
+            ratios=(0.5, 0.3, 0.2, 0.0, 0.0),
+        )
+        for i in range(120)
+    ]
+
+    from finmcp.datasource import realtime_ff as realtime_ff_module
+
+    async def fake_page(symbol):
+        return page
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+
+    result = await datasource.fetch_stock_data_with_requirements(
+        "SH600519", "2024-01-01", "2026-06-16",
+        requirements=FetchRequirements(fund_flow_page=True, fund_flow_history_table=False),
+    )
+
+    assert calls["gateway"] == 0
+    assert len(result.fund_flow_history["DATE"]) == 121  # 120 + 今日栏补的今天
+    last = datetime.datetime.fromtimestamp(
+        result.fund_flow_history["DATE"][-1] / 1e9).date()
+    assert last == datetime.date(2026, 6, 16)
+    assert result.fund_main_amount[-1] == pytest.approx(3.062e9)  # 行来自今日栏
