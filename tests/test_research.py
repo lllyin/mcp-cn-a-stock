@@ -965,3 +965,29 @@ class TestSelectFundFlowRowForQueryDate:
         table_text = table_fp.getvalue()
         assert "| 2026-08-27 |" in table_text and "5437.65万" in table_text
         assert "-4.01%" in table_text  # 小单占比：当日行与表格行同源同值
+
+
+def test_nan_tiers_are_dropped_not_printed():
+    """部分帧（停牌/占位/今日栏部分有值）的缺档是 NaN：跳过，不印 nan万/nan%。
+
+    NaN 印出来是假数字，report_contract 还按"标记在"记成拿到了——缺口被盖住。
+    """
+    data = _flow_data("2026-09-04", "2026-09-04")
+    data["M_A"] = np.array([np.nan])
+    data["M_R"] = np.array([np.nan])
+    buf = StringIO()
+    ok = research._print_fund_flow_lines(buf, data)
+    assert ok is True                       # 真拿到的三档照印
+    assert "当日中单净流入" not in buf.getvalue()   # 缺档不印
+    assert "nan" not in buf.getvalue()
+
+
+def test_all_nan_tiers_look_like_missing_not_zero():
+    """五档全 NaN（纯占位）：整个段落如实说没有，不是"今日为零"。"""
+    data = _flow_data("2026-09-04", "2026-09-04")
+    for field in ("A", "XL", "L", "M", "S"):
+        data[f"{field}_A"] = np.array([np.nan])
+        data[f"{field}_R"] = np.array([np.nan])
+    buf = StringIO()
+    assert research._print_fund_flow_lines(buf, data) is False
+    assert buf.getvalue() == ""

@@ -506,7 +506,13 @@ def build_fund_flow(field: tuple[str, str], data: Dict[str, ndarray]) -> str:
     kind = field[0]
     raw_amount = value_amount[-1]
     ratio = value_ratio[-1]
-    
+
+    # NaN 不是值：部分帧（停牌、页面占位、今日栏部分有值）会把缺档带成
+    # NaN——印 nan万/nan% 是假数字，report_contract 还按"标记在"记成拿到，
+    # 缺口就被盖住了。缺的档跳过，只印真的拿到的。
+    if np.isnan(raw_amount) or np.isnan(ratio):
+        return ""
+
     # 自动转换单位：超过1亿显示亿，否则显示万
     if abs(raw_amount) >= 1e8:
         amount_str = f"{raw_amount / 1e8:.2f}亿"
