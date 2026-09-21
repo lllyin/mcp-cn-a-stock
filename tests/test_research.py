@@ -769,6 +769,18 @@ def test_a_lead_is_also_reported(monkeypatch):
     assert lag == (datetime.date(2026, 9, 4), datetime.date(2026, 9, 3))
 
 
+@pytest.mark.parametrize("flow_day,kline_day", [
+    ("2026-09-21", "2026-08-28"),   # 帧止于今天、钉 08-28：898c17b 误报的形态
+    ("2026-08-27", "2026-08-28"),   # 帧比钉的那天还旧：同样归精确命中管
+])
+def test_pinned_queries_never_report_a_lag(flow_day, kline_day):
+    """钉日期查询不算滞后：数据日期就是钉的那一天（K 线按它裁剪），资金流帧
+    延伸到今天是常态；钉住那天的数据一致性由精确命中判据管，不叠第二道。"""
+    data = _data(kline_day, flow_day)
+    data["IS_HISTORICAL_QUERY"] = True
+    assert research.fund_flow_lag(data) is None
+
+
 def _flow_data(kline_day: str, flow_day: str):
     """kline 日期 + 资金流日期 + 五档字段都齐的渲染输入。"""
     out = _data(kline_day, flow_day)

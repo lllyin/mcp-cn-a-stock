@@ -549,9 +549,17 @@ def fund_flow_lag(data: Dict[str, ndarray]) -> Optional[tuple]:
     旧了（兜底源滞后）——渲染层只印和数据日期同一天的那行，两个方向的不一致
     对读者都是"那一段没了"。
 
+    钉日期查询一律不算滞后：它的数据日期就是钉的那一天（K 线按它裁剪），而
+    资金流帧自然延伸到今天——两者不等是常态，不是不一致。钉住那天的数据一致性
+    由 _select_fund_flow_row_for_query_date 的精确命中管（帧里没有那天就清字段、
+    走降级文案），不在这里叠第二道判据——叠加的实测代价是每份钉日期报告白挨
+    一条假警告，且整个 CLOSED 纪元不进缓存、每次全额打上游。
+
     盘中不算滞后：那时资金流走的是实时抓取，本来就是当天的。
     """
-    if is_realtime_fund_flow_window() and not data.get("IS_HISTORICAL_QUERY", False):
+    if data.get("IS_HISTORICAL_QUERY", False):
+        return None
+    if is_realtime_fund_flow_window():
         return None
     flow, kline = fund_flow_date(data), data_date(data)
     if flow is None or kline is None or flow == kline:
