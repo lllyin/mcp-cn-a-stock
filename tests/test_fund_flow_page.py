@@ -776,3 +776,50 @@ def test_captured_page_has_no_captcha_marker():
     for name in ("eastmoney_zjlx_300408.html", "eastmoney_zjlx_full_300408.html"):
         fixture = Path(__file__).parent / "fixtures" / name
         assert parse_fund_flow_page(fixture.read_text(encoding="utf-8")).captcha_present is False
+
+
+
+def _page_with_today(amounts=None, quote=None):
+    from finmcp.datasource.fund_flow_page import FundFlowPage
+
+    page = FundFlowPage()
+    if amounts is None:
+        amounts = {
+            "主力净流入-净额": 3.062e9, "主力净流入-净占比": 0.32,
+            "超大单净流入-净额": 2.961e9, "超大单净流入-净占比": 0.31,
+            "大单净流入-净额": 1.0e8, "大单净流入-净占比": 0.01,
+            "中单净流入-净额": -5.833e9, "中单净流入-净占比": -0.62,
+            "小单净流入-净额": 2.771e9, "小单净流入-净占比": 0.29,
+        }
+    page.today = amounts
+    page.quote_text = quote if quote is not None else {"最新价": "3949.91", "涨跌幅": "0.97%"}
+    return page
+
+
+def test_today_record_builds_a_full_row():
+    page = _page_with_today()
+    record = page.today_record("2026-06-16")
+    assert record["日期"] == "2026-06-16"
+    assert record["收盘价"] == 3949.91
+    assert record["涨跌幅"] == 0.97
+    assert record["主力净流入-净额"] == 3.062e9
+    assert record["小单净流入-净占比"] == 0.29
+
+
+def test_today_record_returns_none_for_placeholders():
+    """今日栏十档全是 None（占位符）：不是"今日为零"，是没有数据。"""
+    page = _page_with_today(amounts={k: None for k in (
+        "主力净流入-净额", "主力净流入-净占比", "超大单净流入-净额",
+        "超大单净流入-净占比", "大单净流入-净额", "大单净流入-净占比",
+        "中单净流入-净额", "中单净流入-净占比", "小单净流入-净额",
+        "小单净流入-净占比")})
+    assert page.today_record("2026-06-16") is None
+
+
+def test_today_record_tolerates_a_missing_quote():
+    """页头行情缺了（指数没有价格区？）：收盘价留 None，五档照给——
+    brief/medium 的当日行只需要五档。"""
+    page = _page_with_today(quote={})
+    record = page.today_record("2026-06-16")
+    assert record["收盘价"] is None
+    assert record["主力净流入-净额"] == 3.062e9

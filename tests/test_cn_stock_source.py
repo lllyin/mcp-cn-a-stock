@@ -1336,7 +1336,7 @@ async def test_page_fallback_supplies_history_and_clears_the_failure(monkeypatch
     page = _captured_page()
     loaded = []
 
-    async def fake_page(symbol):
+    async def fake_page(symbol, today_date=None):
         loaded.append(symbol)
         return page
 
@@ -1376,7 +1376,7 @@ async def test_partial_fund_flow_still_goes_to_the_page_and_takes_its_history(mo
     page = _captured_page()
     loaded = []
 
-    async def fake_page(symbol):
+    async def fake_page(symbol, today_date=None):
         loaded.append(symbol)
         return page
 
@@ -1397,7 +1397,7 @@ async def test_partial_fund_flow_survives_a_failed_page_but_blocks_the_cache(mon
 
     datasource = _page_fallback_datasource(monkeypatch, _partial_fund_flow_result())
 
-    async def failing_page(symbol):
+    async def failing_page(symbol, today_date=None):
         raise RuntimeError("风控滑块")
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", failing_page)
@@ -1417,7 +1417,7 @@ async def test_partial_fund_flow_for_a_symbol_without_a_page_skips_the_browser(m
     datasource = _page_fallback_datasource(monkeypatch, _partial_fund_flow_result())
     loaded = []
 
-    async def fake_page(symbol):
+    async def fake_page(symbol, today_date=None):
         loaded.append(symbol)
         return _captured_page()
 
@@ -1439,7 +1439,7 @@ async def test_a_complete_fund_flow_never_pays_for_a_page(monkeypatch):
     datasource = _page_fallback_datasource(monkeypatch, complete)
     loaded = []
 
-    async def fake_page(symbol):
+    async def fake_page(symbol, today_date=None):
         loaded.append(symbol)
         return _captured_page()
 
@@ -2093,7 +2093,7 @@ async def test_gateway_runs_only_after_the_page_also_fails(monkeypatch):
         return source_module._fetch_failure("fund_flow")
 
     monkeypatch.setattr(datasource, "_fetch_fund_flow_sync", fake_fetch)
-    monkeypatch.setattr(datasource, "_fetch_fund_flow_from_page", lambda symbol: asyncio.sleep(0))
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_from_page", lambda symbol, today_date=None: asyncio.sleep(0))
     stored = []
     monkeypatch.setattr(source_module, "store_fund_flow", lambda s, v: stored.append(v))
 
@@ -2122,7 +2122,7 @@ async def test_gateway_is_not_paid_when_the_page_satisfies(monkeypatch):
         calls.append(order)
         return source_module._fetch_failure("fund_flow")
 
-    async def fake_page(symbol):
+    async def fake_page(symbol, today_date=None):
         return {"fund_flow": _fund_flow_frame_of(120), "is_market": False,
                 "provider": "page_fallback"}
 
@@ -2167,7 +2167,7 @@ async def test_a_stale_complete_frame_still_goes_to_the_page(monkeypatch, caplog
     )
     loaded = []
 
-    async def fake_page(symbol):
+    async def fake_page(symbol, today_date=None):
         loaded.append(symbol)
         return {"fund_flow": _fund_flow_frame_of(120), "is_market": False,
                 "provider": "page_fallback"}
@@ -2241,7 +2241,7 @@ async def test_the_merge_keeps_the_aligned_row_when_the_page_is_longer_but_stale
             "is_market": False, "complete": False, "provider": "eastmoney_delay"},
     )
 
-    async def fake_page(symbol):
+    async def fake_page(symbol, today_date=None):
         # 页面 120 行止于 06-13：更长但滞后
         return {"fund_flow": _fund_flow_frame_of(120, end=datetime.date(2026, 6, 13)),
                 "is_market": False, "provider": "page_fallback"}
@@ -2343,7 +2343,7 @@ def _empty_probe_datasource(monkeypatch):
         return {"fund_flow": _empty_probes_delay_frame(),
                 "is_market": False, "complete": False, "provider": "eastmoney_delay"}
 
-    async def fake_page(symbol):
+    async def fake_page(symbol, today_date=None):
         calls["page"] += 1
         return {"fund_flow": _empty_probes_delay_frame(rows=120),
                 "is_market": False, "provider": "page_fallback"}
@@ -2388,7 +2388,7 @@ async def test_a_refused_page_is_not_recorded_and_the_next_request_retries(monke
     calls = []
 
     # _fetch_fund_flow_from_page 内部把异常吃掉、返回 None——模拟"什么都没学到"
-    async def failing_page(symbol):
+    async def failing_page(symbol, today_date=None):
         calls.append(symbol)
         return None
 
@@ -2430,3 +2430,91 @@ def test_the_probe_store_is_bounded(monkeypatch):
     # 过期的项被查出来（TTL 很短时 fresh 判定为 False）
     monkeypatch.setattr(source_module, "FUND_FLOW_EMPTY_PROBE_SECONDS", 0.0)
     assert source_module._empty_probe_fresh("SZ000019", "2026-06-16", "page") is None
+
+
+# --- 页面今日栏兜底：历史表被拒、今日栏有值时，need=today 不落到付费网关 ----------
+
+
+def _today_only_page_stub():
+    """今日=True 历史=0 的页面：历史表被拒，但今日栏填得好好的（22-43 服务器实测形态）。"""
+    from finmcp.datasource.fund_flow_page import FundFlowPage
+
+    page = FundFlowPage()
+    page.today = {
+        "主力净流入-净额": 3.062e9, "主力净流入-净占比": 0.32,
+        "超大单净流入-净额": 2.961e9, "超大单净流入-净占比": 0.31,
+        "大单净流入-净额": 1.0e8, "大单净流入-净占比": 0.01,
+        "中单净流入-净额": -5.833e9, "中单净流入-净占比": -0.62,
+        "小单净流入-净额": 2.771e9, "小单净流入-净占比": 0.29,
+    }
+    page.quote_text = {"最新价": "3949.91", "涨跌幅": "0.97%"}
+    return page
+
+
+def _today_block_orchestration_stubs(monkeypatch, datasource):
+    """同步链全挂、K 线止于 2026-06-16（且把"现在"钉在这一天）。"""
+    _fund_flow_orchestration_stubs(monkeypatch, datasource)
+    monkeypatch.setattr(
+        source_module.fund_flow_source, "configured_order",
+        lambda: ("eastmoney", "eastmoney_delay", "fund_flow_page", "eastmoney_gateway"),
+    )
+    monkeypatch.setattr(
+        source_module.market_session, "now_shanghai",
+        lambda now=None: datetime.datetime(2026, 6, 16, 16, 30),
+    )
+    calls = {"gateway": 0}
+
+    def fake_sync(code, symbol, need=None, order=None):
+        if order == ("eastmoney_gateway",):
+            calls["gateway"] += 1
+        return source_module._fetch_failure("fund_flow")
+
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_sync", fake_sync)
+    monkeypatch.setattr(source_module, "store_fund_flow", lambda s, v: None)
+    source_module._fund_flow_empty_probes.clear()
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_today_block_saves_a_today_only_query_from_the_gateway(monkeypatch):
+    """历史表被拒、今日栏有值：brief/medium 拿今日栏合成的一行，一次网关都不调。"""
+    datasource = CNStockDataSource()
+    calls = _today_block_orchestration_stubs(monkeypatch, datasource)
+    page = _today_only_page_stub()
+
+    async def fake_page(symbol, today_date=None):
+        return page
+
+    from finmcp.datasource import realtime_ff as realtime_ff_module
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+
+    result = await datasource.fetch_stock_data_with_requirements(
+        "SH600519", "2024-01-01", "2026-06-16",
+        requirements=FetchRequirements(fund_flow_page=True, fund_flow_history_table=False),
+    )
+
+    assert calls["gateway"] == 0                      # 今日栏接住了，没付费
+    assert result.fund_main_amount[-1] == pytest.approx(3.062e9)
+    assert result.fetch_failures == []                # 当日五档齐了，报告可缓存
+
+
+@pytest.mark.asyncio
+async def test_full_still_goes_to_the_gateway_when_only_the_today_block_is_there(monkeypatch):
+    """full 要的是历史表：今日栏满足不了它，网关照常走。"""
+    datasource = CNStockDataSource()
+    calls = _today_block_orchestration_stubs(monkeypatch, datasource)
+
+    from finmcp.datasource import realtime_ff as realtime_ff_module
+
+    async def fake_page(symbol, today_date=None):
+        return _today_only_page_stub()
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+
+    await datasource.fetch_stock_data_with_requirements(
+        "SH600519", "2024-01-01", "2026-06-16",
+        requirements=FetchRequirements(fund_flow_page=True, fund_flow_rows=60),
+    )
+
+    assert calls["gateway"] == 1   # 今日栏不是历史需求的答案，照付

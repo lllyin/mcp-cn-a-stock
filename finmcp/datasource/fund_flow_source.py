@@ -154,6 +154,7 @@ PROVIDER_ENDPOINTS = {
     "eastmoney_delay": "push2delay fflow/daykline",
     "eastmoney_gateway": "push2his fflow/daykline(付费网关)",
     "page_fallback": "zjlx 页面 table_ls",
+    "page_fallback_today": "zjlx 页面今日一栏",
 }
 
 

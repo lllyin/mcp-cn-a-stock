@@ -1273,12 +1273,18 @@ class CNStockDataSource(DataSource):
             "S_R": to_float_array("小单净流入-净占比", 0.01),
         }
     
-    async def _fetch_fund_flow_from_page(self, symbol: str) -> Optional[Dict]:
+    async def _fetch_fund_flow_from_page(
+        self, symbol: str, today_date=None
+    ) -> Optional[Dict]:
         """接口不可用时，从东财资金流向页面兜底取资金流向。
 
         页面走浏览器，不经过 requests，所以不消耗网关积分；代价是一次 Chromium
         页面加载。返回结构与 _fetch_fund_flow_sync 完全相同，下游的转换和渲染
         一行不用改——今日数值取的是历史表最后一行，与主源同一条路径。
+
+        today_date：历史表被拒时允许用页面今日栏合成一行（只给这一天）。
+        今日栏和历史表走不同端点、风控待遇不同——历史被拒、今日有值是实测
+        常态。空着（历史/钉日期需求）就走原路，不合成。
         """
         if not FUND_FLOW_PAGE_ENABLED:
             return None
@@ -1347,8 +1353,21 @@ class CNStockDataSource(DataSource):
 
         records = page.history_records()
         if not records:
-            logger.warning("资金流向页面兜底无历史数据 %s", symbol)
-            return None
+            # 历史表被拒，但今日栏也许有值——它们是两条不同的端点。只要"今天"
+            # 的查询拿今日栏合成一行，本来这次要落到付费网关。
+            record = page.today_record(today_date) if today_date is not None else None
+            if record is None:
+                logger.warning("资金流向页面兜底无历史数据 %s", symbol)
+                return None
+            import pandas as pd
+
+            frame = pd.DataFrame([record])
+            logger.info(
+                "资金流向页面今日栏兜底成功 %s：历史表被拒，今日栏有值 cost=%.3fs",
+                symbol, time.perf_counter() - started_at,
+            )
+            return {"fund_flow": frame, "is_market": False,
+                    "provider": "page_fallback_today"}
 
         import pandas as pd
 
@@ -1572,7 +1591,22 @@ class CNStockDataSource(DataSource):
                     FUND_FLOW_EMPTY_PROBE_SECONDS,
                 )
             else:
-                page_result = await self._fetch_fund_flow_from_page(canonical_symbol)
+                page_result = await self._fetch_fund_flow_from_page(
+                    canonical_symbol,
+                    # 只要"今天"且数据日期就是今天：允许页面用今日栏合成一行。
+                    # 历史表被拒时这是 brief/medium 在网关前的最后一条免费路。
+                    # 周末/盘前数据日期是上个交易日，今日栏对应哪天无法验证，不合成。
+                    today_date=(
+                        kline_day
+                        if (
+                            kline_day is not None
+                            and fund_flow_need.history_rows == 0
+                            and not fund_flow_need.pinned_date
+                            and kline_day == market_session.now_shanghai().date()
+                        )
+                        else None
+                    ),
+                )
                 merged = _merge_fund_flow(fetched.get("fund_flow"), page_result)
                 if merged is not None:
                     # 并集合并而不是"行数多的赢"：页面给 120 行止于昨天、delay 给当天

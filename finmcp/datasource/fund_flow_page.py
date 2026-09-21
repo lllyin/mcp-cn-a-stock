@@ -203,6 +203,25 @@ class FundFlowPage:
     def history_records(self) -> list:
         return [row.as_record() for row in self.history]
 
+    def today_record(self, date) -> Optional[dict]:
+        """用今日一栏合成一行 AkShare 列序的记录；没有真值就返回 None。
+
+        今日栏和历史表走的是**不同端点**，风控待遇不同：历史表被拒时今日栏
+        常有值（实测 ``今日=True 历史=0``）。brief/medium 只要"今天"时，这一行
+        就是免费路径的最后一条——本来那次请求要落到付费网关。
+
+        日期由调用方给定而不是猜：只在报告的数据日期等于墙钟今天时用——那时
+        今日栏对应哪一天是确定的；周末/盘前靠它判不出来就不合成。
+        """
+        if not self.has_today:
+            return None
+        record = {"日期": date}
+        record["收盘价"] = parse_price(self.quote_text.get("最新价", ""))
+        record["涨跌幅"] = parse_percent(self.quote_text.get("涨跌幅", ""))
+        for column in TODAY_FIELDS.values():
+            record[column] = (self.today or {}).get(column)
+        return record
+
 
 def parse_amount(text: str) -> Optional[float]:
     """把 ``1.59亿`` / ``-4725.87万`` 解析成元。占位符返回 None。
