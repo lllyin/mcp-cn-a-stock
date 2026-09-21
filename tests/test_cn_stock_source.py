@@ -1276,12 +1276,7 @@ def test_simple_kline_returns_none_for_a_quiet_window(monkeypatch):
 
 
 def _page_fallback_datasource(monkeypatch, fund_flow_result):
-    """装好一个除资金流向外都成功的数据源。
-
-    顺带复位页面兜底熔断器：它是模块级状态，不复位的话用例之间会互相污染，
-    测试顺序一变结果就变。
-    """
-    source_module._FUND_FLOW_PAGE_BREAKER.reset()
+    """装好一个除资金流向外都成功的数据源。"""
     datasource = CNStockDataSource()
 
     def fake_kline(code, start_date, end_date, adjust, symbol, include_unadjusted, *args):
@@ -1559,11 +1554,11 @@ async def test_page_fallback_ignores_an_empty_history(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_page_fallback_stops_after_repeated_futile_attempts(monkeypatch):
-    """连续徒劳后必须停手。
+async def test_page_fallback_is_attempted_on_every_request(monkeypatch):
+    """页面兜底不熔断：每次主源失败都必须真试一次页面。
 
-    页面的历史表由主源同一个端点填充，端点拒绝时这条路必然徒劳，而每次徒劳都
-    要付一次 Chromium 页面加载：2026-09-03 实测一次把请求从 6.7s 拖到 20.1s。
+    它是付费网关之前的最后一级免费途径。熔断它省的是一次可能徒劳的页面加载，
+    代价是请求直接落到网关付积分——而页面被拒是逐次随机的，下一次仍可能成功。
     """
     from finmcp.datasource import realtime_ff as realtime_ff_module
     from finmcp.datasource.fund_flow_page import FundFlowPageError
@@ -1579,26 +1574,20 @@ async def test_page_fallback_stops_after_repeated_futile_attempts(monkeypatch):
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", futile)
 
-    threshold = source_module.FUND_FLOW_PAGE_OPEN_AFTER_FAILURES
-    for _ in range(threshold + 3):
+    rounds = 7
+    for _ in range(rounds):
         result = await datasource.fetch_stock_data(
             "SZ300408", "2024-01-01", "2026-09-03"
         )
         assert result.fetch_failures == ["fund_flow"]
 
-    # 熔断打开后不再加载页面，冷却期内最多只放一次探测。
-    assert len(attempts) == threshold
-    assert source_module._FUND_FLOW_PAGE_BREAKER.is_open
+    # 没有任何熔断：每一次请求都真的加载了页面。
+    assert len(attempts) == rounds
 
 
 @pytest.mark.asyncio
 async def test_page_fallback_ignores_symbols_without_a_page(monkeypatch):
-    """没有资金流向页面的标的不能拖垮整层兜底。
-
-    科创 50 这类指数就没有 zjlx 页面，fetch_history_page 抛
-    FundFlowPageUnavailable。把它算成一次源失败的话，查几次就到了阈值，兜底对
-    所有别的标的一起关闭一整个冷却期。
-    """
+    """没有资金流向页面的标的干净地记一次失败，不影响别的标的。"""
     from finmcp.datasource import realtime_ff as realtime_ff_module
 
     datasource = _page_fallback_datasource(
@@ -1610,31 +1599,40 @@ async def test_page_fallback_ignores_symbols_without_a_page(monkeypatch):
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", unavailable)
 
-    for _ in range(source_module.FUND_FLOW_PAGE_OPEN_AFTER_FAILURES + 2):
-        await datasource.fetch_stock_data("SH000688", "2024-01-01", "2026-09-03")
+    result = await datasource.fetch_stock_data("SH000688", "2024-01-01", "2026-09-03")
 
-    assert not source_module._FUND_FLOW_PAGE_BREAKER.is_open
+    assert result.fetch_failures == ["fund_flow"]
 
 
 @pytest.mark.asyncio
-async def test_page_fallback_breaker_closes_after_a_success(monkeypatch):
-    """端点恢复后要能自动回到兜底可用状态。"""
+async def test_page_fallback_success_after_failures(monkeypatch):
+    """前几次失败不挡后面的成功：同一标的先败后成，成功那次必须拿到数据。"""
     from finmcp.datasource import realtime_ff as realtime_ff_module
+    from finmcp.datasource.fund_flow_page import FundFlowPageError
 
     datasource = _page_fallback_datasource(
         monkeypatch, source_module._fetch_failure("fund_flow")
     )
     page = _captured_page()
+    attempts = []
 
-    async def working(symbol):
+    async def flaky(symbol):
+        attempts.append(symbol)
+        if len(attempts) <= 3:
+            raise FundFlowPageError("页面既无今日数据也无历史表")
         return page
 
-    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", working)
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", flaky)
+
+    for _ in range(3):
+        result = await datasource.fetch_stock_data(
+            "SZ300408", "2024-01-01", "2026-09-03"
+        )
+        assert result.fetch_failures == ["fund_flow"]
 
     result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
-
     assert result.fetch_failures == []
-    assert not source_module._FUND_FLOW_PAGE_BREAKER.is_open
+    assert len(attempts) == 4
 
 
 # --- 北交所代码归属 ----------------------------------------------------------
@@ -1752,9 +1750,11 @@ class TestSourceBreakerWindow:
         breaker.record(success=False)
         assert not breaker.is_open
 
-    def test_the_fund_flow_page_breaker_uses_the_window(self):
-        assert source_module._FUND_FLOW_PAGE_BREAKER.window > 0
-        # K 线那个仍是连续口径：它的上游是"要么全通要么全封"。
+    def test_the_fund_flow_page_fallback_has_no_breaker(self):
+        # 页面兜底是付费网关前的最后一级免费途径，不能有熔断器——它的存在本身
+        # 就是这次要钉住的行为（历史编排层曾经有一个，2026-09-21 移除）。
+        assert not hasattr(source_module, "_FUND_FLOW_PAGE_BREAKER")
+        # K 线那个仍在，且是连续口径：它的上游是"要么全通要么全封"。
         assert source_module._KLINE_BREAKER.window == 0
 
 

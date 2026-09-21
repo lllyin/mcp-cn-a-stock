@@ -370,3 +370,47 @@ async def test_repeated_refusals_pause_the_browser_layer(monkeypatch, shared_loa
         await realtime_ff._load_page_shared("601138", require_today=True)
 
     assert attempts == ["600026", "600938"]      # 熔断期内一次页面都不加载
+
+
+@pytest.mark.asyncio
+async def test_the_open_breaker_never_blocks_the_history_fallback(monkeypatch, shared_loader):
+    """历史兜底是付费网关前的最后一级免费途径：浏览器熔断器打开也必须真加载。"""
+    full, _ = _pages()
+
+    async def working(symbol, context, *, loads=1, satisfies=None, stats=None):
+        stats["loads"] = 1
+        stats["refused"] = set()
+        return full
+
+    monkeypatch.setattr(realtime_ff, "load_fund_flow_page", working)
+    # 直接把熔断器打到打开状态，不走实时路径的失败计数。
+    monkeypatch.setattr(realtime_ff._PAGE_BREAKER, "threshold", 1)
+    monkeypatch.setattr(realtime_ff._PAGE_BREAKER, "window", 60.0)
+    realtime_ff._PAGE_BREAKER.record(success=False)
+    assert realtime_ff._PAGE_BREAKER.is_open
+
+    page = await realtime_ff._load_page_shared("300408", require_history=True)
+
+    assert len(page.history) == 121
+    # 历史路径也不喂熔断器：一次成功不该把它"救好"……
+    assert realtime_ff._PAGE_BREAKER.is_open
+
+
+@pytest.mark.asyncio
+async def test_history_failures_do_not_feed_the_browser_breaker(monkeypatch, shared_loader):
+    """历史路径的被拒不计进浏览器熔断器：它的成败与"实时要不要停"无关。"""
+    async def always_refused(symbol, context, *, loads=1, satisfies=None, stats=None):
+        stats["loads"] = 1
+        stats["refused"] = {"today", "history"}
+        raise realtime_ff._PageRefusal("拒", captcha=True)
+
+    monkeypatch.setattr(realtime_ff, "load_fund_flow_page", always_refused)
+    monkeypatch.setattr(realtime_ff, "FUND_FLOW_PAGE_MAX_LOADS", 1)
+    monkeypatch.setattr(realtime_ff._PAGE_BREAKER, "threshold", 2)
+    monkeypatch.setattr(realtime_ff._PAGE_BREAKER, "window", 60.0)
+
+    for symbol in ("600026", "600938", "601138"):
+        with pytest.raises(realtime_ff.FundFlowPageRefused):
+            await realtime_ff._load_page_shared(symbol, require_history=True)
+
+    assert realtime_ff._PAGE_BREAKER.is_open is False

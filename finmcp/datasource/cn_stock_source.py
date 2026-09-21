@@ -26,10 +26,7 @@ from ..config import (
     FINANCE_CACHE_MAX_ENTRIES,
     FINANCE_CACHE_TTL_SECONDS,
     FUND_FLOW_PAGE_CONCURRENCY,
-    FUND_FLOW_PAGE_COOLDOWN_SECONDS,
     FUND_FLOW_PAGE_ENABLED,
-    FUND_FLOW_PAGE_FAILURE_WINDOW_SECONDS,
-    FUND_FLOW_PAGE_OPEN_AFTER_FAILURES,
     FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS,
     CACHE_FUND_FLOW_MAX_ROWS,
     FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS,
@@ -80,21 +77,10 @@ _KLINE_BREAKER = SourceBreaker(
     degraded=impersonated_hosts_degraded,
 )
 
-# The page fallback does get one, for the opposite reason: it is expensive
-# rather than cheap. The page fills its table from the same endpoint the HTTP
-# tier uses, so once that endpoint refuses, every attempt is futile and costs a
-# Chromium page load. Measured on 2026-09-03: one futile attempt turned a 6.7s
-# request into 20.1s.
-#
-# 用窗口口径而不是连续口径：实测被拒是逐次随机的（单次被拒率 12.5%，而同一批
-# 标的可获取 94%），连续计数在这种上游下两头都不准——两次噪声就能凑满阈值把整层
-# 停掉，而真的持续半通时又总有一次成功把它清零。
-_FUND_FLOW_PAGE_BREAKER = SourceBreaker(
-    "fund_flow_page",
-    FUND_FLOW_PAGE_OPEN_AFTER_FAILURES,
-    FUND_FLOW_PAGE_COOLDOWN_SECONDS,
-    window=FUND_FLOW_PAGE_FAILURE_WINDOW_SECONDS,
-)
+# The page fallback deliberately gets none: it is the last free tier before the
+# paid gateway. A futile page load costs seconds; skipping it costs credits.
+# The browser layer keeps its own breaker for the realtime path (realtime_ff
+# ._PAGE_BREAKER) — that one exists to stop captcha storms, not to save money.
 
 
 # 兜底 K 线的帧归一逻辑搬到了 kline_frame，好让 provider 直接用而不产生循环依赖。
@@ -1127,12 +1113,10 @@ class CNStockDataSource(DataSource):
             logger.debug("资金流向页面兜底跳过 %s: 该标的没有资金流向页面", symbol)
             return None
 
-        if _FUND_FLOW_PAGE_BREAKER.should_skip():
-            # 页面和主源取的是同一个端点，主源被拒时页面的表也填不上。不熔断的
-            # 话每次请求都要白付一次页面加载，把"缺一段"变成"慢三倍还是缺一段"。
-            logger.debug("资金流向页面兜底跳过 %s: 熔断器打开", symbol)
-            return None
-
+        # 这一层 deliberately 没有熔断器：它是付费网关之前的最后一级免费途径。
+        # 熔断它省的是一次可能徒劳的页面加载（秒级），代价是请求直接落到网关
+        # （积分）——页面还有三成逐次成功率，而跳过它的成功率是零。页面也没
+        # 拿到才轮到网关，见 FUND_FLOW_PROVIDERS 的链尾。
         request_id, _, _ = log_context()
         wait_budget = _fund_flow_page_wait_budget(request_id)
         slots = _get_fund_flow_page_slots()
@@ -1161,15 +1145,13 @@ class CNStockDataSource(DataSource):
             page = await realtime_ff.fetch_history_page(symbol)
         except realtime_ff.FundFlowPageUnavailable:
             # 兜底的兜底：上面已经用 get_fund_flow_url 提前拦过一次，走到这里说明
-            # 那两处的判断分叉了。仍然不计进熔断器——这跟数据源的健康状况无关，
-            # 计进去的话查几次这种标的就会把兜底整层关掉一整个冷却期。
+            # 那两处的判断分叉了。
             logger.debug("资金流向页面兜底跳过 %s: 该标的没有资金流向页面", symbol)
             return None
         except realtime_ff.FundFlowPageRefused as e:
-            # 与普通失败用同一个冷却：实测被拒是逐次随机的，8 轮里有 3 轮当场重试
-            # 就能成功，长时间退避只会把本可以拿到的数据挡在外面。
+            # 被拒是逐次随机的，8 轮里有 3 轮当场重试就能成功——所以这一层不熔断，
+            # 下一个请求照样来试。
             logger.warning("资金流向页面接口被拒 %s: %s", symbol, e)
-            _FUND_FLOW_PAGE_BREAKER.record(success=False)
             return None
         except Exception as e:
             # 带上异常类型：FundFlowPageUnavailable 这类异常的 str() 就是标的本身，
@@ -1177,7 +1159,6 @@ class CNStockDataSource(DataSource):
             logger.warning(
                 "资金流向页面兜底失败 %s: %s: %s", symbol, type(e).__name__, e
             )
-            _FUND_FLOW_PAGE_BREAKER.record(success=False)
             return None
         finally:
             slots.release()
@@ -1185,9 +1166,7 @@ class CNStockDataSource(DataSource):
         records = page.history_records()
         if not records:
             logger.warning("资金流向页面兜底无历史数据 %s", symbol)
-            _FUND_FLOW_PAGE_BREAKER.record(success=False)
             return None
-        _FUND_FLOW_PAGE_BREAKER.record(success=True)
 
         import pandas as pd
 

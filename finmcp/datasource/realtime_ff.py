@@ -85,10 +85,11 @@ _LAUNCH_ARGS = [
 #: 自己重发的；第一次断连就判被拒等于把这些数据扔掉。6 秒盖住实测最长的 3.7 秒。
 REFUSAL_GRACE_SECONDS = 6.0
 
-#: 浏览器层自己的熔断器。原先只有历史兜底那条路有熔断，实时那条路没有：滑块一出现，
-#: 实时调用方照样一个标的接一个标的地连发（09-07 上午 15 只标的 95 次加载），把偶发
-#: 的拒绝喂成整批的滑块。阈值、窗口、冷却与历史兜底共用同一组配置。只有"要今日却被拒"
-#: 才计失败——daykline 在 main 身份下也有一半被拒，历史缺失是常态，不能让它把实时停掉。
+#: 浏览器层自己的熔断器，只拦实时（require_today）那条路：滑块一出现，实时调用方
+#: 照样一个标的接一个标的地连发（09-07 上午 15 只标的 95 次加载），把偶发的拒绝喂成
+#: 整批的滑块。历史兜底（require_history）不受它管也不喂它——那是付费网关之前的
+#: 最后一级免费途径，必须每次都真试。只有"要今日却被拒"才计失败——daykline 在
+#: main 身份下也有一半被拒，历史缺失是常态，不能让它把实时停掉。
 _PAGE_BREAKER = SourceBreaker(
     "fund_flow_browser",
     FUND_FLOW_PAGE_OPEN_AFTER_FAILURES,
@@ -1180,7 +1181,11 @@ async def _load_page_shared(
     # 整段重试盖在一次借用里：中途被空闲回收拆掉浏览器，会让 tab 和 CDP 覆盖一起
     # 失效，而被拒之后的重试正是最需要稳定的时候。
     async with browser_lease() as context:
-        if _PAGE_BREAKER.should_skip():
+        # 熔断器只拦实时那条路（require_today）：它防的是滑块被连发喂大。历史兜底
+        # 是付费网关之前的最后一级免费途径，必须每次都真加载——它被熔断的话，请求
+        # 直接落到网关付积分，而页面还有逐次成功的可能。历史路径也不喂这个熔断器：
+        # 它的成败与"实时要不要停"无关。
+        if require_today and _PAGE_BREAKER.should_skip():
             # 浏览器层刚被连续拒过：这一刻再加载只会把滑块续下去，直接告诉调用方没有。
             raise FundFlowPageRefused(f"{symbol} 浏览器层熔断中，暂不加载页面")
         budget = FUND_FLOW_PAGE_MAX_LOADS
@@ -1208,11 +1213,13 @@ async def _load_page_shared(
                         budget,
                     )
                     continue
-                _PAGE_BREAKER.record(success=False)
+                if require_today:
+                    _PAGE_BREAKER.record(success=False)
                 raise
             used += stats.get("loads", loads)
             if predicate(page):
-                _PAGE_BREAKER.record(success=True)
+                if require_today:
+                    _PAGE_BREAKER.record(success=True)
                 return page
             refused = stats.get("refused") or set()
             if refused:

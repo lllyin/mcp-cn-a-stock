@@ -341,9 +341,9 @@ M 取 `fund_flow_limit` 与同一份报告里 K 线交易日数的较小值—�
 | `FUND_FLOW_PAGE_REUSE_SECONDS` | 同一标的页面解析结果的复用窗口，避免一次请求内重复加载同一页面 | 秒，`0` 关闭复用（默认 `30`） |
 | `FUND_FLOW_PAGE_MAX_LOADS` | 单次请求允许的页面加载次数，只在没拿到数据时才会用掉。被拒直接换 tab，不 reload；别调大，被拒后每多开一个 tab 都消耗同一出口的频率额度，会把偶发的拒绝放大成整批滑块，合适的值用 `scripts/probe_tuning.py` 量 | 正整数（默认 `2`） |
 | `FUND_FLOW_PAGE_RETRY_DELAY_MS` | 重试刷新之前的随机等待区间，只作用在重试路径上 | `下界,上界` 毫秒<br>单个数字为固定值<br>`0` 关闭<br>（默认 `250,350`） |
-| `FUND_FLOW_PAGE_OPEN_AFTER_FAILURES` | 多少次徒劳加载后暂停整层兜底 | 正整数（默认 `4`） |
+| `FUND_FLOW_PAGE_OPEN_AFTER_FAILURES` | 实时页面加载多少次被拒后暂停实时路径（历史兜底不熔断，它是付费网关前的最后一级免费途径） | 正整数（默认 `4`） |
 | `FUND_FLOW_PAGE_FAILURE_WINDOW_SECONDS` | 上一项按这个滑动窗口计数 | 秒，`0` 退回连续计数（默认 `60`） |
-| `FUND_FLOW_PAGE_COOLDOWN_SECONDS` | 暂停时长 | 秒（默认 `60`） |
+| `FUND_FLOW_PAGE_COOLDOWN_SECONDS` | 实时路径的暂停时长 | 秒（默认 `60`） |
 
 ### 上游源熔断
 
