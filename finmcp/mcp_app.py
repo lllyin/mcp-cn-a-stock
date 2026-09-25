@@ -1028,6 +1028,16 @@ async def tech(
   return await fetch_technical_reports(symbol, days, fields, include_derived, date, who)
 
 
+def _kline_price_decimals(symbol: str) -> int:
+  """K 线价格按标的最小变动价位渲染：ETF/基金 0.001 元，个股与指数两位小数。
+
+  上游对 ETF 给的就是三位小数。截成两位对一元上下的品种是 0.5% 以上的价差，两端都截的
+  单日涨跌能差出一个百分点——和下游按 ±0.5% 划档的统计同量级。个股最小变动 0.01，
+  两位小数不丢信息，输出保持原样。品种判据与报告契约共用 ``report_contract.classify``。
+  """
+  return 3 if report_contract.classify(symbol) == report_contract.ETF else 2
+
+
 @mcp_app.tool()
 async def kline_daily(
   symbol: str,
@@ -1095,18 +1105,19 @@ async def kline_daily(
   
   data = result["data"][0]
   adjust_name = {"qfq": "前复权", "hfq": "后复权", "none": "不复权"}.get(adjust, adjust)
-  
+  decimals = _kline_price_decimals(symbol)
+
   buf = StringIO()
   print(f"# {symbol} {date} 日K线数据 ({adjust_name})", file=buf)
   print("", file=buf)
-  print(f"- 开盘价: {data['开盘']:.2f}", file=buf)
-  print(f"- 收盘价: {data['收盘']:.2f}", file=buf)
-  print(f"- 最高价: {data['最高']:.2f}", file=buf)
-  print(f"- 最低价: {data['最低']:.2f}", file=buf)
+  print(f"- 开盘价: {data['开盘']:.{decimals}f}", file=buf)
+  print(f"- 收盘价: {data['收盘']:.{decimals}f}", file=buf)
+  print(f"- 最高价: {data['最高']:.{decimals}f}", file=buf)
+  print(f"- 最低价: {data['最低']:.{decimals}f}", file=buf)
   print(f"- 成交量: {data['成交量']:,}", file=buf)
   print(f"- 成交额: {data['成交额']:,.2f}", file=buf)
   print(f"- 涨跌幅: {data['涨跌幅']:.2f}%", file=buf)
-  print(f"- 涨跌额: {data['涨跌额']:.2f}", file=buf)
+  print(f"- 涨跌额: {data['涨跌额']:.{decimals}f}", file=buf)
   print(f"- 振幅: {data['振幅']:.2f}%", file=buf)
   print(f"- 换手率: {data['换手率']:.2f}%", file=buf)
 
@@ -1207,10 +1218,11 @@ async def kline_range(
   print("| --- | ---: | ---: | ---: | ---: | ---: | ---: |", file=buf)
   
   # 表格内容
+  decimals = _kline_price_decimals(symbol)
   for item in data_list:
     print(
-      f"| {item['日期']} | {item['开盘']:.2f} | {item['收盘']:.2f} | "
-      f"{item['最高']:.2f} | {item['最低']:.2f} | {item['成交量']:,} | "
+      f"| {item['日期']} | {item['开盘']:.{decimals}f} | {item['收盘']:.{decimals}f} | "
+      f"{item['最高']:.{decimals}f} | {item['最低']:.{decimals}f} | {item['成交量']:,} | "
       f"{item['涨跌幅']:.2f}% |",
       file=buf
     )
