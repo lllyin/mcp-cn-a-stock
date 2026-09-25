@@ -45,6 +45,25 @@ async def test_trading_data_includes_open_price(sample_stock_data_dict):
     assert expected in fp.getvalue()
 
 
+@pytest.mark.asyncio
+async def test_trading_data_hands_its_symbol_to_the_history_table(sample_stock_data_dict):
+    """raw_data 没带 SYMBOL 时，历史资金流向表按 build_trading_data 收到的代码判精度。"""
+    data = dict(sample_stock_data_dict)
+    data["IS_HISTORICAL_QUERY"] = True
+    data["_DS_FUND_FLOW"] = {
+        "DATE": data["DATE"][-2:].copy(),
+        "CLOSE": np.array([1.051, 1.023], dtype=np.float64),
+        "PCT_CHG": np.zeros(2, dtype=np.float64),
+    }
+    fp = StringIO()
+
+    await build_trading_data(
+        fp, "SH512480", data, include_historical_fund_flow=True, historical_fund_flow_limit=2
+    )
+
+    assert "| 1.023 |" in fp.getvalue()
+
+
 class TestIsStock:
     """测试 is_stock 函数"""
 
@@ -346,6 +365,87 @@ class TestHistoricalFundFlow:
         output = self._render(up_to_cutoff[:2], kline, limit=60, query_date="2026-05-31")
 
         assert "历史资金流向只取到 2/8 个交易日，其余 6 天上游没有返回" in output
+
+    def _two_closes(self, closes: list) -> dict:
+        return {
+            "DATE": np.array(
+                [self._date_ns("2026-06-01"), self._date_ns("2026-06-02")], dtype=np.int64
+            ),
+            "CLOSE": np.array(closes, dtype=np.float64),
+            "PCT_CHG": np.zeros(2, dtype=np.float64),
+        }
+
+    @pytest.mark.parametrize("symbol,closes,cells", [
+        # 东财资金流接口对 ETF 给的收盘价就是三位小数
+        ("SH512480", [1.051, 1.023], ["| 2026-06-01 | 1.051 |", "| 2026-06-02 | 1.023 |"]),
+        ("SH600362", [15.53, 15.49], ["| 2026-06-01 | 15.53 |", "| 2026-06-02 | 15.49 |"]),
+        ("SH000001", [3345.12, 3351.9], ["| 2026-06-01 | 3345.12 |", "| 2026-06-02 | 3351.90 |"]),
+    ])
+    def test_close_follows_instrument_tick(self, symbol, closes, cells):
+        """收盘价列和 K 线工具同一个判据：ETF 三位，个股与指数两位。"""
+        data = {"SYMBOL": symbol, "_DS_FUND_FLOW": self._two_closes(closes)}
+        fp = StringIO()
+
+        build_historical_fund_flow_data(fp, data)
+
+        for cell in cells:
+            assert cell in fp.getvalue()
+
+    def test_close_precision_falls_back_to_the_passed_symbol(self):
+        """raw_data 里没有纠偏后的 SYMBOL 时，按调用方传进来的代码判。"""
+        data = {"_DS_FUND_FLOW": self._two_closes([1.051, 1.023])}
+        fp = StringIO()
+
+        build_historical_fund_flow_data(fp, data, symbol="SH512480")
+
+        assert "| 2026-06-01 | 1.051 |" in fp.getvalue()
+
+
+class TestTechnicalTablePrecision:
+    """技术指标表：MACD、布林带跟价格同一个位数，KDJ、RSI 固定两位。"""
+
+    @staticmethod
+    def _data(symbol: str, close) -> dict:
+        start = datetime.datetime(2026, 6, 1)
+        close = np.asarray(close, dtype=np.float64)
+        return {
+            "SYMBOL": symbol,
+            "DATE": np.array(
+                [int((start + datetime.timedelta(days=i)).timestamp() * 1e9) for i in range(len(close))],
+                dtype=np.int64,
+            ),
+            "CLOSE": close,
+            "HIGH": close * 1.01,
+            "LOW": close * 0.99,
+        }
+
+    @staticmethod
+    def _latest(data: dict) -> tuple:
+        """最新一行日期之后的 11 个单元格，以及同一天的指标原值。"""
+        fp = StringIO()
+        research.build_technical_data(fp, data["SYMBOL"], data)
+        row = next(line for line in fp.getvalue().splitlines() if line.startswith("| 2026-"))
+        cells = [cell.strip() for cell in row.strip().strip("|").split("|")][1:]
+        return cells, research.get_technical_indicators(data, days=30, include_derived=False)[0]
+
+    def test_etf_price_scale_columns_keep_third_decimal(self):
+        # 一元上下的 ETF：MACD 在 ±0.05 以内，两位小数下 DIF、DEA 常印成同一个数
+        data = self._data("SZ159995", np.round(1.0 + 0.05 * np.sin(np.arange(60) / 5), 3))
+
+        cells, raw = self._latest(data)
+
+        assert cells[3:5] == [f"{raw['macd']['dif']:.3f}", f"{raw['macd']['dea']:.3f}"]
+        assert cells[8:11] == [f"{raw['bbands'][k]:.3f}" for k in ("upper", "middle", "lower")]
+        assert cells[0] == f"{raw['kdj']['k']:.2f}"
+        assert cells[5] == f"{raw['rsi']['rsi6']:.2f}"
+
+    def test_stock_columns_stay_two_decimals(self):
+        data = self._data("SH600362", np.round(10 + 0.5 * np.sin(np.arange(60) / 5), 2))
+
+        cells, raw = self._latest(data)
+
+        assert cells[3:5] == [f"{raw['macd']['dif']:.2f}", f"{raw['macd']['dea']:.2f}"]
+        assert cells[8:11] == [f"{raw['bbands'][k]:.2f}" for k in ("upper", "middle", "lower")]
 
 
 class TestRealtimeFundFlowTarget:

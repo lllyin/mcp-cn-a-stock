@@ -55,6 +55,19 @@ def classify(symbol: str) -> str:
     return ETF if (symbol or "")[2:].startswith(("1", "5")) else STOCK
 
 
+def price_decimals(symbol: str) -> int:
+    """价格按标的最小变动价位渲染的小数位：ETF/基金 0.001 元，个股与指数两位小数。
+
+    上游对 ETF 给的就是三位小数。截成两位对一元上下的品种是 0.5% 以上的价差，两端都截的
+    单日涨跌能差出一个百分点——和下游按 ±0.5% 划档的统计同量级。A 股个股最小变动 0.01，
+    两位小数不丢信息，输出保持原样。
+
+    资金流历史表的收盘价、价格量纲的技术指标（MACD、布林带）跟着同一个位数走：一元上下的
+    ETF 的 MACD 在 ±0.05 以内，两位小数下 DIF 和 DEA 常印成同一个数，看不出谁在上。
+    """
+    return 3 if classify(symbol) == ETF else 2
+
+
 @dataclass(frozen=True)
 class Dimension:
     name: str

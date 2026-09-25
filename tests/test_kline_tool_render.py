@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from finmcp import report_contract
+
 
 app_module = importlib.import_module("finmcp.mcp_app")
 
@@ -40,7 +42,7 @@ async def _run(tool_name, arguments):
     ("SH000001", 2), ("SZ399006", 2),
 ])
 def test_price_decimals_follow_instrument_tick(symbol, decimals):
-    assert app_module._kline_price_decimals(symbol) == decimals
+    assert report_contract.price_decimals(symbol) == decimals
 
 
 @pytest.mark.asyncio

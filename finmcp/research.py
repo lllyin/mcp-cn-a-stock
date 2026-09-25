@@ -19,7 +19,7 @@ from .datafeed import load_data_msd
 from .config import ALL_INDICES
 from .datasource.base import FetchRequirements
 from .datasource import finance_source, trading_calendar
-from . import market_session
+from . import market_session, report_contract
 from .datasource.realtime_ff import get_fund_flow
 from .datasource import realtime_fund_flow_source
 from .datasource.fund_flow_source import FundFlowRequest
@@ -728,14 +728,16 @@ def format_fund_flow_percent(value) -> str:
     return f"{val:.2%}"
 
 
-def format_fund_flow_price(value) -> str:
+def format_fund_flow_price(value, decimals: int = 2) -> str:
     val = _json_number(value)
     if val is None:
         return "--"
-    return f"{val:.2f}"
+    return f"{val:.{decimals}f}"
 
 
-def build_historical_fund_flow_data(fp: TextIO, data: Dict[str, ndarray], limit: int = 15) -> None:
+def build_historical_fund_flow_data(
+    fp: TextIO, data: Dict[str, ndarray], limit: int = 15, symbol: str = ""
+) -> None:
     """构建历史资金流向表格"""
     limit = int(limit or 0)
     if limit <= 0:
@@ -777,6 +779,8 @@ def build_historical_fund_flow_data(fp: TextIO, data: Dict[str, ndarray], limit:
         file=fp,
     )
 
+    # 优先用纠偏后的规范代码，与 build_basic_data 一致。
+    decimals = report_contract.price_decimals(data.get("SYMBOL", symbol))
     for idx in supply.indices:
         def value_for(key: str):
             values = fund_flow.get(key)
@@ -787,7 +791,7 @@ def build_historical_fund_flow_data(fp: TextIO, data: Dict[str, ndarray], limit:
         date_str = datetime.datetime.fromtimestamp(dates[idx] / 1e9).strftime("%Y-%m-%d")
         row = [
             date_str,
-            format_fund_flow_price(value_for("CLOSE")),
+            format_fund_flow_price(value_for("CLOSE"), decimals),
             format_fund_flow_percent(value_for("PCT_CHG")),
             format_fund_flow_amount(value_for("A_A")),
             format_fund_flow_percent(value_for("A_R")),
@@ -1049,7 +1053,9 @@ async def build_trading_data(
         print("", file=fp)
 
     if include_historical_fund_flow:
-        build_historical_fund_flow_data(fp, data, limit=historical_fund_flow_limit)
+        build_historical_fund_flow_data(
+            fp, data, limit=historical_fund_flow_limit, symbol=symbol
+        )
 
     # 换手率计算
     fcap = data.get("FCAP", np.array([]))
@@ -1104,9 +1110,12 @@ def build_technical_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> N
     print("| " + " | ".join(columns) + " |", file=fp)
     print("| --- " * len(columns) + "|", file=fp)
 
-    def format_value(value: float | None) -> str:
-        return "N/A" if value is None else f"{value:.2f}"
+    def format_value(value: float | None, decimals: int = 2) -> str:
+        return "N/A" if value is None else f"{value:.{decimals}f}"
 
+    # KDJ、RSI 是 0～100 的摆动指标，两位足够；MACD 和布林带是价格量纲，跟价格同一个
+    # 位数。优先用纠偏后的规范代码，与 build_basic_data 一致。
+    price = report_contract.price_decimals(data.get("SYMBOL", symbol))
     for item in indicators:
         kdj = item["kdj"]
         macd = item["macd"]
@@ -1116,14 +1125,14 @@ def build_technical_data(fp: TextIO, symbol: str, data: Dict[str, ndarray]) -> N
             format_value(kdj["k"]),
             format_value(kdj["d"]),
             format_value(kdj["j"]),
-            format_value(macd["dif"]),
-            format_value(macd["dea"]),
+            format_value(macd["dif"], price),
+            format_value(macd["dea"], price),
             format_value(rsi["rsi6"]),
             format_value(rsi["rsi12"]),
             format_value(rsi["rsi24"]),
-            format_value(bbands["upper"]),
-            format_value(bbands["middle"]),
-            format_value(bbands["lower"]),
+            format_value(bbands["upper"], price),
+            format_value(bbands["middle"], price),
+            format_value(bbands["lower"], price),
         ]
         print(
             "| " + item["date"] + "|" + " | ".join(values) + " |",
