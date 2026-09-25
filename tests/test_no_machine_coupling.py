@@ -43,13 +43,14 @@ _SUFFIXES = {".py", ".md", ".sh", ".toml", ".example", ".cfg", ".yaml", ".yml"}
 
 #: 归档不改：``verification/baseline/*.md`` 记的是**当时实际执行的那条命令**，改了它
 #: 就不是归档了（连带 verify_release 的复放也会对不上）。reports/ 同理，是产出物。
-#: ``.runtime`` / ``private`` / ``tests_research`` 不进发布。
+#: ``.runtime`` / ``private`` / ``tests_research`` 不进发布。``.commandcode`` 是本地编码
+#: 工具写的偏好记录，在 .gitignore 里，同样不进发布。
 #:
 #: ``.server-logs`` 是 scripts/rsync-logs.sh 从远端同步下来的日志和报告，里面的绝对
 #: 路径是**那一端**的、如实记录，改了就不是同步下来的东西了。和 reports/ 同一类。
 _SKIP_PARTS = {
     ".git", ".venv", ".runtime", ".server-logs", "private", "tests_research",
-    "node_modules", "__pycache__", "build", "dist", ".pytest_cache",
+    ".commandcode", "node_modules", "__pycache__", "build", "dist", ".pytest_cache",
 }
 
 
