@@ -268,6 +268,54 @@ class TestSingleflight:
         assert results["follower"] is None
         assert not follower_sends  # leader 失败，follower 不再发
 
+    def test_follower_wait_stops_when_request_is_cancelled(self):
+        """客户端断开时，同步 follower 等待应及时退出，不占满线程池。"""
+        transport = FakeTransport()
+        client = make_client(transport, wait_seconds=10)
+        release = threading.Event()
+        leader_started = threading.Event()
+        cancel_event = threading.Event()
+        follower_done = threading.Event()
+        follower_sends = []
+
+        def leader_send(*args, **kwargs):
+            leader_started.set()
+            release.wait(5)
+            return ok_response()
+
+        def follower_send(*args, **kwargs):
+            follower_sends.append(1)
+            return ok_response()
+
+        leader = threading.Thread(
+            target=lambda: client.request("GET", URL, leader_send)
+        )
+        leader.start()
+        assert leader_started.wait(2)
+
+        result = {}
+
+        def run_follower():
+            result["value"] = client.request(
+                "GET", URL, follower_send,
+                follower_wait=10,
+                cancel_event=cancel_event,
+            )
+            follower_done.set()
+
+        follower = threading.Thread(target=run_follower)
+        follower.start()
+        time.sleep(0.05)
+        cancel_event.set()
+
+        assert follower_done.wait(0.5)
+        assert result["value"] is None
+        assert not follower_sends
+
+        release.set()
+        leader.join(2)
+        follower.join(2)
+
     def test_cooldown_blocks_without_sending(self):
         transport = FakeTransport()
         client = make_client(transport, data_cooldown_seconds=30)

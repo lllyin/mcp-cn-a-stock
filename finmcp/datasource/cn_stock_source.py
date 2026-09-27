@@ -295,14 +295,20 @@ def _prune_finance_cache(now: float, *, reserve_entry: bool = False) -> tuple[in
     return len(expired_codes), evicted
 
 
-def _execute_timed(func, args, requested_at, submitted_at, request_id, tool, symbol):
+def _execute_timed(
+    func, args, requested_at, submitted_at, request_id, tool, symbol, cancel_event
+):
     started_at = time.perf_counter()
     try:
         # 线程池的 worker 线程有自己的一份 contextvars，默认全是 "-"。不在这里补绑
         # 一次的话，同步函数内部打出来的日志——K 线失败、兜底、熔断打开——全都没有
         # request_id，而它们恰恰是排查时最需要和入口那条串起来的几行。
-        with bind_log_context(request_id=request_id, tool=tool, symbol=symbol):
-            return func(*args)
+        previous_cancel_event = gateway.set_current_request_cancel_event(cancel_event)
+        try:
+            with bind_log_context(request_id=request_id, tool=tool, symbol=symbol):
+                return func(*args)
+        finally:
+            gateway.restore_current_request_cancel_event(previous_cancel_event)
     finally:
         logger.debug(
             "Data task %s request_id=%s tool=%s symbol=%s "
@@ -325,6 +331,7 @@ async def _run_in_executor(func, *args):
     submitted_at = time.perf_counter()
     request_id, tool, symbol = log_context()
     loop = asyncio.get_running_loop()
+    cancel_event = threading.Event()
     try:
         future = loop.run_in_executor(
             _executor,
@@ -336,6 +343,7 @@ async def _run_in_executor(func, *args):
             request_id,
             tool,
             symbol,
+            cancel_event,
         )
     except BaseException:
         slots.release()
@@ -346,7 +354,14 @@ async def _run_in_executor(func, *args):
     future.add_done_callback(
         lambda completed: _release_data_fetch_slot(slots, completed)
     )
-    return await asyncio.shield(future)
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        # run_in_executor 的同步函数不能被 asyncio 直接取消；把信号传进网关层，
+        # 让它至少停止 leader/follower 等待和后续重试。正在进行的 HTTP 调用仍由
+        # 自己的短超时收尾，不能在任意 Python 线程安全地强杀。
+        cancel_event.set()
+        raise
 
 
 # ── 资金流 / 基本数据的缓存包装 ──────────────────────────────────────────────
@@ -519,12 +534,12 @@ def _fund_flow_needs_more(value, need, kline_day) -> bool:
 
 
 def _merge_fund_flow(current, new) -> Optional[Dict]:
-    """按日期并集合并两份资金流结果；新源没有贡献任何新日期时返回 None。
+    """按日期并集合并两份资金流结果；同日只补空字段。
 
     "行数多的赢"会把对齐的一行换成不对齐的一整份（盘后 delay 给当天 1 行、
     页面给 120 行止于昨天，120 > 1 就把今天丢了）——所以改成并集：新源补上
-    旧源没有的日期。同一天的行留旧源：链顺序就是权威顺序（eastmoney > delay
-    > 页面 > 网关），同一上游同一口径，先到的为准。
+    旧源没有的日期。同一天的行按字段合并：链顺序就是权威顺序（eastmoney >
+    delay > 页面 > 网关），已有非空值由先到的源保留，空字段由后到的源补齐。
 
     每行记一行来路（``_src`` 列）：容差是它的属性——API 行是精确值，页面行经
     两位小数渲染。合并前帧级 provider 碰巧等于行级来路，合并后就破了，一致性
@@ -548,14 +563,59 @@ def _merge_fund_flow(current, new) -> Optional[Dict]:
 
     import pandas as pd
 
+    current_frame = current_frame.copy()
+    new_frame = new_frame.copy()
+    current_src = current.get("provider") or "unknown"
+    new_src = new.get("provider") or "unknown"
     if "_src" not in current_frame.columns:
-        current_frame = current_frame.assign(
-            _src=current.get("provider") or "unknown")
+        current_frame["_src"] = current_src
+    if "_src" not in new_frame.columns:
+        new_frame["_src"] = new_src
+
+    # 所有标准列都应存在，但合并不能因旧缓存或新源少一列而丢弃整帧。
+    # 缺列按空值处理，后续源仍可补上。
+    for column in new_frame.columns:
+        if column not in current_frame.columns:
+            current_frame[column] = pd.NA
+
+    def missing(value) -> bool:
+        try:
+            result = pd.isna(value)
+            if result is pd.NA:
+                return True
+            return bool(result) if not hasattr(result, "__len__") else False
+        except (TypeError, ValueError):
+            return value is None
+
+    new_by_day = {}
+    for _, row in new_frame.iterrows():
+        new_by_day.setdefault(str(row["日期"])[:10], row)
+
+    changed = False
+    for index, row in current_frame.iterrows():
+        day = str(row["日期"])[:10]
+        incoming = new_by_day.get(day)
+        if incoming is None:
+            continue
+        row_changed = False
+        for column in new_frame.columns:
+            if column in {"日期", "_src"} or column not in current_frame.columns:
+                continue
+            if missing(current_frame.at[index, column]) and not missing(incoming[column]):
+                current_frame.at[index, column] = incoming[column]
+                changed = True
+                row_changed = True
+
+        # 一行可能由两个源共同构成，保留这个事实供容差选择和告警映射使用。
+        if row_changed and current_frame.at[index, "_src"] != incoming.get("_src", new_src):
+            current_frame.at[index, "_src"] = (
+                f"{current_frame.at[index, '_src']}+{incoming.get('_src', new_src)}"
+            )
+
     have = {str(d)[:10] for d in current_frame["日期"]}
     add = new_frame[[str(d)[:10] not in have for d in new_frame["日期"]]]
-    if len(add) == 0:
-        return None
-    add = add.assign(_src=new.get("provider") or "unknown")
+    if len(add) > 0:
+        changed = True
     combined = pd.concat([current_frame, add])
     merged = (
         combined
@@ -564,6 +624,10 @@ def _merge_fund_flow(current, new) -> Optional[Dict]:
         .drop(columns="_k")
         .reset_index(drop=True)
     )
+    complete_changed = current.get("complete") is not True and new.get("complete") is True
+    if not changed and not complete_changed:
+        return None
+
     result = dict(current)
     result["fund_flow"] = merged
     result.pop("complete", None)

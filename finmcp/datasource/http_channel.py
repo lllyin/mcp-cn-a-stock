@@ -360,7 +360,11 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
         host, urlsplit(url).path, request_id, tool, symbol,
     )
     response = client.request(
-        method, url, _gateway_send_with(base_cls, session), **kwargs
+        method,
+        url,
+        _gateway_send_with(base_cls, session),
+        cancel_event=gateway.current_request_cancel_event(),
+        **kwargs,
     )
     if response is not None:
         with _auto_proxy_lock:
@@ -398,7 +402,12 @@ def gateway_request(method: str, url: str, **kwargs):
             return session.request(method, url, **kw)
 
     return client.request(
-        method, url, send, follower_wait=client.leader_budget(kwargs["timeout"]), **kwargs
+        method,
+        url,
+        send,
+        follower_wait=client.leader_budget(kwargs["timeout"]),
+        cancel_event=gateway.current_request_cancel_event(),
+        **kwargs,
     )
 
 def _record_auto_proxy_local_failure(url) -> None:

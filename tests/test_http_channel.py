@@ -3,6 +3,7 @@
 import builtins
 import importlib
 import logging
+import threading
 import types
 
 import pytest
@@ -1251,6 +1252,30 @@ def test_gateway_request_is_the_explicit_entry(monkeypatch):
     # 东财身份头在这里补齐，调用方不用各自重复
     assert seen["headers"]["User-Agent"] == channel._AUTH_UA
     assert seen["headers"]["Referer"] == "https://data.eastmoney.com/"
+
+
+def test_gateway_request_forwards_the_worker_cancel_event(monkeypatch):
+    transport = _FakeGatewayTransport(["http://proxy-a:1"])
+    client = gateway.GatewayClient(transport)
+    seen = {}
+
+    def spy_request(method, url, send, **kwargs):
+        seen.update(kwargs)
+        return types.SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(client, "request", spy_request)
+    monkeypatch.setattr(gateway, "get_gateway_client", lambda: client)
+    cancel_event = threading.Event()
+    previous = gateway.set_current_request_cancel_event(cancel_event)
+    try:
+        channel.gateway_request(
+            "GET",
+            "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get",
+        )
+    finally:
+        gateway.restore_current_request_cancel_event(previous)
+
+    assert seen["cancel_event"] is cancel_event
 
 
 def test_gateway_request_returns_none_without_a_client(monkeypatch):

@@ -26,6 +26,32 @@ from ..config import (
 logger = logging.getLogger("finmcp")
 
 
+_request_cancel_local = threading.local()
+
+
+def set_current_request_cancel_event(event):
+    """Bind the current executor thread's request-cancel signal."""
+    previous = getattr(_request_cancel_local, "event", None)
+    _request_cancel_local.event = event
+    return previous
+
+
+def restore_current_request_cancel_event(previous) -> None:
+    """Restore the executor thread's previous request-cancel signal."""
+    if previous is None:
+        try:
+            del _request_cancel_local.event
+        except AttributeError:
+            pass
+    else:
+        _request_cancel_local.event = previous
+
+
+def current_request_cancel_event():
+    """Return the cancellation signal bound to the current worker thread."""
+    return getattr(_request_cancel_local, "event", None)
+
+
 class GatewayAuth(NamedTuple):
     """一份网关出口凭据：代理地址、配套 Cookie、配套 UA。三者一组，拆用无效。"""
 
@@ -280,7 +306,7 @@ class GatewayClient:
     # -- 请求 ---------------------------------------------------------------
 
     def request(self, method: str, url: str, send, *, follower_wait: Optional[float] = None,
-                **kwargs):
+                cancel_event: Optional[threading.Event] = None, **kwargs):
         """走网关发一次请求。成功返回 response；不可用/失败返回 None。
 
         ``send(method, url, **kwargs)`` 由调用方提供，决定用哪个 session 发——
@@ -290,6 +316,9 @@ class GatewayClient:
         ``follower_wait``：已有 leader 在飞时最多等它多久，缺省用构造时的
         ``wait_seconds``。放弃的代价由调用方判断：后面还有源可退就短等，链尾就
         传 ``leader_budget(timeout)``。
+
+        ``cancel_event`` 由异步请求层绑定。同步网关等待不能直接感知
+        ``asyncio`` 任务取消，所以这里用短间隔轮询让已断开的请求及时退出。
         """
         wait_seconds = self._wait_seconds if follower_wait is None else follower_wait
         host = (urlsplit(url).hostname or "?").lower()
@@ -307,7 +336,12 @@ class GatewayClient:
                 leader_done = None
 
         if leader_done is not None:
-            if not leader_done.wait(timeout=wait_seconds):
+            wait_result = _wait_for_event(leader_done, wait_seconds, cancel_event)
+            if wait_result == "cancelled":
+                logger.debug("gateway_skip host=%s family=%s reason=request_cancelled",
+                             host, key[1])
+                return None
+            if wait_result == "timeout":
                 logger.debug("gateway_skip host=%s family=%s reason=leader_timeout waited=%.1fs",
                              host, key[1], wait_seconds)
                 return None
@@ -318,16 +352,23 @@ class GatewayClient:
                     return None
             # leader 证明出口可用，本次用同一份凭据自己发（不共享响应正文——
             # 不同标的的应答不能互用）。
-            return self._attempt(method, url, send, kwargs, key, leader=False)
+            return self._attempt(
+                method, url, send, kwargs, key, leader=False,
+                cancel_event=cancel_event,
+            )
 
         try:
-            return self._attempt(method, url, send, kwargs, key, leader=True)
+            return self._attempt(
+                method, url, send, kwargs, key, leader=True,
+                cancel_event=cancel_event,
+            )
         finally:
             with self._lock:
                 state.in_flight = False
                 state.leader_done.set()
 
-    def _attempt(self, method, url, send, kwargs, key, *, leader: bool):
+    def _attempt(self, method, url, send, kwargs, key, *, leader: bool,
+                 cancel_event: Optional[threading.Event] = None):
         """发一次网关请求，出口死了就换新的重试，连续失败才冷却。
 
         网关出口是住宅代理，有一定比例的当场死亡（2026-09-15 实测约 15%）。
@@ -346,16 +387,30 @@ class GatewayClient:
         auth_failed = False       # 有过一次"拿不到新出口"
         fresh_after_failure = False  # 失败之后认证服务给过新出口——它活着
         for attempt in range(self._exit_retries):
+            if cancel_event is not None and cancel_event.is_set():
+                return None
             auth = self._acquire_auth()
             if auth is None:
+                if cancel_event is not None and cancel_event.is_set():
+                    return None
                 auth_failed = True
                 logger.warning(
                     "gateway_failure host=%s family=%s path=%s attempt=%d/%d error=authentication_unavailable",
                     host, key[1], urlsplit(url).path, attempt + 1, self._exit_retries,
                 )
                 if attempt + 1 < self._exit_retries and self._auth_retry_backoff:
-                    time.sleep(self._auth_retry_backoff)
+                    interrupted = (
+                        cancel_event.wait(self._auth_retry_backoff)
+                        if cancel_event is not None
+                        else False
+                    )
+                    if interrupted:
+                        return None
+                    if cancel_event is None:
+                        time.sleep(self._auth_retry_backoff)
                 continue  # 没拿到出口，隔一下再要
+            if cancel_event is not None and cancel_event.is_set():
+                return None
             if attempt > 0:
                 # 前一次失败时已作废旧凭据，这里拿到的必然是认证服务新给的。
                 fresh_after_failure = True
@@ -374,6 +429,8 @@ class GatewayClient:
             try:
                 response = send(method, url, **retry_kwargs)
             except Exception as exc:
+                if cancel_event is not None and cancel_event.is_set():
+                    return None
                 logger.warning(
                     "gateway_failure host=%s family=%s path=%s attempt=%d/%d error=%s",
                     host, key[1], urlsplit(url).path, attempt + 1, self._exit_retries,
@@ -382,6 +439,8 @@ class GatewayClient:
                 self._drop_auth(auth)
                 continue  # 出口死了，换一个新的重试
             elapsed = time.perf_counter() - started
+            if cancel_event is not None and cancel_event.is_set():
+                return None
             if response_ok(url, response):
                 if leader:
                     with self._lock:
@@ -404,6 +463,20 @@ class GatewayClient:
         else:
             self._cool_down(key, self._data_cooldown_seconds, "data_failure")
         return None
+
+
+def _wait_for_event(event: threading.Event, timeout: float,
+                    cancel_event: Optional[threading.Event]):
+    """Wait for ``event`` with a bounded, cancellation-aware polling interval."""
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            return "cancelled"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "timeout"
+        if event.wait(timeout=min(0.05, remaining)):
+            return "done"
 
 
 def _sanitize(text: str, auth: Optional[GatewayAuth]) -> str:

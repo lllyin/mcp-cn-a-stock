@@ -102,6 +102,32 @@ async def test_executor_cancellation_holds_slot_until_thread_finishes(monkeypatc
     assert second_started.is_set()
 
 
+@pytest.mark.asyncio
+async def test_executor_cancellation_signals_the_worker(monkeypatch):
+    slots = asyncio.Semaphore(1)
+    started = threading.Event()
+    stopped = threading.Event()
+
+    def worker():
+        cancel_event = source_module.gateway.current_request_cancel_event()
+        assert cancel_event is not None
+        started.set()
+        while not cancel_event.is_set():
+            time.sleep(0.005)
+        stopped.set()
+
+    monkeypatch.setattr(source_module, "_get_data_fetch_slots", lambda: slots)
+    task = asyncio.create_task(source_module._run_in_executor(worker))
+    while not started.is_set():
+        await asyncio.sleep(0)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert stopped.wait(0.5)
+
+
 def test_executor_limiter_can_be_reused_across_event_loops(monkeypatch):
     monkeypatch.setattr(source_module, "FETCH_MAX_IN_FLIGHT", 1)
 
@@ -2347,6 +2373,41 @@ def test_the_merge_marks_each_row_with_its_source_and_judges_tolerances_per_row(
     assert set(frame["_src"]) == {"eastmoney_delay", "page_fallback"}
     # 86 条误报一条都不该有；delay 那行精确值也不该被页面容差放松
     assert source_module.fund_flow_source.consistency_violations(frame) == []
+
+
+def test_the_merge_fills_missing_fields_from_a_same_day_later_source():
+    current_frame = _empty_probes_delay_frame()
+    current_frame.loc[0, "中单净流入-净额"] = None
+    current_frame.loc[0, "中单净流入-净占比"] = None
+    current_frame.loc[0, "小单净流入-净额"] = None
+    current_frame.loc[0, "小单净流入-净占比"] = None
+    current_frame.loc[0, "主力净流入-净额"] = -100.0
+
+    new_frame = _empty_probes_delay_frame().copy()
+    new_frame.loc[0, "主力净流入-净额"] = -200.0
+    new_frame.loc[0, "中单净流入-净额"] = -3_000_000_000.0
+    new_frame.loc[0, "中单净流入-净占比"] = -30.0
+    new_frame.loc[0, "小单净流入-净额"] = 3_100_000_000.0
+    new_frame.loc[0, "小单净流入-净占比"] = 31.0
+
+    merged = source_module._merge_fund_flow(
+        {"fund_flow": current_frame, "provider": "page_fallback", "is_market": False},
+        {
+            "fund_flow": new_frame,
+            "provider": "eastmoney_gateway",
+            "complete": True,
+            "is_market": False,
+        },
+    )
+
+    assert merged is not None
+    row = merged["fund_flow"].iloc[0]
+    assert row["主力净流入-净额"] == -100.0  # 先到的非空值优先
+    assert row["中单净流入-净额"] == -3_000_000_000.0
+    assert row["小单净流入-净额"] == 3_100_000_000.0
+    assert "page_fallback" in row["_src"]
+    assert "eastmoney_gateway" in row["_src"]
+    assert merged["complete"] is True
 
 
 def _empty_probes_delay_frame(rows=1, end=datetime.date(2026, 6, 15)):
