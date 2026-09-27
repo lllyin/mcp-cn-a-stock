@@ -2540,7 +2540,9 @@ async def test_today_block_saves_a_today_only_query_from_the_gateway(monkeypatch
 
 @pytest.mark.asyncio
 async def test_full_still_goes_to_the_gateway_when_only_the_today_block_is_there(monkeypatch):
-    """full 要的是历史表：今日栏满足不了它，网关照常走。"""
+    """full 要的是历史表：今日栏满足不了它，网关照常走；但网关也失败时，
+    当日五档要靠今日栏留住——实测一轮验证里 5 个 full 标的因网关冷却连当日
+    资金流一起丢掉，而同一时刻页面今日栏是有值的。"""
     datasource = CNStockDataSource()
     calls = _today_block_orchestration_stubs(monkeypatch, datasource)
 
@@ -2551,12 +2553,49 @@ async def test_full_still_goes_to_the_gateway_when_only_the_today_block_is_there
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
 
-    await datasource.fetch_stock_data_with_requirements(
+    result = await datasource.fetch_stock_data_with_requirements(
         "SH600519", "2024-01-01", "2026-06-16",
         requirements=FetchRequirements(fund_flow_page=True, fund_flow_rows=60),
     )
 
     assert calls["gateway"] == 1   # 今日栏不是历史需求的答案，照付
+    # 网关（这里桩成失败）没补上历史，但当日那一行来自今日栏：五档不该空，
+    # 历史表只有这一行（报告会写"只取到 1/60"，不进缓存）
+    assert result.fund_main_amount[-1] == pytest.approx(3.062e9)
+    assert len(result.fund_flow_history["DATE"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_full_unions_the_today_block_with_the_gateway_history(monkeypatch):
+    """网关成功时并集合并：历史行来自网关，当天那一行已在，行数是并集不是替换。"""
+    datasource = CNStockDataSource()
+    calls = _today_block_orchestration_stubs(monkeypatch, datasource)
+
+    def gateway_gives_history(code, symbol, need=None, order=None):
+        if order == ("eastmoney_gateway",):
+            calls["gateway"] += 1
+            return {"fund_flow": _fund_flow_frame_of(120), "is_market": False,
+                    "complete": True, "provider": "eastmoney_gateway"}
+        return source_module._fetch_failure("fund_flow")
+
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_sync", gateway_gives_history)
+
+    from finmcp.datasource import realtime_ff as realtime_ff_module
+
+    async def fake_page(symbol, today_date=None):
+        return _today_only_page_stub()
+
+    monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+
+    result = await datasource.fetch_stock_data_with_requirements(
+        "SH600519", "2024-01-01", "2026-06-16",
+        requirements=FetchRequirements(fund_flow_page=True, fund_flow_rows=60),
+    )
+
+    assert calls["gateway"] == 1
+    # 网关的 120 行里已含当天：并集不多不少，历史表齐了
+    assert len(result.fund_flow_history["DATE"]) == 120
+    assert result.fund_main_amount[-1] == pytest.approx(3.062e9)  # 同一天留链序靠前的页面行
 
 
 # --- P0-2/P0-3：缓存只增不减 + 尾部单飞 ---------------------------------------

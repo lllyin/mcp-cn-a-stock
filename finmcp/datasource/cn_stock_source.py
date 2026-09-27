@@ -1349,7 +1349,8 @@ class CNStockDataSource(DataSource):
 
         today_date：历史表被拒时允许用页面今日栏合成一行（只给这一天）。
         今日栏和历史表走不同端点、风控待遇不同——历史被拒、今日有值是实测
-        常态。空着（历史/钉日期需求）就走原路，不合成。
+        常态。空着（钉日期需求）就走原路，不合成。历史需求也给：那一行满足不了
+        历史表，但网关也失败时它就是报告里的当日五档。
         """
         if not FUND_FLOW_PAGE_ENABLED:
             return None
@@ -1500,17 +1501,18 @@ class CNStockDataSource(DataSource):
             else:
                 page_result = await self._fetch_fund_flow_from_page(
                     canonical_symbol,
-                    # 只要"今天"且数据日期就是今天：允许页面用今日栏合成一行。
-                    # 历史表被拒时这是 brief/medium 在网关前的最后一条免费路。
-                    # 周末/盘前数据日期是上个交易日，今日栏对应哪天无法验证，不合成。
-                    # 不给 full 用：合成行只有 1 行，补不满几十行的历史需求，那次网关
-                    # 照样得发——生产里所有"历史行数不足"的落地都是只有一两行，没有
-                    # 一次是只差今天那一行。补进去只会让历史表里混进合成行，省不到积分。
+                    # 数据日期就是"此刻的最近已结束交易日"时，允许页面用今日栏合成当天
+                    # 那一行。历史表被拒时这是网关前的最后一条免费路。周末/盘前数据日期
+                    # 是上个交易日，今日栏对应哪天无法验证，不合成；钉日期要的是过去那一
+                    # 天，今日栏答不了。
+                    # full 也给：1 行补不满几十行的历史需求，网关照样往下走，省不到积分；
+                    # 但网关也失败时（出口冷却、认证不可用），报告里的当日五档就靠它——
+                    # 实测一轮验证里 5 个 full 标的因此连当日资金流一起丢掉。网关成功时
+                    # 并集合并，同一天的行留链序靠前的页面行，可见值一致（都按亿/万两位渲染）。
                     today_date=(
                         kline_day
                         if (
                             kline_day is not None
-                            and fund_flow_need.history_rows == 0
                             and not fund_flow_need.pinned_date
                             and kline_day == _settled_trading_day()
                         )
