@@ -168,7 +168,9 @@ def test_nothing_when_every_source_fails(registry):
 
 
 def test_default_order_and_env_switch(monkeypatch):
-    assert ffs.DEFAULT_PROVIDER_ORDER == ("eastmoney", "eastmoney_delay")
+    # 默认链里有 fund_flow_page：不配置的部署没有付费网关，主源和备用集群都拒绝出口时
+    # 页面是剩下唯一的免费来源（mcp_app 按链推导要不要走页面）。
+    assert ffs.DEFAULT_PROVIDER_ORDER == ("eastmoney", "eastmoney_delay", "fund_flow_page")
     monkeypatch.setenv(ffs.PROVIDER_ORDER_ENV, "eastmoney")
     assert ffs.configured_order() == ("eastmoney",)
     monkeypatch.setenv(ffs.PROVIDER_ORDER_ENV, "off")

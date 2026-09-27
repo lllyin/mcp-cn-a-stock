@@ -1,4 +1,4 @@
-"""配置名和默认值在代码、.env.example、README 之间必须一致。
+"""配置名和默认值在代码、.env.example、配置参考（docs/configuration.md）之间必须一致。
 
 这一组测试是有来历的：一次改名之后，`.env.example` 里还留着
 `FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS=0.5`，而代码已经是 8——照文档抄一份 .env 出来
@@ -18,6 +18,10 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
+#: 完整配置表所在的文档。README 只留上手要用的几项并链接过来——整张表放在首页，
+#: 第一次来的人要先翻过一百多行参数才看得到怎么接客户端。
+CONFIG_DOC = ROOT / "docs" / "configuration.md"
+
 # 前缀由 ENV_PREFIX 统一决定，本身不能再带前缀，所以不参与名字集合的比对。
 _META = {"ENV_PREFIX"}
 
@@ -31,7 +35,7 @@ _LEGACY = {"AKSHARE_PROXY_IP", "AKSHARE_PROXY_PASSWORD", "AKSHARE_PROXY_PORT", "
 
 #: 按命名空间派生的配置名：``CACHE_<命名空间>_TTL_SECONDS`` / ``_MAX_ENTRIES``。
 #: 代码里用 f-string 拼名字（config.cache_ttl / cache_max_entries），扫不出来；
-#: 而八个命名空间 × 两项 = 十六行文档，写进 README 也没人会逐行看。所以这一族按
+#: 而八个命名空间 × 两项 = 十六行文档，写进配置参考也没人会逐行看。所以这一族按
 #: **模式**校验：文档必须写清模式本身（见下面那条测试），具体名字不逐个比对。
 _NAMESPACED_CACHE = re.compile(r"^CACHE_[A-Z0-9]+_(TTL_SECONDS|MAX_ENTRIES|ENABLED)$")
 
@@ -56,11 +60,11 @@ def _drop_namespaced(names: dict) -> dict:
 
 def test_the_namespaced_cache_override_pattern_is_documented():
     """这一族不逐个比对，那就必须保证模式本身写在文档里，否则等于没写。"""
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    config_doc = CONFIG_DOC.read_text(encoding="utf-8")
     env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
-    assert "CACHE_<命名空间>_MAX_ENTRIES" in readme
+    assert "CACHE_<命名空间>_MAX_ENTRIES" in config_doc
     assert "CACHE_<命名空间>_TTL_SECONDS" in env_example
-    assert "CACHE_<命名空间>_ENABLED" in readme
+    assert "CACHE_<命名空间>_ENABLED" in config_doc
     assert "CACHE_<命名空间>_ENABLED" in env_example
 
 
@@ -116,10 +120,10 @@ def _env_example() -> dict[str, str]:
     return {k: v for k, v in found.items() if k not in _META}
 
 
-def _readme_configs() -> dict[str, str | None]:
-    """README 配置表里的配置名，以及括号里写的默认值。"""
+def _config_doc_configs() -> dict[str, str | None]:
+    """配置参考里配置表的配置名，以及括号里写的默认值。"""
     found: dict[str, str | None] = {}
-    for line in (ROOT / "README.md").read_text(encoding="utf-8").splitlines():
+    for line in CONFIG_DOC.read_text(encoding="utf-8").splitlines():
         match = re.match(r"^\|\s*`([A-Z0-9_]+)`\s*\|(.*)$", line)
         if not match:
             continue
@@ -155,7 +159,7 @@ def test_scripts_only_write_config_the_code_reads():
 
     实测踩过：两个 A/B 脚本写的是 `REPORT_CACHE_ENABLED=0`，那是 2.0 改名前的旧名，
     代码里已经没人读了。于是"整轮关掉报告缓存"这句话从来没成立过，第二轮照样整批
-    命中缓存，量出来的"取数成功率"其实是缓存命中率。README 和 .env.example 那两条
+    命中缓存，量出来的"取数成功率"其实是缓存命中率。配置参考和 .env.example 那两条
     检查抓不到它——这个不住在文档里，住在脚本里。
 
     只扫"写进 .env 的那一行"，不扫注释和文档里 `NAME=值` 形状的提法：实测那样会捞出
@@ -172,11 +176,23 @@ def test_scripts_only_write_config_the_code_reads():
     assert not offenders, f"这些名字会被写进 .env，但代码不读: {offenders}"
 
 
-def test_readme_covers_exactly_what_the_code_reads():
+def test_config_doc_covers_exactly_what_the_code_reads():
     code = set(_drop_namespaced(_code_configs()))
-    doc = set(_drop_namespaced(_readme_configs()))
-    assert not code - doc, f"README 缺少代码在读的配置: {sorted(code - doc)}"
-    assert not doc - code, f"README 写了代码不读的配置: {sorted(doc - code)}"
+    doc = set(_drop_namespaced(_config_doc_configs()))
+    assert not code - doc, f"配置参考缺少代码在读的配置: {sorted(code - doc)}"
+    assert not doc - code, f"配置参考写了代码不读的配置: {sorted(doc - code)}"
+
+
+def test_readme_only_mentions_config_the_code_reads():
+    """README 只点名几项常用配置、其余链接到配置参考；点名的必须真的被读。
+
+    改名之后首页还留着旧名，照着首页抄进 .env 就是静默失效——和
+    `test_scripts_only_write_config_the_code_reads` 防的是同一种漏法。
+    """
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    mentioned = set(re.findall(r"`([A-Z][A-Z0-9]*_[A-Z0-9_]+)(?:=[^`]*)?`", readme)) - _META
+    unknown = mentioned - set(_code_configs()) - _cache_derived()
+    assert not unknown, f"README 提到了代码不读的配置: {sorted(unknown)}"
 
 
 def _same_value(left: str, right: str) -> bool:
@@ -197,13 +213,47 @@ def test_env_example_default_matches_the_code(name, expected):
     assert _same_value(documented, expected), f"{name}: 文档 {documented!r} / 代码 {expected!r}"
 
 
-def test_readme_and_env_example_agree_on_defaults():
-    env_example, readme = _env_example(), _readme_configs()
+def _provider_order_defaults() -> dict[str, str]:
+    """各取数能力的默认来源顺序：``PROVIDER_ORDER_ENV`` → ``DEFAULT_PROVIDER_ORDER``。
+
+    这一类默认值是元组常量，不写成 ``env("NAME", "字面量")``，上面按字面量扫默认值的
+    那条测试看不见它们。漏过一次：K 线兜底在代码里补上了同花顺（新浪不认 ETF，只剩
+    腾讯一个源），`.env.example` 却还写着 `tencent,sina`——照抄出来的 .env 把修好的
+    洞原样带回去。
+    """
+    import importlib
+    import pkgutil
+
+    from finmcp import datasource
+
+    found: dict[str, str] = {}
+    pairs = (
+        ("PROVIDER_ORDER_ENV", "DEFAULT_PROVIDER_ORDER"),
+        ("INDEX_PROVIDER_ORDER_ENV", "INDEX_PROVIDER_ORDER"),
+    )
+    for info in pkgutil.iter_modules(datasource.__path__):
+        module = importlib.import_module(f"finmcp.datasource.{info.name}")
+        for env_attr, order_attr in pairs:
+            name = getattr(module, env_attr, None)
+            order = getattr(module, order_attr, None)
+            if name and order is not None:
+                found[name] = ",".join(order)
+    return found
+
+
+@pytest.mark.parametrize("name,expected", sorted(_provider_order_defaults().items()))
+def test_provider_order_defaults_match_the_code(name, expected):
+    assert _env_example().get(name) == expected, f"{name}: .env.example 与代码默认顺序不一致"
+    assert _config_doc_configs().get(name) == expected, f"{name}: 配置参考与代码默认顺序不一致"
+
+
+def test_config_doc_and_env_example_agree_on_defaults():
+    env_example, config_doc = _env_example(), _config_doc_configs()
     mismatched = {
         name: (value, env_example[name])
-        for name, value in readme.items()
+        for name, value in config_doc.items()
         if value is not None and name in env_example and env_example[name] != ""
-        # 空字符串两边写法不同：.env.example 写 `NAME=`，README 写「默认空」。
+        # 空字符串两边写法不同：.env.example 写 `NAME=`，配置参考写「默认空」。
         and not _same_value(value, env_example[name])
     }
-    assert not mismatched, f"README 与 .env.example 默认值不一致: {mismatched}"
+    assert not mismatched, f"配置参考与 .env.example 默认值不一致: {mismatched}"

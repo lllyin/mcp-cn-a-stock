@@ -23,7 +23,7 @@ def restore_requests(monkeypatch):
     ``install_http_channel("impersonate")`` 会按设计降级成 direct，21 个用例
     集体判 ``requests_already_patched``——那是产品行为对、测试前提被破坏。
 
-    真实来源：``tests_research/test_etf.py`` 顶层的
+    真实来源：本地调研目录 ``tests_research/``（不进仓库）里一个脚本顶层的
     ``akshare_proxy_patch.install_patch(...)`` 在 pytest **收集阶段**就跑了。
     ``testpaths`` 已经把那个目录挡在默认收集之外，但这里仍然自己兜一层——
     顺序相关的测试早晚会被下一个人用别的方式再触发一次。

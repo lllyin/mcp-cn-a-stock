@@ -24,6 +24,8 @@ log.txt
 /verification/reports/
 /benchmarks/
 /private/
+# 本地调研脚本：顶层就会连付费网关、patch 全进程的 requests，不是给别人跑的
+/tests_research/
 .commandcode
 
 libs

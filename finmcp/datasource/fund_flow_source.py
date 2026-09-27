@@ -32,7 +32,10 @@ logger = logging.getLogger("finmcp")
 
 CAPABILITY = "fund_flow"
 PROVIDER_ORDER_ENV = "FUND_FLOW_PROVIDERS"
-DEFAULT_PROVIDER_ORDER = ("eastmoney", "eastmoney_delay")
+#: 页面兜底（``fund_flow_page``）默认在链里：链里没写它就不走页面（mcp_app 按链推导），
+#: 而不配置的部署没有付费网关——主源和备用集群都拒绝当前出口时，页面是剩下唯一的
+#: 免费来源，不放进默认链就等于把这一段资金流直接判缺。
+DEFAULT_PROVIDER_ORDER = ("eastmoney", "eastmoney_delay", "fund_flow_page")
 
 #: 归一后的列，就是 ``ak.stock_individual_fund_flow`` 的列。金额是元，占比是百分数
 #: （7.79 表示 7.79%），涨跌幅同样是百分数——下游 ``_build_fund_flow_history`` 按这个
@@ -401,7 +404,8 @@ def split_order(order: tuple) -> tuple:
     provider 链，由编排层在 gather 之后执行。它在配置里的位置决定网关级
     （``eastmoney_gateway``）排在它前面还是后面——目标顺序是
     ``eastmoney,eastmoney_delay,fund_flow_page,eastmoney_gateway``：页面是免费的，
-    排在付费级前面。配置里没写页面时，页面按既有行为挂在链尾。
+    排在付费级前面。配置里没写页面就不走页面（``mcp_app`` 按链推导
+    ``requirements.fund_flow_page``），默认链里有它。
     """
     if "fund_flow_page" in order:
         index = order.index("fund_flow_page")

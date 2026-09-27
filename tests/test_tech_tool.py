@@ -298,6 +298,9 @@ async def test_medium_keeps_historical_fund_flow_disabled(monkeypatch):
 @pytest.mark.parametrize("providers,page_expected", [
     ("eastmoney,eastmoney_delay,fund_flow_page,eastmoney_gateway", True),
     ("eastmoney,eastmoney_delay,eastmoney_gateway", False),
+    # 不配置：默认链里有页面。漏过一次——默认链里没有它，不写 .env 的部署在主源和
+    # 备用集群都拒绝时就直接判缺，而那种部署恰好没有付费网关可退。
+    (None, True),
 ])
 @pytest.mark.parametrize("mode", ["brief", "medium", "full"])
 async def test_markdown_reports_preserve_all_datasource_requirements(
@@ -312,7 +315,10 @@ async def test_markdown_reports_preserve_all_datasource_requirements(
     async def fake_build_trading_data(fp, symbol, data, **kwargs):
         print("# trading", file=fp)
 
-    monkeypatch.setenv("FUND_FLOW_PROVIDERS", providers)
+    if providers is None:
+        monkeypatch.delenv("FUND_FLOW_PROVIDERS", raising=False)
+    else:
+        monkeypatch.setenv("FUND_FLOW_PROVIDERS", providers)
     monkeypatch.setattr(app_module.research, "load_raw_data", fake_load_raw_data)
     monkeypatch.setattr(app_module.research, "build_trading_data", fake_build_trading_data)
 

@@ -450,7 +450,7 @@ async def aget_or_load(ns: str, key: str, loader: Callable[[], Awaitable[Any]], 
 ## 六、配置
 
 配置名全部重排，**不保留旧名字**（2.0 尚未上线，改名无成本）。落地时同步改
-`.env.example` 和 README，`test_config_docs.py` 会强制三者一致。
+`.env.example` 和[配置参考](configuration.md)，`test_config_docs.py` 会强制三者一致。
 
 ### 市场纪元边界
 

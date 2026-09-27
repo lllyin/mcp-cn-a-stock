@@ -1,438 +1,309 @@
-# A 股数据 MCP 服务（CnStock）
+# CnStock · A 股数据 MCP 服务
 
-CnStock 是一个面向大模型和 MCP 客户端的 A 股数据服务。
-提供股票、指数和场内 ETF 的行情、财务、资金流、技术指标、K 线与全市场涨跌分布数据。
+给 AI Agent 用的 A 股数据服务。一次调用拿到行情、财务、资金流向和技术指标，直接交给大模型分析。
 
-## 项目亮点
+*An MCP server that gives AI agents China A-share market data — quotes, financials, capital flows and technical indicators — in a single call.*
 
-- 覆盖沪深京股票、主要指数和场内 ETF。
-- 支持 Markdown 报告和适合程序消费的严格 JSON 输出。
-- `brief`、`medium`、`full`、`tech` 单次最多并行查询 4 个标的。
-- 支持指定历史截止日期，非交易日自动使用最近可用行情。
-- 自动纠正错误市场前缀，例如将 `SH000333` 规范为 `SZ000333`。
-- 内置 KDJ、MACD、RSI、布林带等技术指标。
-- 开箱即用，不需要付费网关；上游接口不可用时逐级回退到备用数据源。
-- 使用有界并发控制同步数据请求，适合 Ubuntu 2 核 4G 等小型服务器。
+![Python](https://img.shields.io/badge/Python-3.12%2B-3776ab)
+![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP%20%7C%20stdio-6e56cf)
+![覆盖](https://img.shields.io/badge/%E8%A6%86%E7%9B%96-%E6%B2%AA%E6%B7%B1%E4%BA%AC%20A%20%E8%82%A1%20%C2%B7%20%E6%8C%87%E6%95%B0%20%C2%B7%20ETF-c0392b)
 
-## MCP 工具
+## 特性
 
-| 工具 | 用途 | 返回格式 |
+- 覆盖沪深京 A 股、主要指数和场内 ETF
+- 个股报告：基本数据、行情、资金流、财务和技术指标，按需选 `brief`、`medium`、`full` 三档，一次最多 4 个标的
+- 资金流：个股当日超大单、大单、中单、小单净流入，逐日历史和盘中实时；行业、概念、地域板块资金流排行
+- K 线和技术指标：日 K 线支持前复权、后复权、不复权，内置 KDJ、MACD、RSI、布林带
+- 市场数据：全市场涨跌分布、行业强弱、龙虎榜、涨停池、公告和业绩预告
+- 历史查询：个股报告、K 线、技术指标和事件池都可以查某一天，如 `date=2026-06-05`
+- 多源兜底：主要数据都有多个来源（东方财富、腾讯、新浪、同花顺），一个取不到自动换下一个；最终没取到的会在报告里写明，不用 0 或旧数据冒充
+- 标准接入：支持 Streamable HTTP、SSE、stdio，输出 Markdown 报告或严格 JSON
+- 免账号、免密钥，开箱即用，自带 `health` 工具查看服务可用率
+
+## 工具一览
+
+| 分类 | 工具 | 用途 |
 | --- | --- | --- |
-| `brief` | 基本信息、行情和资金流 | JSON 外壳 + Markdown 报告 |
-| `medium` | 在 `brief` 基础上增加财务摘要 | JSON 外壳 + Markdown 报告 |
-| `full` | 完整财务、历史资金流和技术分析 | JSON 外壳 + Markdown 报告 |
-| `tech` | OHLCV、KDJ、MACD、RSI、布林带 | 严格 JSON |
-| `kline_daily` | 指定交易日的 K 线 | Markdown |
-| `kline_range` | 指定日期区间的 K 线 | Markdown 表格 |
-| `sector_fund_flow` | 行业/概念/地域板块的资金流排行，与东财官网同口径 | Markdown 表格 |
-| `market_breadth` | 全市场涨跌家数、涨跌停和十档分布 | 严格 JSON |
-| `market_map` | 行业资金流入流出与板块内个股强弱，支持按市场筛选 | 严格 JSON 或 Markdown |
-| `market_events` | 指定日期的龙虎榜、涨停池、公告和业绩预告 | 严格 JSON |
-| `trading_calendar` | 某天是否开市（三态，日历未覆盖给 null）、前后交易日、区间交易日列表；零上游请求 | 严格 JSON |
-| `health` | 服务自身的可用率、缺失明细、耗时分布和事件；只读日志，不发上游请求 | Markdown |
+| 个股报告 | `brief` | 基本数据、行情、当日资金流 |
+| | `medium` | 在 `brief` 基础上增加财务摘要 |
+| | `full` | 在 `medium` 基础上增加完整财务、历史资金流和技术分析 |
+| K 线与指标 | `kline_daily` | 指定交易日的日 K 线，支持前复权、后复权、不复权 |
+| | `kline_range` | 指定区间的日 K 线 |
+| | `tech` | OHLCV 以及 KDJ、MACD、RSI、布林带，返回严格 JSON |
+| 市场与板块 | `sector_fund_flow` | 行业、概念、地域板块的资金流排行，可看当日、5 日、10 日 |
+| | `market_map` | 各行业资金流入流出和行业内个股强弱，可按市场筛选 |
+| | `market_breadth` | 全市场涨跌家数、涨跌停家数和涨跌幅十档分布 |
+| | `market_events` | 指定日期的龙虎榜、涨停池、炸板池、公告和业绩预告 |
+| 辅助 | `trading_calendar` | 某天是否交易日、前后交易日、区间内的交易日列表 |
+| | `health` | 服务自身的可用率、缺失明细和耗时，只读日志，不请求上游 |
 
-完整报告示例：[兆易创新 SH603986](docs/SH603986-full.md)。
-各工具的返回字段见[技术实现说明](docs/technical-details.md#9-输出与错误契约)。
+标的代码写成交易所前缀加 6 位代码，如 `SH600519`、`SZ000001`；前缀写错会自动纠正（`SH000333` 会改成 `SZ000333`）。个股报告和 `tech` 每次最多处理 4 个标的，多出的会写进 `warnings`。各工具返回的字段见[输出与错误契约](docs/technical-details.md#9-输出与错误契约)。
 
-## 环境要求
+## 效果示例
 
-- Python 3.12 或更高版本。
-- Linux、macOS；生产部署推荐 Ubuntu。
-- 推荐使用 [uv](https://docs.astral.sh/uv/) 管理依赖。
-- 能访问公开行情接口，不需要账号或密钥。
-- Chromium：盘中实时资金流和 `market_breadth` 的首选数据源需要，`start.sh` 会在缺失时自动安装。
+比如问 Agent「贵州茅台最近资金面怎么样」，它会调用 `brief symbol=SH600519`，得到下面这份报告（节选）：
 
-## 快速安装
+```text
+# 基本数据
+
+- 股票代码: SH600519
+- 股票名称: 贵州茅台
+- 数据日期: 2026-09-24
+- 总市值: 15463.51亿
+- 市盈率(静): 18.78
+- 市盈率(动): 17.37
+- 市净率: 6.15
+- 净资产收益率: 16.75%
+
+# 交易数据
+
+## 价格
+- 当日: 1237.000 开盘: 1250.010 最高: 1256.130 最低: 1231.050
+- 20日均价: 1281.338 最高: 1338.860 最低: 1231.050
+
+## 涨跌幅
+- 当日: -1.14%
+- 20日累计: -4.66%
+
+## 资金流向
+- 当日主力净流入: -5.28亿  主力净占比: -13.64%
+- 当日超大单净流入: -2.63亿  超大单净占比: -6.80%
+- 当日大单净流入: -2.64亿  大单净占比: -6.84%
+- 当日中单净流入: 5.28亿  中单净占比: 13.65%
+- 当日小单净流入: -37.32万  小单净占比: -0.01%
+```
+
+完整报告还有行业概念，5 日到 240 日的均价、涨跌幅、振幅、成交量、成交额，以及换手率。`full` 的完整样例见[兆易创新 SH603986](docs/SH603986-full.md)。
+
+## 快速开始
+
+需要 Python 3.12 或更高版本，支持 Linux 和 macOS，服务器推荐 Ubuntu。装了 [uv](https://docs.astral.sh/uv/) 会用 uv 安装，没有就用标准的 venv 和 pip。
 
 ```bash
 git clone https://github.com/lllyin/mcp-cn-a-stock.git
 cd mcp-cn-a-stock
-./install.sh
+./install.sh     # 安装 Python 依赖和 Chromium，只需执行一次
+./start.sh       # 后台启动，不需要任何配置
 ```
 
-`install.sh` 装 Python 依赖和 Chromium，只需执行一次。有 `uv` 就用 `uv`，没有就用
-标准 venv + pip。
-
-无桌面的 Ubuntu 可额外安装 `xvfb`，`start.sh` 会在没有 `DISPLAY` 时自动启动并管理它；
-未安装也不影响其他工具。
-
-## 启动和停止
-
-零配置即可启动，不需要账号、密钥或网关：
-
-```bash
-./start.sh
-```
-
-默认 MCP 地址：
+启动后的 MCP 地址：
 
 ```text
 http://127.0.0.1:8686/cnstock/mcp
 ```
 
-写 `127.0.0.1` 而不是 `localhost`：服务只监听 IPv4 回环，而 macOS 上 `localhost`
-会先解析到 IPv6 的 `::1`，有些客户端在那里被拒之后不会回退到 IPv4，表现是连接
-一直挂着不报错。
-
-查看日志（启动时会打印当前版本）：
+验证是否可用（需要 Node.js）：
 
 ```bash
-tail -f logs/cn-stock-mcp.log
+npx mcporter call "http://127.0.0.1:8686/cnstock/mcp.brief" symbol=SH600519
 ```
 
-停止服务：
+能看到和上面类似的报告就说明装好了。停止服务用 `./stop.sh`；日志在 `logs/cn-stock-mcp.log`，启动时会打印当前版本。
+
+> Chromium 用于盘中实时资金流和 `market_breadth` 的首选数据源。没有桌面的 Ubuntu 可以再装 `xvfb`，
+> 没有 `DISPLAY` 时 `start.sh` 会自动启动它；不装也不影响其他工具。
+
+## 接入 MCP 客户端
+
+服务使用 Streamable HTTP 传输，地址填 `http://127.0.0.1:8686/cnstock/mcp`。
+
+**Claude Code**
 
 ```bash
-./stop.sh
+claude mcp add --transport http cn-stock http://127.0.0.1:8686/cnstock/mcp
 ```
 
-### 清掉磁盘缓存
+**Cursor 等用 JSON 配置的客户端**
+
+```json
+{
+  "mcpServers": {
+    "cn-stock": {
+      "url": "http://127.0.0.1:8686/cnstock/mcp"
+    }
+  }
+}
+```
+
+各客户端的字段名略有不同，有的还要求写 `"type": "streamableHttp"`，以客户端文档为准。
+
+**Cherry Studio**：设置 → MCP 服务器，添加一个服务器，类型选「可流式传输的 HTTP（streamableHttp）」，URL 填上面的地址。保存后在「工具」页能看到 12 个工具。
+
+<img src="docs/cherrystudio.png" alt="Cherry Studio 中的 MCP 服务器配置" width="720">
+
+DeepChat 的配置方法和使用效果见[让 DeepSeek 通过 MCP 分析股票](docs/let-your-deepseek-analyze-stock-by-mcp.md)。
+
+> 地址请写 `127.0.0.1`，不要写 `localhost`。服务只监听 IPv4，而 macOS 上 `localhost` 会先解析到 IPv6 的
+> `::1`，有的客户端被拒绝后不会改用 IPv4，表现为一直连不上也不报错。
+
+也可以不用 `start.sh`，在前台启动并指定传输方式。只支持 stdio 的客户端，可以让它直接执行第二条命令（路径写绝对路径）。这种方式下，`start.sh` 负责的日志归档和 Xvfb 管理不会生效。
 
 ```bash
-./stop.sh && ./start.sh --clear-cache
+.venv/bin/python main.py --transport http --port 8686
+.venv/bin/python main.py --transport sse --port 8686
+.venv/bin/python main.py --transport stdio
 ```
 
-用在**代码没变、但缓存里存了错值**的时候。闭市期间的缓存跨重启保留、也不过期，所以光重启
-带不走它。
+## 可以这样问
 
-**部署后不用加**，升级会自动让旧缓存失效。服务正在跑时这个参数不执行，会提示先停服务。
+接入后直接用自然语言提问，Agent 会自己选工具：
 
-也可以前台运行并选择 transport：
+- 贵州茅台今天主力资金是流入还是流出？（`brief`）
+- 对比兆易创新和北方华创近 60 日的资金流和 MACD。（`full`）
+- 2026-08-20 有哪些涨停股上了龙虎榜？（`market_events`）
+- 今天哪些行业在被主力买入？创业板里哪只股票最强？（`sector_fund_flow`、`market_map`）
+- 6 月 5 日收盘时宁德时代的资金面怎么样？（`brief`，带 `date`）
+
+<details>
+<summary><b>用命令行调用（mcporter）</b></summary>
+
+先注册一次服务名：
 
 ```bash
-cn-stock-mcp --transport http --port 8686
-cn-stock-mcp --transport stdio
-cn-stock-mcp --transport sse --port 8686
+npx mcporter config add cn-stock --url http://127.0.0.1:8686/cnstock/mcp --scope home
 ```
 
-## MCP 客户端接入
-
-支持 Streamable HTTP 的客户端填写：
-
-```text
-名称: cn-stock
-类型: streamableHttp
-地址: http://127.0.0.1:8686/cnstock/mcp
-```
-
-CherryStudio 中进入“设置 → MCP 设置 → 添加服务器”，选择
-“可流式传输的 HTTP（streamableHttp）”并填写上述地址。
-
-![CherryStudio MCP 配置](docs/cherrystudio.jpg)
-
-其他客户端的操作示例见[让 DeepSeek 通过 MCP 分析股票](docs/let-your-deepseek-analyze-stock-by-mcp.md)。
-
-## 使用 mcporter 调用
-
-以下示例假设 `mcporter` 已配置名为 `cn-stock` 的服务：
+个股报告，多个标的用半角逗号隔开，一次最多 4 个：
 
 ```bash
-export MCPORTER_CONFIG=~/.openclaw/workspace/config/mcporter.json
+npx mcporter call cn-stock.brief symbol=SH600519
+npx mcporter call cn-stock.medium symbol=SZ000333
+npx mcporter call cn-stock.full symbol=SH603986 fund_flow_limit=30
+npx mcporter call cn-stock.brief symbol=SH600000,SZ000333,SZ300750,SH688981
 ```
 
-查询简要、财务和完整报告：
+查历史某一天：
 
 ```bash
-mcporter call cn-stock brief symbol=SH600000
-mcporter call cn-stock medium symbol=SZ000333
-mcporter call cn-stock full symbol=SH603986 fund_flow_limit=30
+npx mcporter call cn-stock.brief symbol=SZ002463 date=2026-06-05
+npx mcporter call cn-stock.tech symbol=SZ002463 days=30 date=2026-06-05
 ```
 
-单次批量查询，标的之间使用半角逗号：
+技术指标，`fields` 可以只取其中几组：
 
 ```bash
-mcporter call cn-stock brief symbol=SH600000,SZ000333,SZ300750,SH688981
+npx mcporter call cn-stock.tech symbol=SZ002463,SH688981 days=10
+npx mcporter call cn-stock.tech symbol=SZ002463 fields=macd,kdj include_derived=true
 ```
 
-超过 4 个标的时只处理前 4 个，其余代码会写入响应的 `warnings`。
-
-查询机器可读技术指标：
+K 线，`adjust` 可选 `qfq`（前复权，默认）、`hfq`（后复权）、`none`（不复权）：
 
 ```bash
-mcporter call cn-stock tech symbol=SZ002463 days=30
-mcporter call cn-stock tech symbol=SZ002463,SH688981 days=10
-mcporter call cn-stock tech symbol=SZ002463 fields=macd,kdj include_derived=true
+npx mcporter call cn-stock.kline_daily symbol=SH603986 date=2026-05-29 adjust=qfq
+npx mcporter call cn-stock.kline_range symbol=SH603986 start_date=2026-05-22 end_date=2026-05-29
 ```
 
-查询指定历史截止日期：
+市场与板块：
 
 ```bash
-mcporter call cn-stock brief symbol=SZ002463 date=2026-06-05
-mcporter call cn-stock tech symbol=SZ002463 days=30 date=2026-06-05
+npx mcporter call cn-stock.market_breadth
+npx mcporter call cn-stock.sector_fund_flow sector_type=concept period=5d
+npx mcporter call cn-stock.market_map board=star fmt=markdown
+npx mcporter call cn-stock.market_events date=2026-08-20 sources=lhb,limit_up,announcements
 ```
 
-查询单日或区间 K 线，`adjust` 可选 `qfq`（前复权）、`hfq`（后复权）和 `none`（不复权）：
+`market_map` 的 `board` 可选 `all`（全部 A 股）、`sse`（上证主板）、`star`（科创板）、`szse`（深证主板）、
+`chinext`（创业板）、`bse`（北交所）。按市场筛选比 `all` 快得多，需要翻的页少。`market_events` 的 `sources`
+可以组合 `lhb`、`limit_up`、`strong`、`previous_limit_up`、`broken_board`、`announcements`、`earnings_forecast`。
+其余参数见各工具的说明：`npx mcporter list cn-stock`。
 
-```bash
-mcporter call cn-stock kline_daily symbol=SH603986 date=2026-05-29 adjust=qfq
-mcporter call cn-stock kline_range symbol=SH603986 start_date=2026-05-22 end_date=2026-05-29
-mcporter call cn-stock kline_range symbol=SH603986 start_date=2026-05-22 end_date=2026-05-29 adjust=none
-```
+</details>
 
-查询全市场涨跌分布：
+## 数据来源与可靠性
 
-```bash
-mcporter call cn-stock market_breadth
-```
+默认只用公开接口，不需要任何账号。主要数据都配了备用源，按下表的顺序尝试，前一个取不到就换下一个：
 
-查询市场云图。`board` 可选 `all`（全部A股）、`sse`（上证主板）、`star`（科创板）、
-`szse`（深证主板）、`chinext`（创业板）、`bse`（北交所）：
+| 数据 | 默认来源顺序 |
+| --- | --- |
+| 基本数据（市值、市盈率、市净率） | 东方财富 → 腾讯 |
+| 日 K 线（个股、ETF） | 东方财富 → 腾讯 → 新浪 → 同花顺 |
+| 日 K 线（指数） | 东方财富 → 同花顺 → 腾讯 → 新浪 |
+| 盘中实时行情 | 东方财富资金流页面 → 腾讯 → 同花顺 → 新浪 |
+| 个股资金流 | 东方财富 → 东方财富备用集群 → 东方财富资金流页面（浏览器）；盘中实时数据直接取自资金流页面 |
+| 财务报表 | 同花顺 → 新浪 |
+| 板块资金流 | 东方财富 → 东方财富备用接口（只有主力净额） |
+| 市场宽度 | 同花顺 → efinance |
+| 交易日历 | 新浪（交易所公布的交易日名单）→ holiday-cn（国务院放假安排）→ 按工作日推算 |
+| 龙虎榜、涨停池、公告、业绩预告 | 东方财富 |
 
-```bash
-mcporter call cn-stock market_map board=star fmt=markdown
-mcporter call cn-stock market_map board=all sectors=10 stocks_per_sector=20
-mcporter call cn-stock market_map board=chinext sectors=0 stocks_per_sector=0 weight_by=turnover
-```
+- 最终没取到的数据，报告里会写明（例如「暂无资金流向数据」）；降级和截断的原因写在返回结果的 `warnings` 里。
+- 行情和资金流都对齐到报告开头的「数据日期」。周末、节假日和开盘前，数据日期是最近一个已经收盘的交易日。
+- `health` 工具从日志统计各维度的可用率、缺失明细和耗时，不请求上游，随时可以调。
+- 东方财富对部分出口 IP 限流较严。资金流的来源链末尾还可以加按积分计费的付费网关（默认关闭），见[配置参考](docs/configuration.md#取数源与顺序)。
 
-`fmt=markdown` 将同一批数据列成表格（默认），`fmt=json` 返回逐股基础数据。
-个股含最新价、涨跌幅、流通市值、成交额、主力净流入与净占比，按涨跌幅降序排列；缺值返回 `null`，表格显示 `—`。
-`rank_by=main_net` 默认按成员主力净流入合计选行业，`rank_by=change_pct` 按加权涨跌选行业。
-`sectors` 保留排序两端各 N 个行业，`0` 返回全部。`weight_by` 指定加权涨跌的权重（`float_cap` 流通市值或 `turnover` 成交额）。
-`stocks_per_sector` 每个行业按涨跌幅最多返回 N 只，默认 `20`，`0` 返回全部成员。
-资金流仅统计所选市场内的成员；缺资金流的行业不参与净流入排名，用 `sectors=0` 查看。
-按板块筛选比 `all` 快一个量级，上游要翻的页数少得多。
-
-查询指定日期的公开事件池：
-
-```bash
-mcporter call cn-stock market_events \
-  date=2026-08-20 \
-  sources=lhb,limit_up,announcements \
-  announcement_lookback_days=3 \
-  keywords=中标,订单,涨价,投产,收购,重组 \
-  symbols=SH600000,SZ000001 \
-  max_rows_per_source=200
-```
-
-`sources` 可组合 `lhb`、`limit_up`、`strong`、`previous_limit_up`、`broken_board`、
-`announcements` 和 `earnings_forecast`。`symbols` 可选，使用标准 `SH/SZ/BJ + 6 位代码`，
-在 `max_rows_per_source` 截断前过滤；省略时保持全市场行为。
-
-## 常见问题
-
-**首次调用较慢**
-
-首次请求要额外做启动、认证和建连，属于一次性开销。判断快慢请看
-`logs/cn-stock-mcp.log` 里的分段耗时，不要只比较单次冷启动。
-
-**指定日期没有数据**
-
-周末和节假日通常返回截止日期之前最近一个交易日的数据；代码错误或标的尚未上市时可能返回空结果。
-
-**报告里出现“盘中实时数据暂时不可用”**
-
-东财资金流接口和页面兜底都没取到数据，其余部分不受影响。这是瞬时状态，不会被写进缓存。
-
-**`full` 缺“历史资金流向”**
-
-东财只给部分指数提供资金流向页面（科创 50 `SH000688` 就没有）。没有页面的标的只剩一个来源，
-那个来源拒绝当前出口 IP 时这一段就缺失。同一份报告里的“资金流向”（当日）来自另一处，通常还在。
-
-**报告里出现“历史资金流向只取到 N/M 个交易日”**
-
-本次 `fund_flow_limit` 要 M 行，接口、页面兜底、网关整条链加起来只给到 N 行。表格里那 N 行
-本身是完整的，缺的是更早的日子；重新请求可能就补上，所以带这一句的报告不会被写进缓存。
-M 取 `fund_flow_limit` 与同一份报告里 K 线交易日数的较小值——新股上市不足 M 天不会出这一句。
-
-**`market_breadth` 出现 fallback warning**
-
-首选数据源认证失败、处于冷却期或浏览器不可用时会自动回退。响应仍可使用，但应关注
-`source`、`trade_date` 和 `warnings`。
-
-**批量请求被截断**
-
-每次 tool 调用最多处理 4 个标的。需要更多标的时由客户端拆分请求，并控制并发，避免集中冲击上游接口。
+数据链路、回退和缓存的细节见[技术实现说明](docs/technical-details.md)。
 
 ## 配置
 
-所有配置都通过 `.env` 提供，全部可省略，省略即使用下表的默认值；改完需要重启服务。
-可以从 `.env.example` 复制一份来改。
+不配置就能运行。需要调整时，把 `.env.example` 复制成 `.env` 再改，改完重启服务。最常用的几项：
 
-> `.env` 的取值优先于 shell 环境变量。`HTTP_CHANNEL=direct ./start.sh` 会被 `.env` 里的
-> 同名项覆盖，临时改配置请直接改 `.env`。
+- `FUND_FLOW_PROVIDERS`：资金流的来源顺序，默认已包含浏览器页面兜底（`fund_flow_page`），可以在末尾加付费网关（`eastmoney_gateway`）
+- `AKSHARE_PROXY_ENABLED`：付费网关的开关，默认关闭
+- `CACHE_ENABLED`：缓存总开关
+- `BROWSER_MAX_PAGES`：浏览器同时打开的页面数，直接决定峰值内存
+- `ENV_PREFIX`：和别的程序共用环境变量时，给所有配置名加上前缀
 
-要和别的程序共存时设 `ENV_PREFIX`，之后所有配置名都带上这个前缀（`ENV_PREFIX=CNSTOCK_`
-时写 `CNSTOCK_HTTP_CHANNEL`）。`AKSHARE_PROXY_*` 属于第三方插件，不受影响。
+全部配置项、默认值和取值方法见[配置参考](docs/configuration.md)。
 
-### 出站 HTTP 通道
+## 常见问题
 
-部分东方财富接口会直接断开普通 HTTP 客户端的连接，`HTTP_CHANNEL` 决定用哪种方式访问这些
-主机。默认的 `auto` 在没有配置网关时使用 `impersonate`，无需任何额外账号。
+**数据日期为什么不是今天？**
 
-| 配置名 | 作用 | 可选参数 |
-| --- | --- | --- |
-| `HTTP_CHANNEL` | 访问东财行情主机的方式：<br>`auto` 按 `AKSHARE_PROXY_ENABLED` 选择，并在运行中按请求回退<br>`proxy` 经授权网关和代理出口，按积分计费<br>`impersonate` 本机直连，伪装成浏览器<br>`direct` 本机直连，不做伪装，可写作 `off` | `auto`<br>`proxy`<br>`impersonate`<br>`direct`<br>（默认 `auto`） |
-| `IMPERSONATE_RETRY` | 单个请求的伪装尝试次数，用尽后不带伪装再试一次 | 正整数（默认 `3`） |
-| `IMPERSONATE_TIMEOUT_SECONDS` | 单次伪装请求的超时 | 秒（默认 `8`） |
-| `EASTMONEY_FALLBACK_TIMEOUT_SECONDS` | 东财 API 在伪装失败后重放、或 `auto` 网关回退时的单次超时；调用方显式 timeout 优先 | 秒（默认 `8`） |
-| `IMPERSONATE_BROWSER` | 伪装成哪个浏览器 | 浏览器名，如 `chrome`、`safari`（默认 `chrome`） |
-| `IMPERSONATE_SUSPEND_AFTER_FAILURES` | 连续多少次请求打满重试仍失败后暂停伪装通道 | 正整数（默认 `4`） |
-| `IMPERSONATE_SUSPEND_SECONDS` | 暂停时长。期间东财源直接跳过，改用备用源 | 秒（默认 `300`） |
-| `EASTMONEY_AUTH_ENABLED` | 是否自动取得并复用东财访问凭据，提高行情列表、快照和资金流接口的成功率 | `0`<br>`1`<br>（默认 `1`） |
-| `EASTMONEY_AUTH_TTL_SECONDS` | 多久主动刷新一次。到期后后台刷新，新值到手前继续使用旧值；连续被拒也会触发刷新 | 秒（默认 `21600`） |
-| `EASTMONEY_AUTH_PAGE` | 采集凭据的页面，通常不需要修改 | URL（默认 `https://quote.eastmoney.com/center/gridlist.html`） |
-| `EASTMONEY_AUTH_INVALIDATE_AFTER_FAILURES` | 连续多少次被拒后刷新凭据 | 正整数（默认 `3`） |
-| `EASTMONEY_AUTH_HARVEST_TIMEOUT_SECONDS` | 一次采集的总预算，超时后继续走既有请求链路 | 秒（默认 `45`） |
+非交易日和开盘前，返回的是最近一个交易日的数据，行情和资金流都对齐到这一天。指定日期查询时，
+如果那天不是交易日，会用那天之前最近的交易日。代码写错或标的尚未上市时，可能返回空结果。
 
-只有少数东方财富行情主机会被接管，其余原样直连；详见[出站 HTTP 通道](docs/technical-details.md#6-出站-http-通道)。
+**第一次调用比较慢**
 
-### AkShare Proxy Patch（可选，付费）
+第一次请求要额外完成启动、认证和建立连接，这是一次性的开销。判断快慢请看
+`logs/cn-stock-mcp.log` 里的分段耗时，不要只看冷启动那一次。
 
-**默认关闭。** 这是一个按积分计费的授权网关，不配置也能正常使用全部工具；上游对本机出口 IP
-限流严重时可以启用它来提高东财接口的成功率。
+**报告里出现「盘中实时数据暂时不可用」**
 
-| 配置名 | 作用 | 可选参数 |
-| --- | --- | --- |
-| `AKSHARE_PROXY_ENABLED` | 网关使用方式；`auto` 仅在东财本地请求失败后按请求回退 | `0`<br>`1`<br>`auto`<br>（默认 `0`） |
-| `AKSHARE_PROXY_GATEWAY` | 授权网关地址，不含协议和端口 | 主机名或 IP（默认空） |
-| `AKSHARE_PROXY_TOKEN` | 网关访问令牌 | 字符串（默认空） |
-| `GATEWAY_EXIT_RETRIES` | 网关出口死了换新的重试次数；连续失败才进冷却（旧名 `AKSHARE_PROXY_RETRY` 仍然认） | 次数（默认 `3`） |
-| `AUTO_PROXY_AFTER_FAILURES` | `AKSHARE_PROXY_ENABLED=auto` 时，触发网关回退前的连续本地失败次数 | 正整数（默认 `3`） |
-| `AUTO_PROXY_COOLDOWN_SECONDS` | `auto` 模式网关回退失败后的暂停时长 | 秒（默认 `300`） |
-| `AUTO_PROXY_DATA_COOLDOWN_SECONDS` | 网关数据失败（出口已拿到、请求没成）后的暂停秒数；失败同时作废缓存的认证，下一次尝试换新出口 | 秒（默认 `30`） |
-| `AUTO_PROXY_RECOVERY_PROBES` | 网关回退激活期间，本地成功多少次就退出回退。默认 `1`：间歇性拒绝下"连续 N 次"几乎攒不够，网关会永久激活；误判恢复的代价只是几个请求走回退链 | 次数（默认 `1`） |
-| `AUTO_PROXY_RECOVERY_INTERVAL_SECONDS` | 相邻两次恢复探测的最小间隔秒数；间隔内的本地成功不累计 | 秒（默认 `60`） |
-| `GATEWAY_TRANSPORT` | 网关传输实现；接新的代理库时在 `gateway.py` 写一个 `GatewayTransport` 实现再加一个可选值 | 默认 `akshare_proxy_patch` |
-| `GATEWAY_AUTH_REUSE_SECONDS` | 一份网关出口凭据的复用上限；出口死亡是静默的，由失败即作废兜住 | 秒（默认 `600`） |
-| `GATEWAY_SINGLEFLIGHT_WAIT_SECONDS` | 同一主机同一接口族已有网关请求在飞时，其余请求等它出结果的上限 | 秒（默认 `5`） |
+东财资金流接口和页面兜底都没取到数据，报告的其余部分不受影响。这是瞬时状态，不会被写进缓存。
 
-从旧版本升级时注意：这个开关以前默认开启，现在需要显式写 `AKSHARE_PROXY_ENABLED=1`
-才会继续走网关，否则自动降级到 `impersonate`。
+**`full` 缺「历史资金流向」**
 
-### 取数源与顺序
+东财只给部分指数提供资金流向页面（比如科创 50 `SH000688` 就没有）。没有页面的标的只剩一个来源，
+这个来源拒绝当前出口 IP 时，这一段就会缺失。同一份报告里的当日「资金流向」来自另一处，通常还在。
 
-每一维数据都可以配多个来源，逗号分隔按顺序尝试，前一个没取到就问下一个，`off` 关掉整层。
-多个来源各给一部分字段时会合起来用。
+**报告里出现「历史资金流向只取到 N/M 个交易日」**
 
-| 配置名 | 作用 | 可选参数 |
-| --- | --- | --- |
-| `BASIC_INFO_PROVIDERS` | 基本数据（市值、市盈率、市净率）的尝试顺序，后面的源补前面缺的字段：<br>`eastmoney` 字段最全，需要网关或未被封的出口<br>`tencent` 无需鉴权，没有网关的部署靠它兜住这一组 | `eastmoney`<br>`tencent`<br>`off`<br>（默认 `eastmoney,tencent`） |
-| `FINANCE_PROVIDERS` | 财务报表（净利润、营业总收入、每股收益、每股净资产、净资产收益率）的尝试顺序：**第一个给全这六列的源整份胜出**，不按字段跨源拼表——两家的报告期轴不同，拼一次错一位就是把上一年的净利润配到今年的净资产收益率上。`ths` 列最多、是主源；`sina` 是独立主机，一次调用带全部历史期。年度净资产收益率两家口径不同，走了回退时报告会在财务段写明这一节来自谁 | `ths`<br>`sina`<br>`off`<br>（默认 `ths,sina`） |
-| `INTRADAY_QUOTE_PROVIDERS` | 盘中实时行情的尝试顺序，逗号分隔按序尝试，`off` 关闭整层。**当天那一根 K 线只认这一层**（历史 K 线给的当天数据不作准）：<br>`fund_flow_page` 复用已解析的资金流页面，不发请求但没有开高低<br>`tencent` 字段全<br>`tonghuashun` 字段全<br>`sina` 个股/ETF 的末级兜底，不提供指数报价和换手率 | `fund_flow_page`<br>`tencent`<br>`tonghuashun`<br>`sina`<br>`off`<br>（默认 `fund_flow_page,tencent,tonghuashun,sina`） |
-| `INTRADAY_QUOTE_PROVIDERS_INDEX` | **指数**用的顺序，和上一项分开配：指数的成交量各源口径不一致，腾讯/新浪比东财/同花顺低约 3.5%（两家同源，互相校验不了）。东财是基准源，所以指数把同花顺排前面；个股各源逐位一致，不换 | `fund_flow_page`、`tonghuashun`、`tencent`、`off`（默认 `fund_flow_page,tonghuashun,tencent`） |
-| `INTRADAY_QUOTE_CROSS_CHECK_PCT` | 报价字段相对偏差的告警阈值。排查时按当前环境设置；这一段挡在报价返回之前，开启会串行请求所有剩余来源，每个标的多付一份下面的预算 | 百分比，`0` 关闭（默认 `0`） |
-| `INTRADAY_QUOTE_CROSS_CHECK_BUDGET_SECONDS` | 上面那轮校验的总预算。预算会穿给各来源压缩其超时，所以是真正的总上限而非单次超时。按最大值定不按分位数：各源单次最大耗时 × 源个数再留余量 | 秒，`0` 不限（默认 `2`） |
-| `LOG_FILE` | 服务日志文件的路径，`health` 工具读它算可用率和耗时。`start.sh` 启动时会把实际路径传进来，正常不用配 | 路径（默认 `logs/cn-stock-mcp.log`） |
-| `LOG_RETENTION_DAYS` | 归档日志保留几天。每次启动会把上一轮日志存成一份归档，超过这个天数的清掉。`health` 默认把归档一起统计，所以这个值决定它最多能回看多久 | 天数，`0` 表示不留归档（默认 `3`） |
-| `TRADING_CALENDAR_PROVIDERS` | 判「今天开不开市」的日历来源：<br>`sina` 上交所公布的交易日名单，最权威<br>`holiday_cn` [NateScarlet/holiday-cn](https://github.com/NateScarlet/holiday-cn) 的国务院放假安排换算而来，与交易所名单的差异只在个别调休日<br>`weekday` 兜底，周一到周五算交易日——长假会被整段算成交易日，所以放最后 | `sina`<br>`holiday_cn`<br>`weekday`<br>`off`<br>（默认 `sina,holiday_cn,weekday`） |
-| `FUND_FLOW_PROVIDERS` | 个股/指数资金流的来源顺序（页面兜底另算，排在这一层之后）：<br>`eastmoney` 给全部历史<br>`eastmoney_delay` 只回当日一行，但主源拒绝当前出口时它还通<br>`eastmoney_gateway` 同一个接口走付费网关，放链尾才不花冤枉钱 | `eastmoney`<br>`eastmoney_delay`<br>`eastmoney_gateway`<br>`off`<br>（默认 `eastmoney,eastmoney_delay`） |
-| `REALTIME_FUND_FLOW_PROVIDERS` | 没有资金流向页面的标的（科创 50 等）盘中实时资金流的来源，给当日累计的五档净流入；有页面的标的不走这里 | `eastmoney_delay`<br>`off`<br>（默认 `eastmoney_delay`） |
-| `SECTOR_FUND_FLOW_PROVIDERS` | 板块资金流的取数顺序：<br>`eastmoney` 字段全<br>`eastmoney_dataapi` 只有主力净额，但主源连不上时它还通；报告备注里会标出是降级源 | `eastmoney`<br>`eastmoney_dataapi`<br>`off`<br>（默认 `eastmoney,eastmoney_dataapi`） |
-| `MARKET_MAP_PROVIDERS` | 市场云图的来源顺序：<br>`eastmoney` 主集群<br>`eastmoney_delay` 同口径备用集群 | `eastmoney`<br>`eastmoney_delay`<br>`off`<br>（默认 `eastmoney,eastmoney_delay`） |
-| `MARKET_MAP_BUDGET_SECONDS` | 一次市场云图取数的总预算；用尽时返回已取到的页并标注缺页 | 秒（默认 `30`） |
-| `SECTOR_TAXONOMY_PROVIDERS` | 板块分级表的来源，用来只排同一层——东财的行业板块名单把各级混在一起，不分级会让父子板块同时上榜、同一笔钱数两遍。默认排申万二级，和东财官网那张榜一致：<br>`shenwan`、`swsresearch` 是同一套申万分类的两个来源，一个不通时另一个补上，缺的级也会互补<br>`off` 退回全部板块一起排，报告里会标出来 | `shenwan,swsresearch`<br>`shenwan`<br>`off`<br>（默认 `shenwan,swsresearch`） |
-| `KLINE_PROVIDERS` | 东财那一级取不到时，**个股/ETF** 的兜底顺序，逗号分隔按序尝试，`off` 关闭整层：<br>`tonghuashun` 不覆盖北交所<br>`tencent` 个股/ETF/指数都覆盖，北交所大半不认<br>`sina` 覆盖腾讯不认的北交所代码，但不认 ETF 和创业板指<br>三家各补各的洞 | `tonghuashun`<br>`tencent`<br>`sina`<br>`off`<br>（默认 `tencent,sina`） |
-| `KLINE_PROVIDERS_INDEX` | **指数**用的兜底顺序，和 `KLINE_PROVIDERS` 分开配：腾讯/新浪的指数成交量比东财/同花顺低约 3.5%，这个量级不能忽略，所以指数按准确度排而不是按稳定性 | 同上（默认 `tonghuashun,tencent,sina`） |
-| `KLINE_TONGHUASHUN_BUDGET_SECONDS` | 同花顺取一次 K 线的**总**预算，用尽即判该源失败、链路回退。它按年份取文件，跨 N 年就是 N 个请求，没有这一项时最坏耗时随窗口线性增长、没有上界。取值有两个下界，取大的那个：本环境**成功**取数的最大耗时，以及一次取数要发的请求数 × 单次超时。低于任何一个都会砍掉本来能拿到的结果、让指数成交量退到腾讯口径（低约 3.5%）；用 `probe_tuning.py tonghuashun` 量，它会把两个都算进去 | 秒，`0` 关闭（默认 `45`） |
-| `KLINE_MAX_GAP_TRADING_DAYS` | 相邻两根 K 线之间允许缺多少个**交易日**，超过就判该源失败、让链路回退。防的是「序列断裂」——列是齐的、数值也在合理区间，源「成功」返回，但涨跌幅会跨缺口计算、均线全错。单位是交易日而非自然日，所以长假在结构上就是 0，阈值只用来容忍停牌（10 是 2018 年后重大资产重组停牌的上限）。是偏好不是硬条件：每个源都带同样缺口时（真实长期停牌）会宽松再问一轮并放行，不会让 K 线整段缺失 | 交易日，`0` 关闭（默认 `10`） |
+这次请求要 M 行，整条来源链加起来只取到 N 行。表格里的 N 行本身是完整的，缺的是更早的日子；
+重新请求可能就能补上，所以带这句话的报告不会被写进缓存。M 取 `fund_flow_limit` 和这份报告里
+K 线交易日数中较小的那个，新股上市不足 M 天时不会出现这句话。
 
-### 资金流页面兜底
+**`market_breadth` 返回里有 fallback 警告**
 
-东财资金流接口不可用时，改用浏览器加载东财的资金流向页面取同一份数据。这条路不花网关积分，
-但每次要付一个页面加载，所以下面每一项都是在给它设上界——它不该在压力下变成常态。
+首选数据源认证失败、处于冷却期或浏览器不可用时，会自动改用备用源。结果仍然可以用，但要留意
+`source`、`trade_date` 和 `warnings`。
 
-| 配置名 | 作用 | 可选参数 |
-| --- | --- | --- |
-| `FUND_FLOW_PAGE_ENABLED` | 东财资金流接口不可用时，是否回退到资金流向页面 | `0`<br>`1`<br>（默认 `1`） |
-| `FUND_FLOW_PAGE_CONCURRENCY` | 同时进行的兜底页面加载数。要和 `BROWSER_MAX_PAGES` 一起调，只提一个另一个就成了新瓶颈 | 正整数（默认 `3`） |
-| `FUND_FLOW_PAGE_QUEUE_WAIT_SECONDS` | 单个标的等一个名额的上限，等不到就跳过兜底。必须大于一次页面加载的耗时，否则一批里的最后一个标的结构上永远排不到；用 `scripts/probe_tuning.py` 量当前环境的分布 | 秒（默认 `8`） |
-| `FUND_FLOW_PAGE_REQUEST_BUDGET_SECONDS` | 一次请求里所有标的等名额的总时长上限，必须大于上一项 | 秒，`0` 关闭（默认 `15`） |
-| `FUND_FLOW_PAGE_TABLE_WAIT_SECONDS` | 等历史表渲染完成的上限 | 秒（默认 `15`） |
-| `FUND_FLOW_PAGE_REUSE_SECONDS` | 同一标的页面解析结果的复用窗口，避免一次请求内重复加载同一页面 | 秒，`0` 关闭复用（默认 `30`） |
-| `FUND_FLOW_PAGE_MAX_LOADS` | 单次请求允许的页面加载次数，只在没拿到数据时才会用掉。被拒直接换 tab，不 reload；别调大，被拒后每多开一个 tab 都消耗同一出口的频率额度，会把偶发的拒绝放大成整批滑块，合适的值用 `scripts/probe_tuning.py` 量 | 正整数（默认 `2`） |
-| `FUND_FLOW_PAGE_RETRY_DELAY_MS` | 重试刷新之前的随机等待区间，只作用在重试路径上 | `下界,上界` 毫秒<br>单个数字为固定值<br>`0` 关闭<br>（默认 `250,350`） |
-| `FUND_FLOW_PAGE_OPEN_AFTER_FAILURES` | 实时页面加载多少次被拒后暂停实时路径（历史兜底不熔断，它是付费网关前的最后一级免费途径） | 正整数（默认 `4`） |
-| `FUND_FLOW_PAGE_FAILURE_WINDOW_SECONDS` | 上一项按这个滑动窗口计数 | 秒，`0` 退回连续计数（默认 `60`） |
-| `FUND_FLOW_PAGE_COOLDOWN_SECONDS` | 实时路径的暂停时长 | 秒（默认 `60`） |
-| `FUND_FLOW_EMPTY_PROBE_SECONDS` | 日期对齐门的空探测有效期：探到目标日的行在上游不存在后，这段时间内同一（标的, 目标日）不再重复付页面/网关。按落地窗口的最大值量（probe_tuning 的 fund-flow-landing 项），量不到样本时宁小勿大 | 秒（默认 `3600`） |
+**缓存里存了错误的值**
 
-### 上游源熔断
+代码没变、但缓存里存了错值时，执行 `./stop.sh && ./start.sh --clear-cache`。收盘后的缓存会跨重启保留、
+也不会过期，所以只重启清不掉。升级版本会自动让旧缓存失效，不需要加这个参数；服务运行时这个参数不会执行，
+会提示先停止服务。
 
-某个来源连续失败时直接跳过它，不必每次请求都把整条备用链走完。
+## 文档
 
-| 配置名 | 作用 | 可选参数 |
-| --- | --- | --- |
-| `SOURCE_BREAKER_ENABLED` | 是否启用熔断 | `0`<br>`1`<br>（默认 `1`） |
-| `SOURCE_BREAKER_OPEN_AFTER_FAILURES` | 连续失败多少次后跳过该源 | 正整数（默认 `3`） |
-| `SOURCE_BREAKER_COOLDOWN_SECONDS` | 冷却时长，结束后放行一次探测请求 | 秒（默认 `120`） |
-
-### 并发与线程池
-
-取数用一个有界线程池执行。小内存机器建议保持默认值，调高会增加上游压力，并不保证降低延迟。
-
-| 配置名 | 作用 | 可选参数 |
-| --- | --- | --- |
-| `FETCH_MAX_WORKERS` | 同时执行同步数据任务的线程数 | 正整数（默认 `8`） |
-| `FETCH_MAX_IN_FLIGHT` | 已运行和已提交任务的总上限，超出后请求以协程等待 | 正整数（默认 `16`） |
-| `BATCH_CONCURRENCY` | `brief/medium/full` 共享的活跃批次数上限 | 正整数（默认 `2`） |
-| `FINANCE_CACHE_TTL_SECONDS` | 财务摘要的缓存时间。财务数据只在定期报告发布后变动 | 秒，`0` 关闭（默认 `21600`） |
-| `FINANCE_CACHE_MAX_ENTRIES` | 财务缓存的最大标的数，超出后淘汰最早项 | 正整数（默认 `512`） |
-
-### 市场纪元边界
-
-交易所的时刻表是死的（09:30 开盘、15:00 收盘），但上游不在这些时刻定稿：盘前已经开始
-更新当日数据，盘后还要整理一会儿。下面几项就是调这个提前量和延后量的，越界会夹回合法
-区间并告警。它们同时决定报告缓存按什么时段划分、以及盘中资金流从哪里取。
-
-| 配置名 | 作用 | 可选参数 |
-| --- | --- | --- |
-| `MARKET_EPOCH_WARMUP_TIME` | 从这一刻起按盘中对待。晚于开盘会把真在交易的一段判成闭市 | 四位 HHMM，夹在 `0700`–`0930`（默认 `0915`） |
-| `MARKET_EPOCH_SETTLE_TIME` | 当日数据从这一刻起算定稿、报告可完全复用。早于收盘会把仍在变动的连续竞价折进来 | 四位 HHMM，不早于 `1500`、不晚于 `MARKET_EPOCH_FINAL_TIME`（默认 `1530`） |
-| `MARKET_EPOCH_FINAL_TIME` | 资金流从抓页面切回读接口的时刻，同时是纪元边界 | 四位 HHMM，夹在 `1500`–`2300`（默认 `1600`） |
-| `MARKET_EPOCH_BUFFER_MINUTES` | 午休、傍晚这些边界后留给上游整理的缓冲 | 分钟，`0`–`60`（默认 `5`） |
-
-### 缓存
-
-缓存唯一的正当理由是"这段时间里这份数据不会变"：非交易日数据冻结，一个纪元可以一直
-命中；盘中数据在变，只用短 TTL 合并重复请求。命中与否不改变返回内容。
-
-| 配置名 | 作用 | 可选参数 |
-| --- | --- | --- |
-| `CACHE_ENABLED` | 总开关。关掉后所有命名空间既不读也不写，可用于冷热对照压测 | `0`<br>`1`<br>（默认 `1`） |
-| `CACHE_INTRADAY_TTL_SECONDS` | 盘中软过期秒数的默认值，`0` 表示盘中绝不复用。盘中数值持续变动，这个 TTL 只用于合并突发重复请求 | 秒（默认 `30`） |
-| `CACHE_STALE_ON_ERROR` | 软过期后刷新失败，是否继续用旧值。用了一定会在输出里标注；跨纪元的旧值永远不给 | `0`<br>`1`<br>（默认 `1`） |
-| `CACHE_DISK_ENABLED` | 跨重启保留闭市纪元的条目。傍晚纪元长达 16 小时，周末达 64 小时 | `0`<br>`1`<br>（默认 `1`） |
-| `CACHE_DIR` | 缓存文件目录，相对项目根目录。每个命名空间一个子目录 | 路径（默认 `.runtime/cache`） |
-| `CACHE_<命名空间>_MAX_ENTRIES`<br>`CACHE_<命名空间>_TTL_SECONDS` | 单个命名空间的覆盖，命名空间有 `report`、`market_events`、`sector_flow`、`market_breadth`、`finance`、`calendar`、`taxonomy`。例：`CACHE_REPORT_MAX_ENTRIES=512` | 正整数 / 秒 |
-| `CACHE_<命名空间>_ENABLED` | 单独关掉某一层缓存，缺省跟随 `CACHE_ENABLED`。用于 A/B——只有总开关时无法把收益归因到某一层 | `0`/`1`（默认跟随总开关） |
-| `CACHE_FUND_FLOW_MAX_ROWS` | 资金流历史一条最多缓存多少行。主源给全部历史（老标的数千行），截断可控内存；请求要的行数超过存下来的会判未命中、照常打上游，所以不会让数据变少 | 正整数（默认 `250`） |
-| `CONF_DIR` | 参考数据目录（指数名单、代码表、板块表）。默认随包发布，正常不用配；指到别处可临时替换而不重装，只放要改的那个文件即可，其余仍从包内读 | 路径（默认包内 `finmcp/confs`） |
-
-盘中命中返回的必然是一份稍旧的快照，TTL 决定这份快照能有多旧。对资金流精度要求高时设为 `0`。
-纪元划分、TTL 取值依据和实测数据见[报告缓存](docs/technical-details.md#10-报告缓存)。
-
-### 市场宽度（同花顺）
-
-| 配置名 | 作用 | 可选参数 |
-| --- | --- | --- |
-| `MARKET_BREADTH_AUTH_FILE` | 同花顺认证缓存文件 | 路径（默认 `.runtime/tonghuashun-auth.json`） |
-| `MARKET_BREADTH_COOLDOWN_SECONDS` | 同花顺认证失败后的冷却时间，冷却期内 `market_breadth` 直接用备用源 | 秒（默认 `300`） |
-
-### 浏览器与虚拟显示
-
-资金流兜底和 `market_breadth` 共用同一个浏览器实例，下面几项对两者同时生效。
-
-| 配置名 | 作用 | 可选参数 |
-| --- | --- | --- |
-| `BROWSER_MAX_PAGES` | 整个浏览器同时开着的页面数上限。这同时就是同时有几个渲染进程，是峰值内存的直接决定项——每多一个并发页就多一个渲染进程 | 正整数（默认 `3`） |
-| `BROWSER_IDLE_TIMEOUT_SECONDS` | **盘中**多久没人调用就关掉浏览器。默认 90 分钟盖住午休，关早了下一批调用要重新等冷启动 | 秒，`0` 整层关闭回收（总开关，不看时段）（默认 `5400`） |
-| `BROWSER_IDLE_TIMEOUT_CLOSED_SECONDS` | **盘外**（收盘后、非交易日）的空闲回收超时。盘外没有午休要盖，而浏览器进程树是常驻内存的大头，拆掉能省下大部分 | 秒，`0` 盘外不回收、盘中照旧（默认 `300`） |
-| `BROWSER_DISGUISE` | 把无头浏览器的自报特征改成普通浏览器的样子。哪种身份被拒得少取决于出口 IP，两个方向都出现过，所以默认关、由实测决定：用 `scripts/probe_tuning.py` 量当前环境，置 1 启用伪装 | `0`<br>`1`<br>（默认 `0`） |
-| `BROWSER_CLAIM_PLATFORM` | 对外声明哪个平台。`auto` 下 Windows/macOS 照实报，Linux 报 macOS | `auto`<br>`real`<br>`macos`<br>`windows`<br>（默认 `auto`） |
-| `BROWSER_NO_SANDBOX` | 为 Chromium 添加 `--no-sandbox`。会降低隔离，仅在 sandbox 确实不可用时启用 | `0`<br>`1`<br>（默认 `0`） |
-| `XVFB_DISPLAY_NUMBER` | 无 `DISPLAY` 时 `start.sh` 使用的 Xvfb 起始显示号，被占用则依次往后试到 109 | 整数（默认 `99`） |
-| `XVFB_SCREEN` | Xvfb 屏幕配置 | `宽x高x色深`（默认 `1920x1080x24`） |
-| `BROWSER_HEADFUL` | 调试开关：用有头浏览器加载，便于人工观察 | `0`<br>`1`<br>（默认 `0`） |
-| `BROWSER_KEEP_PAGES` | 调试开关：抓完不关页面。每个页面是一个独立渲染进程，会显著抬高内存 | `0`<br>`1`<br>（默认 `0`） |
-
-## 更多文档
-
-- [2.0.0 变更说明与上线清单](docs/release-notes-2.0.0.md)：输出文本和配置名改了什么、下游怎么改、服务器上怎么验
-- [开发与维护](docs/development.md)：跑测试、调试、发布前验证、重构时怎么证明行为没变
-- [项目架构](docs/architecture.md)：分层、每层负责什么、加工具/加数据源该动哪里
+- [配置参考](docs/configuration.md)：全部配置项、默认值和取值方法
 - [技术实现说明](docs/technical-details.md)：数据链路与回退、输出契约、报告缓存、调优边界
+- [项目架构](docs/architecture.md)：分层和职责，加工具、加数据源该改哪里
+- [开发与维护](docs/development.md)：运行测试、调试、发布前验证
+- [2.0.0 变更说明](docs/release-notes-2.0.0.md)：从 1.x 升级需要改什么
 - [完整报告示例](docs/SH603986-full.md)
 - [DeepChat 使用示例](docs/let-your-deepseek-analyze-stock-by-mcp.md)
+
+## 参与开发
+
+欢迎提交 Issue 和 Pull Request。修改代码前请先阅读[开发与维护](docs/development.md)和项目的开发约束
+[AGENTS.md](AGENTS.md)。执行 `./install.sh --dev` 安装测试依赖，测试的运行方法见开发文档。
+
+## 致谢
+
+- [elsejj/mcp-cn-a-stock](https://github.com/elsejj/mcp-cn-a-stock)：本项目最初在它的基础上改造而来
+- [AkShare](https://github.com/akfamily/akshare) 和 [efinance](https://github.com/Micro-sheep/efinance)：公开数据接口
+- [TA-Lib](https://github.com/TA-Lib/ta-lib-python)：技术指标计算
+- [holiday-cn](https://github.com/NateScarlet/holiday-cn)：法定节假日数据
 
 ## 免责声明
 
@@ -441,4 +312,4 @@ M 取 `fund_flow_limit` 与同一份报告里 K 线交易日数的较小值—�
 
 ## 许可证
 
-基于原项目协议，本项目采用 MIT 许可证。问题和建议请通过 GitHub Issue 提交。
+本项目采用 [MIT 许可证](LICENSE)。问题和建议请提交 [GitHub Issue](https://github.com/lllyin/mcp-cn-a-stock/issues)。

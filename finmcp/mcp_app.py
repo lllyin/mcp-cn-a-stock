@@ -24,6 +24,7 @@ from .datasource.base import (FETCH_FAILURES_KEY, FUND_FLOW_ANOMALIES_KEY,
 from .datasource.market_breadth import get_market_breadth
 from .datasource.public_events import PublicEventPoolResponse, get_public_market_events
 from .config import BATCH_CONCURRENCY
+from .version import __version__
 from .observability import bind_log_context, http_trace_id_var
 
 logger = logging.getLogger("finmcp")
@@ -890,6 +891,13 @@ class RequestLifecycleLogMiddleware:
 
 
 class QtfMCP(FastMCP):
+
+  def __init__(self, *args, **kwargs):
+    super().__init__(*args, **kwargs)
+    # 握手时回给客户端的 serverInfo.version。FastMCP 不收 version、也不往底层 Server
+    # 传，底层拿不到就报 mcp 这个 SDK 包自己的版本号——客户端（Cherry Studio 把它
+    # 显示在服务名旁边）看到的就是 SDK 版本，和本服务的版本对不上。
+    self._mcp_server.version = __version__
 
   def streamable_http_app(self) -> Starlette:
     super_app = super().streamable_http_app()
