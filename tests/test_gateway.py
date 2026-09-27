@@ -316,6 +316,32 @@ class TestSingleflight:
         leader.join(2)
         follower.join(2)
 
+    def test_cancelled_failed_send_invalidates_the_dead_auth(self):
+        transport = FakeTransport()
+        client = make_client(transport, exit_retries=3)
+        cancel_event = threading.Event()
+        send_started = threading.Event()
+        result = []
+
+        def send(*args, **kwargs):
+            send_started.set()
+            cancel_event.wait(1)
+            raise ConnectionError("proxy died")
+
+        worker = threading.Thread(
+            target=lambda: result.append(
+                client.request("GET", URL, send, cancel_event=cancel_event)
+            )
+        )
+        worker.start()
+        assert send_started.wait(2)
+        cancel_event.set()
+        worker.join(2)
+
+        assert result == [None]
+        assert client._auth is None
+        assert transport.invalidated == ["http://proxy-a:1"]
+
     def test_cooldown_blocks_without_sending(self):
         transport = FakeTransport()
         client = make_client(transport, data_cooldown_seconds=30)

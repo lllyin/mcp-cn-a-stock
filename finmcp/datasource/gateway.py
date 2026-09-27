@@ -430,6 +430,7 @@ class GatewayClient:
                 response = send(method, url, **retry_kwargs)
             except Exception as exc:
                 if cancel_event is not None and cancel_event.is_set():
+                    self._drop_auth(auth)
                     return None
                 logger.warning(
                     "gateway_failure host=%s family=%s path=%s attempt=%d/%d error=%s",
@@ -440,6 +441,8 @@ class GatewayClient:
                 continue  # 出口死了，换一个新的重试
             elapsed = time.perf_counter() - started
             if cancel_event is not None and cancel_event.is_set():
+                if not response_ok(url, response):
+                    self._drop_auth(auth)
                 return None
             if response_ok(url, response):
                 if leader:
