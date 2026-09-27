@@ -80,7 +80,8 @@ GATEWAY_TRANSPORT = str(env("GATEWAY_TRANSPORT", "akshare_proxy_patch")).strip()
 # 寿命分布后按最大值调整。
 GATEWAY_AUTH_REUSE_SECONDS = max(1.0, float(env("GATEWAY_AUTH_REUSE_SECONDS", "600")))
 # 同一 (host, 接口族) 已有网关请求在飞时，其余请求等它出结果的上限。超时或
-# leader 失败就走原回退链，不无限排队。
+# leader 失败就走原回退链，不无限排队。只管通道层自动回退——那条后面还有别的源
+# 可退；资金流链尾的网关级后面没有回退，等待按 leader 的最坏耗时算，不看这一项。
 GATEWAY_SINGLEFLIGHT_WAIT_SECONDS = max(0.5, float(env("GATEWAY_SINGLEFLIGHT_WAIT_SECONDS", "5")))
 
 # --- Outbound HTTP channel (finmcp/datasource/http_channel.py) ---

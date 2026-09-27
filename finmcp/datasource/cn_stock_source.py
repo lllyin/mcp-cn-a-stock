@@ -6,6 +6,7 @@ CN Stock 数据源实现
 
 import asyncio
 import collections
+import functools
 import json
 import logging
 import threading
@@ -38,7 +39,7 @@ from ..config import (
     SZ_INDICES,
 )
 from .. import cache
-from . import basic_info
+from . import basic_info, gateway
 from .. import market_session
 from .base import DataSource, FetchRequirements, StockData
 from .breaker import SourceBreaker  # noqa: F401  原地定义已抽到 breaker.py，这里保留名字给旧引用
@@ -62,6 +63,20 @@ def _fetch_failure(source: str) -> Dict[str, str]:
 def _is_fetch_failure(result) -> bool:
     """Whether a fetch result carries the failure sentinel."""
     return isinstance(result, dict) and _FETCH_FAILURE_MARKER in result
+
+
+def _counting_gateway_sends(func):
+    """包一层，让 func 在工作线程里跑完后连同它发出去的网关请求数一起返回。
+
+    网关按线程记账，所以计数必须在同一个工作线程里读。保留原函数名：线程池的
+    ``Data task`` 日志按名字统计各阶段耗时。
+    """
+    @functools.wraps(func)
+    def run(*args):
+        before = gateway.gateway_sends_in_current_thread()
+        result = func(*args)
+        return result, gateway.gateway_sends_in_current_thread() - before
+    return run
 
 
 # The K-line tier gets a breaker because it has an equivalent fallback; the
@@ -1451,7 +1466,8 @@ class CNStockDataSource(DataSource):
         fund_flow_post_order, kline_day, current,
     ):
         """页面/网关两条腿的本体（单飞包住它）。输入手上的资金流结果，
-        返回（兜底/合并后的最终结果, paid 状态）：0=没到网关 / 1=真付 / skipped=被止损。"""
+        返回（兜底/合并后的最终结果, paid 状态）：0=没到网关 / 1=真付 / skipped=被止损 /
+        gated=到了网关这一级但被网关挡下、一个请求都没发。"""
         value = current
 
         if (
@@ -1530,14 +1546,16 @@ class CNStockDataSource(DataSource):
                     FUND_FLOW_EMPTY_PROBE_SECONDS,
                 )
             else:
-                paid = "1"
-                post_result = await _run_in_executor(
-                    self._fetch_fund_flow_sync,
+                post_result, sends = await _run_in_executor(
+                    _counting_gateway_sends(self._fetch_fund_flow_sync),
                     code,
                     canonical_symbol,
                     fund_flow_need,
                     fund_flow_post_order,
                 )
+                # 真发出去才记 1。走到这一级却被网关挡下（并发闸等不到 leader、冷却中、
+                # 认证不可用）时一个请求都没发，记成 1 会把积分账算多。
+                paid = "1" if sends else "gated"
                 merged = _merge_fund_flow(value, post_result)
                 if merged is not None:
                     value = merged
@@ -1809,8 +1827,10 @@ class CNStockDataSource(DataSource):
             # "网关补齐率"和"恢复后是否停止付费"都靠这行算；last_date 对 data_date
             # 是"资金流滞后"这个可观测量的唯一出处。
             #
-            # paid 三态：0＝后置闸门没开（主源已满足需求），skipped＝被空探测止损
-            # 拦住，1＝**这次请求发出了网关调用**。1 计的是"发没发"，不是"扣没扣分"：
+            # paid：0＝后置闸门没开（主源已满足需求），skipped＝被空探测止损拦住，
+            # gated＝走到网关这一级但被网关挡下（并发闸等不到 leader、冷却、认证不可用）、
+            # 一个请求都没发，waited＝同标的单飞复用了别人的结果，
+            # 1＝**这次请求发出了网关调用**。1 计的是"发没发"，不是"扣没扣分"：
             # 上游在传输层拒掉（RemoteDisconnected）也记 1，而那一次未必真结算。
             # 所以它给出的是积分消耗的**上界**——用它比较两个版本谁更省时成立（口径
             # 相同），把它当账本对数就不成立。空探测省下的积分同样按"少发一次调用"计。

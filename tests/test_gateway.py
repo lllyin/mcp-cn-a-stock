@@ -221,6 +221,94 @@ class TestSingleflight:
         assert client.request("GET", URL, lambda *a, **k: sends.append(1)) is None
         assert not sends
 
+    @staticmethod
+    def _follower_while_leader_is_slow(client, **follower_kwargs):
+        """leader 发出后卡 0.3s 再成功；follower 在它在飞时进来。"""
+        leader_started = threading.Event()
+        results = {}
+        follower_sends = []
+
+        def leader_send(*args, **kwargs):
+            leader_started.set()
+            time.sleep(0.3)
+            return ok_response()
+
+        leader = threading.Thread(
+            target=lambda: results.setdefault("leader", client.request("GET", URL, leader_send)))
+        leader.start()
+        assert leader_started.wait(2)
+        follower = threading.Thread(target=lambda: results.setdefault(
+            "follower", client.request(
+                "GET", URL, lambda *a, **k: follower_sends.append(1) or ok_response(),
+                **follower_kwargs)))
+        follower.start()
+        leader.join(3)
+        follower.join(3)
+        return results, follower_sends
+
+    def test_a_last_resort_follower_outwaits_a_leader_slower_than_the_short_wait(self):
+        """链尾调用传 leader_budget：leader 换出口用掉的时间超过短等待，也要等到它、
+        再用它验证过的凭据自己发。短等待一到就放弃的话，链尾后面没有回退，就是缺数据。"""
+        transport = FakeTransport()
+        client = make_client(transport, wait_seconds=0.05)
+
+        results, follower_sends = self._follower_while_leader_is_slow(client, follower_wait=2)
+
+        assert results["follower"] is not None and results["follower"].status_code == 200
+        assert len(follower_sends) == 1
+        assert transport.auth_calls == 1      # 等到了 leader，没为自己另开出口
+
+    def test_a_channel_follower_still_gives_up_after_the_short_wait(self):
+        """通道层不传 follower_wait：后面还有别的源可退，照旧短等待后放弃。"""
+        client = make_client(FakeTransport(), wait_seconds=0.05)
+
+        results, follower_sends = self._follower_while_leader_is_slow(client)
+
+        assert results["follower"] is None
+        assert not follower_sends
+
+    def test_leader_budget_covers_every_exit_attempt(self):
+        transport = FakeTransport()
+        transport.auth_budget_seconds = 4.5
+        client = make_client(transport, exit_retries=3)
+
+        # 数字超时对连接、读取各生效一次；每换一个出口都可能先认证一次
+        assert client.leader_budget(8) == pytest.approx(3 * (4.5 + 16))
+        assert client.leader_budget((1.5, 8)) == pytest.approx(3 * (4.5 + 9.5))
+        # 没声明认证耗时的 transport 按 0 计
+        assert make_client(FakeTransport(), exit_retries=2).leader_budget(8) == pytest.approx(32)
+
+
+class TestSendAccounting:
+    """编排层据此区分"真付了"和"走到网关却一个请求都没发"。"""
+
+    def test_sends_are_counted_per_thread_and_include_failed_attempts(self):
+        transport = FakeTransport(exits=["http://dead:1", "http://live:1"])
+        client = make_client(transport, exit_retries=3)
+        outcomes = iter([ConnectionError("dead"), None])
+
+        def send(*args, **kwargs):
+            outcome = next(outcomes)
+            if outcome is not None:
+                raise outcome
+            return ok_response()
+
+        assert client.request("GET", URL, send) is not None
+        assert client.sends_in_current_thread() == 2   # 死出口那一次也发出去了
+        seen_elsewhere = []
+        other = threading.Thread(target=lambda: seen_elsewhere.append(client.sends_in_current_thread()))
+        other.start()
+        other.join(2)
+        assert seen_elsewhere == [0]                    # 别的线程各记各的
+
+    def test_a_request_blocked_by_cooldown_sends_nothing(self):
+        client = make_client(FakeTransport(), data_cooldown_seconds=30, exit_retries=1)
+        client.request("GET", URL, lambda *a, **k: (_ for _ in ()).throw(ConnectionError("x")))
+        before = client.sends_in_current_thread()
+
+        assert client.request("GET", URL, lambda *a, **k: ok_response()) is None
+        assert client.sends_in_current_thread() == before
+
 
 class TestExitRotation:
     def test_a_dead_exit_is_rotated_within_the_same_request(self):

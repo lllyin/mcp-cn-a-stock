@@ -377,6 +377,9 @@ def gateway_request(method: str, url: str, **kwargs):
 
     没配置网关或网关不可用（冷却中/认证不可用/并发闸）时返回 None，调用方按
     既有回退链继续。东财的身份头在这里补齐，调用方不用各自重复。
+
+    并发闸的等待按 leader 的最坏耗时给：这一级排在资金流链尾，后面没有回退，
+    等的人先放弃就是直接缺数据。通道层那条后面还有别的源，照旧用短等待。
     """
     client = gateway.get_gateway_client()
     if client is None:
@@ -394,7 +397,9 @@ def gateway_request(method: str, url: str, **kwargs):
         with base() as session:
             return session.request(method, url, **kw)
 
-    return client.request(method, url, send, **kwargs)
+    return client.request(
+        method, url, send, follower_wait=client.leader_budget(kwargs["timeout"]), **kwargs
+    )
 
 def _record_auto_proxy_local_failure(url) -> None:
     if not _auto_proxy:

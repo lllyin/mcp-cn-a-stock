@@ -59,6 +59,9 @@ class AkshareProxyTransport:
     """
 
     name = "akshare_proxy_patch"
+    #: 一次认证最多要多久：插件取凭据用的是 timeout=(1.5, 3)，连接加读取。
+    #: GatewayClient 用它算领头请求的最坏耗时。
+    auth_budget_seconds = 1.5 + 3
 
     def __init__(self, gateway: str, token: str) -> None:
         self._auth_url = f"http://{gateway}:47001/api/akshare-auth"
@@ -177,7 +180,8 @@ class GatewayClient:
     - 并发闸：同一 (host, 接口族) 一次只允许一个网关请求在飞；其余有界等待
       leader 的结果——leader 成功就用同一份凭据自己发，失败/超时就返回 None
       走原回退链。等待有上界，且线程结果在批次取消后会被丢弃，不会成为新的
-      堆积点。
+      堆积点。**等多久由调用方定**：后面还有别的源可退的（通道层）用短等待；
+      链尾没有回退的（编排层显式调用）等满 leader 的最坏耗时，见 ``leader_budget``。
     - 冷却：认证不可用（网关没出口可给）用长冷却；数据失败（出口本身差）用
       短冷却换出口。
     """
@@ -203,6 +207,27 @@ class GatewayClient:
         self._auth_at = 0.0
         self._last_failed_proxy: Optional[str] = None
         self._states: dict = {}
+        # 按线程数真正发出去的请求：编排层要知道这一级是真付了，还是被并发闸/
+        # 冷却挡下、一个请求都没发。
+        self._local = threading.local()
+
+    def leader_budget(self, timeout) -> float:
+        """一个 leader 最坏要用多久：每换一个出口都可能先认证一次，再把请求超时用满。
+
+        requests 的数字超时对连接和读取各生效一次，所以单次请求按两倍算；
+        ``(connect, read)`` 元组按两项之和。按最大值定、不按分位数：等的人比
+        leader 先放弃，那一次就白等了、还空手回去（AGENTS.md §五）。
+        """
+        if isinstance(timeout, (tuple, list)):
+            send = float(sum(part for part in timeout if part is not None))
+        else:
+            send = 2 * float(timeout)
+        auth = float(getattr(self._transport, "auth_budget_seconds", 0.0))
+        return self._exit_retries * (auth + send)
+
+    def sends_in_current_thread(self) -> int:
+        """本线程累计真正发出去的网关请求数（含失败的那几次）。"""
+        return getattr(self._local, "sends", 0)
 
     # -- 凭据复用 ----------------------------------------------------------
 
@@ -248,13 +273,19 @@ class GatewayClient:
 
     # -- 请求 ---------------------------------------------------------------
 
-    def request(self, method: str, url: str, send, **kwargs):
+    def request(self, method: str, url: str, send, *, follower_wait: Optional[float] = None,
+                **kwargs):
         """走网关发一次请求。成功返回 response；不可用/失败返回 None。
 
         ``send(method, url, **kwargs)`` 由调用方提供，决定用哪个 session 发——
         通道层传原始 requests.Session（绕过自己装的包装），脚本可以传任何
         兼容 requests 的对象。
+
+        ``follower_wait``：已有 leader 在飞时最多等它多久，缺省用构造时的
+        ``wait_seconds``。放弃的代价由调用方判断：后面还有源可退就短等，链尾就
+        传 ``leader_budget(timeout)``。
         """
+        wait_seconds = self._wait_seconds if follower_wait is None else follower_wait
         host = (urlsplit(url).hostname or "?").lower()
         key = (host, path_family(url))
         with self._lock:
@@ -270,9 +301,9 @@ class GatewayClient:
                 leader_done = None
 
         if leader_done is not None:
-            if not leader_done.wait(timeout=self._wait_seconds):
-                logger.debug("gateway_skip host=%s family=%s reason=leader_timeout",
-                             host, key[1])
+            if not leader_done.wait(timeout=wait_seconds):
+                logger.debug("gateway_skip host=%s family=%s reason=leader_timeout waited=%.1fs",
+                             host, key[1], wait_seconds)
                 return None
             with self._lock:
                 if not state.leader_ok:
@@ -314,6 +345,7 @@ class GatewayClient:
             retry_kwargs.pop("impersonate", None)
 
             started = time.perf_counter()
+            self._local.sends = self.sends_in_current_thread() + 1
             try:
                 response = send(method, url, **retry_kwargs)
             except Exception as exc:
@@ -373,6 +405,12 @@ def get_gateway_client() -> Optional[GatewayClient]:
             return None
         _client = GatewayClient(AkshareProxyTransport(AKSHARE_PROXY_IP, AKSHARE_PROXY_PASSWORD))
         return _client
+
+
+def gateway_sends_in_current_thread() -> int:
+    """共享客户端在本线程累计发出去的请求数；网关没配置时恒为 0。"""
+    client = _client
+    return client.sends_in_current_thread() if client is not None else 0
 
 
 def reset_gateway_client() -> None:

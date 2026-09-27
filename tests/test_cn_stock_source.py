@@ -2138,6 +2138,45 @@ async def test_gateway_is_not_paid_when_the_page_satisfies(monkeypatch):
     assert calls == [("eastmoney", "eastmoney_delay")]  # 网关一次都没被调到
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gateway_sent,expected_paid", [(1, "1"), (0, "gated")])
+async def test_paid_counts_real_gateway_sends_not_reaching_the_tier(
+    monkeypatch, caplog, gateway_sent, expected_paid,
+):
+    """paid=1 只在真发出网关请求时记。走到网关这一级却被网关挡下（并发闸等不到
+    leader、冷却中）时一个请求都没发，记 gated——记成 1 会把积分账算多。"""
+    datasource = CNStockDataSource()
+    _fund_flow_orchestration_stubs(monkeypatch, datasource)
+    monkeypatch.setattr(
+        source_module.fund_flow_source, "configured_order",
+        lambda: ("eastmoney", "eastmoney_delay", "fund_flow_page", "eastmoney_gateway"),
+    )
+    counter = {"sends": 0}
+    monkeypatch.setattr(
+        source_module.gateway, "gateway_sends_in_current_thread", lambda: counter["sends"])
+
+    def fake_fetch(code, symbol, need=None, order=None):
+        if order == ("eastmoney_gateway",):
+            counter["sends"] += gateway_sent
+            if gateway_sent:
+                return {"fund_flow": _fund_flow_frame_of(99), "is_market": False,
+                        "complete": True, "provider": "eastmoney_gateway"}
+        return source_module._fetch_failure("fund_flow")
+
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_sync", fake_fetch)
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_from_page", lambda symbol, today_date=None: asyncio.sleep(0))
+    monkeypatch.setattr(source_module, "store_fund_flow", lambda s, v: None)
+
+    with caplog.at_level("INFO", logger="finmcp"):
+        await datasource.fetch_stock_data_with_requirements(
+            "SH600519", "2024-01-01", "2026-06-17",
+            requirements=FetchRequirements(fund_flow_page=True, fund_flow_rows=60),
+        )
+
+    outcomes = [r.getMessage() for r in caplog.records if "fund_flow_outcome" in r.getMessage()]
+    assert outcomes and f"paid={expected_paid}" in outcomes[-1]
+
+
 # --- 资金流最后一行必须对齐数据日期（K 线最后一根） --------------------------
 #
 # 报告只写一个"数据日期"，资金流那段没有自己的日期：对不上就是错的数据。

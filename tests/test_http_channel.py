@@ -1244,6 +1244,9 @@ def test_gateway_request_is_the_explicit_entry(monkeypatch):
 
     assert response is not None and response.status_code == 200
     assert seen["timeout"] == channel.EASTMONEY_FALLBACK_TIMEOUT_SECONDS
+    # 这一级在资金流链尾、后面没有回退：并发闸要等满 leader 的最坏耗时，
+    # 不能用通道层那个短等待——等的人先放弃就是缺数据。
+    assert seen["follower_wait"] == client.leader_budget(channel.EASTMONEY_FALLBACK_TIMEOUT_SECONDS)
     # 东财身份头在这里补齐，调用方不用各自重复
     assert seen["headers"]["User-Agent"] == channel._AUTH_UA
     assert seen["headers"]["Referer"] == "https://data.eastmoney.com/"
