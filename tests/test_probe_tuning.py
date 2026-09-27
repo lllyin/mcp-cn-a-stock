@@ -398,6 +398,41 @@ def test_render_env_carries_the_evidence_above_each_line():
     assert "不要整份覆盖" in text
 
 
+def test_facts_probe_sees_the_proxy_the_service_sees(monkeypatch):
+    """服务的代理来自 .env（load_dotenv(override=True)），探针只看 shell 就量了另一张网：
+    .env 配了本地代理时，探针报「伪装 dns_error」，同一时刻服务经代理取东财 52/56 成功。"""
+    environ = {"PATH": "/usr/bin"}
+    monkeypatch.setattr(probe.os, "environ", environ)
+    dotenv = {"http_proxy": "http://127.0.0.1:7897", "https_proxy": "http://127.0.0.1:7897",
+              "FUND_FLOW_PROVIDERS": "eastmoney"}
+
+    record = probe.apply_service_proxy_env(dotenv)
+
+    # 大小写照 .env 原样：libcurl 只认小写 http_proxy，改了大小写等于改了服务的行为
+    assert environ["http_proxy"] == environ["https_proxy"] == "http://127.0.0.1:7897"
+    assert "FUND_FLOW_PROVIDERS" not in environ          # 只装代理项，别的配置不碰
+    assert record == {"effective": {"http_proxy": "http://127.0.0.1:7897",
+                                    "https_proxy": "http://127.0.0.1:7897"},
+                      "from_dotenv": ["http_proxy", "https_proxy"]}
+
+
+def test_dotenv_proxy_overrides_the_shell_and_credentials_are_masked(monkeypatch):
+    environ = {"HTTPS_PROXY": "http://shell:1", "NO_PROXY": "localhost"}
+    monkeypatch.setattr(probe.os, "environ", environ)
+
+    record = probe.apply_service_proxy_env({"HTTPS_PROXY": "http://user:pw@dotenv:2"})
+
+    assert environ["HTTPS_PROXY"] == "http://user:pw@dotenv:2"   # override=True：.env 盖过 shell
+    assert record["effective"] == {"HTTPS_PROXY": "dotenv:2", "NO_PROXY": "localhost"}  # 凭据不进报告
+    assert record["from_dotenv"] == ["HTTPS_PROXY"]
+    # 报告首行要说清代理是谁的，读者才知道可达性量的是不是服务那张网
+    text = probe.render_report(
+        facts={"egress_ip": "1.2.3.4", "proxy_env": record["effective"],
+               "proxy_env_from_dotenv": record["from_dotenv"], "machine": {}},
+        browser=None, decisions=[], lint=[], notes=[], meta={"generated": "x", "hostname": "box"})
+    assert "来自 .env，与服务一致" in text
+
+
 def test_build_decisions_survives_a_json_round_trip():
     browser = {"summary": _summary(_arm("legacy", ALL_OK), _arm("disguise", MORNING)), "max_tabs": 3, "memory": {}}
     browser = json.loads(json.dumps(browser))          # 键变成字符串，和从 browser.json 读出来一样

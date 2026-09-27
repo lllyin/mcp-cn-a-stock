@@ -610,6 +610,38 @@ def _dotenv(path: Path) -> dict:
     return {k: v for k, v in dotenv_values(path).items() if v is not None}
 
 
+_PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
+
+
+def service_proxy_env(env_values: dict, environ: dict) -> tuple:
+    """服务进程眼里的代理变量。
+
+    服务的直连和伪装两条通道都不显式传代理，全靠环境变量；而服务的环境是 main.py 用
+    ``load_dotenv(override=True)`` 装进去的——``.env`` 里的代理项盖过 shell 的。探针要量
+    的是服务走的那张网，就得按同一条规则合并。
+
+    返回（该写进本进程环境的 .env 代理项，合并后生效的全部代理项，凭据已抹掉）。
+    只挑代理这几个键，大小写照 .env 原样：libcurl 只认小写 ``http_proxy``，改了大小写
+    等于改了服务的行为。
+    """
+    from_dotenv = {k: v for k, v in env_values.items() if k.upper() in _PROXY_KEYS}
+    effective = {k: v for k, v in environ.items() if k.upper() in _PROXY_KEYS}
+    effective.update(from_dotenv)
+    return from_dotenv, {k: v.split("@")[-1] for k, v in effective.items()}
+
+
+def apply_service_proxy_env(env_values: dict) -> dict:
+    """把 .env 的代理项装进本进程，之后的出口 IP、可达性、浏览器探测看到的就是服务那张网。
+
+    不装的话量的是另一张网。实测过一次：当前环境的 .env 配了本地代理，探针只看 shell，报出
+    「伪装 dns_error、push2delay refused」，而同一时刻服务经代理取东财资金流 52/56 成功——
+    按那份报告去调 provider 顺序就是把好路关掉。
+    """
+    from_dotenv, effective = service_proxy_env(env_values, os.environ)
+    os.environ.update(from_dotenv)
+    return {"effective": effective, "from_dotenv": sorted(from_dotenv)}
+
+
 def run_facts(args) -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -617,9 +649,12 @@ def run_facts(args) -> int:
     facts = {"started": _now_text(), "machine": machine_facts()}
     env_values = _dotenv(PROJECT_ROOT / ".env")
     facts["proxy_configured"] = proxy_configured({**env_values, **os.environ})
-    # 系统代理会让"直连"其实经代理出去，而 curl_cffi 不一定跟着走——两条通道的结果要对着它看。
-    facts["proxy_env"] = {k: v.split("@")[-1] for k, v in os.environ.items()
-                          if k.upper() in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")}
+    proxy = apply_service_proxy_env(env_values)
+    facts["proxy_env"] = proxy["effective"]
+    facts["proxy_env_from_dotenv"] = proxy["from_dotenv"]
+    if proxy["effective"]:
+        origin = "来自 .env，与服务一致" if proxy["from_dotenv"] else "来自 shell"
+        print(f"[facts] 代理 {proxy['effective']}（{origin}）", flush=True)
     print(f"[facts] 出口 IP…", flush=True)
     facts["egress_ip"] = egress_ip()
     print(f"[facts] 可达性（{len(_probes())} 个源）…", flush=True)
@@ -1338,8 +1373,11 @@ def render_report(*, facts: Optional[dict], browser: Optional[dict], decisions: 
     L = []
     L.append(f"# 探测调优报告 {meta.get('generated')}")
     L.append("")
-    L.append(f"- 机器：{meta.get('hostname')}；出口 IP：{(facts or {}).get('egress_ip') or '未取到'}"
-             + (f"；系统代理 {facts['proxy_env']}" if (facts or {}).get("proxy_env") else ""))
+    proxy_note = ""
+    if (facts or {}).get("proxy_env"):
+        origin = "来自 .env，与服务一致" if facts.get("proxy_env_from_dotenv") else "来自 shell"
+        proxy_note = f"；代理 {facts['proxy_env']}（{origin}）"
+    L.append(f"- 机器：{meta.get('hostname')}；出口 IP：{(facts or {}).get('egress_ip') or '未取到'}{proxy_note}")
     if facts:
         m = facts["machine"]
         L.append(f"- {m.get('system')} {m.get('release')} {m.get('machine')}，{m.get('cores')} 核，内存 {m.get('mem_total_mib')} MiB"
