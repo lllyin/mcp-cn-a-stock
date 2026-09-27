@@ -1189,6 +1189,7 @@ class TestAutoProxyRecoveryAndRotation:
             monkeypatch,
             auths=["http://stale-exit"],  # 永远给同一个
             data_cooldown_seconds=0.01,
+            auth_retry_backoff_seconds=0.01,
         )
         channel._auto_proxy_state("push2his.eastmoney.com")["active"] = True
         original = getattr(std_requests, "_qtf_original_session", std_requests.Session)
@@ -1201,7 +1202,7 @@ class TestAutoProxyRecoveryAndRotation:
         assert channel._auto_proxy_request(original, object(), "GET", self.URL, {}) is None
         channel.time.sleep(0.02)  # 过数据冷却
         assert channel._auto_proxy_request(original, object(), "GET", self.URL, {}) is None
-        assert transport.auth_calls == 2  # 重新认证过，但吐回的还是坏出口
+        assert transport.auth_calls == 3  # 剩下两次名额都去要了新出口，吐回的还是坏的
         assert len(sends) == 1  # 第二次没发数据请求
         state = client._states[("push2his.eastmoney.com", "fflow")]
         assert state.cooldown_until > channel.time.monotonic() + gateway.AUTO_PROXY_COOLDOWN_SECONDS - 5

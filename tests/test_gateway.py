@@ -51,7 +51,22 @@ def ok_response(payload=None):
 
 
 def make_client(transport=None, **kwargs):
+    # 认证重试间隔默认 1s 是给生产防连发的，测试里只会拖慢；要测预算的用例自己显式传。
+    kwargs.setdefault("auth_retry_backoff_seconds", 0.01)
     return GatewayClient(transport or FakeTransport(), **kwargs)
+
+
+class ScriptedTransport(FakeTransport):
+    """按脚本逐次给出认证结果：None 表示这一次拿不到出口（超时/吐回死出口）。"""
+
+    def __init__(self, script):
+        super().__init__(exits=[])
+        self._script = list(script)
+
+    def authenticate(self):
+        self.auth_calls += 1
+        proxy = self._script.pop(0) if self._script else None
+        return None if proxy is None else GatewayAuth(proxy=proxy, cookie="nid18=x", user_agent="UA")
 
 
 class TestResponseOk:
@@ -134,7 +149,7 @@ class TestAuthReuse:
             ConnectionError("refused"))) is None
         time.sleep(0.02)  # 过数据冷却
         assert client.request("GET", URL, lambda *a, **k: ok_response()) is None
-        assert transport.auth_calls == 2  # 第二次认证了但被拒收
+        assert transport.auth_calls == 3  # 剩下两次尝试各去要了一次新出口，吐回的都是坏的
         state = client._states[("push2his.eastmoney.com", "fflow")]
         assert state.cooldown_until > time.monotonic() + 100  # 长冷却
 
@@ -144,8 +159,49 @@ class TestAuthReuse:
         client = make_client(transport, cooldown_seconds=300)
 
         assert client.request("GET", URL, lambda *a, **k: ok_response()) is None
+        assert transport.auth_calls == 3  # 三次名额全用在要出口上，都没要到
         state = client._states[("push2his.eastmoney.com", "fflow")]
         assert state.cooldown_until > time.monotonic() + 100
+
+
+class TestAuthRetry:
+    """拿不到新出口只算一次失败：占一个重试名额、隔一下再要，N 次全用尽才冷却。
+
+    以前认证一失败立刻冷却 300s。实测一次 3 秒的认证抖动让资金流网关停摆 5 分钟，
+    16 个请求被挡；29 秒后别的接口族已经拿到新出口了。
+    """
+
+    def test_an_auth_blip_is_retried_within_the_same_request(self):
+        transport = ScriptedTransport([None, "http://live:1"])
+        client = make_client(transport, cooldown_seconds=300)
+        sends = []
+
+        response = client.request("GET", URL, lambda *a, **k: sends.append(1) or ok_response())
+
+        assert response is not None and response.status_code == 200
+        assert transport.auth_calls == 2 and len(sends) == 1
+        assert client._states[("push2his.eastmoney.com", "fflow")].cooldown_until == 0.0  # 没进冷却
+
+    def test_cooldown_waits_for_every_attempt(self):
+        transport = FakeTransport(exits=[])
+        transport._exits = []
+        client = make_client(transport, exit_retries=5, cooldown_seconds=300)
+
+        assert client.request("GET", URL, lambda *a, **k: ok_response()) is None
+        assert transport.auth_calls == 5  # 配了 5 就要 5 次，不是第 1 次失败就放弃
+
+    def test_a_fresh_exit_after_a_blip_means_the_auth_service_is_alive(self):
+        # 死出口 → 认证抖动 → 又给了个新出口（也死了）：三次用尽，但认证服务给过新出口，
+        # 坏的是出口不是认证，走短冷却而不是 300s。
+        transport = ScriptedTransport(["http://dead-a:1", None, "http://dead-b:1"])
+        client = make_client(transport, cooldown_seconds=300, data_cooldown_seconds=0.01)
+
+        assert client.request("GET", URL, lambda *a, **k: (_ for _ in ()).throw(
+            ConnectionError("refused"))) is None
+
+        assert transport.auth_calls == 3
+        state = client._states[("push2his.eastmoney.com", "fflow")]
+        assert state.cooldown_until < time.monotonic() + 1  # 短冷却
 
 
 class TestSingleflight:
@@ -270,13 +326,15 @@ class TestSingleflight:
     def test_leader_budget_covers_every_exit_attempt(self):
         transport = FakeTransport()
         transport.auth_budget_seconds = 4.5
-        client = make_client(transport, exit_retries=3)
+        client = make_client(transport, exit_retries=3, auth_retry_backoff_seconds=1.0)
 
-        # 数字超时对连接、读取各生效一次；每换一个出口都可能先认证一次
-        assert client.leader_budget(8) == pytest.approx(3 * (4.5 + 16))
-        assert client.leader_budget((1.5, 8)) == pytest.approx(3 * (4.5 + 9.5))
+        # 数字超时对连接、读取各生效一次；每换一个出口都可能先认证一次；
+        # 两次尝试之间最多再隔一个认证重试间隔
+        assert client.leader_budget(8) == pytest.approx(3 * (4.5 + 16) + 2 * 1.0)
+        assert client.leader_budget((1.5, 8)) == pytest.approx(3 * (4.5 + 9.5) + 2 * 1.0)
         # 没声明认证耗时的 transport 按 0 计
-        assert make_client(FakeTransport(), exit_retries=2).leader_budget(8) == pytest.approx(32)
+        assert make_client(FakeTransport(), exit_retries=2,
+                           auth_retry_backoff_seconds=1.0).leader_budget(8) == pytest.approx(32 + 1.0)
 
 
 class TestSendAccounting:

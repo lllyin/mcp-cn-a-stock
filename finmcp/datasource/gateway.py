@@ -182,8 +182,8 @@ class GatewayClient:
       走原回退链。等待有上界，且线程结果在批次取消后会被丢弃，不会成为新的
       堆积点。**等多久由调用方定**：后面还有别的源可退的（通道层）用短等待；
       链尾没有回退的（编排层显式调用）等满 leader 的最坏耗时，见 ``leader_budget``。
-    - 冷却：认证不可用（网关没出口可给）用长冷却；数据失败（出口本身差）用
-      短冷却换出口。
+    - 冷却：``exit_retries`` 次尝试全部用尽才进冷却；这一轮里认证服务一个新出口都
+      没给过用长冷却，给过（坏的是出口本身）用短冷却换出口。
     """
 
     def __init__(
@@ -195,6 +195,7 @@ class GatewayClient:
         data_cooldown_seconds: float = AUTO_PROXY_DATA_COOLDOWN_SECONDS,
         wait_seconds: float = GATEWAY_SINGLEFLIGHT_WAIT_SECONDS,
         exit_retries: int = GATEWAY_EXIT_RETRIES,
+        auth_retry_backoff_seconds: float = 1.0,
     ) -> None:
         self._transport = transport
         self._reuse_seconds = reuse_seconds
@@ -202,6 +203,9 @@ class GatewayClient:
         self._data_cooldown_seconds = data_cooldown_seconds
         self._wait_seconds = wait_seconds
         self._exit_retries = max(1, exit_retries)
+        # 拿不到新出口时，隔多久再要一次。认证请求自己有 4.5s 超时，超时那种失败本身
+        # 就等过了；这个间隔防的是连接被立刻拒绝那种毫秒级失败把认证服务打成连发。
+        self._auth_retry_backoff = max(0.0, auth_retry_backoff_seconds)
         self._lock = threading.Lock()
         self._auth: Optional[GatewayAuth] = None
         self._auth_at = 0.0
@@ -223,7 +227,9 @@ class GatewayClient:
         else:
             send = 2 * float(timeout)
         auth = float(getattr(self._transport, "auth_budget_seconds", 0.0))
-        return self._exit_retries * (auth + send)
+        # 每次尝试：认证 + 请求；两次尝试之间最多再隔一个认证重试间隔。
+        return (self._exit_retries * (auth + send)
+                + (self._exit_retries - 1) * self._auth_retry_backoff)
 
     def sends_in_current_thread(self) -> int:
         """本线程累计真正发出去的网关请求数（含失败的那几次）。"""
@@ -327,13 +333,32 @@ class GatewayClient:
         网关出口是住宅代理，有一定比例的当场死亡（2026-09-15 实测约 15%）。
         一个死出口就冷却 30s 的话，网关会频繁整段不可用；换成"死了立刻换新的
         重试 N 次"，把单次请求的失败率从 15% 压到 0.15^N 量级。
+
+        **拿不到新出口也只算一次失败**，隔一小段再要，N 次都要不到才冷却。以前是
+        认证一失败立刻冷却 300s：插件的认证请求超时 3s 就把旧缓存（刚死的那个出口）
+        原样吐回来，一次 3 秒的抖动换来 5 分钟这一族网关停摆——12 天里 17 次，其中
+        至少 8 次别的接口族 60 秒内就重新拿到了出口。失败的认证不发凭据、不花积分。
+
+        冷却长短看这一轮里认证服务给没给过**新**出口：给过，说明它活着，坏的是出口，
+        用短冷却；一个都没给才是认证不可用，用长冷却。
         """
         host = key[0]
+        auth_failed = False       # 有过一次"拿不到新出口"
+        fresh_after_failure = False  # 失败之后认证服务给过新出口——它活着
         for attempt in range(self._exit_retries):
             auth = self._acquire_auth()
             if auth is None:
-                self._cool_down(key, self._cooldown_seconds, "authentication_unavailable")
-                return None
+                auth_failed = True
+                logger.warning(
+                    "gateway_failure host=%s family=%s path=%s attempt=%d/%d error=authentication_unavailable",
+                    host, key[1], urlsplit(url).path, attempt + 1, self._exit_retries,
+                )
+                if attempt + 1 < self._exit_retries and self._auth_retry_backoff:
+                    time.sleep(self._auth_retry_backoff)
+                continue  # 没拿到出口，隔一下再要
+            if attempt > 0:
+                # 前一次失败时已作废旧凭据，这里拿到的必然是认证服务新给的。
+                fresh_after_failure = True
             retry_kwargs = dict(kwargs)
             headers = dict(retry_kwargs.get("headers") or {})
             if auth.user_agent:
@@ -373,8 +398,11 @@ class GatewayClient:
             )
             self._drop_auth(auth)
             continue  # 响应无效，换一个新的重试
-        # 连续几个出口都失败才冷却
-        self._cool_down(key, self._data_cooldown_seconds, "data_failure")
+        # N 次全部用尽才冷却
+        if auth_failed and not fresh_after_failure:
+            self._cool_down(key, self._cooldown_seconds, "authentication_unavailable")
+        else:
+            self._cool_down(key, self._data_cooldown_seconds, "data_failure")
         return None
 
 

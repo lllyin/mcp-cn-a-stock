@@ -54,9 +54,9 @@
 | `AKSHARE_PROXY_ENABLED` | 网关使用方式；`auto` 仅在东财本地请求失败后按请求回退 | `0`<br>`1`<br>`auto`<br>（默认 `0`） |
 | `AKSHARE_PROXY_GATEWAY` | 授权网关地址，不含协议和端口 | 主机名或 IP（默认空） |
 | `AKSHARE_PROXY_TOKEN` | 网关访问令牌 | 字符串（默认空） |
-| `GATEWAY_EXIT_RETRIES` | 网关出口死了换新的重试次数；连续失败才进冷却（旧名 `AKSHARE_PROXY_RETRY` 仍然认） | 次数（默认 `3`） |
+| `GATEWAY_EXIT_RETRIES` | 一次网关请求最多尝试几次，每次换一个新出口；拿不到新出口也只算一次失败，隔一秒再要，N 次全用尽才进冷却（旧名 `AKSHARE_PROXY_RETRY` 仍然认） | 次数（默认 `3`） |
 | `AUTO_PROXY_AFTER_FAILURES` | `AKSHARE_PROXY_ENABLED=auto` 时，触发网关回退前的连续本地失败次数 | 正整数（默认 `3`） |
-| `AUTO_PROXY_COOLDOWN_SECONDS` | `auto` 模式网关回退失败后的暂停时长 | 秒（默认 `300`） |
+| `AUTO_PROXY_COOLDOWN_SECONDS` | N 次尝试里一次都没从认证服务拿到新出口时的暂停时长；拿到过新出口就说明坏的是出口不是认证，改用下面的短冷却 | 秒（默认 `300`） |
 | `AUTO_PROXY_DATA_COOLDOWN_SECONDS` | 网关数据失败（出口已拿到、请求没成）后的暂停秒数；失败同时作废缓存的认证，下一次尝试换新出口 | 秒（默认 `30`） |
 | `AUTO_PROXY_RECOVERY_PROBES` | 网关回退激活期间，本地成功多少次就退出回退。默认 `1`：间歇性拒绝下"连续 N 次"几乎攒不够，网关会永久激活；误判恢复的代价只是几个请求走回退链 | 次数（默认 `1`） |
 | `AUTO_PROXY_RECOVERY_INTERVAL_SECONDS` | 相邻两次恢复探测的最小间隔秒数；间隔内的本地成功不累计 | 秒（默认 `60`） |

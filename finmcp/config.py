@@ -52,10 +52,11 @@ def _parse_bool(raw, default: bool) -> bool:
 AKSHARE_PROXY_ENABLED = str(env("AKSHARE_PROXY_ENABLED", "0")).strip().lower()
 AKSHARE_PROXY_IP = env("AKSHARE_PROXY_GATEWAY") or env("AKSHARE_PROXY_IP")
 AKSHARE_PROXY_PASSWORD = env("AKSHARE_PROXY_TOKEN") or env("AKSHARE_PROXY_PASSWORD")
-# 网关出口死了换新的重试次数。三条路共用：插件全局模式（AKSHARE_PROXY_ENABLED=1）、
-# 通道层 auto 回退、以及编排层的 eastmoney_gateway provider。住宅代理出口有一定比例
-# 当场死亡（2026-09-15 实测约 15%），死一个就冷却会让网关频繁整段不可用；换 N 次
-# 把单次失败率压到 0.15^N 量级。旧名 AKSHARE_PROXY_RETRY 仍然认。
+# 一次网关请求最多尝试几次。三条路共用：插件全局模式（AKSHARE_PROXY_ENABLED=1）、
+# 通道层 auto 回退、以及编排层的 eastmoney_gateway provider。每次尝试换一个新出口；
+# 拿不到新出口（认证超时、吐回刚死的那个）也只算一次失败，隔一秒再要，N 次全用尽
+# 才进冷却。住宅代理出口有一定比例当场死亡（2026-09-15 实测约 15%），死一个就冷却
+# 会让网关频繁整段不可用；换 N 次把单次失败率压到 0.15^N 量级。旧名 AKSHARE_PROXY_RETRY 仍然认。
 GATEWAY_EXIT_RETRIES = max(1, int(
     env("GATEWAY_EXIT_RETRIES") or env("AKSHARE_PROXY_RETRY") or "3"))
 AKSHARE_PROXY_RETRY = GATEWAY_EXIT_RETRIES
