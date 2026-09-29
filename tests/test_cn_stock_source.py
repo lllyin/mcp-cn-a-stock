@@ -2824,8 +2824,8 @@ async def test_a_leader_failure_does_not_take_the_follower_down(monkeypatch):
     original_tail = CNStockDataSource._fetch_fund_flow_tail
 
     async def tail_hook(self, code, canonical_symbol, *args, **kwargs):
-        task = source_module._get_fund_flow_tail_inflight().get(canonical_symbol)
-        if task is not None and not task.done():
+        flight = source_module._get_fund_flow_tail_inflight().get(canonical_symbol)
+        if flight is not None and not flight.task.done():
             follower_joined.set()
         return await original_tail(self, code, canonical_symbol, *args, **kwargs)
 

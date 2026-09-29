@@ -427,8 +427,8 @@ class GatewayClient:
                 continue  # 没拿到出口，隔一下再要
             if cancel_event is not None and cancel_event.is_set():
                 return None
-            if attempt > 0:
-                # 前一次失败时已作废旧凭据，这里拿到的必然是认证服务新给的。
+            if auth_failed:
+                # 认证失败之后又取到可用凭据，说明认证服务已经恢复。
                 fresh_after_failure = True
             retry_kwargs = dict(kwargs)
             headers = dict(retry_kwargs.get("headers") or {})
@@ -449,8 +449,19 @@ class GatewayClient:
             try:
                 response = send(method, url, **retry_kwargs)
             except request_control.BudgetExceeded:
-                # A locally exhausted budget says nothing about exit health.
-                raise
+                # send 的子预算已退出，这里恢复的是全程剩余预算。只有全程
+                # 耗尽或客户端取消才退出；单次阶段超时仍可用剩余次数重试。
+                remaining = request_control.current_budget().remaining()
+                logger.debug(
+                    "gateway_send_budget_exhausted host=%s family=%s attempt=%d/%d "
+                    "remaining=%.3fs action=%s",
+                    host, key[1], attempt + 1, self._exit_retries, remaining,
+                    "retry" if attempt + 1 < self._exit_retries else "stop",
+                )
+                # 本地阶段预算不证明出口失效：不作废凭据，也不据此开启冷却。
+                if attempt + 1 == self._exit_retries:
+                    return None
+                continue
             except request_control.RequestCancelled:
                 # A pre-send cancellation is not evidence of a bad exit. Actual
                 # send failures take the Exception path below and invalidate it.

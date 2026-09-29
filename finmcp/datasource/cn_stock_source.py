@@ -12,6 +12,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
@@ -250,7 +251,13 @@ def _get_finance_inflight() -> dict[str, asyncio.Task[Optional[Dict]]]:
         setattr(loop, _FINANCE_INFLIGHT_ATTR, inflight)
     return inflight
 
-def _get_fund_flow_tail_inflight():
+@dataclass
+class _FundFlowTailFlight:
+    task: asyncio.Task
+    waiters: int = 0
+
+
+def _get_fund_flow_tail_inflight() -> dict[str, _FundFlowTailFlight]:
     """Return the current event loop's fund-flow-tail singleflight registry."""
     loop = asyncio.get_running_loop()
     registry = getattr(loop, _FUND_FLOW_TAIL_INFLIGHT_ATTR, None)
@@ -260,9 +267,11 @@ def _get_fund_flow_tail_inflight():
     return registry
 
 
-def _complete_fund_flow_tail(registry, key, task) -> None:
-    if registry.get(key) is task:
+def _complete_fund_flow_tail(registry, key, flight) -> None:
+    if registry.get(key) is flight:
         registry.pop(key, None)
+    if not flight.task.cancelled():
+        flight.task.exception()
 
 
 def _complete_finance_inflight(
@@ -1655,43 +1664,62 @@ class CNStockDataSource(DataSource):
         不付第二份；等待超时或复用不了（需求不同，比如等的人是 full）就自己再跑。
         """
         registry = _get_fund_flow_tail_inflight()
-        task = registry.get(canonical_symbol)
-        if task is None or task.done():
+        flight = registry.get(canonical_symbol)
+        leader = flight is None or flight.task.done()
+        if leader:
             task = asyncio.create_task(
                 self._run_fund_flow_tail_inner(
                     code, canonical_symbol, requirements, fund_flow_need,
                     fund_flow_post_order, kline_day, current,
                 )
             )
-            registry[canonical_symbol] = task
+            flight = _FundFlowTailFlight(task)
+            registry[canonical_symbol] = flight
             task.add_done_callback(
-                lambda completed, key=canonical_symbol, reg=registry:
-                _complete_fund_flow_tail(reg, key, completed)
+                lambda completed, key=canonical_symbol, reg=registry, entry=flight:
+                _complete_fund_flow_tail(reg, key, entry)
             )
-            value, paid = await task
-            return value, paid, "leader"
 
-        request_id, _, _ = log_context()
-        budget = _fund_flow_page_wait_budget(request_id)
+        flight.waiters += 1
         wait_started = time.perf_counter()
         try:
-            outcome = await asyncio.wait_for(asyncio.shield(task), timeout=max(0.1, budget))
-        except (asyncio.TimeoutError, TimeoutError):
-            outcome = None
-        except Exception as e:
-            # leader 出错不该连坐：wait_for(shield(task)) 会把 leader 的异常原样
-            # 送进每个 follower——改动前一个请求坏了只坏自己，不能让单飞把它变成
-            # 同标的一起坏。回落到自己再跑一份，风险面回到改动前。
-            # CancelledError 是 BaseException，不在这一层拦：follower 自己被取消
-            # （客户端断开）必须照常传出去。
-            logger.info(
-                "资金流兜底单飞等待落空 %s: %s: %s，自己再跑一份",
-                canonical_symbol, type(e).__name__, e,
-            )
-            outcome = None
+            try:
+                # 首个消费者也必须 shield：它断开时，其他客户端仍需要这份结果。
+                if leader:
+                    outcome = await asyncio.shield(flight.task)
+                else:
+                    request_id, _, _ = log_context()
+                    budget = _fund_flow_page_wait_budget(request_id)
+                    outcome = await asyncio.wait_for(
+                        asyncio.shield(flight.task), timeout=max(0.1, budget)
+                    )
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise  # 当前客户端取消，不得再启动一份取数。
+                # 共享任务自身取消不等于本客户端断开，仍可独立回退。
+                logger.info("资金流兜底共享任务已取消 %s，自己再跑一份", canonical_symbol)
+                outcome = None
+            except Exception as e:
+                if leader:
+                    raise
+                # leader 的异常或等待超时只终止本次复用，不连坐其他请求。
+                logger.info(
+                    "资金流兜底单飞等待落空 %s: %s: %s，自己再跑一份",
+                    canonical_symbol, type(e).__name__, e,
+                )
+                outcome = None
+        finally:
+            flight.waiters -= 1
+            if flight.waiters == 0 and not flight.task.done():
+                # 最后一个消费者退出才取消；先摘登记，避免新请求接到正在取消的任务。
+                if registry.get(canonical_symbol) is flight:
+                    registry.pop(canonical_symbol, None)
+                flight.task.cancel()
         wait = time.perf_counter() - wait_started
         if outcome is not None:
-            value, _ = outcome
+            value, paid = outcome
+            if leader:
+                return value, paid, "leader"
             if not _fund_flow_needs_more(value, fund_flow_need, kline_day):
                 logger.info(
                     "资金流兜底单飞复用 %s role=follower wait=%.3fs",

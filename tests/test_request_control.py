@@ -152,12 +152,22 @@ def test_total_timeout_object_keeps_its_tighter_total_limit():
     assert bounded.total == 16
 
 
-def test_budget_expiry_does_not_invalidate_a_healthy_exit():
+def test_repeated_stage_expiry_is_bounded_without_invalidating_a_healthy_exit(monkeypatch):
     auth = gateway.GatewayAuth('http://unused.invalid:1', '', '')
     invalidated = []
+    clock = [0.0]
+    remaining = []
+    monkeypatch.setattr(control.time, 'monotonic', lambda: clock[0])
     client = gateway.GatewayClient(SimpleNamespace(
-        authenticate=lambda:auth, invalidate=lambda a:invalidated.append(a)))
-    def send(*a, **kw): raise control.BudgetExceeded('injected local expiry')
+        authenticate=lambda:auth, invalidate=lambda a:invalidated.append(a)),
+        exit_retries=3, wait_seconds=0, auth_retry_backoff_seconds=0)
+    def send(*a, **kw):
+        remaining.append(control.current_budget().remaining())
+        with control.budget_scope(1):
+            clock[0] += 2
+            control.current_budget().remaining()
     assert client.request('GET', 'https://push2.eastmoney.com/api/qt/stock/get', send) is None
+    assert len(remaining) == 3
+    assert remaining == [48, 46, 44]  # 不为每次重试重新启动父预算。
     assert invalidated == [] and client._auth == auth
     assert all(state.cooldown_until == 0 for state in client._states.values())
