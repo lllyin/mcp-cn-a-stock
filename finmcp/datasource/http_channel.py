@@ -243,7 +243,13 @@ class _BudgetAdapter:
     """Borrow a session's pools without mutating its shared retry configuration."""
 
     def __init__(self, adapter, budget):
-        self.adapter = copy.copy(adapter)
+        # HTTPAdapter's copy/pickle protocol runs __setstate__, which creates
+        # new pools and clears proxy_manager. Borrow its instance state instead:
+        # the owner retains both managers (and responsibility for closing them),
+        # while this view has its own max_retries attribute. Preserve the class
+        # and custom TLS/config attributes of HTTPAdapter subclasses as well.
+        self.adapter = object.__new__(type(adapter))
+        self.adapter.__dict__.update(adapter.__dict__)
         self.adapter.max_retries = Retry(total=0, redirect=0)
         self.budget = budget
 
@@ -346,9 +352,14 @@ def _plain_then_gateway(base_cls, session, method, url, kwargs, track_auth):
         response = _plain_with_auth_outcome(
             base_cls, session, method, url, kwargs, track_auth=track_auth,
         )
-    except request_control.BudgetExceeded:
-        raise
     except Exception:
+        # The native send's budget_scope has already restored the parent here.
+        # A spent native-stage budget still permits the usual gateway fallback;
+        # only cancellation or exhaustion of the parent stops the HTTP chain.
+        request_control.check_cancelled()
+        budget = request_control.current_budget()
+        if budget is not None:
+            budget.remaining()
         _record_auto_proxy_local_failure(url)
         proxy_response = _auto_proxy_request(base_cls, session, method, url, kwargs)
         if proxy_response is not None:
