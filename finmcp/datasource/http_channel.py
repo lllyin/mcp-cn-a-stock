@@ -13,11 +13,13 @@ be installed before ``import efinance`` or that shared session never sees it.
 """
 
 import logging
+import copy
 import os
 import threading
 import time
 from typing import Optional
 from urllib.parse import urlsplit
+from urllib3.util import Timeout, Retry
 
 import requests as std_requests
 
@@ -35,6 +37,7 @@ from ..config import (
     resolve_http_mode,
 )
 from ..observability import log_context
+from .. import request_control
 from . import eastmoney_auth, gateway
 
 logger = logging.getLogger("finmcp")
@@ -236,6 +239,76 @@ def _note_auth_outcome(url, *, success: bool) -> None:
         logger.debug("eastmoney_auth 记账失败 url=%s", url, exc_info=True)
 
 
+class _BudgetAdapter:
+    """Borrow a session's pools without mutating its shared retry configuration."""
+
+    def __init__(self, adapter, budget):
+        self.adapter = copy.copy(adapter)
+        self.adapter.max_retries = Retry(total=0, redirect=0)
+        self.budget = budget
+
+    def send(self, request, **kwargs):
+        remaining = self.budget.remaining()
+        timeout = request_control.capped_timeout(
+            kwargs.get("timeout"), EASTMONEY_FALLBACK_TIMEOUT_SECONDS
+        )
+        if isinstance(timeout, Timeout):
+            remaining = min(remaining, timeout.total)
+            connect, read = timeout.connect_timeout, timeout.read_timeout
+        else:
+            connect, read = timeout if isinstance(timeout, tuple) else (timeout, timeout)
+        kwargs["timeout"] = Timeout(
+            total=remaining, connect=min(connect, remaining), read=min(read, remaining)
+        )
+        return self.adapter.send(request, **kwargs)
+
+    def close(self):
+        # Pools are owned and closed by the original session.
+        pass
+
+
+def _bounded_plain_request(base_cls, session, method, url, kwargs):
+    request_control.check_cancelled()
+    budget = request_control.current_budget()
+    managed = eastmoney_auth.needs_auth(url) or _in_auto_proxy_scope(
+        (urlsplit(url).hostname or "").lower()
+    )
+    if not managed and budget is None:
+        return base_cls.request(session, method, url, **kwargs)
+    kwargs = dict(kwargs)
+    kwargs["timeout"] = request_control.capped_timeout(
+        kwargs.get("timeout"), EASTMONEY_FALLBACK_TIMEOUT_SECONDS
+    )
+    # A direct invocation (including tests and explicit providers) still has a
+    # bound; nested sends inherit the remaining logical request budget.
+    with request_control.budget_scope(
+        request_control.timeout_seconds(kwargs["timeout"])
+    ) as send_budget:
+        if hasattr(session, "adapters"):
+            borrowed = copy.copy(session)
+            borrowed.adapters = {
+                prefix: _BudgetAdapter(adapter, send_budget)
+                for prefix, adapter in session.adapters.items()
+            }
+        else:
+            borrowed = session
+        response = base_cls.request(borrowed, method, url, **kwargs)
+        return response
+
+
+def _http_budget_seconds(kwargs, retry, timeout):
+    """Derive the maximum from existing knobs, without adding a tuned cutoff."""
+    plain_timeout = request_control.capped_timeout(
+        kwargs.get("timeout"), EASTMONEY_FALLBACK_TIMEOUT_SECONDS
+    )
+    seconds = retry * timeout + max(0, retry - 1) * 0.3
+    seconds += request_control.timeout_seconds(plain_timeout)
+    client = gateway.get_gateway_client() if _auto_proxy else None
+    if client is not None:
+        seconds += client.leader_budget(plain_timeout) + client.wait_budget()
+    return seconds
+
+
 def _plain_with_auth_outcome(
     base_cls, session, method, url, kwargs: dict, *, track_auth: bool
 ):
@@ -248,14 +321,10 @@ def _plain_with_auth_outcome(
     状态码用 ``getattr`` 取：这一层会包住别人的 Session，而"响应"未必是 requests 的
     Response（桩、别的通道的返回类型都可能）。取不到就不记这一笔，而不是崩在记账上。
     """
-    if eastmoney_auth.needs_auth(url):
-        # AkShare 的 stock_individual_fund_flow 没有传 timeout。伪装失败后的
-        # 原生重放若沿用它，会无限阻塞 worker，客户端超时后仍占批次名额。
-        # 调用方显式指定的 timeout 优先，避免改变已有的精细调用约束。
-        kwargs = dict(kwargs)
-        kwargs.setdefault("timeout", EASTMONEY_FALLBACK_TIMEOUT_SECONDS)
     try:
-        response = base_cls.request(session, method, url, **kwargs)
+        response = _bounded_plain_request(base_cls, session, method, url, kwargs)
+    except request_control.BudgetExceeded:
+        raise
     except Exception:
         if track_auth:
             _note_auth_outcome(url, success=False)
@@ -277,6 +346,8 @@ def _plain_then_gateway(base_cls, session, method, url, kwargs, track_auth):
         response = _plain_with_auth_outcome(
             base_cls, session, method, url, kwargs, track_auth=track_auth,
         )
+    except request_control.BudgetExceeded:
+        raise
     except Exception:
         _record_auto_proxy_local_failure(url)
         proxy_response = _auto_proxy_request(base_cls, session, method, url, kwargs)
@@ -325,7 +396,7 @@ def _fflow_gateway_in_chain() -> bool:
 
 def _gateway_send_with(base_cls, session):
     def send(method, url, **kwargs):
-        return base_cls.request(session, method, url, **kwargs)
+        return _bounded_plain_request(base_cls, session, method, url, kwargs)
     return send
 
 
@@ -353,7 +424,9 @@ def _auto_proxy_request(base_cls, session, method, url, kwargs: dict):
     if client is None:
         return None
     kwargs = dict(kwargs)
-    kwargs.setdefault("timeout", EASTMONEY_FALLBACK_TIMEOUT_SECONDS)
+    kwargs["timeout"] = request_control.capped_timeout(
+        kwargs.get("timeout"), EASTMONEY_FALLBACK_TIMEOUT_SECONDS
+    )
     request_id, tool, symbol = log_context()
     logger.warning(
         "auto_proxy_attempt host=%s path=%s request_id=%s tool=%s symbol=%s",
@@ -395,11 +468,13 @@ def gateway_request(method: str, url: str, **kwargs):
     for key, value in _AUTH_IDENTITY_HEADERS.items():
         headers.setdefault(key, value)
     kwargs["headers"] = headers
-    kwargs.setdefault("timeout", EASTMONEY_FALLBACK_TIMEOUT_SECONDS)
+    kwargs["timeout"] = request_control.capped_timeout(
+        kwargs.get("timeout"), EASTMONEY_FALLBACK_TIMEOUT_SECONDS
+    )
 
     def send(method, url, **kw):
         with base() as session:
-            return session.request(method, url, **kw)
+            return _bounded_plain_request(base, session, method, url, kw)
 
     return client.request(
         method,
@@ -649,6 +724,37 @@ def _install_impersonate(
 
     class ImpersonateSession(original_session_cls):
         def request(self, method, url, **kwargs):
+            request_control.check_cancelled()
+            managed = _is_impersonated(url) or _in_auto_proxy_scope(
+                (urlsplit(url).hostname or "").lower()
+            )
+            if not managed:
+                return self._request(method, url, **kwargs)
+            started = time.monotonic()
+            outcome = "success"
+            seconds = _http_budget_seconds(kwargs, retry, timeout)
+            try:
+                with request_control.budget_scope(seconds):
+                    return self._request(method, url, **kwargs)
+            except request_control.RequestCancelled:
+                outcome = "cancelled"
+                raise
+            except request_control.BudgetExceeded:
+                outcome = "budget_exhausted"
+                raise
+            except Exception:
+                outcome = "failed"
+                raise
+            finally:
+                request_id, tool, symbol = log_context()
+                logger.debug(
+                    "HTTP budget request_id=%s tool=%s symbol=%s host=%s "
+                    "budget=%.3fs elapsed=%.3fs outcome=%s",
+                    request_id, tool, symbol, urlsplit(url).hostname,
+                    seconds, time.monotonic() - started, outcome,
+                )
+
+        def _request(self, method, url, **kwargs):
             # 凭据在最前面补：伪装分支和裸重放分支都要带上。这两条正是同一批主机的
             # 两条出路，只给一条带等于让另一条继续被拒。
             kwargs, track_auth = _with_auth_cookie(url, kwargs)
@@ -667,10 +773,15 @@ def _install_impersonate(
             attempt_kwargs.setdefault("verify", _resolve_verify(self))
             outcome = "non_200"
             for attempt in range(retry):
+                request_control.check_cancelled()
+                budget = request_control.current_budget()
+                if budget is not None:
+                    attempt_kwargs["timeout"] = min(timeout, budget.remaining())
                 try:
                     response = _cffi_session(impersonate).request(
                         method, url, **attempt_kwargs
                     )
+                    request_control.check_cancelled()
                     if response.status_code == 200:
                         # 200 不等于有效：拦截页/业务拒绝不能记成"本地恢复"，
                         # 否则无效 200 会把失败计数清掉、让状态机误判恢复。
@@ -687,7 +798,7 @@ def _install_impersonate(
                     # A broken session cannot be reused for the retry.
                     _thread_local.cffi_session = None
                 if attempt + 1 < retry:
-                    time.sleep(0.3)
+                    request_control.sleep(0.3)
 
             # Without this the only visible error is the plain replay's, which
             # hides why impersonation failed and made a proxy misconfiguration

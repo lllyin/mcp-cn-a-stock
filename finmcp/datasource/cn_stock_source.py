@@ -38,7 +38,7 @@ from ..config import (
     SOURCE_BREAKER_OPEN_AFTER_FAILURES,
     SZ_INDICES,
 )
-from .. import cache
+from .. import cache, request_control
 from . import basic_info, gateway
 from .. import market_session
 from .base import DataSource, FetchRequirements, StockData
@@ -306,6 +306,7 @@ def _execute_timed(
         previous_cancel_event = gateway.set_current_request_cancel_event(cancel_event)
         try:
             with bind_log_context(request_id=request_id, tool=tool, symbol=symbol):
+                request_control.check_cancelled()
                 return func(*args)
         finally:
             gateway.restore_current_request_cancel_event(previous_cancel_event)
@@ -931,6 +932,7 @@ class CNStockDataSource(DataSource):
         status: dict = None,
     ) -> Optional[Dict]:
         """同步获取K线数据"""
+        request_control.check_cancelled()
         if _KLINE_BREAKER.should_skip():
             # 东财这一级正在熔断，直接用兜底源，省掉必然失败的整条重试链。
             return self._fallback_kline_result(
@@ -997,6 +999,7 @@ class CNStockDataSource(DataSource):
                     if df is None or df.empty:
                         return None
             
+            request_control.check_cancelled()
             # 同时获取不复权数据用于计算
             if fqt != 0 and include_unadjusted:
                 df_unadj = None
@@ -1041,7 +1044,9 @@ class CNStockDataSource(DataSource):
                 code, start_date, end_date, adjust, symbol, include_unadjusted, status
             )
         finally:
-            _KLINE_BREAKER.record(success=eastmoney_ok)
+            cancelled = gateway.current_request_cancel_event()
+            if cancelled is None or not cancelled.is_set():
+                _KLINE_BREAKER.record(success=eastmoney_ok)
 
     def _fallback_kline_result(
         self,
@@ -1068,6 +1073,7 @@ class CNStockDataSource(DataSource):
         - 改成两次并发取能省一半墙钟，但会把对腾讯/新浪的并发翻倍，而它们在同一
           轮里本来就在 Max retries——收益和副作用都说不清量级，所以不动。
         """
+        request_control.check_cancelled()
         df = self._fetch_fallback_kline_sync(
             code, start_date, end_date, adjust, symbol, status
         )
@@ -1403,13 +1409,13 @@ class CNStockDataSource(DataSource):
         }
     
     async def _fetch_fund_flow_from_page(
-        self, symbol: str, today_date=None
+        self, symbol: str, today_date=None, *, need_history: bool = True
     ) -> Optional[Dict]:
         """接口不可用时，从东财资金流向页面兜底取资金流向。
 
         页面走浏览器，不经过 requests，所以不消耗网关积分；代价是一次 Chromium
-        页面加载。返回结构与 _fetch_fund_flow_sync 完全相同，下游的转换和渲染
-        一行不用改——今日数值取的是历史表最后一行，与主源同一条路径。
+        页面加载。返回结构与 _fetch_fund_flow_sync 相同；只需今日且日期可确认时
+        可以用完整今日栏提前完成，历史或钉日期需求仍等待历史表。
 
         today_date：历史表被拒时允许用页面今日栏合成一行（只给这一天）。
         今日栏和历史表走不同端点、风控待遇不同——历史被拒、今日有值是实测
@@ -1460,7 +1466,10 @@ class CNStockDataSource(DataSource):
         started_at = time.perf_counter()
 
         try:
-            page = await realtime_ff.fetch_history_page(symbol)
+            if today_date is not None and not need_history:
+                page = await realtime_ff.fetch_today_page(symbol)
+            else:
+                page = await realtime_ff.fetch_history_page(symbol)
         except realtime_ff.FundFlowPageUnavailable:
             # 兜底的兜底：上面已经用 get_fund_flow_url 提前拦过一次，走到这里说明
             # 那两处的判断分叉了。
@@ -1565,10 +1574,9 @@ class CNStockDataSource(DataSource):
             else:
                 page_result = await self._fetch_fund_flow_from_page(
                     canonical_symbol,
-                    # 数据日期就是"此刻的最近已结束交易日"时，允许页面用今日栏合成当天
-                    # 那一行。历史表被拒时这是网关前的最后一条免费路。周末/盘前数据日期
-                    # 是上个交易日，今日栏对应哪天无法验证，不合成；钉日期要的是过去那一
-                    # 天，今日栏答不了。
+                    need_history=bool(fund_flow_need.history_rows or fund_flow_need.pinned_date),
+                    # 数据日期与页面今日栏对应的交易日一致时才合成。盘前和非交易日
+                    # 按上一交易日匹配，开盘后按当日匹配；钉日期仍由历史表精确命中。
                     # full 也给：1 行补不满几十行的历史需求，网关照样往下走，省不到积分；
                     # 但网关也失败时（出口冷却、认证不可用），报告里的当日五档就靠它——
                     # 实测一轮验证里 5 个 full 标的因此连当日资金流一起丢掉。网关成功时

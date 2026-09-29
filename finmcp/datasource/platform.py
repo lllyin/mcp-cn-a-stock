@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from .. import request_control
 from ..config import env
 
 logger = logging.getLogger("finmcp")
@@ -226,6 +227,7 @@ def resolve(
     merged_from: list = []
 
     for name in order:
+        request_control.check_cancelled()
         platform = _PLATFORMS.get(name)
         if platform is None:
             continue

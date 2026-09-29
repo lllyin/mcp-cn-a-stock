@@ -26,6 +26,10 @@ def _pin_kline_order(monkeypatch):
     同花顺自己的行为归 test_kline_source.py 和平台层的测试管。
     """
     monkeypatch.setenv("KLINE_PROVIDERS", "tencent,sina")
+    # These tests provide historical frames; do not fetch a live bar to upsert
+    # into them. Intraday normalization has its own provider tests.
+    from finmcp.datasource import intraday_quote
+    monkeypatch.setattr(intraday_quote, "resolve", lambda *a, **kw: None)
 
 def _sample_kline_frame():
     return pd.DataFrame(
@@ -1344,6 +1348,7 @@ async def test_page_fallback_is_not_used_while_the_api_works(monkeypatch):
         raise AssertionError(f"主源可用时不应加载页面: {symbol}")
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", unexpected)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", unexpected)
 
     result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
 
@@ -1362,11 +1367,12 @@ async def test_page_fallback_supplies_history_and_clears_the_failure(monkeypatch
     page = _captured_page()
     loaded = []
 
-    async def fake_page(symbol, today_date=None):
+    async def fake_page(symbol, today_date=None, **kwargs):
         loaded.append(symbol)
         return page
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", fake_page)
 
     result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
 
@@ -1402,11 +1408,12 @@ async def test_partial_fund_flow_still_goes_to_the_page_and_takes_its_history(mo
     page = _captured_page()
     loaded = []
 
-    async def fake_page(symbol, today_date=None):
+    async def fake_page(symbol, today_date=None, **kwargs):
         loaded.append(symbol)
         return page
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", fake_page)
 
     result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
 
@@ -1423,10 +1430,11 @@ async def test_partial_fund_flow_survives_a_failed_page_but_blocks_the_cache(mon
 
     datasource = _page_fallback_datasource(monkeypatch, _partial_fund_flow_result())
 
-    async def failing_page(symbol, today_date=None):
+    async def failing_page(symbol, today_date=None, **kwargs):
         raise RuntimeError("风控滑块")
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", failing_page)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", failing_page)
 
     result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
 
@@ -1443,11 +1451,12 @@ async def test_partial_fund_flow_for_a_symbol_without_a_page_skips_the_browser(m
     datasource = _page_fallback_datasource(monkeypatch, _partial_fund_flow_result())
     loaded = []
 
-    async def fake_page(symbol, today_date=None):
+    async def fake_page(symbol, today_date=None, **kwargs):
         loaded.append(symbol)
         return _captured_page()
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", fake_page)
 
     result = await datasource.fetch_stock_data("SH000688", "2024-01-01", "2026-09-03")
 
@@ -1465,11 +1474,12 @@ async def test_a_complete_fund_flow_never_pays_for_a_page(monkeypatch):
     datasource = _page_fallback_datasource(monkeypatch, complete)
     loaded = []
 
-    async def fake_page(symbol, today_date=None):
+    async def fake_page(symbol, today_date=None, **kwargs):
         loaded.append(symbol)
         return _captured_page()
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", fake_page)
 
     result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
 
@@ -1495,6 +1505,7 @@ async def test_page_fallback_is_skipped_when_the_browser_tier_is_full(monkeypatc
         raise AssertionError("没有空位时不应加载页面")
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", unexpected)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", unexpected)
 
     result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
 
@@ -1514,6 +1525,7 @@ async def test_page_fallback_can_be_disabled(monkeypatch):
         raise AssertionError("开关关闭时不应加载页面")
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", unexpected)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", unexpected)
 
     result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
 
@@ -1533,6 +1545,7 @@ async def test_page_fallback_survives_a_page_error(monkeypatch):
         raise TimeoutError("Timeout 25000ms exceeded")
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", failing)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", failing)
 
     result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
 
@@ -1555,6 +1568,7 @@ async def test_page_fallback_releases_its_slot_after_a_failure(monkeypatch):
         raise TimeoutError("boom")
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", failing)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", failing)
 
     await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
 
@@ -1574,6 +1588,7 @@ async def test_page_fallback_ignores_an_empty_history(monkeypatch):
         return FundFlowPage(name="三环集团", code="300408")
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", empty_page)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", empty_page)
 
     result = await datasource.fetch_stock_data("SZ300408", "2024-01-01", "2026-09-03")
 
@@ -1600,6 +1615,7 @@ async def test_page_fallback_is_attempted_on_every_request(monkeypatch):
         raise FundFlowPageError("页面既无今日数据也无历史表")
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", futile)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", futile)
 
     rounds = 7
     for _ in range(rounds):
@@ -1625,6 +1641,7 @@ async def test_page_fallback_ignores_symbols_without_a_page(monkeypatch):
         raise realtime_ff_module.FundFlowPageUnavailable(symbol)
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", unavailable)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", unavailable)
 
     result = await datasource.fetch_stock_data("SH000688", "2024-01-01", "2026-09-03")
 
@@ -1650,6 +1667,7 @@ async def test_page_fallback_success_after_failures(monkeypatch):
         return page
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", flaky)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", flaky)
 
     for _ in range(3):
         result = await datasource.fetch_stock_data(
@@ -1885,6 +1903,8 @@ class TestFallbackRequestBudget:
 
         monkeypatch.setattr(realtime_ff_module, "fetch_history_page", unexpected)
 
+        monkeypatch.setattr(realtime_ff_module, "fetch_today_page", unexpected)
+
         result = await datasource.fetch_stock_data(
             "SZ300408", "2024-01-01", "2026-09-03"
         )
@@ -1909,6 +1929,8 @@ class TestFallbackRequestBudget:
             return page
 
         monkeypatch.setattr(realtime_ff_module, "fetch_history_page", working)
+
+        monkeypatch.setattr(realtime_ff_module, "fetch_today_page", working)
 
         async def free_it_soon():
             await asyncio.sleep(0.05)
@@ -2003,6 +2025,7 @@ async def test_a_symbol_without_a_page_never_waits_for_a_slot(monkeypatch):
         raise AssertionError("没有页面的标的不该加载页面")
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", unexpected)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", unexpected)
 
     result = await datasource._fetch_fund_flow_from_page("SH000688")
 
@@ -2032,6 +2055,7 @@ async def test_a_symbol_with_a_page_still_goes_through_the_slot(monkeypatch):
         return page
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", working)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", working)
 
     result = await datasource._fetch_fund_flow_from_page("SZ300408")
 
@@ -2056,6 +2080,7 @@ async def test_brief_never_pays_for_the_page_history(monkeypatch):
         raise AssertionError("brief 不该为历史表加载页面")
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", unexpected)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", unexpected)
 
     result = await datasource.fetch_stock_data_with_requirements(
         "SZ300408", "2024-01-01", "2026-09-03",
@@ -2119,7 +2144,7 @@ async def test_gateway_runs_only_after_the_page_also_fails(monkeypatch):
         return source_module._fetch_failure("fund_flow")
 
     monkeypatch.setattr(datasource, "_fetch_fund_flow_sync", fake_fetch)
-    monkeypatch.setattr(datasource, "_fetch_fund_flow_from_page", lambda symbol, today_date=None: asyncio.sleep(0))
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_from_page", lambda symbol, today_date=None, **kwargs: asyncio.sleep(0))
     stored = []
     monkeypatch.setattr(source_module, "store_fund_flow", lambda s, v: stored.append(v))
 
@@ -2148,7 +2173,7 @@ async def test_gateway_is_not_paid_when_the_page_satisfies(monkeypatch):
         calls.append(order)
         return source_module._fetch_failure("fund_flow")
 
-    async def fake_page(symbol, today_date=None):
+    async def fake_page(symbol, today_date=None, **kwargs):
         return {"fund_flow": _fund_flow_frame_of(120), "is_market": False,
                 "provider": "page_fallback"}
 
@@ -2190,7 +2215,7 @@ async def test_paid_counts_real_gateway_sends_not_reaching_the_tier(
         return source_module._fetch_failure("fund_flow")
 
     monkeypatch.setattr(datasource, "_fetch_fund_flow_sync", fake_fetch)
-    monkeypatch.setattr(datasource, "_fetch_fund_flow_from_page", lambda symbol, today_date=None: asyncio.sleep(0))
+    monkeypatch.setattr(datasource, "_fetch_fund_flow_from_page", lambda symbol, today_date=None, **kwargs: asyncio.sleep(0))
     monkeypatch.setattr(source_module, "store_fund_flow", lambda s, v: None)
 
     with caplog.at_level("INFO", logger="finmcp"):
@@ -2232,7 +2257,7 @@ async def test_a_stale_complete_frame_still_goes_to_the_page(monkeypatch, caplog
     )
     loaded = []
 
-    async def fake_page(symbol, today_date=None):
+    async def fake_page(symbol, today_date=None, **kwargs):
         loaded.append(symbol)
         return {"fund_flow": _fund_flow_frame_of(120), "is_market": False,
                 "provider": "page_fallback"}
@@ -2306,7 +2331,7 @@ async def test_the_merge_keeps_the_aligned_row_when_the_page_is_longer_but_stale
             "is_market": False, "complete": False, "provider": "eastmoney_delay"},
     )
 
-    async def fake_page(symbol, today_date=None):
+    async def fake_page(symbol, today_date=None, **kwargs):
         # 页面 120 行止于 06-13：更长但滞后
         return {"fund_flow": _fund_flow_frame_of(120, end=datetime.date(2026, 6, 13)),
                 "is_market": False, "provider": "page_fallback"}
@@ -2443,7 +2468,7 @@ def _empty_probe_datasource(monkeypatch):
         return {"fund_flow": _empty_probes_delay_frame(),
                 "is_market": False, "complete": False, "provider": "eastmoney_delay"}
 
-    async def fake_page(symbol, today_date=None):
+    async def fake_page(symbol, today_date=None, **kwargs):
         calls["page"] += 1
         return {"fund_flow": _empty_probes_delay_frame(rows=120),
                 "is_market": False, "provider": "page_fallback"}
@@ -2488,7 +2513,7 @@ async def test_a_refused_page_is_not_recorded_and_the_next_request_retries(monke
     calls = []
 
     # _fetch_fund_flow_from_page 内部把异常吃掉、返回 None——模拟"什么都没学到"
-    async def failing_page(symbol, today_date=None):
+    async def failing_page(symbol, today_date=None, **kwargs):
         calls.append(symbol)
         return None
 
@@ -2582,12 +2607,13 @@ async def test_today_block_saves_a_today_only_query_from_the_gateway(monkeypatch
     calls = _today_block_orchestration_stubs(monkeypatch, datasource)
     page = _today_only_page_stub()
 
-    async def fake_page(symbol, today_date=None):
+    async def fake_page(symbol, today_date=None, **kwargs):
         return page
 
     from finmcp.datasource import realtime_ff as realtime_ff_module
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", fake_page)
 
     result = await datasource.fetch_stock_data_with_requirements(
         "SH600519", "2024-01-01", "2026-06-16",
@@ -2609,10 +2635,11 @@ async def test_full_still_goes_to_the_gateway_when_only_the_today_block_is_there
 
     from finmcp.datasource import realtime_ff as realtime_ff_module
 
-    async def fake_page(symbol, today_date=None):
+    async def fake_page(symbol, today_date=None, **kwargs):
         return _today_only_page_stub()
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", fake_page)
 
     result = await datasource.fetch_stock_data_with_requirements(
         "SH600519", "2024-01-01", "2026-06-16",
@@ -2643,10 +2670,11 @@ async def test_full_unions_the_today_block_with_the_gateway_history(monkeypatch)
 
     from finmcp.datasource import realtime_ff as realtime_ff_module
 
-    async def fake_page(symbol, today_date=None):
+    async def fake_page(symbol, today_date=None, **kwargs):
         return _today_only_page_stub()
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", fake_page)
 
     result = await datasource.fetch_stock_data_with_requirements(
         "SH600519", "2024-01-01", "2026-06-16",
@@ -2715,7 +2743,7 @@ def _singleflight_stubs(monkeypatch, datasource, gateway_frame):
 
     monkeypatch.setattr(datasource, "_fetch_fund_flow_sync", fake_sync)
     monkeypatch.setattr(datasource, "_fetch_fund_flow_from_page",
-                        lambda symbol, today_date=None: asyncio.sleep(0))
+                        lambda symbol, today_date=None, **kwargs: asyncio.sleep(0))
     monkeypatch.setattr(source_module, "store_fund_flow", lambda s, v: None)
     source_module._fund_flow_empty_probes.clear()
     return gateway_calls
@@ -2850,6 +2878,7 @@ async def test_the_today_block_tops_up_a_history_that_stops_yesterday(monkeypatc
         return page
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", fake_page)
 
     result = await datasource.fetch_stock_data_with_requirements(
         "SH600519", "2024-01-01", "2026-06-16",
@@ -2913,6 +2942,7 @@ async def test_today_block_is_adopted_during_pre_market(monkeypatch):
         return _today_only_page_stub()   # 今日=True 历史=0 的形态（盘前常见）
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", fake_page)
 
     result = await datasource.fetch_stock_data_with_requirements(
         "SH600519", "2024-01-01", "2026-06-16",
@@ -2942,6 +2972,7 @@ async def test_today_block_is_rejected_when_the_kline_is_stale(monkeypatch):
         return _today_only_page_stub()
 
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", fake_page)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", fake_page)
 
     await datasource.fetch_stock_data_with_requirements(
         "SH600519", "2024-01-01", "2026-06-16",
@@ -2949,3 +2980,28 @@ async def test_today_block_is_rejected_when_the_kline_is_stale(monkeypatch):
     )
 
     assert calls["gateway"] == 1   # 没合成，照走网关
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('today_date,need_history,expected', [
+    (datetime.date(2026, 6, 16), False, 'today'),
+    (datetime.date(2026, 6, 16), True, 'history'),
+    (None, False, 'history'),
+])
+async def test_page_entry_matches_history_need_and_known_date(
+    monkeypatch, today_date, need_history, expected
+):
+    from finmcp.datasource import realtime_ff
+    calls = []
+    async def today(symbol):
+        calls.append('today')
+        return _today_only_page_stub()
+    async def history(symbol):
+        calls.append('history')
+        return _today_only_page_stub()
+    monkeypatch.setattr(source_module, 'FUND_FLOW_PAGE_ENABLED', True)
+    monkeypatch.setattr(realtime_ff, 'fetch_today_page', today)
+    monkeypatch.setattr(realtime_ff, 'fetch_history_page', history)
+    await CNStockDataSource()._fetch_fund_flow_from_page(
+        'SH600519', today_date=today_date, need_history=need_history)
+    assert calls == [expected]

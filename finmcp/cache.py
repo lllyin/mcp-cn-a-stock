@@ -963,6 +963,9 @@ def get_or_load(
 
     返回 None 表示 loader 没给出结果，也没有可用的旧值。
     """
+    from . import request_control
+
+    request_control.check_cancelled()
     cache = cache_for(ns)
     cache_key = key_for(ns, key, epoch=epoch, now=now)
     digest = cache_key.digest()
@@ -977,18 +980,20 @@ def get_or_load(
     waiter = cache.claim(digest)
     if waiter is not None:
         # 别人正在取同一份，等它。醒来之后再查一次缓存即可。
-        waiter.wait(timeout=_INFLIGHT_WAIT_SECONDS)
+        request_control.wait(waiter, _INFLIGHT_WAIT_SECONDS)
         hit = cache.get(cache_key)
         if hit is not None and _accepts(hit):
             return Entry(value=hit, fresh=True, age_seconds=cache.age_of(digest))
 
     try:
+        request_control.check_cancelled()
         value = loader()
     except Exception:
         logger.warning("%s 取数失败 key=%s", ns, key, exc_info=True)
         value = None
     finally:
-        cache.release(digest)
+        if waiter is None:  # A follower must never release another loader's claim.
+            cache.release(digest)
 
     if value is not None:
         cache.put(cache_key, value)

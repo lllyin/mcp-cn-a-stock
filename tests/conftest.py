@@ -106,6 +106,7 @@ def forbid_real_browser(monkeypatch):
     # 资金流向页面兜底是第二个会拉起 Chromium 的入口，同样要拦住：主源在测试
     # 环境里必然失败，兜底会被触发。
     monkeypatch.setattr(realtime_ff_module, "fetch_history_page", refuse_browser)
+    monkeypatch.setattr(realtime_ff_module, "fetch_today_page", refuse_browser)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -185,4 +186,3 @@ def sample_stock_data_dict(sample_dates, sample_prices):
         "GCASH": np.zeros(n),
         "GSHARE": np.zeros(n),
     }
-

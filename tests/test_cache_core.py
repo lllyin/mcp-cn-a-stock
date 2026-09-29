@@ -306,3 +306,40 @@ def test_the_report_cache_singleton_can_actually_be_built():
         assert cache.ns.name == "report"
     finally:
         cache_module.reset_caches()
+
+
+def test_cancelled_cache_follower_does_not_load_or_release_leader(ns):
+    from finmcp import request_control
+    cache = cache_module.cache_for(ns)
+    digest = key_for(ns, 'cancelled', now=at(18)).digest()
+    assert cache.claim(digest) is None
+    leader = cache.claim(digest)
+    cancelled = threading.Event()
+    entered = threading.Event()
+    finished = threading.Event()
+    calls = []
+    original_wait = leader.wait
+    def marked_wait(timeout):
+        entered.set()
+        return original_wait(timeout)
+    leader.wait = marked_wait
+    def follower():
+        previous = request_control.set_cancel_event(cancelled)
+        try:
+            with pytest.raises(request_control.RequestCancelled):
+                get_or_load(ns, 'cancelled', lambda: calls.append('loaded'), now=at(18))
+        finally:
+            request_control.set_cancel_event(previous)
+            finished.set()
+    thread = threading.Thread(target=follower)
+    thread.start()
+    try:
+        assert entered.wait(.5)
+        cancelled.set()
+        assert finished.wait(.5)
+        assert calls == []
+        assert cache.claim(digest) is leader
+    finally:
+        cancelled.set()
+        cache.release(digest)
+        thread.join(1)

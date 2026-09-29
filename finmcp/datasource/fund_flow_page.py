@@ -200,6 +200,13 @@ class FundFlowPage:
         """
         return bool(self.today) and any(v is not None for v in self.today.values())
 
+    @property
+    def has_complete_today(self) -> bool:
+        """All five amounts and ratios are present; zero is a valid value."""
+        return bool(self.today) and all(
+            self.today.get(column) is not None for column in TODAY_FIELDS.values()
+        )
+
     def history_records(self) -> list:
         return [row.as_record() for row in self.history]
 

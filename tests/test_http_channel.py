@@ -277,7 +277,8 @@ def test_retries_then_replays_through_plain_requests(monkeypatch):
     assert result == "plain"
     assert len(calls) == channel.IMPERSONATE_RETRY
     # The replay keeps the caller's kwargs, without curl_cffi-only additions.
-    assert replayed == [{"params": {"secid": "1.600000"}}]
+    assert replayed == [{"params": {"secid": "1.600000"},
+                         "timeout": channel.EASTMONEY_FALLBACK_TIMEOUT_SECONDS}]
 
 
 def test_plain_eastmoney_replay_gets_a_bounded_default_timeout(monkeypatch):

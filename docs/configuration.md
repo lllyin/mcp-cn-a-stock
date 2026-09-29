@@ -32,7 +32,7 @@
 | `HTTP_CHANNEL` | 访问东财行情主机的方式：<br>`auto` 按 `AKSHARE_PROXY_ENABLED` 选择，并在运行中按请求回退<br>`proxy` 经授权网关和代理出口，按积分计费<br>`impersonate` 本机直连，伪装成浏览器<br>`direct` 本机直连，不做伪装，可写作 `off` | `auto`<br>`proxy`<br>`impersonate`<br>`direct`<br>（默认 `auto`） |
 | `IMPERSONATE_RETRY` | 单个请求的伪装尝试次数，用尽后不带伪装再试一次 | 正整数（默认 `3`） |
 | `IMPERSONATE_TIMEOUT_SECONDS` | 单次伪装请求的超时 | 秒（默认 `8`） |
-| `EASTMONEY_FALLBACK_TIMEOUT_SECONDS` | 东财 API 在伪装失败后重放、或 `auto` 网关回退时的单次超时；调用方显式 timeout 优先 | 秒（默认 `8`） |
+| `EASTMONEY_FALLBACK_TIMEOUT_SECONDS` | 东财 API 原生重放和网关发送的连接/读取超时上限；保留调用方更短的 timeout，较长或无限 timeout 按此上限收敛 | 秒（默认 `8`） |
 | `IMPERSONATE_BROWSER` | 伪装成哪个浏览器 | 浏览器名，如 `chrome`、`safari`（默认 `chrome`） |
 | `IMPERSONATE_SUSPEND_AFTER_FAILURES` | 连续多少次请求打满重试仍失败后暂停伪装通道 | 正整数（默认 `4`） |
 | `IMPERSONATE_SUSPEND_SECONDS` | 暂停时长。期间东财源直接跳过，改用备用源 | 秒（默认 `300`） |
@@ -43,6 +43,13 @@
 | `EASTMONEY_AUTH_HARVEST_TIMEOUT_SECONDS` | 一次采集的总预算，超时后继续走既有请求链路 | 秒（默认 `45`） |
 
 只有少数东方财富行情主机会被接管，其余原样直连；详见[出站 HTTP 通道](technical-details.md#6-出站-http-通道)。
+
+项目管理的东财 HTTP 链使用单调时钟计算总预算，覆盖伪装尝试、原生重放及网关的等待、
+认证和重试；预算由上表的超时、重试次数及网关等待配置的最大值计算，嵌套请求只使用剩余
+时间。原生重放和网关发送不再叠加第三方 Session 的隐式重试，调用方更短的超时仍保留。
+客户端取消后停止排队任务、缓存等待、退避等待和后续取数；已经发出的同步 HTTP 由连接/
+读取超时收尾，不能通过取消 asyncio 任务强杀线程。`HTTP budget`、`gateway_skip` 日志可
+用于核对实际耗时和退出原因。
 
 ## AkShare Proxy Patch（可选，付费）
 

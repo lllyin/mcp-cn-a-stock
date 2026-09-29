@@ -1,5 +1,7 @@
 import asyncio
 import contextlib
+import contextvars
+from dataclasses import replace
 import json
 import logging
 import os
@@ -114,10 +116,11 @@ BLOCKED_PATTERNS = [
     "**/*advertisement*",
 ]
 
-# 以数据就绪作为信号的等待脚本（等5个主字段同时非空非占位符）
+# 五档金额与占比全部就绪才允许提前交付，部分字段仍沿用完整等待/降级路径。
 WAIT_FOR_DATA_JS = """
     () => {
-        const fields = ['f62', 'f66', 'f72', 'f78', 'f84'];
+        const fields = ['f62', 'f66', 'f72', 'f78', 'f84',
+                        'f184', 'f69', 'f75', 'f81', 'f87'];
         return fields.every(fid => {
             const el = document.querySelector(`td[data-field="${fid}"]`);
             if (!el) return false;
@@ -760,6 +763,7 @@ async def load_fund_flow_page(
                     if last_refusal is not None and last_refusal.captcha
                     else "blocked" if last_refusal is not None
                     else f"today={parsed.has_today} history={len(parsed.history)}"
+                    if parsed is not None else "empty"
                 )
                 _log_page_load(
                     symbol,
@@ -984,15 +988,51 @@ async def _load_once(page, symbol: str, url: str, *, reload: bool):
 
     # 监听器现挂现摘：refused 是这一次的账，不能跨 reload 累计。
     page.on("requestfailed", on_request_failed)
+    progress = _active_page_progress.get()
+    started = time.perf_counter()
+    history_task = None
+    today_at = None
+    history_at = None
+    goto_elapsed = 0.0
+
+    async def wait_history():
+        nonlocal history_at
+        await _wait_for_history(page, history_refused)
+        history_at = time.perf_counter() - started
     try:
         if reload:
             await page.reload(wait_until="domcontentloaded", timeout=25000)
         else:
             await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-        await asyncio.gather(
-            _wait_for_today(page, today_refused),
-            _wait_for_history(page, history_refused),
-        )
+        goto_elapsed = time.perf_counter() - started
+        history_task = asyncio.create_task(wait_history())
+        await _wait_for_today(page, today_refused)
+        if progress is not None:
+            content = await page.content()
+            try:
+                today_page = parse_fund_flow_page(content)
+            except FundFlowPageError:
+                today_page = None
+            if today_page is not None and today_page.has_complete_today:
+                today_at = time.perf_counter() - started
+                if history_at is None:
+                    # A DOM snapshot may contain a history row still being
+                    # filled. It must not outrank the complete today fields or
+                    # become a history-cache hit for a later full consumer.
+                    today_page = replace(today_page, history=[])
+                await eastmoney_auth.remember_from_context(getattr(page, "context", None))
+                # Let already scheduled consumers register their demand before
+                # deciding to close the tab. This is a scheduling turn, not a
+                # timed grace period or an extra browser load.
+                await asyncio.sleep(0)
+                # A full/pinned consumer keeps the same tab alive. Without one,
+                # do not wait for history or issue a history XHR just for brief.
+                if not progress.history_waiters:
+                    progress.today_only_complete = True
+                    return today_page, None, set()
+                if not progress.today.done():
+                    progress.today.set_result(today_page)
+        await history_task
         content = await page.content()
         # 这个页面本来就在 .eastmoney.com 上，加载时 JS 已经把 nid18 写好了。顺手
         # 读一次，纯 API 那条路就不必再单独开一个浏览器去采（见 eastmoney_auth）。
@@ -1001,6 +1041,20 @@ async def _load_once(page, symbol: str, url: str, *, reload: bool):
         await eastmoney_auth.remember_from_context(getattr(page, "context", None))
     finally:
         page.remove_listener("requestfailed", on_request_failed)
+        if history_task is not None:
+            if not history_task.done():
+                history_task.cancel()
+            await asyncio.gather(history_task, return_exceptions=True)
+        request_id, tool, _ = log_context()
+        logger.debug(
+            "Fund flow page readiness request_id=%s tool=%s symbol=%s "
+            "goto=%.3fs today_ready=%s history_wait_done=%s elapsed=%.3fs history_required=%s",
+            request_id, tool, symbol, goto_elapsed,
+            "-" if today_at is None else f"{today_at:.3f}s",
+            "-" if history_at is None else f"{history_at:.3f}s",
+            time.perf_counter() - started,
+            progress is None or bool(progress.history_waiters),
+        )
 
     try:
         parsed = parse_fund_flow_page(content)
@@ -1014,7 +1068,14 @@ async def _load_once(page, symbol: str, url: str, *, reload: bool):
     # 说不出是"没进来补"还是"补了没补上"，而这两件事的排查方向完全不同。
     if parsed is not None and not parsed.history:
         logger.debug("页面历史表为空，尝试在页面内取回 %s", symbol)
+        xhr_started = time.perf_counter()
         rows = await _fetch_history_in_page(page, symbol)
+        request_id, tool, _ = log_context()
+        logger.debug(
+            "Fund flow page history_xhr request_id=%s tool=%s symbol=%s "
+            "elapsed=%.3fs rows=%d",
+            request_id, tool, symbol, time.perf_counter() - xhr_started, len(rows),
+        )
         if rows:
             parsed.history = rows
             history_refused.clear()
@@ -1089,6 +1150,18 @@ _page_inflight: dict[str, asyncio.Task] = {}
 #: 每个在飞页面任务的等待者数。fetch_page_shared 用它决定最后一个消费者离开时
 #: 要不要取消任务——shield 只保护"还有别人在等"的情形。
 _page_inflight_waiters: dict[str, int] = {}
+
+
+class _PageProgress:
+    def __init__(self):
+        self.today = asyncio.get_running_loop().create_future()
+        self.history_waiters = 0
+        self.bypass_breaker = False
+        self.today_only_complete = False
+
+
+_page_progress: dict[str, _PageProgress] = {}
+_active_page_progress = contextvars.ContextVar("fund_flow_page_progress", default=None)
 # 已解析结果的短期复用：key -> (完成时刻, 结果)。单飞只覆盖并发，这一层覆盖
 # "一次请求里两个用途先后要同一个页面"。
 _page_cache: dict[str, tuple[float, FundFlowPage]] = {}
@@ -1123,6 +1196,13 @@ def _cached_page(
 def _remember_page(key: str, page: FundFlowPage) -> None:
     if FUND_FLOW_PAGE_REUSE_SECONDS <= 0:
         return
+    previous = _page_cache.get(key)
+    if (previous is not None and previous[1].today == page.today
+            and len(previous[1].history) > len(page.history)
+            and time.monotonic() - previous[0] <= FUND_FLOW_PAGE_REUSE_SECONDS):
+        # A today's-only waiter can resume after the full waiter cached history.
+        # Keep that richer result and its original age.
+        return
     _page_cache[key] = (time.monotonic(), page)
     # 只保留还在窗口内的条目：标的数不设上限，靠过期回收即可。
     deadline = time.monotonic() - FUND_FLOW_PAGE_REUSE_SECONDS
@@ -1134,6 +1214,9 @@ def _complete_page_inflight(symbol: str, task: asyncio.Task) -> None:
     if _page_inflight.get(symbol) is task:
         _page_inflight.pop(symbol, None)
         _page_inflight_waiters.pop(symbol, None)
+        progress = _page_progress.pop(symbol, None)
+        if progress is not None and not progress.today.done():
+            progress.today.cancel()
     if not task.cancelled():
         task.exception()  # 取一次异常，避免"never retrieved"告警
 
@@ -1185,11 +1268,15 @@ async def _load_page_shared(
         # 是付费网关之前的最后一级免费途径，必须每次都真加载——它被熔断的话，请求
         # 直接落到网关付积分，而页面还有逐次成功的可能。历史路径也不喂这个熔断器：
         # 它的成败与"实时要不要停"无关。
-        if require_today and _PAGE_BREAKER.should_skip():
+        progress = _active_page_progress.get()
+        if (require_today and not (progress and (progress.bypass_breaker or progress.history_waiters))
+                and _PAGE_BREAKER.should_skip()):
             # 浏览器层刚被连续拒过：这一刻再加载只会把滑块续下去，直接告诉调用方没有。
             raise FundFlowPageRefused(f"{symbol} 浏览器层熔断中，暂不加载页面")
         budget = FUND_FLOW_PAGE_MAX_LOADS
-        predicate = lambda page: _satisfies(page, require_history, require_today)
+        predicate = lambda page: _satisfies(
+            page, require_history or bool(progress and progress.history_waiters), require_today
+        )
         last_error = None
         used = 0
 
@@ -1250,12 +1337,13 @@ async def _load_page_shared(
 
 
 async def fetch_page_shared(
-    symbol: str, *, require_history: bool = False, require_today: bool = False
+    symbol: str, *, require_history: bool = False, require_today: bool = False,
+    bypass_breaker: bool = False,
 ) -> FundFlowPage:
     """同一标的的页面加载只做一次，今日与历史两个用途共享结果。
 
-    require_* 声明调用方要哪一块：只影响能否复用既有结果，不影响并发合并——同一
-    时刻的两个等待者拿到的本来就是同一次加载，再加载一遍不会有不同结果。
+    require_* 声明调用方要哪一块：今日五档完整时交付今日快照，历史等待者继续
+    使用同一个 tab。今日字段不全时仍等完整加载，不能因提前返回少一档数据。
 
     等待者计数：shield 保证一个等待者被取消不打断另一个；但**最后一个**消费者
     离开时任务还在白跑（一次页面加载 ~120 MiB 内存加十几秒事件循环），所以
@@ -1271,22 +1359,51 @@ async def fetch_page_shared(
         return cached
     task = _page_inflight.get(key)
     if task is None or task.done():
-        task = asyncio.create_task(
-            _load_page_shared(
-                symbol, require_history=require_history, require_today=require_today
-            )
-        )
+        progress = _PageProgress()
+
+        async def load():
+            token = _active_page_progress.set(progress)
+            try:
+                return await _load_page_shared(
+                    symbol, require_history=require_history, require_today=require_today
+                )
+            finally:
+                _active_page_progress.reset(token)
+
+        task = asyncio.create_task(load())
         _page_inflight[key] = task
+        _page_progress[key] = progress
         task.add_done_callback(
             lambda completed, k=key: _complete_page_inflight(k, completed)
         )
+    progress = _page_progress[key]
+    # Calls without a declared need retain the legacy complete-load behavior.
+    needs_history = require_history or not require_today
+    progress.history_waiters += int(needs_history)
+    progress.bypass_breaker |= bypass_breaker
     _page_inflight_waiters[key] = _page_inflight_waiters.get(key, 0) + 1
     try:
         # shield：一个等待者被取消不能中断另一个等待者需要的加载。
-        page = await asyncio.shield(task)
+        if require_today and not require_history:
+            await asyncio.wait({task, progress.today}, return_when=asyncio.FIRST_COMPLETED)
+            if progress.today.done() and not progress.today.cancelled():
+                page = progress.today.result()
+            else:
+                page = await asyncio.shield(task)
+        else:
+            page = await asyncio.shield(task)
+        if needs_history and progress.today_only_complete and not page.history:
+            # A history consumer can join after the tab has committed to close
+            # but before its task completes. It must make its own full attempt,
+            # rather than inheriting the earlier caller's today-only result.
+            return await fetch_page_shared(
+                symbol, require_history=require_history, require_today=require_today,
+                bypass_breaker=bypass_breaker,
+            )
         _remember_page(key, page)
         return page
     finally:
+        progress.history_waiters -= int(needs_history)
         if _page_inflight.get(key) is task:
             remaining = max(0, _page_inflight_waiters.get(key, 1) - 1)
             if remaining > 0:
@@ -1297,6 +1414,9 @@ async def fetch_page_shared(
                     # 没有消费者了：取消前先从登记表摘掉，新请求不会附到一个
                     # 正在取消的任务上。
                     _page_inflight.pop(key, None)
+                    _page_progress.pop(key, None)
+                    if not progress.today.done():
+                        progress.today.cancel()
                     task.cancel()
 
 
@@ -1314,6 +1434,11 @@ async def fetch_single(symbol: str, context: BrowserContext) -> dict:
 async def fetch_history_page(symbol: str) -> FundFlowPage:
     """取历史资金流。失败一律抛异常，由调用方决定是否降级。"""
     return await fetch_page_shared(symbol, require_history=True)
+
+
+async def fetch_today_page(symbol: str) -> FundFlowPage:
+    """The final free fallback must load even if the realtime breaker is open."""
+    return await fetch_page_shared(symbol, require_today=True, bypass_breaker=True)
 
 
 async def _fetch_single_with_context(symbol: str) -> dict:

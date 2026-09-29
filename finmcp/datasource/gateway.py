@@ -21,35 +21,27 @@ from ..config import (
     GATEWAY_AUTH_REUSE_SECONDS,
     GATEWAY_EXIT_RETRIES,
     GATEWAY_SINGLEFLIGHT_WAIT_SECONDS,
+    EASTMONEY_FALLBACK_TIMEOUT_SECONDS,
 )
+from .. import request_control
+from ..observability import log_context
 
 logger = logging.getLogger("finmcp")
 
 
-_request_cancel_local = threading.local()
-
-
 def set_current_request_cancel_event(event):
     """Bind the current executor thread's request-cancel signal."""
-    previous = getattr(_request_cancel_local, "event", None)
-    _request_cancel_local.event = event
-    return previous
+    return request_control.set_cancel_event(event)
 
 
 def restore_current_request_cancel_event(previous) -> None:
     """Restore the executor thread's previous request-cancel signal."""
-    if previous is None:
-        try:
-            del _request_cancel_local.event
-        except AttributeError:
-            pass
-    else:
-        _request_cancel_local.event = previous
+    request_control.set_cancel_event(previous)
 
 
 def current_request_cancel_event():
     """Return the cancellation signal bound to the current worker thread."""
-    return getattr(_request_cancel_local, "event", None)
+    return request_control.current_cancel_event()
 
 
 class GatewayAuth(NamedTuple):
@@ -248,14 +240,14 @@ class GatewayClient:
         ``(connect, read)`` 元组按两项之和。按最大值定、不按分位数：等的人比
         leader 先放弃，那一次就白等了、还空手回去（AGENTS.md §五）。
         """
-        if isinstance(timeout, (tuple, list)):
-            send = float(sum(part for part in timeout if part is not None))
-        else:
-            send = 2 * float(timeout)
+        send = request_control.timeout_seconds(timeout)
         auth = float(getattr(self._transport, "auth_budget_seconds", 0.0))
         # 每次尝试：认证 + 请求；两次尝试之间最多再隔一个认证重试间隔。
         return (self._exit_retries * (auth + send)
                 + (self._exit_retries - 1) * self._auth_retry_backoff)
+
+    def wait_budget(self) -> float:
+        return self._wait_seconds
 
     def sends_in_current_thread(self) -> int:
         """本线程累计真正发出去的网关请求数（含失败的那几次）。"""
@@ -307,6 +299,36 @@ class GatewayClient:
 
     def request(self, method: str, url: str, send, *, follower_wait: Optional[float] = None,
                 cancel_event: Optional[threading.Event] = None, **kwargs):
+        """Bound waiting, authentication and all sends by one monotonic deadline."""
+        timeout = request_control.capped_timeout(
+            kwargs.get("timeout"), EASTMONEY_FALLBACK_TIMEOUT_SECONDS
+        )
+        kwargs = {**kwargs, "timeout": timeout}
+        wait_seconds = self._wait_seconds if follower_wait is None else follower_wait
+        # Preserve the configured leader and follower allowances, but time spent
+        # in nested auth/send retries cannot restart either budget.
+        seconds = max(0, wait_seconds) + self.leader_budget(timeout)
+        started = time.monotonic()
+        try:
+            with request_control.budget_scope(seconds, cancel_event=cancel_event):
+                return self._request(
+                    method, url, send, follower_wait=follower_wait,
+                    cancel_event=cancel_event, **kwargs,
+                )
+        except (request_control.BudgetExceeded, request_control.RequestCancelled) as error:
+            request_id, tool, symbol = log_context()
+            logger.debug(
+                "gateway_skip host=%s family=%s reason=%s budget=%.3fs elapsed=%.3fs "
+                "request_id=%s tool=%s symbol=%s",
+                urlsplit(url).hostname, path_family(url),
+                "request_cancelled" if isinstance(error, request_control.RequestCancelled)
+                else "budget_exhausted", seconds, time.monotonic() - started,
+                request_id, tool, symbol,
+            )
+            return None
+
+    def _request(self, method: str, url: str, send, *, follower_wait=None,
+                 cancel_event=None, **kwargs):
         """走网关发一次请求。成功返回 response；不可用/失败返回 None。
 
         ``send(method, url, **kwargs)`` 由调用方提供，决定用哪个 session 发——
@@ -336,6 +358,7 @@ class GatewayClient:
                 leader_done = None
 
         if leader_done is not None:
+            wait_seconds = min(wait_seconds, request_control.current_budget().remaining())
             wait_result = _wait_for_event(leader_done, wait_seconds, cancel_event)
             if wait_result == "cancelled":
                 logger.debug("gateway_skip host=%s family=%s reason=request_cancelled",
@@ -387,6 +410,7 @@ class GatewayClient:
         auth_failed = False       # 有过一次"拿不到新出口"
         fresh_after_failure = False  # 失败之后认证服务给过新出口——它活着
         for attempt in range(self._exit_retries):
+            request_control.current_budget().remaining()
             if cancel_event is not None and cancel_event.is_set():
                 return None
             auth = self._acquire_auth()
@@ -399,15 +423,7 @@ class GatewayClient:
                     host, key[1], urlsplit(url).path, attempt + 1, self._exit_retries,
                 )
                 if attempt + 1 < self._exit_retries and self._auth_retry_backoff:
-                    interrupted = (
-                        cancel_event.wait(self._auth_retry_backoff)
-                        if cancel_event is not None
-                        else False
-                    )
-                    if interrupted:
-                        return None
-                    if cancel_event is None:
-                        time.sleep(self._auth_retry_backoff)
+                    request_control.sleep(self._auth_retry_backoff)
                 continue  # 没拿到出口，隔一下再要
             if cancel_event is not None and cancel_event.is_set():
                 return None
@@ -423,11 +439,22 @@ class GatewayClient:
             retry_kwargs["headers"] = headers
             retry_kwargs["proxies"] = {"http": auth.proxy, "https": auth.proxy}
             retry_kwargs.pop("impersonate", None)
+            remaining = request_control.current_budget().remaining()
+            retry_kwargs["timeout"] = request_control.capped_timeout(
+                retry_kwargs["timeout"], remaining
+            )
 
             started = time.perf_counter()
             self._local.sends = self.sends_in_current_thread() + 1
             try:
                 response = send(method, url, **retry_kwargs)
+            except request_control.BudgetExceeded:
+                # A locally exhausted budget says nothing about exit health.
+                raise
+            except request_control.RequestCancelled:
+                # A pre-send cancellation is not evidence of a bad exit. Actual
+                # send failures take the Exception path below and invalidate it.
+                raise
             except Exception as exc:
                 if cancel_event is not None and cancel_event.is_set():
                     self._drop_auth(auth)
