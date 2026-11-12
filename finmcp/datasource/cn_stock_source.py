@@ -2047,10 +2047,8 @@ class CNStockDataSource(DataSource):
             if not df.empty:
                 try:
                     # 一致性检测放咽喉点：主源和页面兜底都汇到这里，两种来路都查。
-                    # 违反恒等式 = 这行不是真实成交的账（push2his 对部分客户端身份
-                    # 发扰动副本，200 + 行数齐全 + 收盘价真值，可用性指标看不见）。
-                    # 检测不过不丢弃——丢一行用户就少一行（AGENTS §一）——记成
-                    # 数据可疑，进 warnings 和 degraded，让读者和缓存守卫知道。
+                    # 原始异常进入内部日志和缓存守卫，用户提示按展示阈值筛选。
+                    # 保留原始数值与全部行，避免一致性提示改变数据完整性。
                     # 每条记录前缀上游端点：事后排查"这份坏数据是谁给的"不用再猜。
                     violations = fund_flow_source.consistency_violations(
                         df, rendered="page_fallback" in (fund_flow_data.get("provider") or ""))
@@ -2059,6 +2057,10 @@ class CNStockDataSource(DataSource):
                             fund_flow_data.get("provider"))
                         stock_data.fund_flow_anomalies = [
                             f"[{endpoint}] {v}" for v in violations
+                        ]
+                        stock_data.fund_flow_warnings = [
+                            f"[{endpoint}] {v}" for v in fund_flow_source.consistency_warnings(
+                                df, rendered="page_fallback" in (fund_flow_data.get("provider") or ""))
                         ]
                         shown = stock_data.fund_flow_anomalies[0] \
                             if len(violations) == 1 \

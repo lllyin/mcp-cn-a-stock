@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -61,6 +62,7 @@ _AMOUNT_TOLERANCE = 1e4      # 元（API 路径；页面万粒度同值）
 _PAGE_YI_TOLERANCE = 2.1e6   # 元（页面亿粒度：0.01 亿步进的四桶舍入上界）
 _PAGE_YI_SCALE = 1e8         # 行内最大金额到这个量级，页面按亿显示
 _RATIO_TOLERANCE = 0.05      # 百分点
+_VISIBLE_RELATIVE_TOLERANCE = 0.005
 
 
 @dataclass(frozen=True)
@@ -186,9 +188,9 @@ def _longer(accumulated, value):
 def consistency_violations(frame, *, rendered: bool = False) -> list:
     """一行一格地报出违反资金流内部恒等式的行。
 
-    恒等式来自分桶的定义本身：主力 = 超大单 + 大单，主力+大+中+小 = 0，
+    恒等式来自分桶的定义本身：主力 = 超大单 + 大单，超大+大+中+小 = 0，
     占比口径同理（主力占比+中单占比+小单占比 = 0）。它们对任何真实交易日都
-    成立，所以违反即「这行不是真实成交的账」。
+    成立，违反时保留异常供日志、提示和缓存守卫判断。
 
     起因是 2026-09-11 的发现：push2his 会按请求身份给一部分客户端发一份金额
     被扰动过的副本——HTTP 200、行数齐全、收盘价和涨跌幅是真值，只有各单净额
@@ -253,6 +255,55 @@ def consistency_violations(frame, *, rendered: bool = False) -> list:
                 row_issues.append(f"占比之和(主力+中+小)={total:+.2f}%，应为 0")
         if row_issues:
             issues.append(f"{date}: " + "；".join(row_issues))
+    return issues
+
+
+def consistency_warnings(frame, *, rendered: bool = False) -> list:
+    """用户提示只展示四档金额扣除舍入容差后的相对偏差 > 0.5% 的行。
+
+    分母为四档金额绝对值之和。页面按每项金额的万/亿/万亿两位小数估算舍入上限，
+    API 金额不扣页面舍入容差。合并帧逐行读取 _src，旧帧使用 rendered。
+    内部原始异常仍由 consistency_violations 记录，并供缓存守卫使用。
+    """
+    columns = ("超大单净流入-净额", "大单净流入-净额",
+               "中单净流入-净额", "小单净流入-净额")
+    if (frame is None or getattr(frame, "empty", True)
+            or not {"日期", *columns} <= set(frame.columns)):
+        return []
+    issues = []
+    has_row_src = "_src" in frame.columns
+    order = list(frame.columns)
+    for values in frame.itertuples(index=False, name=None):
+        row = dict(zip(order, values))
+        amounts = [row[name] for name in columns]
+        if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in amounts):
+            continue
+        scale = math.fsum(abs(v) for v in amounts)
+        if scale == 0:
+            continue
+        row_rendered = (
+            "page_fallback" in str(row.get("_src") or "")
+            if has_row_src else rendered
+        )
+        rounding = 0.0
+        if row_rendered:
+            for value in amounts:
+                magnitude = abs(value)
+                if magnitude >= 1e12:
+                    unit = 1e12
+                elif magnitude >= _PAGE_YI_SCALE:
+                    unit = _PAGE_YI_SCALE
+                else:
+                    unit = 1e4
+                rounding += unit * 0.005
+        total = math.fsum(amounts)
+        excess = max(0.0, abs(total) - rounding)
+        relative = excess / scale
+        if relative > _VISIBLE_RELATIVE_TOLERANCE:
+            issues.append(
+                f"{row['日期']}: 四档之和={total:+.0f} 元，舍入容差={rounding:.0f} 元，"
+                f"超出容差的相对偏差={relative:.3%}"
+            )
     return issues
 
 
@@ -424,6 +475,7 @@ __all__ = [
     "PROVIDER_ORDER_ENV",
     "configured_order",
     "consistency_violations",
+    "consistency_warnings",
     "provider_endpoint",
     "registered",
     "resolve",

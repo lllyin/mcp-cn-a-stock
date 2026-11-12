@@ -18,7 +18,9 @@ import finmcp.mcp_app  # noqa: F401  确保子模块已加载
 from finmcp import cache as cache_module
 from finmcp import research
 from finmcp.cache import ReportCache
-from finmcp.datasource.base import FETCH_FAILURES_KEY, StockData
+from finmcp.datasource.base import (
+    FETCH_FAILURES_KEY, FUND_FLOW_ANOMALIES_KEY, FUND_FLOW_WARNINGS_KEY, StockData,
+)
 
 # finmcp/__init__.py 把 `mcp_app` 这个名字重绑定成了 QtfMCP 实例，
 # 因此必须从 sys.modules 取真正的模块对象。
@@ -127,6 +129,34 @@ def install_cache(tmp_path, **kwargs) -> ReportCache:
     cache = ReportCache(**params)
     cache_module.set_report_cache(cache)
     return cache
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("visible", [[], ["相对偏差=0.728%"], None])
+async def test_visible_anomaly_filter_keeps_raw_anomalies_out_of_cache(
+    tmp_path, monkeypatch, deterministic_render, visible,
+):
+    data = StockData(symbol="SH600000")
+    data.fund_flow_anomalies = ["四档之和=+75868 元，应为 0"]
+    data.fund_flow_warnings = visible
+    raw = build_raw_data()
+    raw.update({k: v for k, v in data.to_dict().items()
+                if k in (FUND_FLOW_ANOMALIES_KEY, FUND_FLOW_WARNINGS_KEY)})
+
+    async def load(*args, **kwargs):
+        deterministic_render["count"] += 1
+        return raw
+
+    monkeypatch.setattr(research, "load_raw_data", load)
+    install_cache(tmp_path)
+    first = await mcp_app.fetch_batch_reports("SH600000", "brief", "test")
+    second = await mcp_app.fetch_batch_reports("SH600000", "brief", "test")
+    assert not first.errors
+    assert first.reports == second.reports
+    assert deterministic_render["count"] == 2
+    warnings = [w for w in first.warnings if "一致性偏差" in w]
+    assert bool(warnings) is (visible != [])
+    assert raw[FUND_FLOW_ANOMALIES_KEY] == data.fund_flow_anomalies
 
 
 @pytest.mark.asyncio

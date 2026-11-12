@@ -19,7 +19,7 @@ from .cache import build_key, get_report_cache, is_cacheable_report
 from .datasource import get_datasource
 from .datasource import fund_flow_source
 from .datasource import trading_calendar as trading_calendar_layer
-from .datasource.base import (FETCH_FAILURES_KEY, FUND_FLOW_ANOMALIES_KEY,
+from .datasource.base import (FETCH_FAILURES_KEY, FUND_FLOW_ANOMALIES_KEY, FUND_FLOW_WARNINGS_KEY,
                               FetchRequirements)
 from .datasource.market_breadth import get_market_breadth
 from .datasource.public_events import PublicEventPoolResponse, get_public_market_events
@@ -525,15 +525,15 @@ async def fetch_batch_reports(
                         f"{symbol}: 资金流向数据止于 {flow_day}，与报告的数据日期 "
                         f"{kline_day} 不一致——{detail}"
                     )
-                # 一致性检测咬住的扰动副本（算术不闭合的历史资金流行）在这里浮出：
-                # 数字看着齐全，但不是真实成交的账，读者必须知道哪些行不可信。
+                # 原始异常供缓存守卫使用，用户提示采用展示阈值。缺少分级字段的旧数据
+                # 沿用原始提示，避免旧调用方提供的数据绕过异常提示。
                 anomalies = raw_data.get(FUND_FLOW_ANOMALIES_KEY) or []
-                if anomalies:
-                    shown = anomalies[0] if len(anomalies) == 1 \
-                        else f"{len(anomalies)} 行（首见 {anomalies[0]}）"
+                visible_anomalies = raw_data.get(FUND_FLOW_WARNINGS_KEY, anomalies) or []
+                if visible_anomalies:
+                    shown = visible_anomalies[0] if len(visible_anomalies) == 1 \
+                        else f"{len(visible_anomalies)} 行（首见 {visible_anomalies[0]}）"
                     output["warnings"].append(
-                        f"{symbol}: 历史资金流向有 {shown} 违反内部恒等式"
-                        "（主力≠超大+大 / 四档之和≠0），数据疑似被上游扰动，不可信"
+                        f"{symbol}: 资金流向存在一致性偏差，{shown}"
                     )
                 missing_tiers = research.fund_flow_missing_tiers(raw_data)
                 if missing_tiers:

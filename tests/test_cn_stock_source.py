@@ -2126,6 +2126,35 @@ def _fund_flow_orchestration_stubs(monkeypatch, datasource):
 
 
 @pytest.mark.asyncio
+async def test_small_fund_flow_anomaly_is_logged_and_filtered_for_display(monkeypatch, caplog):
+    datasource = CNStockDataSource()
+    _fund_flow_orchestration_stubs(monkeypatch, datasource)
+    frame = _fund_flow_frame_of(1)
+    for column, value in {
+        "主力净流入-净额": 56175000., "超大单净流入-净额": 47753100.,
+        "大单净流入-净额": 8421900., "中单净流入-净额": 3869700.,
+        "小单净流入-净额": -59968832.,
+    }.items():
+        frame[column] = value
+    monkeypatch.setattr(
+        datasource, "_fetch_fund_flow_sync", lambda *args: {
+            "fund_flow": frame, "provider": "eastmoney", "complete": True,
+        },
+    )
+    with caplog.at_level("WARNING", logger="finmcp"):
+        result = await datasource.fetch_stock_data_with_requirements(
+            "SH600519", "2024-01-01", "2026-06-17",
+            requirements=FetchRequirements(finance=False, realtime=False, fund_flow_page=False),
+        )
+    assert result.fund_flow_anomalies
+    assert result.fund_flow_warnings == []
+    assert "差" in result.fund_flow_anomalies[0] or "四档之和" in result.fund_flow_anomalies[0]
+    assert "资金流向数据一致性可疑 SH600519" in caplog.text
+    assert "75868" in caplog.text
+    assert result.fund_s_amount.tolist() == [-59968832.]
+
+
+@pytest.mark.asyncio
 async def test_gateway_runs_only_after_the_page_also_fails(monkeypatch):
     """目标顺序 eastmoney → delay → 页面 → 网关：页面也没满足需求才付费。"""
     datasource = CNStockDataSource()

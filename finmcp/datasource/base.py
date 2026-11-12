@@ -14,6 +14,8 @@ import numpy as np
 FETCH_FAILURES_KEY = "_DS_FETCH_FAILURES"
 #: 资金流一致性检测的异常行，随 raw_data 一起出取数层。见 StockData.fund_flow_anomalies。
 FUND_FLOW_ANOMALIES_KEY = "_DS_FUND_FLOW_ANOMALIES"
+#: 按展示阈值筛选后的用户提示。空列表表示已筛选；缺省表示旧数据尚未分级。
+FUND_FLOW_WARNINGS_KEY = "_DS_FUND_FLOW_WARNINGS"
 
 
 @dataclass(frozen=True)
@@ -113,10 +115,11 @@ class StockData:
     # 取数层已降级返回的数据源；只用于阻止残缺报告进入跨请求缓存。
     fetch_failures: List[str] = field(default_factory=list)
 
-    # 资金流一致性检测发现的异常行（fund_flow_source.consistency_violations 的
-    # 原样输出）。非空 = 这份资金流的算术不闭合，大概率不是真实成交的账。
+    # 资金流一致性检测发现的原始异常行，供内部日志和缓存守卫使用。
     # 不进 fetch_failures：数据在那，不能因为可疑就说"没有"。
     fund_flow_anomalies: List[str] = field(default_factory=list)
+    # 按展示阈值筛选后的四档金额异常；None 兼容尚未分级的旧数据。
+    fund_flow_warnings: Optional[List[str]] = None
     
     def to_dict(self) -> Dict[str, np.ndarray]:
         """
@@ -199,6 +202,8 @@ class StockData:
             result[FETCH_FAILURES_KEY] = list(self.fetch_failures)  # type: ignore
         if self.fund_flow_anomalies:
             result[FUND_FLOW_ANOMALIES_KEY] = list(self.fund_flow_anomalies)  # type: ignore
+        if self.fund_flow_warnings is not None:
+            result[FUND_FLOW_WARNINGS_KEY] = list(self.fund_flow_warnings)  # type: ignore
         
         return result
     

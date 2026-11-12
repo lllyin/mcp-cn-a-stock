@@ -419,6 +419,49 @@ def test_anomalies_flow_to_raw_data_and_block_cache(monkeypatch):
     assert raw[FUND_FLOW_ANOMALIES_KEY] == anomalies
 
 
+def test_small_known_anomaly_stays_internal():
+    frame = pd.DataFrame([_row(
+        datetime.date(2026, 7, 1), 56175000., 47753100., 8421900.,
+        3869700., -59968832.,
+    )])
+    assert ffs.consistency_violations(frame)
+    assert ffs.consistency_warnings(frame) == []
+
+
+@pytest.mark.parametrize("small,expected", [(-49_750_000., False), (-49_749_999., True)])
+def test_visible_warning_requires_strictly_more_than_half_percent(small, expected):
+    frame = pd.DataFrame([_row(
+        datetime.date(2026, 7, 1), 100_500_000., 100_500_000., 0.,
+        -49_750_000., small,
+    )])
+    assert bool(ffs.consistency_warnings(frame)) is expected
+
+
+def test_visible_warning_subtracts_rounding_per_bucket_and_respects_row_source():
+    row = _row(datetime.date(2026, 7, 1), 100_600_000., 100_600_000.,
+               -49_700_000., -49_700_000., 0.)
+    frame = pd.DataFrame([
+        {**row, "_src": "page_fallback_today"},
+        {**row, "日期": datetime.date(2026, 7, 2), "_src": "eastmoney"},
+    ])
+    issues = ffs.consistency_warnings(frame, rendered=True)
+    assert len(issues) == 1
+    assert "2026-07-02" in issues[0]
+    assert "0.600%" in issues[0]
+    assert "舍入容差=0 元" in issues[0]
+
+
+def test_visible_warnings_skip_unavailable_amounts_and_ignore_ratio_only_drift():
+    rows = [
+        _row(datetime.date(2026, 7, 1), 0., 0., 0., 0., 0.),
+        _row(datetime.date(2026, 7, 2), 50e6, 30e6, 20e6, 5e6, -55e6, 4., .5, -3.),
+        _row(datetime.date(2026, 7, 3), 50e6, float("nan"), 20e6, 5e6, -55e6),
+    ]
+    assert ffs.consistency_violations(pd.DataFrame(rows))
+    assert ffs.consistency_warnings(pd.DataFrame(rows)) == []
+    assert ffs.consistency_warnings(None) == []
+
+
 def test_page_yi_scale_rounding_is_not_a_violation():
     """页面兜底把大额行渲染成两位小数的"亿"（步进 100 万元），四桶各有
     ±50 万的舍入——这是显示粒度，不是扰动。2026-09-13 曾整批误报。"""
